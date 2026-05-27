@@ -1,0 +1,27 @@
+# Custom gitleaks rules extending the default ruleset.
+# Adds detection for LLM provider API keys that the default rules miss
+# or handle weakly (Anthropic, OpenAI project keys, OpenRouter).
+#
+# To test:
+#   gitleaks detect --source . --no-git --verbose
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key"
+regex = '''sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{80,120}'''
+keywords = ["sk-ant-"]
+
+[[rules]]
+id = "openai-project-api-key"
+description = "OpenAI project-scoped API key (sk-proj-)"
+regex = '''sk-proj-[A-Za-z0-9_-]{100,}'''
+keywords = ["sk-proj-"]
+
+[[rules]]
+id = "openrouter-api-key"
+description = "OpenRouter API key"
+regex = '''sk-or-v1-[a-f0-9]{64}'''
+keywords = ["sk-or-v1-"]

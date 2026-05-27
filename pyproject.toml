@@ -1,0 +1,61 @@
+[project]
+name = "atlas"
+version = "0.1.0"
+description = "Local AI agent deployment"
+readme = "README.md"
+authors = [
+    { name = "CodeKnight314", email = "tang.ri@northeastern.edu" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.104.1",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.4",
+    "python-dotenv>=1.2.2",
+]
+
+[project.scripts]
+atlas = "atlas:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+    "pre-commit>=4.6.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+    "pytest-recording>=0.13.4",
+    "ruff>=0.15.14",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle + pyflakes
+    "I",             # isort
+    "B",             # flake8-bugbear
+    "UP",            # pyupgrade
+    "SIM",           # flake8-simplify
+    "RUF",           # ruff-specific
+]
+ignore = ["E501"]    # line length handled by formatter
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+markers = [
+    "evals: opt-in evaluation tests that hit real APIs (deselect with '-m \"not evals\"')",
+]

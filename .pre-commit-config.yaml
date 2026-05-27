@@ -1,0 +1,47 @@
+# After cloning, run once:  uv run pre-commit install
+# Hooks then run on every `git commit`.
+# To run all hooks on all files:  uv run pre-commit run --all-files
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  # Ruff: lint + format (replaces black, isort, flake8)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.14
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # mypy: static type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.18.2
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - pydantic
+          - anthropic
+          - httpx
+        args: [--config-file=pyproject.toml]
+        files: ^src/
+
+  # gitleaks: scan for accidentally-committed secrets.
+  # Uses the system binary (brew install gitleaks) instead of the upstream
+  # hook, which pulls Go at install time and fails on machines without it.
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks
+        language: system
+        entry: gitleaks protect --staged --redact --verbose
+        pass_filenames: false

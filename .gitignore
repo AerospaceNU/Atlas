@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Secrets — never commit .env files; only the .env.example template is tracked
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Coverage / build
+.coverage
+htmlcov/
+dist/
+build/
+
+# Local agent state (logs, cached responses outside test fixtures)
+.atlas/
+logs/
+
+CLAUDE.md
+AGENTS.md
