@@ -29,6 +29,7 @@ build/
 # Local agent state (logs, cached responses outside test fixtures)
 .atlas/
 logs/
+local/
 
 CLAUDE.md
 AGENTS.md
