@@ -1,0 +1,11 @@
+from __future__ import annotations
+
+from typing import ClassVar
+
+from atlas.data.modis_base import MODISClient
+
+
+class MODISLandCoverClient(MODISClient):
+    """MCD12Q1 - MODIS Land Cover Type (Terra + Aqua). Annual, 500 m."""
+
+    short_name: ClassVar[str] = "MCD12Q1"
