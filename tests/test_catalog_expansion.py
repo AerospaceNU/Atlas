@@ -13,10 +13,13 @@ from atlas.data.earth_search import EarthSearchSentinel1GrdClient
 from atlas.data.firms import FirmsClient
 from atlas.data.gibs import GibsModisTrueColorClient
 from atlas.data.goes import GOES_EAST_BUCKET, GoesClient
+from atlas.data.himawari import HIMAWARI_BUCKET, HimawariClient
 from atlas.data.hls_sentinel import HLSSentinelClient
+from atlas.data.maxar_opendata import MaxarOpenDataClient
 from atlas.data.naip import NaipClient
 from atlas.data.registry import SOURCES
 from atlas.data.sentinel2 import Sentinel2Client
+from atlas.data.usgs import UsgsLandsatC2L1Client
 
 
 class FakeResponse:
@@ -242,12 +245,104 @@ def test_new_sources_are_registered() -> None:
         "hls_sentinel",
         "naip",
         "cop_dem",
+        "cop_dem_90",
+        "nasadem",
+        "aster",
+        "alos_palsar",
+        "landsat_c2_l1",
+        "pc_modis_14a1",
+        "goes_cmi",
+        "esa_worldcover",
+        "io_lulc_annual",
+        "mrms_qpe_24h",
+        "usgs_landsat_l1",
+        "gedi",
+        "icesat2_atl03",
+        "smap_l3",
+        "dea_s2_ard",
+        "deafrica_s2",
+        "cbers4_mux",
+        "amazonia1_wfi",
+        "maxar_opendata",
+        "firms_viirs_noaa21",
+        "firms_landsat",
+        "gibs_night_lights",
+        "gibs_flood_3day",
+        "gibs_snow",
+        "himawari",
+        "cdse_sentinel3_slstr_lst",
+        "cdse_sentinel5p_ch4",
         "earthsearch_sentinel1_grd",
-        "cdse_sentinel3_olci",
-        "cdse_sentinel5p_no2",
-        "firms_viirs",
-        "gibs_modis_truecolor",
-        "gibs_viirs_truecolor",
         "goes",
     ):
         assert name in SOURCES
+
+
+@pytest.mark.asyncio
+async def test_usgs_and_worldcover_stac_targets() -> None:
+    fake = FakeAsyncClient(json_payload=_stac_payload(platform="landsat-8"))
+    async with _client(UsgsLandsatC2L1Client, fake) as client:
+        await client.search(_request())
+    assert fake.calls[0][1] == "https://landsatlook.usgs.gov/stac-server/search"
+    assert fake.calls[0][2]["json"]["collections"] == ["landsat-c2l1"]
+
+
+@pytest.mark.asyncio
+async def test_himawari_lists_ahi_slots() -> None:
+    xml = """<?xml version="1.0"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Contents>
+    <Key>AHI-L1b-FLDK/2024/07/01/0000/HS_H09_20240701_0000_B01_FLDK_R10_S0110.DAT.bz2</Key>
+  </Contents>
+</ListBucketResult>
+"""
+    fake = FakeAsyncClient(text=xml)
+    async with _client(HimawariClient, fake) as client:
+        result = await client.search(
+            _request(limit=1, start_date=date(2024, 7, 1), end_date=date(2024, 7, 1))
+        )
+    assert (
+        result.scenes[0]
+        .assets["data"]
+        .href.startswith(f"https://{HIMAWARI_BUCKET}.s3.amazonaws.com/")
+    )
+    assert "AHI-L1b-FLDK/2024/07/01/" in fake.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_maxar_walks_event_catalog() -> None:
+    root = {
+        "links": [{"rel": "child", "href": "./Event/collection.json"}],
+    }
+    event = {
+        "extent": {
+            "spatial": {"bbox": [[-71.2, 42.2, -70.9, 42.5]]},
+            "temporal": {"interval": [["2024-07-01T00:00:00Z", "2024-07-03T00:00:00Z"]]},
+        },
+        "links": [{"rel": "child", "href": "./acq/collection.json"}],
+    }
+    acq = {
+        "extent": {
+            "spatial": {"bbox": [[-71.2, 42.2, -70.9, 42.5]]},
+            "temporal": {"interval": [["2024-07-01T00:00:00Z", "2024-07-03T00:00:00Z"]]},
+        },
+        "links": [{"rel": "item", "href": "./item.json"}],
+    }
+    item = _stac_payload(platform="worldview-3")["features"][0]
+
+    class CatalogFake(FakeAsyncClient):
+        async def get(self, url: str, **kwargs: Any) -> FakeResponse:
+            self.calls.append(("GET", url, kwargs))
+            if url.endswith("catalog.json"):
+                return FakeResponse(json_payload=root)
+            if url.endswith("Event/collection.json"):
+                return FakeResponse(json_payload=event)
+            if url.endswith("acq/collection.json"):
+                return FakeResponse(json_payload=acq)
+            return FakeResponse(json_payload=item)
+
+    fake = CatalogFake()
+    async with MaxarOpenDataClient(client=cast(httpx.AsyncClient, fake), max_events=5) as client:
+        result = await client.search(_request())
+    assert result.scenes[0].id == "item-1"
+    assert result.scenes[0].platform == "worldview-3"

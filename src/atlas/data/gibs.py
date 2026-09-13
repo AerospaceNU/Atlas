@@ -81,6 +81,42 @@ class GibsViirsTrueColorClient(GibsClient):
     instrument_name: ClassVar[str] = "VIIRS"
 
 
+class GibsNightLightsClient(GibsClient):
+    layer: ClassVar[str] = "VIIRS_SNPP_DayNightBand_At_Sensor_Radiance"
+    platform_name: ClassVar[str] = "Suomi-NPP"
+    instrument_name: ClassVar[str] = "VIIRS"
+
+
+class GibsBlackMarbleClient(GibsClient):
+    layer: ClassVar[str] = "VIIRS_Black_Marble"
+    platform_name: ClassVar[str] = "Suomi-NPP"
+    instrument_name: ClassVar[str] = "VIIRS"
+
+
+class GibsFlood3DayClient(GibsClient):
+    layer: ClassVar[str] = "MODIS_Combined_Flood_3-Day"
+    platform_name: ClassVar[str] = "Terra/Aqua"
+    instrument_name: ClassVar[str] = "MODIS"
+
+
+class GibsSnowCoverClient(GibsClient):
+    layer: ClassVar[str] = "MODIS_Terra_NDSI_Snow_Cover"
+    platform_name: ClassVar[str] = "Terra"
+    instrument_name: ClassVar[str] = "MODIS"
+
+
+class GibsThermalAnomaliesClient(GibsClient):
+    layer: ClassVar[str] = "VIIRS_NOAA20_Thermal_Anomalies_375m_All"
+    platform_name: ClassVar[str] = "NOAA-20"
+    instrument_name: ClassVar[str] = "VIIRS"
+
+
+class GibsAquaTrueColorClient(GibsClient):
+    layer: ClassVar[str] = "MODIS_Aqua_CorrectedReflectance_TrueColor"
+    platform_name: ClassVar[str] = "Aqua"
+    instrument_name: ClassVar[str] = "MODIS"
+
+
 def _dates_inclusive(start: date, end: date) -> list[date]:
     days: list[date] = []
     cursor = start

@@ -10,3 +10,10 @@ class CopDemGlo30Client(PlanetaryComputerClient):
 
     default_collection: ClassVar[str] = "cop-dem-glo-30"
     include_datetime: ClassVar[bool] = False
+
+
+class CopDemGlo90Client(PlanetaryComputerClient):
+    """Copernicus DEM GLO-90. Static elevation; datetime is omitted from search."""
+
+    default_collection: ClassVar[str] = "cop-dem-glo-90"
+    include_datetime: ClassVar[bool] = False

@@ -34,3 +34,27 @@ class CdseSentinel5PNo2Client(CdseStacClient):
     """Sentinel-5P TROPOMI L2 NO2, offline processing."""
 
     default_collection: ClassVar[str] = "sentinel-5p-l2-no2-offl"
+
+
+class CdseSentinel3SlstrLstClient(CdseStacClient):
+    default_collection: ClassVar[str] = "sentinel-3-sl-2-lst-ntc"
+
+
+class CdseSentinel3SlstrFrpClient(CdseStacClient):
+    default_collection: ClassVar[str] = "sentinel-3-sl-2-frp-ntc"
+
+
+class CdseSentinel3SralWatClient(CdseStacClient):
+    default_collection: ClassVar[str] = "sentinel-3-sr-2-wat-ntc"
+
+
+class CdseSentinel5PCh4Client(CdseStacClient):
+    default_collection: ClassVar[str] = "sentinel-5p-l2-ch4-offl"
+
+
+class CdseSentinel5PCoClient(CdseStacClient):
+    default_collection: ClassVar[str] = "sentinel-5p-l2-co-offl"
+
+
+class CdseClmsBurntAreaClient(CdseStacClient):
+    default_collection: ClassVar[str] = "clms_ba_global_300m_daily_v4_cog"

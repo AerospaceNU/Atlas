@@ -84,10 +84,21 @@ class FirmsViirsNoaa20Client(FirmsClient):
     platform_name: ClassVar[str] = "NOAA-20"
 
 
+class FirmsViirsNoaa21Client(FirmsClient):
+    source: ClassVar[str] = "VIIRS_NOAA21_NRT"
+    platform_name: ClassVar[str] = "NOAA-21"
+
+
 class FirmsModisClient(FirmsClient):
     source: ClassVar[str] = "MODIS_NRT"
     platform_name: ClassVar[str] = "Terra/Aqua"
     instrument_name: ClassVar[str] = "MODIS"
+
+
+class FirmsLandsatClient(FirmsClient):
+    source: ClassVar[str] = "LANDSAT_NRT"
+    platform_name: ClassVar[str] = "Landsat"
+    instrument_name: ClassVar[str] = "OLI"
 
 
 def _chunk_days(start: date, end: date) -> list[tuple[date, int]]:
