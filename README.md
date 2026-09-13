@@ -34,6 +34,35 @@ uv run pre-commit install
 uv run atlas
 ```
 
+## Local tool-using agent interface
+
+The initial agent interface operates on a caller-selected local artifact directory.
+It has an explicit tool registry; a model may only use registered tools, and each
+run is bounded by a maximum number of tool rounds. The built-in tools can list
+and inspect local images, and generate a labeled contact sheet as a new local PNG.
+
+```python
+from pathlib import Path
+
+from atlas.agent import Agent, LocalArtifactStore, default_registry
+from atlas.agent.model import ModelConfig, OpenRouterModel
+
+artifacts = LocalArtifactStore(Path(".atlas/my-session"))
+model = OpenRouterModel(ModelConfig(model="openai/gpt-4.1-mini", api_key="..."))
+agent = Agent(model, default_registry(), artifacts)
+result = agent.run("List the local images and make a contact sheet.")
+print(result.response)
+print(result.steps)
+```
+
+`default_registry(allow_script_proposals=True)` also lets the agent *stage* a
+Python helper under `proposals/` in the artifact directory, then use
+`review_script_proposals` to create a static review report after the main
+conversation. These drafts are not executed, loaded, or promoted automatically.
+A reviewed implementation still needs to be added to application code and
+registered explicitly. This keeps a self-improving workflow auditable without
+granting the model arbitrary code execution or self-modification.
+
 ## Development
 
 ```bash
