@@ -22,7 +22,8 @@ uv sync
 
 # 4. Configure environment
 cp .env.example .env
-# then edit .env and set your OPENROUTER_API_KEY
+# then edit .env: OPENROUTER_API_KEY (agent) and optional FIRMS_MAP_KEY
+# FIRMS key: https://firms.modaps.eosdis.nasa.gov/api/map_key/ (free, emailed)
 
 # 5. Install git hooks (lint, format, type-check, secret scan on commit)
 uv run pre-commit install

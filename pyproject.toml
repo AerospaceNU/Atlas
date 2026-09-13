@@ -56,7 +56,12 @@ disallow_untyped_defs = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-ra --strict-markers"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "-m",
+    "not evals",
+]
 markers = [
     "evals: opt-in evaluation tests that hit real APIs (deselect with '-m \"not evals\"')",
 ]
