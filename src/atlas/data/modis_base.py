@@ -1,6 +1,14 @@
+"""NASA CMR search for MODIS Collection 6.1 granules.
+
+These clients implement ``DataPullClient.search`` against Earthdata CMR, not
+Planetary Computer STAC. Compile mosaics still require a
+``PlanetaryComputerClient``; a MODIS hit is catalog metadata plus HTTPS
+download URLs. Fetching HDF/NetCDF needs Earthdata login and is out of band.
+"""
+
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, ClassVar, Self
 
 import httpx
@@ -15,6 +23,8 @@ from atlas.data.base import (
 )
 
 CMR_SEARCH_URL = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
+
+_TILE_ATTRS = frozenset({"HORIZONTALTILENUMBER", "VERTICALTILENUMBER", "TileID"})
 
 
 class MODISClient(DataPullClient):
@@ -31,6 +41,10 @@ class MODISClient(DataPullClient):
             raise ValueError(f"{type(self).__name__} has no short_name; use a concrete subclass.")
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._owns_client = client is None
+
+    @property
+    def collection(self) -> str:
+        return self.short_name
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -55,77 +69,212 @@ class MODISClient(DataPullClient):
             ),
             "page_size": request.limit,
         }
+        if request.max_cloud_cover is not None:
+            params["cloud_cover"] = f"0,{request.max_cloud_cover:g}"
 
         resp = await self._client.get(CMR_SEARCH_URL, params=params)
         resp.raise_for_status()
         payload = resp.json()
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected CMR object, got {type(payload)}")
 
-        scenes = [self._granule_to_scene(item) for item in payload.get("items", [])]
+        scenes: list[Scene] = []
+        for item in payload.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            scene = self._granule_to_scene(item)
+            if scene is not None:
+                scenes.append(scene)
         return PullResult(request=request, scenes=scenes)
 
-    def _granule_to_scene(self, item: dict[str, Any]) -> Scene:
-        meta: dict[str, Any] = item.get("meta", {})
-        umm: dict[str, Any] = item.get("umm", {})
+    def _granule_to_scene(self, item: dict[str, Any]) -> Scene | None:
+        raw_meta = item.get("meta")
+        raw_umm = item.get("umm")
+        meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
+        umm: dict[str, Any] = raw_umm if isinstance(raw_umm, dict) else {}
 
-        time_range = umm.get("TemporalExtent", {}).get("RangeDateTime", {})
-        raw_dt = time_range.get("BeginningDateTime") or time_range.get("EndingDateTime", "")
-        try:
-            scene_dt = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
-            scene_dt = datetime.utcnow()
+        scene_dt = _scene_datetime(umm)
+        bbox = _scene_bbox(umm)
+        scene_id = meta.get("concept-id") or umm.get("GranuleUR")
+        if scene_dt is None or bbox is None or not isinstance(scene_id, str) or not scene_id:
+            return None
 
-        bb = (
-            umm.get("SpatialExtent", {})
-            .get("HorizontalSpatialDomain", {})
-            .get("Geometry", {})
-            .get("BoundingRectangles", [{}])[0]
-        )
-        bbox = BBox(
-            west=float(bb.get("WestBoundingCoordinate", -180)),
-            south=float(bb.get("SouthBoundingCoordinate", -90)),
-            east=float(bb.get("EastBoundingCoordinate", 180)),
-            north=float(bb.get("NorthBoundingCoordinate", 90)),
-        )
-
-        platforms = umm.get("Platforms", [{}])
-        platform_name: str = platforms[0].get("ShortName", "MODIS") if platforms else "MODIS"
-        instruments = platforms[0].get("Instruments", [{}]) if platforms else [{}]
-        instrument_name: str | None = instruments[0].get("ShortName") if instruments else None
-
-        assets: dict[str, Asset] = {}
-        for related in umm.get("RelatedUrls", []):
-            url: str = related.get("URL", "")
-            url_type: str = related.get("Type", "")
-            if "DATA" in url_type or "GET DATA" in url_type:
-                key = url.rstrip("/").split("/")[-1].rsplit(".", 1)[0][:64] or "data"
-                assets[key] = Asset(
-                    href=url,
-                    media_type=_guess_media_type(url),
-                    title=related.get("Description") or key,
-                    roles=["data"],
-                )
-
+        platform_name, instrument_name = _platform(umm)
         return Scene(
-            id=meta.get("concept-id", "unknown"),
+            id=scene_id,
             datetime=scene_dt,
             bbox=bbox,
             platform=platform_name,
             instrument=instrument_name,
-            cloud_cover=None,
-            assets=assets,
-            properties={
-                "short_name": self.short_name,
-                "version": self.version,
-            },
+            cloud_cover=_cloud_cover(umm),
+            assets=_https_data_assets(umm),
+            properties=_properties(self.short_name, self.version, umm),
         )
 
 
+def _scene_datetime(umm: dict[str, Any]) -> datetime | None:
+    temporal = umm.get("TemporalExtent")
+    if not isinstance(temporal, dict):
+        return None
+    range_dt = temporal.get("RangeDateTime")
+    raw: object = None
+    if isinstance(range_dt, dict):
+        raw = range_dt.get("BeginningDateTime") or range_dt.get("EndingDateTime")
+    if not raw:
+        raw = temporal.get("SingleDateTime")
+    return _parse_datetime(raw)
+
+
+def _parse_datetime(raw: object) -> datetime | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _scene_bbox(umm: dict[str, Any]) -> BBox | None:
+    spatial = umm.get("SpatialExtent")
+    if not isinstance(spatial, dict):
+        return None
+    domain = spatial.get("HorizontalSpatialDomain")
+    if not isinstance(domain, dict):
+        return None
+    geometry = domain.get("Geometry")
+    if not isinstance(geometry, dict):
+        return None
+    return _bbox_from_rectangles(geometry) or _bbox_from_polygons(geometry)
+
+
+def _bbox_from_rectangles(geometry: dict[str, Any]) -> BBox | None:
+    rects = geometry.get("BoundingRectangles")
+    if not isinstance(rects, list) or not rects:
+        return None
+    bb = rects[0]
+    if not isinstance(bb, dict):
+        return None
+    try:
+        return BBox(
+            west=float(bb["WestBoundingCoordinate"]),
+            south=float(bb["SouthBoundingCoordinate"]),
+            east=float(bb["EastBoundingCoordinate"]),
+            north=float(bb["NorthBoundingCoordinate"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _bbox_from_polygons(geometry: dict[str, Any]) -> BBox | None:
+    polygons = geometry.get("GPolygons")
+    if not isinstance(polygons, list):
+        return None
+    lons: list[float] = []
+    lats: list[float] = []
+    for poly in polygons:
+        if not isinstance(poly, dict):
+            continue
+        boundary = poly.get("Boundary")
+        points = boundary.get("Points") if isinstance(boundary, dict) else None
+        if not isinstance(points, list):
+            continue
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            try:
+                lons.append(float(point["Longitude"]))
+                lats.append(float(point["Latitude"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    if not lons or not lats:
+        return None
+    return BBox(west=min(lons), south=min(lats), east=max(lons), north=max(lats))
+
+
+def _platform(umm: dict[str, Any]) -> tuple[str, str | None]:
+    platforms = umm.get("Platforms")
+    if not isinstance(platforms, list) or not platforms or not isinstance(platforms[0], dict):
+        return "MODIS", None
+    first = platforms[0]
+    name = first.get("ShortName")
+    platform_name = name if isinstance(name, str) and name else "MODIS"
+    instruments = first.get("Instruments")
+    if not isinstance(instruments, list) or not instruments or not isinstance(instruments[0], dict):
+        return platform_name, None
+    instrument = instruments[0].get("ShortName")
+    instrument_name = instrument if isinstance(instrument, str) and instrument else None
+    return platform_name, instrument_name
+
+
+def _cloud_cover(umm: dict[str, Any]) -> float | None:
+    value = umm.get("CloudCover")
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
+def _https_data_assets(umm: dict[str, Any]) -> dict[str, Asset]:
+    assets: dict[str, Asset] = {}
+    related = umm.get("RelatedUrls")
+    if not isinstance(related, list):
+        return assets
+    for entry in related:
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("URL")
+        url_type = entry.get("Type")
+        if not isinstance(url, str) or not url.startswith("https://"):
+            continue
+        if url_type == "GET DATA" and "data" not in assets:
+            assets["data"] = Asset(
+                href=url,
+                media_type=_guess_media_type(url),
+                title=_asset_title(entry, "data"),
+                roles=["data"],
+            )
+        elif url_type == "GET RELATED VISUALIZATION" and "browse" not in assets:
+            assets["browse"] = Asset(
+                href=url,
+                media_type=_guess_media_type(url),
+                title=_asset_title(entry, "browse"),
+                roles=["overview"],
+            )
+    return assets
+
+
+def _asset_title(entry: dict[str, Any], default: str) -> str:
+    description = entry.get("Description")
+    return description if isinstance(description, str) and description else default
+
+
+def _properties(short_name: str, version: str, umm: dict[str, Any]) -> dict[str, Any]:
+    props: dict[str, Any] = {"short_name": short_name, "version": version}
+    attributes = umm.get("AdditionalAttributes")
+    if not isinstance(attributes, list):
+        return props
+    for attr in attributes:
+        if not isinstance(attr, dict):
+            continue
+        name = attr.get("Name")
+        values = attr.get("Values")
+        if name in _TILE_ATTRS and isinstance(values, list) and values:
+            props[str(name)] = values[0]
+    return props
+
+
 def _guess_media_type(url: str) -> str:
-    lower = url.lower()
-    if lower.endswith((".hdf", ".he4")):
+    path = url.split("?", 1)[0].lower()
+    if path.endswith((".hdf", ".he4")):
         return "application/x-hdf"
-    if lower.endswith((".nc", ".nc4")):
+    if path.endswith((".nc", ".nc4")):
         return "application/x-netcdf"
-    if lower.endswith((".tif", ".tiff")):
+    if path.endswith((".tif", ".tiff")):
         return "image/tiff"
+    if path.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if path.endswith(".png"):
+        return "image/png"
     return "application/octet-stream"

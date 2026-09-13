@@ -3,6 +3,10 @@ from __future__ import annotations
 from atlas.data.base import DataPullClient
 from atlas.data.landsat8 import Landsat8Client
 from atlas.data.landsat9 import Landsat9Client
+from atlas.data.modis_active_fire import MODISActiveFireClient
+from atlas.data.modis_land_cover import MODISLandCoverClient
+from atlas.data.modis_surface import MODISSurfaceReflClient
+from atlas.data.modis_vegetation import MODISVegetationClient
 from atlas.data.sentinel1 import Sentinel1Client
 from atlas.data.sentinel2 import Sentinel2Client
 
@@ -13,6 +17,10 @@ SOURCES: dict[str, type[DataPullClient]] = {
     "sentinel2": Sentinel2Client,
     "landsat8": Landsat8Client,
     "landsat9": Landsat9Client,
+    "modis_active_fire": MODISActiveFireClient,
+    "modis_land_cover": MODISLandCoverClient,
+    "modis_surface": MODISSurfaceReflClient,
+    "modis_vegetation": MODISVegetationClient,
 }
 
 
