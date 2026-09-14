@@ -121,6 +121,10 @@ def test_gpolygons_bbox_and_https_data_not_s3() -> None:
     assert scene.properties["HORIZONTALTILENUMBER"] == "12"
     assert scene.cloud_cover is None
     assert scene.platform == "MODIS"
+    assert scene.geometry_kind.value == "polygon"
+    assert scene.kind.value == "optical"
+    assert scene.gsd_m == 1000.0
+    assert scene.collection == "MOD13A2"
 
 
 def test_bounding_rectangles_preferred_when_present() -> None:
@@ -153,6 +157,7 @@ def test_bounding_rectangles_preferred_when_present() -> None:
     assert scene.instrument == "MODIS"
     assert scene.cloud_cover == 0.0
     assert scene.datetime == datetime(2020, 1, 1, tzinfo=UTC)
+    assert scene.geometry_kind.value == "bbox"
 
 
 def test_empty_bounding_rectangles_and_missing_polygons_are_skipped() -> None:

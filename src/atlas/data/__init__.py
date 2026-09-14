@@ -2,9 +2,11 @@ from atlas.data.base import (
     Asset,
     BBox,
     DataPullClient,
+    GeometryKind,
     PullRequest,
     PullResult,
     Scene,
+    SceneKind,
 )
 from atlas.data.cdse import CdseSentinel3OlciClient, CdseSentinel5PNo2Client
 from atlas.data.cmr_stac import GediL2AClient, IceSat2Atl03Client, SmapL3PassiveClient
@@ -64,6 +66,7 @@ __all__ = [
     "FirmsViirsNoaa20Client",
     "FirmsViirsNoaa21Client",
     "GediL2AClient",
+    "GeometryKind",
     "GibsFlood3DayClient",
     "GibsModisTrueColorClient",
     "GibsNightLightsClient",
@@ -87,6 +90,7 @@ __all__ = [
     "PullRequest",
     "PullResult",
     "Scene",
+    "SceneKind",
     "Sentinel1Client",
     "Sentinel2Client",
     "SmapL3PassiveClient",

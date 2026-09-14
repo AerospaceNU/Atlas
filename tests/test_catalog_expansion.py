@@ -6,7 +6,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from atlas.data.base import BBox, PullRequest
+from atlas.data.base import BBox, GeometryKind, PullRequest, SceneKind
 from atlas.data.cdse import CdseSentinel3OlciClient
 from atlas.data.cop_dem import CopDemGlo30Client
 from atlas.data.earth_search import EarthSearchSentinel1GrdClient
@@ -189,6 +189,8 @@ async def test_gibs_builds_wms_preview_per_day() -> None:
         "2024-07-03",
     ]
     href = result.scenes[0].assets["rendered_preview"].href
+    assert result.scenes[0].kind is SceneKind.browse
+    assert result.scenes[0].footprint_is_request is True
     assert "MODIS_Terra_CorrectedReflectance_TrueColor" in href
     assert "TIME=2024-07-01" in href
     assert "42.32" in href
@@ -212,6 +214,9 @@ async def test_firms_parses_csv_and_requires_key() -> None:
     scene = result.scenes[0]
     assert scene.datetime == datetime(2024, 7, 1, 13, 42, tzinfo=UTC)
     assert scene.bbox.west < -71.08 < scene.bbox.east
+    assert scene.geometry_kind is GeometryKind.point
+    assert scene.kind is SceneKind.detection
+    assert scene.lon == pytest.approx(-71.08)
     assert "area/csv/abc/VIIRS_SNPP_NRT" in fake.calls[0][1]
 
 
@@ -236,6 +241,8 @@ async def test_goes_lists_netcdf_from_s3() -> None:
         .href.startswith(f"https://{GOES_EAST_BUCKET}.s3.amazonaws.com/")
     )
     assert result.scenes[0].assets["data"].href.endswith(".nc")
+    assert result.scenes[0].kind is SceneKind.optical
+    assert result.scenes[0].bbox.as_list() != BOSTON.as_list()
     assert "ABI-L2-MCMIPC/2024/183/" in fake.calls[0][1]
 
 

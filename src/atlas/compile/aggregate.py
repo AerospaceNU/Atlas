@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Mapping
 
 from atlas.compile.product import SceneCatalog, SourceScenes
-from atlas.data.base import DataPullClient, PullRequest
+from atlas.data.base import DataPullClient, PullRequest, Scene
 
 
 async def _search_one(name: str, client: DataPullClient, request: PullRequest) -> SourceScenes:
@@ -17,7 +17,15 @@ async def _search_one(name: str, client: DataPullClient, request: PullRequest) -
         return SourceScenes(
             source=name, collection=collection, scenes=[], error=f"{type(exc).__name__}: {exc}"
         )
-    return SourceScenes(source=name, collection=collection, scenes=result.scenes)
+    stamped: list[Scene] = []
+    for scene in result.scenes:
+        updates: dict[str, str] = {}
+        if not scene.source:
+            updates["source"] = name
+        if not scene.collection and collection:
+            updates["collection"] = collection
+        stamped.append(scene.model_copy(update=updates) if updates else scene)
+    return SourceScenes(source=name, collection=collection, scenes=stamped)
 
 
 async def aggregate(request: PullRequest, clients: Mapping[str, DataPullClient]) -> SceneCatalog:

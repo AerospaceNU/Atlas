@@ -8,7 +8,14 @@ from urllib.parse import urlencode
 
 import httpx
 
-from atlas.data.base import Asset, DataPullClient, PullRequest, PullResult, Scene
+from atlas.data.base import (
+    Asset,
+    DataPullClient,
+    PullRequest,
+    PullResult,
+    Scene,
+    SceneKind,
+)
 
 GIBS_WMS = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
 
@@ -18,6 +25,7 @@ class GibsClient(DataPullClient):
     platform_name: ClassVar[str] = "GIBS"
     instrument_name: ClassVar[str | None] = None
     image_size: ClassVar[int] = 512
+    scene_kind: ClassVar[SceneKind] = SceneKind.browse
 
     def __init__(
         self,
@@ -46,14 +54,21 @@ class GibsClient(DataPullClient):
 
     async def search(self, request: PullRequest) -> PullResult:
         days = _dates_inclusive(request.start_date, request.end_date)[: request.limit]
-        scenes = [
-            Scene(
+        scenes: list[Scene] = []
+        for day in days:
+            start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+            end = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=UTC)
+            scene = Scene.try_new(
                 id=f"{self.layer}:{day.isoformat()}",
-                datetime=datetime(day.year, day.month, day.day, tzinfo=UTC),
+                collection=self.layer,
+                kind=self.scene_kind,
+                datetime=start,
+                start_datetime=start,
+                end_datetime=end,
                 bbox=request.bbox,
+                footprint_is_request=True,
                 platform=self.platform_name,
                 instrument=self.instrument_name,
-                cloud_cover=None,
                 assets={
                     "rendered_preview": Asset(
                         href=_wms_url(self.layer, day, request, self.image_size),
@@ -64,8 +79,8 @@ class GibsClient(DataPullClient):
                 },
                 properties={"layer": self.layer, "time": day.isoformat()},
             )
-            for day in days
-        ]
+            if scene is not None:
+                scenes.append(scene)
         return PullResult(request=request, scenes=scenes)
 
 
@@ -109,6 +124,7 @@ class GibsThermalAnomaliesClient(GibsClient):
     layer: ClassVar[str] = "VIIRS_NOAA20_Thermal_Anomalies_375m_All"
     platform_name: ClassVar[str] = "NOAA-20"
     instrument_name: ClassVar[str] = "VIIRS"
+    scene_kind: ClassVar[SceneKind] = SceneKind.thermal
 
 
 class GibsAquaTrueColorClient(GibsClient):

@@ -8,15 +8,25 @@ that belongs to the local-COG path and is intentionally not done here.
 
 from __future__ import annotations
 
-from atlas.data.base import BBox, Scene
+from atlas.data.base import BBox, GeometryKind, Scene, SceneKind
+
+_CLOUD_KINDS = frozenset({SceneKind.optical, SceneKind.browse})
+_COVERAGE_SKIP_KINDS = frozenset({SceneKind.browse, SceneKind.lidar, SceneKind.altimetry})
 
 
 def filter_cloud(scenes: list[Scene], max_cloud: float | None) -> list[Scene]:
-    """Drop scenes above the cloud threshold. Scenes without a cloud value
-    (e.g. SAR) are always kept."""
+    """Drop optical/browse scenes above the cloud threshold.
+
+    Other kinds (SAR, thermal, detections, …) are kept regardless of cloud.
+    Optical/browse with ``cloud_cover is None`` are kept.
+    """
     if max_cloud is None:
         return list(scenes)
-    return [s for s in scenes if s.cloud_cover is None or s.cloud_cover <= max_cloud]
+    return [
+        s
+        for s in scenes
+        if s.kind not in _CLOUD_KINDS or s.cloud_cover is None or s.cloud_cover <= max_cloud
+    ]
 
 
 def dedup(scenes: list[Scene]) -> list[Scene]:
@@ -32,11 +42,13 @@ def dedup(scenes: list[Scene]) -> list[Scene]:
 
 def sort_clearest(scenes: list[Scene]) -> list[Scene]:
     """Order so the best pixels come first: lowest cloud, then most recent.
-    Scenes without cloud cover (SAR) sort by recency alone."""
+
+    Cloud is only considered for optical/browse. Other kinds sort by recency.
+    """
     return sorted(
         scenes,
         key=lambda s: (
-            s.cloud_cover if s.cloud_cover is not None else -1.0,
+            s.cloud_cover if s.kind in _CLOUD_KINDS and s.cloud_cover is not None else -1.0,
             -s.datetime.timestamp(),
         ),
     )
@@ -51,21 +63,27 @@ def select(
 
 
 def representative_cloud(scenes: list[Scene]) -> float | None:
-    """Lowest cloud cover among scenes (None if no scene reports cloud)."""
-    values = [s.cloud_cover for s in scenes if s.cloud_cover is not None]
+    """Lowest cloud cover among optical/browse scenes (None if none report cloud)."""
+    values = [s.cloud_cover for s in scenes if s.kind in _CLOUD_KINDS and s.cloud_cover is not None]
     return min(values) if values else None
 
 
+def _counts_for_coverage(scene: Scene) -> bool:
+    """Area-filling footprints only. Points, AOI snapshots, browse, lidar, altimetry skip."""
+    if scene.geometry_kind is GeometryKind.point or scene.footprint_is_request:
+        return False
+    return scene.kind not in _COVERAGE_SKIP_KINDS
+
+
 def coverage_fraction(scenes: list[Scene], aoi: BBox, *, grid: int = 16) -> float:
-    """Approximate fraction of the AOI covered by the union of scene footprints.
+    """Approximate fraction of the AOI covered by area-filling scene footprints.
 
     Samples a grid x grid lattice of points across the AOI and reports the
-    fraction that fall inside at least one scene's bbox. Cheap and coarse, but
-    enough to tell the difference between full coverage and a clipped sliver.
+    fraction that fall inside at least one counted scene's bbox.
     """
-    if not scenes:
+    boxes = [s.bbox for s in scenes if _counts_for_coverage(s)]
+    if not boxes:
         return 0.0
-    boxes = [s.bbox for s in scenes]
     hits = 0
     total = grid * grid
     for i in range(grid):
