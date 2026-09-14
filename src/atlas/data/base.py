@@ -11,14 +11,12 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 
 class SceneKind(StrEnum):
-    """What a scene *is*, for routing — not a vendor collection id."""
-
     optical = "optical"
     sar = "sar"
     thermal = "thermal"
     lidar = "lidar"
     dem = "dem"
-    atmosphere = "atmosphere"  # retrieval rasters, including microwave (e.g. SMAP)
+    atmosphere = "atmosphere"
     browse = "browse"
     detection = "detection"
     altimetry = "altimetry"
