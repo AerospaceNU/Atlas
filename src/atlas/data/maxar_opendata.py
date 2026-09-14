@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from atlas.data.base import BBox, DataPullClient, PullRequest, PullResult, Scene
+from atlas.data.base import BBox, DataPullClient, PullRequest, PullResult, Scene, SceneKind
 from atlas.data.stac import item_to_scene
 
 MAXAR_ROOT = "https://maxar-opendata.s3.amazonaws.com/events/catalog.json"
@@ -85,7 +85,13 @@ class MaxarOpenDataClient(DataPullClient):
                 item_url = urljoin(urljoin(event_url, href), item_href)
                 item = await self._get_json(item_url)
                 _absolutize_asset_hrefs(item, item_url)
-                scene = item_to_scene(item, default_platform="maxar")
+                scene = item_to_scene(
+                    item,
+                    default_platform="maxar",
+                    collection="maxar-opendata",
+                    kind=SceneKind.optical,
+                    gsd_m=0.5,
+                )
                 if scene is not None:
                     scenes.append(scene)
                 if len(scenes) >= request.limit:

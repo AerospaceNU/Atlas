@@ -10,7 +10,15 @@ from typing import Any, ClassVar, Self
 
 import httpx
 
-from atlas.data.base import BBox, DataPullClient, PullRequest, PullResult, Scene
+from atlas.data.base import (
+    BBox,
+    DataPullClient,
+    GeometryKind,
+    PullRequest,
+    PullResult,
+    Scene,
+    SceneKind,
+)
 
 FIRMS_AREA_URL = (
     "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{bbox}/{days}/{date}"
@@ -24,6 +32,8 @@ class FirmsClient(DataPullClient):
     source: ClassVar[str] = "VIIRS_SNPP_NRT"
     platform_name: ClassVar[str] = "Suomi-NPP"
     instrument_name: ClassVar[str] = "VIIRS"
+    scene_kind: ClassVar[SceneKind] = SceneKind.detection
+    nominal_gsd_m: ClassVar[float | None] = 375.0
 
     def __init__(
         self,
@@ -72,6 +82,8 @@ class FirmsClient(DataPullClient):
                 source=self.source,
                 platform=self.platform_name,
                 instrument=self.instrument_name,
+                kind=self.scene_kind,
+                gsd_m=self.nominal_gsd_m,
             ):
                 scenes.append(scene)
                 if len(scenes) >= request.limit:
@@ -93,12 +105,14 @@ class FirmsModisClient(FirmsClient):
     source: ClassVar[str] = "MODIS_NRT"
     platform_name: ClassVar[str] = "Terra/Aqua"
     instrument_name: ClassVar[str] = "MODIS"
+    nominal_gsd_m: ClassVar[float | None] = 1000.0
 
 
 class FirmsLandsatClient(FirmsClient):
     source: ClassVar[str] = "LANDSAT_NRT"
     platform_name: ClassVar[str] = "Landsat"
     instrument_name: ClassVar[str] = "OLI"
+    nominal_gsd_m: ClassVar[float | None] = 30.0
 
 
 def _chunk_days(start: date, end: date) -> list[tuple[date, int]]:
@@ -112,21 +126,42 @@ def _chunk_days(start: date, end: date) -> list[tuple[date, int]]:
     return chunks
 
 
-def _rows_to_scenes(text: str, *, source: str, platform: str, instrument: str) -> list[Scene]:
+def _rows_to_scenes(
+    text: str,
+    *,
+    source: str,
+    platform: str,
+    instrument: str,
+    kind: SceneKind,
+    gsd_m: float | None,
+) -> list[Scene]:
     body = text.strip()
     if not body or body.lower().startswith("invalid") or "<html" in body.lower():
         return []
     reader = csv.DictReader(io.StringIO(body))
     scenes: list[Scene] = []
     for row in reader:
-        scene = _row_to_scene(row, source=source, platform=platform, instrument=instrument)
+        scene = _row_to_scene(
+            row,
+            source=source,
+            platform=platform,
+            instrument=instrument,
+            kind=kind,
+            gsd_m=gsd_m,
+        )
         if scene is not None:
             scenes.append(scene)
     return scenes
 
 
 def _row_to_scene(
-    row: dict[str, Any], *, source: str, platform: str, instrument: str
+    row: dict[str, Any],
+    *,
+    source: str,
+    platform: str,
+    instrument: str,
+    kind: SceneKind,
+    gsd_m: float | None,
 ) -> Scene | None:
     try:
         lat = float(row["latitude"])
@@ -139,31 +174,30 @@ def _row_to_scene(
         scene_dt = datetime.strptime(acq_date + acq_time, "%Y-%m-%d%H%M").replace(tzinfo=UTC)
     except ValueError:
         return None
-    pad = 0.01
-    try:
-        bbox = BBox(
-            west=max(-180.0, lon - pad),
-            south=max(-90.0, lat - pad),
-            east=min(180.0, lon + pad),
-            north=min(90.0, lat + pad),
-        )
-    except ValueError:
+    bbox = BBox.try_new(
+        west=max(-180.0, lon - 0.01),
+        south=max(-90.0, lat - 0.01),
+        east=min(180.0, lon + 0.01),
+        north=min(90.0, lat + 0.01),
+    )
+    if bbox is None:
         return None
-    frp = row.get("frp")
-    confidence = row.get("confidence")
-    scene_id = f"{source}:{lat:.4f}:{lon:.4f}:{acq_date}T{acq_time}"
-    return Scene(
-        id=scene_id,
+    return Scene.try_new(
+        id=f"{source}:{lat:.4f}:{lon:.4f}:{acq_date}T{acq_time}",
+        collection=source,
+        kind=kind,
         datetime=scene_dt,
         bbox=bbox,
+        geometry_kind=GeometryKind.point,
+        lon=lon,
+        lat=lat,
+        gsd_m=gsd_m,
         platform=str(row.get("satellite") or platform),
         instrument=instrument,
-        cloud_cover=None,
-        assets={},
         properties={
             "source": source,
-            "frp": frp,
-            "confidence": confidence,
+            "frp": row.get("frp"),
+            "confidence": row.get("confidence"),
             "daynight": row.get("daynight"),
             "bright_ti4": row.get("bright_ti4"),
             "latitude": lat,

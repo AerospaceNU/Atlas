@@ -44,8 +44,26 @@ select = [
     "UP",            # pyupgrade
     "SIM",           # flake8-simplify
     "RUF",           # ruff-specific
+    "D",             # pydocstyle (Google)
 ]
-ignore = ["E501"]    # line length handled by formatter
+ignore = [
+    "E501",  # line length handled by formatter
+    # Shape, not presence: thin STAC clients and Pydantic models stay uncommented.
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
 
 [tool.mypy]
 python_version = "3.12"

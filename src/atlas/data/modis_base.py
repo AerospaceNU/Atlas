@@ -17,9 +17,11 @@ from atlas.data.base import (
     Asset,
     BBox,
     DataPullClient,
+    GeometryKind,
     PullRequest,
     PullResult,
     Scene,
+    SceneKind,
 )
 
 CMR_SEARCH_URL = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
@@ -30,6 +32,8 @@ _TILE_ATTRS = frozenset({"HORIZONTALTILENUMBER", "VERTICALTILENUMBER", "TileID"}
 class MODISClient(DataPullClient):
     short_name: ClassVar[str] = ""
     version: ClassVar[str] = "061"
+    scene_kind: ClassVar[SceneKind] = SceneKind.optical
+    nominal_gsd_m: ClassVar[float | None] = None
 
     def __init__(
         self,
@@ -69,7 +73,10 @@ class MODISClient(DataPullClient):
             ),
             "page_size": request.limit,
         }
-        if request.max_cloud_cover is not None:
+        if request.max_cloud_cover is not None and self.scene_kind in {
+            SceneKind.optical,
+            SceneKind.browse,
+        }:
             params["cloud_cover"] = f"0,{request.max_cloud_cover:g}"
 
         resp = await self._client.get(CMR_SEARCH_URL, params=params)
@@ -93,17 +100,24 @@ class MODISClient(DataPullClient):
         meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
         umm: dict[str, Any] = raw_umm if isinstance(raw_umm, dict) else {}
 
-        scene_dt = _scene_datetime(umm)
-        bbox = _scene_bbox(umm)
+        scene_dt, start_dt, end_dt = _scene_times(umm)
+        parsed_bbox = _scene_bbox_and_kind(umm)
         scene_id = meta.get("concept-id") or umm.get("GranuleUR")
-        if scene_dt is None or bbox is None or not isinstance(scene_id, str) or not scene_id:
+        if scene_dt is None or parsed_bbox is None or not isinstance(scene_id, str) or not scene_id:
             return None
+        bbox, geometry_kind = parsed_bbox
 
         platform_name, instrument_name = _platform(umm)
-        return Scene(
+        return Scene.try_new(
             id=scene_id,
+            collection=self.short_name,
+            kind=self.scene_kind,
             datetime=scene_dt,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
             bbox=bbox,
+            geometry_kind=geometry_kind,
+            gsd_m=self.nominal_gsd_m,
             platform=platform_name,
             instrument=instrument_name,
             cloud_cover=_cloud_cover(umm),
@@ -112,17 +126,17 @@ class MODISClient(DataPullClient):
         )
 
 
-def _scene_datetime(umm: dict[str, Any]) -> datetime | None:
+def _scene_times(umm: dict[str, Any]) -> tuple[datetime | None, datetime | None, datetime | None]:
     temporal = umm.get("TemporalExtent")
     if not isinstance(temporal, dict):
-        return None
+        return None, None, None
     range_dt = temporal.get("RangeDateTime")
-    raw: object = None
+    start = end = None
     if isinstance(range_dt, dict):
-        raw = range_dt.get("BeginningDateTime") or range_dt.get("EndingDateTime")
-    if not raw:
-        raw = temporal.get("SingleDateTime")
-    return _parse_datetime(raw)
+        start = _parse_datetime(range_dt.get("BeginningDateTime"))
+        end = _parse_datetime(range_dt.get("EndingDateTime"))
+    nominal = start or _parse_datetime(temporal.get("SingleDateTime")) or end
+    return nominal, start, end
 
 
 def _parse_datetime(raw: object) -> datetime | None:
@@ -137,7 +151,7 @@ def _parse_datetime(raw: object) -> datetime | None:
     return parsed
 
 
-def _scene_bbox(umm: dict[str, Any]) -> BBox | None:
+def _scene_bbox_and_kind(umm: dict[str, Any]) -> tuple[BBox, GeometryKind] | None:
     spatial = umm.get("SpatialExtent")
     if not isinstance(spatial, dict):
         return None
@@ -147,7 +161,13 @@ def _scene_bbox(umm: dict[str, Any]) -> BBox | None:
     geometry = domain.get("Geometry")
     if not isinstance(geometry, dict):
         return None
-    return _bbox_from_rectangles(geometry) or _bbox_from_polygons(geometry)
+    rect = _bbox_from_rectangles(geometry)
+    if rect is not None:
+        return rect, GeometryKind.bbox
+    poly = _bbox_from_polygons(geometry)
+    if poly is not None:
+        return poly, GeometryKind.polygon
+    return None
 
 
 def _bbox_from_rectangles(geometry: dict[str, Any]) -> BBox | None:
@@ -229,19 +249,23 @@ def _https_data_assets(umm: dict[str, Any]) -> dict[str, Asset]:
         if not isinstance(url, str) or not url.startswith("https://"):
             continue
         if url_type == "GET DATA" and "data" not in assets:
-            assets["data"] = Asset(
+            asset = Asset.try_new(
                 href=url,
                 media_type=_guess_media_type(url),
                 title=_asset_title(entry, "data"),
                 roles=["data"],
             )
+            if asset is not None:
+                assets["data"] = asset
         elif url_type == "GET RELATED VISUALIZATION" and "browse" not in assets:
-            assets["browse"] = Asset(
+            asset = Asset.try_new(
                 href=url,
                 media_type=_guess_media_type(url),
                 title=_asset_title(entry, "browse"),
                 roles=["overview"],
             )
+            if asset is not None:
+                assets["browse"] = asset
     return assets
 
 

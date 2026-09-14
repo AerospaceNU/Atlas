@@ -9,7 +9,17 @@ from xml.etree import ElementTree
 
 import httpx
 
-from atlas.data.base import Asset, DataPullClient, PullRequest, PullResult, Scene
+from atlas.data.base import (
+    Asset,
+    BBox,
+    DataPullClient,
+    PullRequest,
+    PullResult,
+    Scene,
+    SceneKind,
+)
+
+_HIMAWARI_DISK = BBox(west=80.0, south=-60.0, east=180.0, north=60.0)
 
 _S3_NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 _TIME_RE = re.compile(r"HS_H09_(\d{8})_(\d{4})_")
@@ -62,7 +72,7 @@ class HimawariClient(DataPullClient):
             resp = await self._client.get(url)
             resp.raise_for_status()
             for key in _parse_keys(resp.text):
-                scene = _key_to_scene(key, request)
+                scene = _key_to_scene(key)
                 if scene is not None:
                     scenes.append(scene)
         return PullResult(request=request, scenes=scenes)
@@ -86,7 +96,7 @@ def _parse_keys(xml_text: str) -> list[str]:
     return [node.text for node in root.findall("s3:Contents/s3:Key", _S3_NS) if node.text]
 
 
-def _key_to_scene(key: str, request: PullRequest) -> Scene | None:
+def _key_to_scene(key: str) -> Scene | None:
     match = _TIME_RE.search(key)
     if match is None:
         return None
@@ -97,13 +107,15 @@ def _key_to_scene(key: str, request: PullRequest) -> Scene | None:
     except ValueError:
         return None
     href = f"https://{HIMAWARI_BUCKET}.s3.amazonaws.com/{key}"
-    return Scene(
+    return Scene.try_new(
         id=key.rsplit("/", 1)[-1],
+        collection=HIMAWARI_PRODUCT,
+        kind=SceneKind.optical,
         datetime=scene_dt,
-        bbox=request.bbox,
+        bbox=_HIMAWARI_DISK,
+        gsd_m=2000.0,
         platform="Himawari-9",
         instrument="AHI",
-        cloud_cover=None,
         assets={
             "data": Asset(
                 href=href,

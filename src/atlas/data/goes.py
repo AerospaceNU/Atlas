@@ -9,7 +9,15 @@ from xml.etree import ElementTree
 
 import httpx
 
-from atlas.data.base import Asset, BBox, DataPullClient, PullRequest, PullResult, Scene
+from atlas.data.base import (
+    Asset,
+    BBox,
+    DataPullClient,
+    PullRequest,
+    PullResult,
+    Scene,
+    SceneKind,
+)
 
 _S3_NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 _START_RE = re.compile(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})")
@@ -19,6 +27,8 @@ GOES_WEST_BUCKET = "noaa-goes18"
 
 # Rough CONUS in WGS84. Outside this, list full-disk MCMIPF instead of CONUS MCMIPC.
 _CONUS = BBox(west=-125.0, south=24.0, east=-66.0, north=50.0)
+_EAST_DISK = BBox(west=-135.0, south=-50.0, east=-15.0, north=50.0)
+_WEST_DISK = BBox(west=-180.0, south=-50.0, east=-105.0, north=60.0)
 
 
 class GoesClient(DataPullClient):
@@ -60,7 +70,7 @@ class GoesClient(DataPullClient):
             resp = await self._client.get(url)
             resp.raise_for_status()
             for key in _parse_keys(resp.text):
-                scene = _key_to_scene(bucket, key, request.bbox)
+                scene = _key_to_scene(bucket, key, product)
                 if scene is not None:
                     scenes.append(scene)
                     if len(scenes) >= request.limit:
@@ -105,7 +115,13 @@ def _parse_keys(xml_text: str) -> list[str]:
     return keys
 
 
-def _key_to_scene(bucket: str, key: str, bbox: BBox) -> Scene | None:
+def _footprint(bucket: str, product: str) -> BBox:
+    if product.endswith("C"):
+        return _CONUS
+    return _EAST_DISK if bucket == GOES_EAST_BUCKET else _WEST_DISK
+
+
+def _key_to_scene(bucket: str, key: str, product: str) -> Scene | None:
     match = _START_RE.search(key)
     if match is None:
         return None
@@ -117,13 +133,15 @@ def _key_to_scene(bucket: str, key: str, bbox: BBox) -> Scene | None:
     except ValueError:
         return None
     href = f"https://{bucket}.s3.amazonaws.com/{key}"
-    return Scene(
+    return Scene.try_new(
         id=key.rsplit("/", 1)[-1],
+        collection=product,
+        kind=SceneKind.optical,
         datetime=scene_dt,
-        bbox=bbox,
+        bbox=_footprint(bucket, product),
+        gsd_m=2000.0,
         platform="GOES-East" if bucket == GOES_EAST_BUCKET else "GOES-West",
         instrument="ABI",
-        cloud_cover=None,
         assets={
             "data": Asset(
                 href=href,
