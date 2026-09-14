@@ -47,11 +47,12 @@ Edit `.env`:
 
 ## 3. Install git hooks
 
+Install hooks once after cloning so lint, format, type-check, tests, and secret
+scans run on every commit:
+
 ```bash
 uv run pre-commit install
 ```
-
-Hooks run Ruff, format, mypy (on `src/`), and gitleaks on each commit.
 
 ## 4. Check the install
 
