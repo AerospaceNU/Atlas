@@ -284,6 +284,9 @@ def default_registry(*, allow_script_proposals: bool = False) -> ToolRegistry:
     if allow_script_proposals:
         registry.register(StageScriptTool())
         registry.register(ReviewScriptProposalsTool())
+    from atlas.models.registry import register_model_tools
+
+    register_model_tools(registry)
     return registry
 
 
