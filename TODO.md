@@ -4,13 +4,15 @@ Local CPU inference on session RGB PNGs (mosaics, GIBS snapshots, chips).
 No GPU. Tile large mosaics at 256–512; do not run detectors on a full mosaic
 in one pass. Spectral / SAR / foundation models are out of scope here.
 
-## classify_chip
+## segment_landcover
 
-Cheap land-cover triage of one chip (bare soil, built-up, water, vegetation,
-cloud) before change or a VLM.
+Per-pixel land cover on an RGB scene (bare, built-up, water, vegetation, cloud).
+Does not resize the input. Large rasters are labeled at native H×W (row strips
+only to bound memory).
 
-- **Input:** RGB PNG, `H×W×3` uint8, resized to `224×224×3`
-- **Output:** `C` class scores, `C=5` (bare, built-up, water, vegetation, cloud)
+- **Input:** RGB PNG, `H×W×3` uint8, any size
+- **Output:** label map `H×W` uint8 (class index), RGB overlay `H×W×3`, JSON
+  pixel fractions
 
 ## detect_objects
 

@@ -20,7 +20,7 @@ EUROSAT_URLS = (
     "https://zenodo.org/records/7711810/files/EuroSAT_RGB.zip?download=1",
     "http://madm.dfki.de/files/sentinel/EuroSAT.zip",
 )
-CHIP = 224
+SYNTHETIC_SIZE = 64
 _STAC_SEARCH = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
 
 # Weak labels by place: real Sentinel-2 L2A true-color previews.
@@ -89,8 +89,9 @@ def _root() -> Path:
 
 
 def _save_chip(image: Image.Image, destination: Path) -> None:
+    """Write RGB PNG at native size. Never resizes the scene."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    image.convert("RGB").resize((CHIP, CHIP), Image.Resampling.BOX).save(destination)
+    image.convert("RGB").save(destination)
 
 
 def write_synthetic(data_root: Path, per_split: int = 3) -> None:
@@ -98,7 +99,7 @@ def write_synthetic(data_root: Path, per_split: int = 3) -> None:
     for split in ("train", "val"):
         for name, color in SYNTHETIC_COLORS.items():
             for index in range(per_split):
-                chip = Image.new("RGB", (CHIP, CHIP), color)
+                chip = Image.new("RGB", (SYNTHETIC_SIZE, SYNTHETIC_SIZE), color)
                 _save_chip(chip, data_root / split / name / f"{index}.png")
 
 
@@ -306,7 +307,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--val-per-class", type=int, default=6)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
-    data_root = _root() / "local" / "models" / "classify_chip"
+    data_root = _root() / "local" / "models" / "segment_landcover"
     data_root.mkdir(parents=True, exist_ok=True)
     if args.synthetic:
         write_synthetic(data_root)

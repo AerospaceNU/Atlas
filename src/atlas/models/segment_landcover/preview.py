@@ -1,4 +1,4 @@
-"""Render a labeled inference sheet for classify_chip chips."""
+"""Render native-resolution overlays for held-out satellite scenes."""
 
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ from atlas.agent.tools import default_registry
 from atlas.models.base import parse_plugin_toml, repo_root
 
 _PLUGIN = Path(__file__).with_name("plugin.toml")
-_CHIP = 128
+_THUMB = 256
 _PAD = 12
-_LABEL_H = 44
+_LABEL_H = 28
 
 
 def _font(size: int) -> Any:
@@ -36,18 +36,29 @@ def _default_out() -> Path:
     root = repo_root()
     if root is None:
         raise SystemExit("No checkout found; pass --out")
-    return root / "local" / "models" / "classify_chip" / "preview.png"
+    return root / "local" / "models" / "segment_landcover" / "preview.png"
 
 
 def _val_dir() -> Path:
     root = repo_root()
     if root is None:
         raise SystemExit("No checkout found; pass --data-dir")
-    return root / "local" / "models" / "classify_chip" / "val"
+    return root / "local" / "models" / "segment_landcover" / "val"
 
 
 def _list_chips(class_dir: Path) -> list[Path]:
     return sorted(class_dir.glob("*.png")) + sorted(class_dir.glob("*.jpg"))
+
+
+def _thumb(image: Image.Image) -> Image.Image:
+    """Downscale only for the contact sheet. Inference already ran at native size."""
+    fitted = image.convert("RGB").copy()
+    fitted.thumbnail((_THUMB, _THUMB))
+    canvas = Image.new("RGB", (_THUMB, _THUMB), (20, 20, 20))
+    x = (_THUMB - fitted.width) // 2
+    y = (_THUMB - fitted.height) // 2
+    canvas.paste(fitted, (x, y))
+    return canvas
 
 
 def render_preview(
@@ -57,70 +68,74 @@ def render_preview(
     per_class: int,
     fixtures: Path | None,
 ) -> Path:
-    """Classify held-out chips through the agent tool and write a labeled PNG."""
+    """Segment held-out scenes at native size; sheet is RGB | overlay thumbnails."""
     spec = parse_plugin_toml(_PLUGIN.read_text(encoding="utf-8"))
     classes = spec.output.classes
     root = repo_root()
-    workspace = (root or out.parent) / "local" / "models" / "classify_chip" / "preview_workspace"
+    workspace = (
+        (root or out.parent) / "local" / "models" / "segment_landcover" / "preview_workspace"
+    )
     if workspace.exists():
         for stale in workspace.rglob("*"):
             if stale.is_file():
                 stale.unlink()
     store = LocalArtifactStore(workspace)
     registry = default_registry()
-    cells: list[tuple[str, str, float, Image.Image]] = []
+    cells: list[tuple[str, str, Image.Image, Image.Image]] = []
     for name in classes:
         chips = _list_chips(data_dir / name)
         if not chips:
-            raise FileNotFoundError(
-                f"No val chips for {name}. Run acquire.sh (satellite) then train/export."
-            )
+            raise FileNotFoundError(f"No val scenes for {name}. Run acquire.sh then train/export.")
         if fixtures is not None:
             fixtures.mkdir(parents=True, exist_ok=True)
             with Image.open(chips[0]) as first:
-                first.convert("RGB").resize((128, 128), Image.Resampling.BOX).save(
-                    fixtures / f"{name}.png"
-                )
+                first.convert("RGB").save(fixtures / f"{name}.png")
         for index, source in enumerate(chips[:per_class]):
             relative = f"{name}_{index}.png"
             with Image.open(source) as image:
                 rgb = image.convert("RGB")
                 rgb.save(store.root / relative)
-                chip = rgb.copy()
+                original = rgb.copy()
             result = registry.execute(
                 spec.name,
-                {"path": relative, "output_path": f"artifacts/{name}_{index}.json"},
+                {
+                    "path": relative,
+                    "labels_path": f"artifacts/{name}_{index}_labels.png",
+                    "overlay_path": f"artifacts/{name}_{index}_overlay.png",
+                    "json_path": f"artifacts/{name}_{index}.json",
+                },
                 store,
             )
             payload = json.loads(
                 (store.root / f"artifacts/{name}_{index}.json").read_text(encoding="utf-8")
             )
-            label = str(payload["label"])
-            score = float(payload["scores"][label])
-            cells.append((name, label, score, chip))
+            if payload["width"] != original.size[0] or payload["height"] != original.size[1]:
+                raise RuntimeError("segment_landcover resized the input")
+            with Image.open(store.root / payload["overlay"]) as overlay_im:
+                overlay = overlay_im.convert("RGB")
+            cells.append((name, f"{payload['width']}x{payload['height']}", original, overlay))
             if not result.artifacts:
-                raise RuntimeError(f"classify_chip produced no artifact for {relative}")
+                raise RuntimeError(f"segment_landcover produced no artifact for {relative}")
 
     columns = min(len(cells), 5)
     rows = (len(cells) + columns - 1) // columns
-    width = columns * (_CHIP + _PAD) + _PAD
-    height = rows * (_CHIP + _LABEL_H) + _PAD
+    cell_w = _THUMB * 2 + 4
+    width = columns * (cell_w + _PAD) + _PAD
+    height = rows * (_THUMB + _LABEL_H) + _PAD
     sheet = Image.new("RGB", (width, height), (255, 255, 255))
     draw = ImageDraw.Draw(sheet)
     title_font = _font(13)
-    for index, (expected, predicted, score, chip) in enumerate(cells):
+    for index, (expected, size_text, original, overlay) in enumerate(cells):
         col = index % columns
         row = index // columns
-        x = _PAD + col * (_CHIP + _PAD)
-        y = _PAD + row * (_CHIP + _LABEL_H)
-        sheet.paste(chip.resize((_CHIP, _CHIP), Image.Resampling.BOX), (x, y))
-        ok = expected == predicted
-        caption = f"{predicted} {score:.2f}"
-        draw.text((x, y + _CHIP + 4), expected, fill=(40, 40, 40), font=title_font)
+        x = _PAD + col * (cell_w + _PAD)
+        y = _PAD + row * (_THUMB + _LABEL_H)
+        sheet.paste(_thumb(original), (x, y))
+        sheet.paste(_thumb(overlay), (x + _THUMB + 4, y))
         draw.text(
-            (x, y + _CHIP + 22),
-            caption,
-            fill=(20, 120, 40) if ok else (180, 30, 30),
+            (x, y + _THUMB + 6),
+            f"{expected} {size_text}",
+            fill=(40, 40, 40),
             font=title_font,
         )
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -132,12 +147,12 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--data-dir", type=Path, default=None)
-    parser.add_argument("--per-class", type=int, default=3)
+    parser.add_argument("--per-class", type=int, default=1)
     parser.add_argument(
         "--fixtures",
         type=Path,
         default=None,
-        help="Optional directory for 128px class chips (repo samples).",
+        help="Optional directory for native-size class samples.",
     )
     args = parser.parse_args(argv)
     path = render_preview(

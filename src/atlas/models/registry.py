@@ -6,7 +6,7 @@ from importlib.resources import files
 
 from atlas.agent.tools import ToolRegistry
 from atlas.models.base import PluginSpec, parse_plugin_toml
-from atlas.models.classify_chip.infer import CentroidTool
+from atlas.models.segment_landcover.infer import SegmentLandcoverTool
 
 _MODELS_PACKAGE = "atlas.models"
 
@@ -28,7 +28,7 @@ def iter_plugin_specs() -> list[PluginSpec]:
 def register_model_tools(registry: ToolRegistry) -> None:
     """Register each discovered model plugin on ``registry``."""
     for spec in iter_plugin_specs():
-        if spec.runtime == "centroid":
-            registry.register(CentroidTool(spec))
+        if spec.runtime == "centroid_pixels":
+            registry.register(SegmentLandcoverTool(spec))
             continue
         raise ValueError(f"Unsupported model runtime {spec.runtime!r} for {spec.name}")
