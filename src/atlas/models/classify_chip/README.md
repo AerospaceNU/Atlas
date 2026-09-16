@@ -28,7 +28,13 @@ From the repo root:
 bash src/atlas/models/classify_chip/acquire.sh
 uv run python src/atlas/models/classify_chip/train.py
 uv run python src/atlas/models/classify_chip/export.py
+uv run python src/atlas/models/classify_chip/preview.py
 ```
+
+`preview.py` classifies one chip per class through the agent tool and writes
+`local/models/classify_chip/preview.png` (labeled predicted class + score).
+Pass `--fixtures src/atlas/models/classify_chip/fixtures` to refresh the
+128px class chips committed as visual samples.
 
 Paste the printed sha256 into `plugin.toml` when you pin an official export.
 Empty `sha256` means “file must exist”; a non-empty value fails closed on mismatch.
