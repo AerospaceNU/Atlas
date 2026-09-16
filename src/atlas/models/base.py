@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import tomllib
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from numpy.typing import NDArray
 from PIL import Image
 from pydantic import BaseModel, Field
+
+_MAX_PIXELS = 8_000_000
 
 _WEIGHTS_ENV = "ATLAS_WEIGHTS_DIR"
 
@@ -119,27 +122,72 @@ def load_centroids(spec: PluginSpec) -> dict[str, tuple[float, float, float]]:
     return centroids
 
 
-def mean_rgb(image: Image.Image, size: int = 224) -> tuple[float, float, float]:
-    """Resize to ``size`` then reduce to a single mean RGB in 0-255."""
-    rgb = image.convert("RGB").resize((size, size), Image.Resampling.BOX)
-    pixel = rgb.resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
-    if not isinstance(pixel, tuple) or len(pixel) < 3:
-        raise ValueError("Expected an RGB pixel from the reduced image")
-    return (float(pixel[0]), float(pixel[1]), float(pixel[2]))
+def mean_rgb(image: Image.Image) -> tuple[float, float, float]:
+    """Mean RGB of the image at native resolution (no resize)."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.float64)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError("Expected an RGB image")
+    channel_means = arr.reshape(-1, 3).mean(axis=0)
+    return (float(channel_means[0]), float(channel_means[1]), float(channel_means[2]))
 
 
-def softmax_neg_l2(
-    mean: tuple[float, float, float],
+def label_pixels(
+    image: Image.Image,
     centroids: dict[str, tuple[float, float, float]],
     classes: list[str],
+) -> NDArray[np.uint8]:
+    """Per-pixel nearest RGB centroid at native HxW. Never resizes the scene.
+
+    Large rasters are processed in row strips so memory stays bounded; the
+    result is still one label per original pixel.
+    """
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError("Expected an RGB image")
+    cents = np.asarray([centroids[name] for name in classes], dtype=np.float32)
+    height, width, _ = arr.shape
+    if height * width <= _MAX_PIXELS:
+        return _nearest_centroid(arr, cents)
+    labels = np.empty((height, width), dtype=np.uint8)
+    step = max(1, _MAX_PIXELS // max(width, 1))
+    for row in range(0, height, step):
+        labels[row : row + step] = _nearest_centroid(arr[row : row + step], cents)
+    return labels
+
+
+def _nearest_centroid(arr: NDArray[np.float32], cents: NDArray[np.float32]) -> NDArray[np.uint8]:
+    delta = arr[:, :, None, :] - cents[None, None, :, :]
+    return np.square(delta).sum(axis=-1).argmin(axis=-1).astype(np.uint8)
+
+
+def colorize_labels(
+    labels: NDArray[np.uint8],
+    colors: list[tuple[int, int, int]],
+) -> Image.Image:
+    """RGB visualization of a label map using a per-class palette."""
+    palette = np.asarray(colors, dtype=np.uint8)
+    return Image.fromarray(palette[labels], mode="RGB")
+
+
+def labels_png(
+    labels: NDArray[np.uint8],
+    colors: list[tuple[int, int, int]],
+) -> Image.Image:
+    """Palette PNG, one byte per pixel, same HxW as the input."""
+    image = Image.fromarray(labels, mode="P")
+    table: list[int] = []
+    for color in colors:
+        table.extend(color)
+    table.extend([0, 0, 0] * (256 - len(colors)))
+    image.putpalette(table)
+    return image
+
+
+def class_fractions(
+    labels: NDArray[np.uint8],
+    classes: list[str],
 ) -> dict[str, float]:
-    """Class scores from softmax of negative L2 distance to each centroid."""
-    logits: list[float] = []
-    for name in classes:
-        centroid = centroids[name]
-        dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(mean, centroid, strict=True)))
-        logits.append(-dist)
-    peak = max(logits)
-    exps = [math.exp(value - peak) for value in logits]
-    total = sum(exps)
-    return {name: exp / total for name, exp in zip(classes, exps, strict=True)}
+    """Fraction of pixels in each class, in class-list order."""
+    total = labels.size
+    counts = np.bincount(labels.ravel(), minlength=len(classes))
+    return {name: float(counts[i]) / float(total) for i, name in enumerate(classes)}

@@ -1,0 +1,14 @@
+name = "segment_landcover"
+description = "Per-pixel land cover on an RGB scene: bare, built-up, water, vegetation, cloud."
+runtime = "centroid_pixels"
+weight = "segment_landcover/model.json"
+sha256 = ""
+
+[input]
+kind = "rgb_png"
+shape = [0, 0, 3]
+dtype = "uint8"
+
+[output]
+kind = "labels"
+classes = ["bare", "built-up", "water", "vegetation", "cloud"]

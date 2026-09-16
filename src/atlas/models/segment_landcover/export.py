@@ -10,14 +10,14 @@ from pathlib import Path
 
 from atlas.models.base import repo_root, weights_root
 
-_RELATIVE_WEIGHT = "classify_chip/model.json"
+_RELATIVE_WEIGHT = "segment_landcover/model.json"
 
 
 def _default_centroids() -> Path:
     root = repo_root()
     if root is None:
         raise SystemExit("No checkout found; pass --centroids")
-    return root / "local" / "models" / "classify_chip" / "centroids.json"
+    return root / "local" / "models" / "segment_landcover" / "centroids.json"
 
 
 def export_weight(centroids_path: Path, destination: Path) -> str:

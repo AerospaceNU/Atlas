@@ -33,6 +33,7 @@ repos:
           - anthropic
           - httpx
           - pillow
+          - numpy
         args: [--config-file=pyproject.toml]
         files: ^src/
 
