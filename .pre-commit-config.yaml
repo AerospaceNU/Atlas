@@ -32,6 +32,7 @@ repos:
           - pydantic
           - anthropic
           - httpx
+          - pillow
         args: [--config-file=pyproject.toml]
         files: ^src/
 

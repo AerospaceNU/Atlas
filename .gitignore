@@ -31,5 +31,9 @@ build/
 logs/
 local/
 
+# Exported model weights (ATLAS_WEIGHTS_DIR or <repo>/weights)
+weights/*
+!weights/.gitkeep
+
 CLAUDE.md
 AGENTS.md
