@@ -20,7 +20,18 @@ def _default_data_dir() -> Path:
     root = repo_root()
     if root is None:
         raise SystemExit("No checkout found; pass --data-dir")
-    return root / "local" / "models" / "classify_chip"
+    return root / "local" / "models" / "classify_chip" / "train"
+
+
+def _default_out() -> Path:
+    root = repo_root()
+    if root is None:
+        raise SystemExit("No checkout found; pass --out")
+    return root / "local" / "models" / "classify_chip" / "centroids.json"
+
+
+def _chips(class_dir: Path) -> list[Path]:
+    return sorted(class_dir.glob("*.png")) + sorted(class_dir.glob("*.jpg"))
 
 
 def fit_centroids(data_dir: Path, size: int = 224) -> dict[str, list[float]]:
@@ -31,7 +42,7 @@ def fit_centroids(data_dir: Path, size: int = 224) -> dict[str, list[float]]:
         class_dir = data_dir / name
         if not class_dir.is_dir():
             raise FileNotFoundError(f"Missing class directory: {name}")
-        for path in sorted(class_dir.glob("*.png")):
+        for path in _chips(class_dir):
             with Image.open(path) as image:
                 mean = mean_rgb(image, size=size)
             for i, value in enumerate(mean):
@@ -49,7 +60,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--size", type=int, default=224)
     args = parser.parse_args(argv)
     data_dir = args.data_dir or _default_data_dir()
-    out = args.out or (data_dir / "centroids.json")
+    out = args.out or _default_out()
     centroids = fit_centroids(data_dir, size=args.size)
     payload = {"classes": _CLASSES, "centroids": centroids}
     out.parent.mkdir(parents=True, exist_ok=True)

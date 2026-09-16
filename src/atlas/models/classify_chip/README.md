@@ -22,7 +22,13 @@ The agent never runs `acquire.sh`, `train.py`, or `export.py`.
 
 ## Train a demo weight
 
-From the repo root:
+Default acquire pulls **real Sentinel-2 L2A true-color previews** from
+Planetary Computer (weak labels by place: Sahara, Amazon, Atlantic, Paris,
+cloudy Ireland). `--eurosat` also downloads labeled EuroSAT RGB chips.
+`--synthetic` writes solid-color PNGs for offline layout checks.
+
+Chips land in `local/models/classify_chip/train|val/<class>/` (gitignored).
+`--synthetic` still writes solid-color PNGs for offline layout checks.
 
 ```bash
 bash src/atlas/models/classify_chip/acquire.sh
@@ -31,10 +37,11 @@ uv run python src/atlas/models/classify_chip/export.py
 uv run python src/atlas/models/classify_chip/preview.py
 ```
 
-`preview.py` classifies one chip per class through the agent tool and writes
-`local/models/classify_chip/preview.png` (labeled predicted class + score).
-Pass `--fixtures src/atlas/models/classify_chip/fixtures` to refresh the
-128px class chips committed as visual samples.
+`preview.py` classifies held-out **val** chips through the agent tool and
+writes `local/models/classify_chip/preview.png`. Pass
+`--fixtures src/atlas/models/classify_chip/fixtures` to refresh the 128px
+samples. Mean-RGB centroids are a template, not a CNN — expect mistakes
+on real S2.
 
 Paste the printed sha256 into `plugin.toml` when you pin an official export.
 Empty `sha256` means “file must exist”; a non-empty value fails closed on mismatch.
