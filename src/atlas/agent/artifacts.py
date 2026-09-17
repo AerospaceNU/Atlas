@@ -46,7 +46,7 @@ class LocalArtifactStore:
     def relative(self, path: Path) -> str:
         """Return a root-relative, portable artifact path."""
         try:
-            return str(path.resolve().relative_to(self.root))
+            return path.resolve().relative_to(self.root).as_posix()
         except ValueError as exc:
             raise ValueError("Path is outside the artifact root") from exc
 
