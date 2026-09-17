@@ -2,19 +2,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import io
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import ClassVar
 
 import httpx
 import pytest
-from PIL import Image
 
 from atlas.cli import _attach_negative_option_values, _inject_data_command, main
 from atlas.cli.catalog import CatalogError, format_catalog, list_satellites, resolve_sources
 from atlas.cli.data import add_data_parser, parse_coords, parse_date_range, run_data
-from atlas.cli.download import download_previews, pick_asset, scene_filename
+from atlas.cli.download import BrowseAssetError, download_assets, pick_asset, scene_filename
 from atlas.data.base import Asset, BBox, DataPullClient, PullRequest, PullResult, Scene, SceneKind
 from atlas.data.registry import SOURCES
 
@@ -129,23 +127,34 @@ def test_parse_date_and_coords() -> None:
 
 
 def test_scene_filename_sanitizes() -> None:
-    assert scene_filename("S2A/tile:1") == "S2A_tile_1.png"
+    assert scene_filename("S2A/tile:1", "visual", ".tif") == "S2A_tile_1_visual.tif"
 
 
-def test_pick_asset_prefers_rendered_preview() -> None:
+def test_pick_asset_skips_browse_and_prefers_visual() -> None:
     scene = _scene(
         assets={
-            "thumbnail": Asset(href="https://example.com/t.png"),
-            "rendered_preview": Asset(href="https://example.com/p.png"),
+            "thumbnail": Asset(href="https://example.com/t.jpg", roles=["thumbnail"]),
+            "rendered_preview": Asset(href="https://example.com/p.png", roles=["overview"]),
+            "visual": Asset(
+                href="https://example.com/visual.tif",
+                media_type="image/tiff; application=geotiff",
+                roles=["visual"],
+            ),
         }
     )
     picked = pick_asset(scene)
     assert picked is not None
     key, asset = picked
-    assert key == "rendered_preview"
-    assert asset.href == "https://example.com/p.png"
-    named = pick_asset(scene, "thumbnail")
-    assert named is not None and named[0] == "thumbnail"
+    assert key == "visual"
+    assert asset.href.endswith("visual.tif")
+    browse_only = _scene(
+        assets={"rendered_preview": Asset(href="https://example.com/p.png", roles=["overview"])}
+    )
+    assert pick_asset(browse_only) is None
+    with pytest.raises(BrowseAssetError):
+        pick_asset(scene, "thumbnail")
+    with pytest.raises(BrowseAssetError):
+        pick_asset(scene, "rendered_preview")
     assert pick_asset(scene, "missing") is None
 
 
@@ -213,6 +222,26 @@ def test_negative_coords_are_not_parsed_as_flags() -> None:
     assert parse_coords(args.coords).west == -71.12
 
 
+def test_asset_thumbnail_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
+    assert (
+        main(
+            [
+                "data",
+                "sentinel2",
+                "optical",
+                "--date",
+                "2024-07-01:2024-07-07",
+                "--coords",
+                "-71.12,42.32,-71.02,42.40",
+                "--asset",
+                "thumbnail",
+            ]
+        )
+        == 2
+    )
+    assert "preview/thumbnail" in capsys.readouterr().err
+
+
 def test_help_contains_example() -> None:
     with pytest.raises(SystemExit) as exc:
         main(["data", "--help"])
@@ -230,34 +259,61 @@ def test_help_example_text(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_download_previews_writes_png(tmp_path: Path) -> None:
-    png = io.BytesIO()
-    Image.new("RGB", (4, 4), color=(10, 20, 30)).save(png, format="PNG")
-    payload = png.getvalue()
+async def test_download_assets_writes_raw_bytes(tmp_path: Path) -> None:
+    payload = b"II*\x00fake-geotiff"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == "https://example.com/p.png"
-        return httpx.Response(200, content=payload)
+        assert str(request.url) == "https://example.com/visual.tif"
+        return httpx.Response(
+            200,
+            content=payload,
+            headers={"content-type": "image/tiff; application=geotiff"},
+        )
 
     scene = _scene(
         id="chip-1",
-        assets={"rendered_preview": Asset(href="https://example.com/p.png")},
+        assets={
+            "rendered_preview": Asset(href="https://example.com/p.png", roles=["overview"]),
+            "visual": Asset(
+                href="https://example.com/visual.tif",
+                media_type="image/tiff; application=geotiff",
+                roles=["visual"],
+            ),
+        },
     )
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as http:
-        saved = await download_previews([scene], tmp_path, http=http, clients={})
+        saved = await download_assets([scene], tmp_path, http=http, clients={})
     path = saved["sentinel2"][0]
-    assert path.name == "chip-1.png"
-    image = Image.open(path)
-    assert image.size == (4, 4)
-    assert image.mode == "RGB"
+    assert path.name == "chip-1_visual.tif"
+    assert path.read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_download_assets_skips_browse_only_scene(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"GET should not run: {request.url}")
+
+    scene = _scene(
+        id="chip-1",
+        assets={"thumbnail": Asset(href="https://example.com/t.jpg", roles=["thumbnail"])},
+    )
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        saved = await download_assets([scene], tmp_path, http=http, clients={})
+    assert saved["sentinel2"] == []
 
 
 def test_run_data_isolates_source_errors(tmp_path: Path) -> None:
     ok_scene = _scene(
         id="ok-1",
         source="ok",
-        assets={"rendered_preview": Asset(href="https://example.com/p.png")},
+        assets={
+            "visual": Asset(
+                href="https://example.com/visual.tif",
+                media_type="image/tiff; application=geotiff",
+            )
+        },
     )
     clients = {
         "ok": FakePullClient(scenes=[ok_scene]),
@@ -285,7 +341,12 @@ def test_search_only_does_not_get(tmp_path: Path) -> None:
     scene = _scene(
         id="chip-1",
         source="ok",
-        assets={"rendered_preview": Asset(href="https://example.com/p.png")},
+        assets={
+            "visual": Asset(
+                href="https://example.com/visual.tif",
+                media_type="image/tiff; application=geotiff",
+            )
+        },
     )
     clients = {"ok": FakePullClient(scenes=[scene])}
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))

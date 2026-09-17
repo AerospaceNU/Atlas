@@ -20,7 +20,7 @@ from atlas.cli.catalog import (
     render_satellite_tree,
     resolve_sources,
 )
-from atlas.cli.download import download_previews
+from atlas.cli.download import BrowseAssetError, download_assets, is_forbidden_asset_name
 from atlas.cli.progress import ProgressReporter, pick_reporter
 from atlas.compile.aggregate import aggregate
 from atlas.compile.product import SceneCatalog
@@ -90,7 +90,7 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     data.add_argument(
         "--asset",
         default=None,
-        help="Asset key to download (default: rendered_preview, then visual/thumbnail)",
+        help="Asset key to download (default: visual COG, then data). Previews/thumbnails are rejected.",
     )
     data.set_defaults(_atlas_cmd="data")
 
@@ -139,6 +139,12 @@ def run_data(
         )
     except (CatalogError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+    if args.asset and is_forbidden_asset_name(args.asset):
+        print(
+            f"{args.asset!r} is a preview/thumbnail and cannot be downloaded",
+            file=sys.stderr,
+        )
         return 2
 
     reporter = pick_reporter(stream=sys.stderr)
@@ -192,11 +198,13 @@ async def execute_pull(
     clients: Mapping[str, DataPullClient] | None = None,
     http: httpx.AsyncClient | None = None,
 ) -> int:
-    """Fan out search, optionally download previews, write a manifest."""
+    """Fan out search, optionally download native-resolution assets, write a manifest."""
     owns_clients = clients is None
     live_clients = dict(clients) if clients is not None else sources(*source_names)
     owns_http = http is None
-    live_http = http if http is not None else httpx.AsyncClient(timeout=60.0)
+    live_http = (
+        http if http is not None else httpx.AsyncClient(timeout=300.0, follow_redirects=True)
+    )
     try:
         for name in live_clients:
             reporter.source_start(name)
@@ -215,17 +223,21 @@ async def execute_pull(
             for src in catalog.sources:
                 if src.error is None:
                     reporter.source_pull(src.source, saved=0, total=len(src.scenes))
-            pulled = await download_previews(
-                to_pull,
-                out_dir,
-                http=live_http,
-                clients=live_clients,
-                concurrency=concurrency,
-                asset_name=asset_name,
-                on_progress=lambda name, n_saved, total: reporter.source_pull(
-                    name, saved=n_saved, total=total
-                ),
-            )
+            try:
+                pulled = await download_assets(
+                    to_pull,
+                    out_dir,
+                    http=live_http,
+                    clients=live_clients,
+                    concurrency=concurrency,
+                    asset_name=asset_name,
+                    on_progress=lambda name, n_saved, total: reporter.source_pull(
+                        name, saved=n_saved, total=total
+                    ),
+                )
+            except BrowseAssetError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
             for name, paths in pulled.items():
                 saved[name] = paths
         for src in catalog.sources:
