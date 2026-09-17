@@ -16,6 +16,7 @@ class Cbers4MuxClient(InpeStacClient):
     """CBERS-4 MUX surface reflectance (Brazil Data Cube)."""
 
     default_collection: ClassVar[str] = "CB4-MUX-L4-SR-1"
+    satellite: ClassVar[str] = "cbers4"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = 20.0
 
@@ -24,5 +25,6 @@ class Amazonia1WfiClient(InpeStacClient):
     """Amazonia-1 WFI surface reflectance (Brazil Data Cube)."""
 
     default_collection: ClassVar[str] = "AMZ1-WFI-L4-SR-1"
+    satellite: ClassVar[str] = "amazonia1"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = 64.0

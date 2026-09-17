@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from datetime import date
 from datetime import datetime as DateTime
 from enum import StrEnum
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -147,6 +147,11 @@ class PullResult(BaseModel):
 
 
 class DataPullClient(ABC):
+    # The CLI catalog is derived from these ClassVars on registered clients.
+    # Subclasses that set satellite + scene_kind are picked up automatically.
+    satellite: ClassVar[str] = ""
+    scene_kind: ClassVar[SceneKind] = SceneKind.optical
+
     @abstractmethod
     async def search(self, request: PullRequest) -> PullResult:
         raise NotImplementedError

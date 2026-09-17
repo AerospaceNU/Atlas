@@ -32,6 +32,7 @@ class FirmsClient(DataPullClient):
     source: ClassVar[str] = "VIIRS_SNPP_NRT"
     platform_name: ClassVar[str] = "Suomi-NPP"
     instrument_name: ClassVar[str] = "VIIRS"
+    satellite: ClassVar[str] = "viirs"
     scene_kind: ClassVar[SceneKind] = SceneKind.detection
     nominal_gsd_m: ClassVar[float | None] = 375.0
 
@@ -92,16 +93,19 @@ class FirmsClient(DataPullClient):
 
 
 class FirmsViirsNoaa20Client(FirmsClient):
+    satellite: ClassVar[str] = "viirs"
     source: ClassVar[str] = "VIIRS_NOAA20_NRT"
     platform_name: ClassVar[str] = "NOAA-20"
 
 
 class FirmsViirsNoaa21Client(FirmsClient):
+    satellite: ClassVar[str] = "viirs"
     source: ClassVar[str] = "VIIRS_NOAA21_NRT"
     platform_name: ClassVar[str] = "NOAA-21"
 
 
 class FirmsModisClient(FirmsClient):
+    satellite: ClassVar[str] = "modis"
     source: ClassVar[str] = "MODIS_NRT"
     platform_name: ClassVar[str] = "Terra/Aqua"
     instrument_name: ClassVar[str] = "MODIS"
@@ -109,6 +113,7 @@ class FirmsModisClient(FirmsClient):
 
 
 class FirmsLandsatClient(FirmsClient):
+    satellite: ClassVar[str] = "landsat"
     source: ClassVar[str] = "LANDSAT_NRT"
     platform_name: ClassVar[str] = "Landsat"
     instrument_name: ClassVar[str] = "OLI"

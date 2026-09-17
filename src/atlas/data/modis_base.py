@@ -32,6 +32,7 @@ _TILE_ATTRS = frozenset({"HORIZONTALTILENUMBER", "VERTICALTILENUMBER", "TileID"}
 class MODISClient(DataPullClient):
     short_name: ClassVar[str] = ""
     version: ClassVar[str] = "061"
+    satellite: ClassVar[str] = "modis"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = None
 
