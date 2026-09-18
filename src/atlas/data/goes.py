@@ -96,12 +96,20 @@ def _product_for_bbox(bbox: BBox) -> str:
     return "ABI-L2-MCMIPC" if inside else "ABI-L2-MCMIPF"
 
 
-def _hours_in_range(start: date, end: date) -> list[tuple[int, int, int]]:
+def _hours_in_range(
+    start: date,
+    end: date,
+    *,
+    now: datetime | None = None,
+) -> list[tuple[int, int, int]]:
+    """UTC hours in ``[start, end]`` that have already finished (GOES prefixes exist)."""
     cursor = datetime(start.year, start.month, start.day, tzinfo=UTC)
     stop = datetime(end.year, end.month, end.day, 23, tzinfo=UTC)
+    latest = now or datetime.now(UTC)
     hours: list[tuple[int, int, int]] = []
     while cursor <= stop:
-        hours.append((cursor.year, cursor.timetuple().tm_yday, cursor.hour))
+        if cursor + timedelta(hours=1) <= latest:
+            hours.append((cursor.year, cursor.timetuple().tm_yday, cursor.hour))
         cursor += timedelta(hours=1)
     return hours
 
