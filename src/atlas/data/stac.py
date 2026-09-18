@@ -90,9 +90,16 @@ class StacApiClient(DataPullClient):
         return PullResult(request=request, scenes=scenes)
 
     def _cloud_query(self, request: PullRequest) -> dict[str, Any] | None:
-        if request.max_cloud_cover is None or self.scene_kind not in _CLOUD_QUERY_KINDS:
+        if self.scene_kind not in _CLOUD_QUERY_KINDS:
             return None
-        return {"eo:cloud_cover": {"lte": request.max_cloud_cover}}
+        bounds: dict[str, float] = {}
+        if request.min_cloud_cover is not None:
+            bounds["gte"] = request.min_cloud_cover
+        if request.max_cloud_cover is not None:
+            bounds["lte"] = request.max_cloud_cover
+        if not bounds:
+            return None
+        return {"eo:cloud_cover": bounds}
 
     def _build_query_filter(self, request: PullRequest) -> dict[str, Any] | None:
         return self._cloud_query(request)

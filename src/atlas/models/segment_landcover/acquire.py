@@ -3,15 +3,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
+import json
 import random
 import sys
 import zipfile
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from PIL import Image
 
+from atlas.data.planetary_computer import PlanetaryComputerClient
 from atlas.models.base import repo_root
 
 EUROSAT_URLS = (
@@ -20,6 +24,10 @@ EUROSAT_URLS = (
 )
 SYNTHETIC_SIZE = 64
 _STAC_SEARCH = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
+_STAC_SOURCE = "planetary_computer"
+_STAC_COLLECTION = "sentinel-2-l2a"
+_PREVIEW_ASSET_KEYS = ("rendered_preview", "visual", "thumbnail")
+_SAS_HOST_SUFFIX = ".blob.core.windows.net"
 
 # Weak labels by place: real Sentinel-2 L2A true-color previews.
 STAC_TARGETS: tuple[dict[str, Any], ...] = (
@@ -172,16 +180,108 @@ def layout_eurosat(
                 _save_chip(image, data_root / "val" / atlas_name / f"eurosat_{index:04d}.png")
 
 
-def _preview_href(feature: dict[str, Any]) -> str | None:
+@dataclass(frozen=True, slots=True)
+class AssetPick:
+    """One downloadable asset plus the scene provenance it came from."""
+
+    scene_id: str
+    collection: str
+    datetime: str | None
+    cloud_cover: float | None
+    bbox: list[float] | None
+    asset: str
+    href: str
+
+
+def _asset_href(spec: object) -> str | None:
+    href = spec.get("href") if isinstance(spec, dict) else None
+    return href if isinstance(href, str) and href else None
+
+
+def _is_data_asset(spec: object) -> bool:
+    roles = spec.get("roles") if isinstance(spec, dict) else None
+    return isinstance(roles, list) and "data" in roles
+
+
+def _choose_asset(feature: dict[str, Any]) -> tuple[str, str] | None:
+    """Prefer a browsable preview, then fall back to any data asset."""
     assets = feature.get("assets")
     if not isinstance(assets, dict):
         return None
-    for key in ("rendered_preview", "visual", "thumbnail"):
-        spec = assets.get(key)
-        href = spec.get("href") if isinstance(spec, dict) else None
-        if isinstance(href, str):
-            return href
+    for key in _PREVIEW_ASSET_KEYS:
+        href = _asset_href(assets.get(key))
+        if href is not None:
+            return key, href
+    for key, spec in assets.items():
+        href = _asset_href(spec)
+        if href is not None and _is_data_asset(spec):
+            return str(key), href
     return None
+
+
+def _float_or_none(raw: object) -> float | None:
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    return float(raw)
+
+
+def _asset_pick(feature: dict[str, Any], *, collection: str) -> AssetPick | None:
+    scene_id = feature.get("id")
+    chosen = _choose_asset(feature)
+    if chosen is None or not isinstance(scene_id, str) or not scene_id:
+        return None
+    props = feature.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+    scene_dt = props.get("datetime")
+    bbox = feature.get("bbox")
+    key, href = chosen
+    return AssetPick(
+        scene_id=scene_id,
+        collection=str(feature.get("collection") or collection),
+        datetime=scene_dt if isinstance(scene_dt, str) else None,
+        cloud_cover=_float_or_none(props.get("eo:cloud_cover")),
+        bbox=[float(value) for value in bbox] if isinstance(bbox, list) else None,
+        asset=key,
+        href=href,
+    )
+
+
+def _asset_suffix(pick: AssetPick) -> str:
+    """Previews are re-encoded as PNG; data assets keep their own extension."""
+    if pick.asset in _PREVIEW_ASSET_KEYS:
+        return ".png"
+    return PurePosixPath(urlparse(pick.href).path).suffix.lower() or ".bin"
+
+
+def _needs_signing(href: str) -> bool:
+    host = urlparse(href).hostname
+    return host is not None and host.endswith(_SAS_HOST_SUFFIX)
+
+
+def _write_asset(content: bytes, destination: Path) -> None:
+    if destination.suffix == ".png":
+        with Image.open(io.BytesIO(content)) as image:
+            _save_chip(image, destination)
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(content)
+
+
+def _write_sidecar(pick: AssetPick, destination: Path) -> None:
+    payload = {
+        "id": pick.scene_id,
+        "source": _STAC_SOURCE,
+        "collection": pick.collection,
+        "datetime": pick.datetime,
+        "cloud_cover": pick.cloud_cover,
+        "bbox": pick.bbox,
+        "asset": pick.asset,
+        "href": pick.href,
+    }
+    sidecar = destination.with_suffix(".json")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 async def _stac_features(
@@ -193,7 +293,7 @@ async def _stac_features(
     limit: int,
 ) -> list[dict[str, Any]]:
     body = {
-        "collections": ["sentinel-2-l2a"],
+        "collections": [_STAC_COLLECTION],
         "bbox": bbox,
         "datetime": datetime_range,
         "limit": limit,
@@ -208,26 +308,42 @@ async def _stac_features(
     return [item for item in features if isinstance(item, dict)]
 
 
-async def _download_previews(
+async def _download_assets(
     client: httpx.AsyncClient,
-    hrefs: list[str],
+    signer: PlanetaryComputerClient,
+    picks: list[AssetPick],
     destinations: list[Path],
 ) -> int:
     saved = 0
-    for href, dest in zip(hrefs, destinations, strict=True):
+    for pick, dest in zip(picks, destinations, strict=True):
         try:
+            href = await signer.sign_href(pick.href) if _needs_signing(pick.href) else pick.href
             response = await client.get(href, follow_redirects=True)
             response.raise_for_status()
-            with Image.open(io.BytesIO(response.content)) as image:
-                _save_chip(image, dest)
+            _write_asset(response.content, dest)
+            _write_sidecar(pick, dest)
             saved += 1
         except (httpx.HTTPError, OSError):
             continue
     return saved
 
 
+def _split_destinations(
+    picks: list[AssetPick], *, data_root: Path, atlas_name: str, val_n: int
+) -> list[Path]:
+    val_count = min(val_n, max(1, len(picks) // 5))
+    train_count = len(picks) - val_count
+    groups = (("train", picks[:train_count]), ("val", picks[train_count:]))
+    return [
+        data_root / split / atlas_name / f"stac_{index:04d}{_asset_suffix(pick)}"
+        for split, group in groups
+        for index, pick in enumerate(group)
+    ]
+
+
 async def fetch_stac_class(
     client: httpx.AsyncClient,
+    signer: PlanetaryComputerClient,
     *,
     atlas_name: str,
     bbox: list[float],
@@ -244,9 +360,12 @@ async def fetch_stac_class(
         query=query,
         limit=max(train_n + val_n, 10) * 2,
     )
-    hrefs = [href for href in (_preview_href(item) for item in features) if href]
-    hrefs = hrefs[: train_n + val_n]
-    if len(hrefs) < 4:
+    picks = [
+        pick
+        for pick in (_asset_pick(item, collection=_STAC_COLLECTION) for item in features)
+        if pick is not None
+    ][: train_n + val_n]
+    if len(picks) < 4:
         keys = []
         if features:
             raw_assets = features[0].get("assets")
@@ -254,23 +373,18 @@ async def fetch_stac_class(
                 keys = list(raw_assets)
         raise RuntimeError(
             f"STAC returned {len(features)} {atlas_name} items, "
-            f"{len(hrefs)} previews (asset keys={keys})"
+            f"{len(picks)} downloadable assets (asset keys={keys})"
         )
-    val_count = min(val_n, max(1, len(hrefs) // 5))
-    train_count = len(hrefs) - val_count
-    dests: list[Path] = []
-    for index in range(train_count):
-        dests.append(data_root / "train" / atlas_name / f"stac_{index:04d}.png")
-    for index in range(val_count):
-        dests.append(data_root / "val" / atlas_name / f"stac_{index:04d}.png")
-    saved = await _download_previews(client, hrefs[: len(dests)], dests)
+    dests = _split_destinations(picks, data_root=data_root, atlas_name=atlas_name, val_n=val_n)
+    saved = await _download_assets(client, signer, picks, dests)
     if saved < 4:
-        raise RuntimeError(f"Only downloaded {saved} {atlas_name} STAC previews")
+        raise RuntimeError(f"Only downloaded {saved} {atlas_name} STAC assets")
 
 
 async def fetch_stac_extras(data_root: Path, *, train_n: int, val_n: int) -> None:
     timeout = httpx.Timeout(60.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
+        signer = PlanetaryComputerClient(collection=_STAC_COLLECTION, client=client)
         for target in STAC_TARGETS:
             name = target["name"]
             assert isinstance(name, str)
@@ -283,6 +397,7 @@ async def fetch_stac_extras(data_root: Path, *, train_n: int, val_n: int) -> Non
             print(f"STAC {name}…", file=sys.stderr)
             await fetch_stac_class(
                 client,
+                signer,
                 atlas_name=name,
                 bbox=[float(v) for v in bbox],
                 datetime_range=datetime_range,
