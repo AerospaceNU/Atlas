@@ -1,13 +1,3 @@
-"""Top-level consolidation: turn one AOI + time window into a CompiledProduct.
-
-Flow: aggregate (fan-out search) -> select (filter/dedup/prioritize per source)
--> optionally render a gap-filled mosaic per source. Provenance (which scene
-ids fed each source) is tracked on the result.
-
-This module is agent-agnostic on purpose: the same `consolidate()` serves both
-an interactive tool call and a batch precompute job.
-"""
-
 from __future__ import annotations
 
 import asyncio

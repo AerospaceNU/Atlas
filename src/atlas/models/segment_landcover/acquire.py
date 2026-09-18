@@ -1,5 +1,3 @@
-"""Download real Sentinel-2 chips into train/ and val/ class folders."""
-
 from __future__ import annotations
 
 import argparse
@@ -296,7 +294,9 @@ async def fetch_stac_extras(data_root: Path, *, train_n: int, val_n: int) -> Non
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Download real Sentinel-2 chips into train/ and val/ class folders."
+    )
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument(
         "--eurosat",

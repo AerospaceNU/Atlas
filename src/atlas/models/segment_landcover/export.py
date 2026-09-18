@@ -1,5 +1,3 @@
-"""Copy trained centroids into the repo-root weights directory."""
-
 from __future__ import annotations
 
 import argparse
@@ -31,7 +29,9 @@ def export_weight(centroids_path: Path, destination: Path) -> str:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Copy trained centroids into the repo-root weights directory."
+    )
     parser.add_argument("--centroids", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)

@@ -1,5 +1,3 @@
-"""Local, tool-using agent primitives."""
-
 from __future__ import annotations
 
 from atlas.agent.artifacts import ImageInfo, LocalArtifactStore

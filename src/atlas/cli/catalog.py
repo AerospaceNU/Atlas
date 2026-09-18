@@ -1,11 +1,3 @@
-"""Discover satellites and kinds from registered ``DataPullClient`` classes.
-
-The CLI never hardcodes the source list. It walks ``SOURCES`` (or a caller-supplied
-registry) and groups clients by their ``satellite`` and ``scene_kind`` ClassVars.
-A new client that sets those the same way as an existing sibling is picked up
-without CLI changes.
-"""
-
 from __future__ import annotations
 
 import io

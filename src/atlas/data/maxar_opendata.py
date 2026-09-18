@@ -1,5 +1,3 @@
-"""Maxar Open Data: per-event STAC catalogs of disaster imagery (not a standing archive)."""
-
 from __future__ import annotations
 
 from datetime import date, datetime

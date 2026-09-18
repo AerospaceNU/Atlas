@@ -1,5 +1,3 @@
-"""Live CLI evals. Run with: uv run pytest -m evals tests/test_cli_evals.py"""
-
 from __future__ import annotations
 
 import json

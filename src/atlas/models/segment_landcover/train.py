@@ -1,5 +1,3 @@
-"""Fit per-class mean RGB centroids from acquired PNG chips."""
-
 from __future__ import annotations
 
 import argparse
@@ -54,7 +52,9 @@ def fit_centroids(data_dir: Path) -> dict[str, list[float]]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Fit per-class mean RGB centroids from acquired PNG chips."
+    )
     parser.add_argument("--data-dir", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)

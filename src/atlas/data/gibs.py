@@ -1,5 +1,3 @@
-"""NASA GIBS WMS snapshots. One scene per calendar day in the request window."""
-
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta

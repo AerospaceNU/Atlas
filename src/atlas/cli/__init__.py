@@ -1,5 +1,3 @@
-"""Command-line entry for Atlas. ``atlas data`` wraps ``atlas.data`` search."""
-
 from __future__ import annotations
 
 import argparse

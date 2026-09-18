@@ -1,5 +1,3 @@
-"""Discover ``plugin.toml`` packages and register them as agent tools."""
-
 from __future__ import annotations
 
 from importlib.resources import files

@@ -1,11 +1,3 @@
-"""NASA CMR search for MODIS Collection 6.1 granules.
-
-These clients implement ``DataPullClient.search`` against Earthdata CMR, not
-Planetary Computer STAC. Compile mosaics still require a
-``PlanetaryComputerClient``; a MODIS hit is catalog metadata plus HTTPS
-download URLs. Fetching HDF/NetCDF needs Earthdata login and is out of band.
-"""
-
 from __future__ import annotations
 
 from datetime import UTC, datetime

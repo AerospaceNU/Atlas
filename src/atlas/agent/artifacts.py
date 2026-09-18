@@ -1,5 +1,3 @@
-"""A filesystem boundary for local image inputs and generated artifacts."""
-
 from __future__ import annotations
 
 from pathlib import Path

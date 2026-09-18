@@ -1,5 +1,3 @@
-"""Fan-out search: run one request across every source concurrently."""
-
 from __future__ import annotations
 
 import asyncio

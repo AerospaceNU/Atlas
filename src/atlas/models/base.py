@@ -1,5 +1,3 @@
-"""Shared plugin spec, weight resolution, and centroid inference helpers."""
-
 from __future__ import annotations
 
 import hashlib

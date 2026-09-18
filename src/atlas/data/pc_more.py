@@ -1,5 +1,3 @@
-"""Additional Planetary Computer collections (new sensors/products, same STAC API)."""
-
 from __future__ import annotations
 
 from typing import ClassVar
