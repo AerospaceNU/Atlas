@@ -16,5 +16,6 @@ class EarthSearchSentinel1GrdClient(EarthSearchClient):
     """Sentinel-1 GRD on AWS Open Data (not the PC RTC collection)."""
 
     default_collection: ClassVar[str] = "sentinel-1-grd"
+    satellite: ClassVar[str] = "sentinel1"
     scene_kind: ClassVar[SceneKind] = SceneKind.sar
     nominal_gsd_m: ClassVar[float | None] = 10.0

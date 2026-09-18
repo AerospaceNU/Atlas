@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from atlas.compile.product import SceneCatalog, SourceScenes
 from atlas.data.base import DataPullClient, PullRequest, Scene
@@ -28,13 +28,23 @@ async def _search_one(name: str, client: DataPullClient, request: PullRequest) -
     return SourceScenes(source=name, collection=collection, scenes=stamped)
 
 
-async def aggregate(request: PullRequest, clients: Mapping[str, DataPullClient]) -> SceneCatalog:
+async def aggregate(
+    request: PullRequest,
+    clients: Mapping[str, DataPullClient],
+    *,
+    on_source: Callable[[SourceScenes], None] | None = None,
+) -> SceneCatalog:
     """Search every source for `request` and collect results into one catalog.
 
     A failure in one source is captured on its `SourceScenes.error` rather than
-    aborting the whole fan-out.
+    aborting the whole fan-out. ``on_source`` is called as each source finishes.
     """
-    sources = await asyncio.gather(
-        *(_search_one(name, client, request) for name, client in clients.items())
-    )
+
+    async def run(name: str, client: DataPullClient) -> SourceScenes:
+        result = await _search_one(name, client, request)
+        if on_source is not None:
+            on_source(result)
+        return result
+
+    sources = await asyncio.gather(*(run(name, client) for name, client in clients.items()))
     return SceneCatalog(request=request, sources=list(sources))

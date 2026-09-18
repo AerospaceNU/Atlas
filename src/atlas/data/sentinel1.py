@@ -8,5 +8,6 @@ from atlas.data.planetary_computer import PlanetaryComputerClient
 
 class Sentinel1Client(PlanetaryComputerClient):
     default_collection: ClassVar[str] = "sentinel-1-rtc"
+    satellite: ClassVar[str] = "sentinel1"
     scene_kind: ClassVar[SceneKind] = SceneKind.sar
     nominal_gsd_m: ClassVar[float | None] = 10.0

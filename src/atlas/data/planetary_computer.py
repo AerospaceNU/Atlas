@@ -13,7 +13,10 @@ class PlanetaryComputerClient(StacApiClient):
     search_url: ClassVar[str] = STAC_SEARCH_URL
 
     async def sign_href(self, href: str) -> str:
-        resp = await self._client.get(f"{SAS_SIGN_URL}?{urlencode({'href': href})}")
+        resp = await self._client.get(
+            f"{SAS_SIGN_URL}?{urlencode({'href': href})}",
+            timeout=60.0,
+        )
         resp.raise_for_status()
         signed = resp.json()["href"]
         if not isinstance(signed, str):
