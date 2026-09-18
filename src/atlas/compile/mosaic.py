@@ -1,19 +1,3 @@
-"""Server-side mosaic rendering over an AOI (the "A+" path).
-
-Registers a STAC search with Planetary Computer's mosaic API, which composites
-ACROSS all matching scenes server-side (clearest pixel first for optical,
-newest first for SAR), then fetches the web-mercator tiles covering the AOI,
-stitches them, and crops to the exact bbox.
-
-The render recipe (band combo / color formula) is reused verbatim from a
-representative scene's `rendered_preview` asset, so each collection renders the
-way Planetary Computer intends without hardcoding per-collection recipes here.
-
-NOTE: this currently targets the Planetary Computer mosaic API and assumes the
-client exposes `.collection` and `._build_query_filter` (i.e. a
-PlanetaryComputerClient subclass). Local-COG compositing is a future path.
-"""
-
 from __future__ import annotations
 
 import io

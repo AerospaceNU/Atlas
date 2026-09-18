@@ -1,5 +1,3 @@
-"""Search/pull progress: bar + ETA on a TTY, line logs otherwise."""
-
 from __future__ import annotations
 
 from typing import Protocol, TextIO

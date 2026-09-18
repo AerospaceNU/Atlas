@@ -1,5 +1,3 @@
-"""Live catalog evals. Run with: uv run pytest -m evals tests/test_live_catalogs.py"""
-
 from __future__ import annotations
 
 import os

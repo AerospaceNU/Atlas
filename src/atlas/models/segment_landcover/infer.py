@@ -1,5 +1,3 @@
-"""Native-resolution per-pixel land-cover segmentation."""
-
 from __future__ import annotations
 
 import json

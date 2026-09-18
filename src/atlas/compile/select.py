@@ -1,11 +1,3 @@
-"""Scene selection: filter, dedup, prioritize, and estimate AOI coverage.
-
-This is the decision layer between raw search results and compositing. It works
-purely on `Scene` metadata (no pixels), so it is cheap and provider-agnostic.
-Cloud *masking* (per-pixel, from SCL/qa bands) is a separate, heavier concern
-that belongs to the local-COG path and is intentionally not done here.
-"""
-
 from __future__ import annotations
 
 from atlas.data.base import BBox, GeometryKind, Scene, SceneKind

@@ -1,5 +1,3 @@
-"""NASA CMR-STAC / CloudSTAC collections (search is public; some assets need Earthdata)."""
-
 from __future__ import annotations
 
 from typing import ClassVar

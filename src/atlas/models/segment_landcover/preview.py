@@ -1,5 +1,3 @@
-"""Render native-resolution overlays for held-out satellite scenes."""
-
 from __future__ import annotations
 
 import argparse
@@ -144,7 +142,9 @@ def render_preview(
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Render native-resolution overlays for held-out satellite scenes."
+    )
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--data-dir", type=Path, default=None)
     parser.add_argument("--per-class", type=int, default=1)

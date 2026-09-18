@@ -1,5 +1,3 @@
-"""NOAA GOES ABI Cloud and Moisture Imagery on AWS Open Data (no sign-in)."""
-
 from __future__ import annotations
 
 import re

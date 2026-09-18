@@ -1,5 +1,3 @@
-"""Generic STAC Item Search client used by Planetary Computer, Earth Search, and CDSE."""
-
 from __future__ import annotations
 
 from datetime import UTC, datetime

@@ -1,5 +1,3 @@
-"""Himawari-9 AHI full-disk on NOAA Open Data (AWS, no sign-in)."""
-
 from __future__ import annotations
 
 import re

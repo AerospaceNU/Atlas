@@ -1,11 +1,3 @@
-"""Data models for the consolidation layer.
-
-A `SceneCatalog` is the raw fan-out result (every source's scenes). A
-`CompiledProduct` is the consolidated, provenance-tracked output for one AOI +
-time window: which scenes were used per source, representative cloud cover, and
-any mosaics that were rendered.
-"""
-
 from __future__ import annotations
 
 from pydantic import BaseModel, Field

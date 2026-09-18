@@ -1,5 +1,3 @@
-"""Trusted local tools exposed to Atlas agents."""
-
 from __future__ import annotations
 
 import ast

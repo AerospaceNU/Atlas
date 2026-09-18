@@ -1,5 +1,3 @@
-"""``atlas data``: list discovered satellites or search and pull previews."""
-
 from __future__ import annotations
 
 import argparse

@@ -1,5 +1,3 @@
-"""Parallel download of native-resolution scene assets. Browse imagery is rejected."""
-
 from __future__ import annotations
 
 import asyncio

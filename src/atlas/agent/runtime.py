@@ -1,5 +1,3 @@
-"""Bounded autonomous tool-use loop for a local Atlas workspace."""
-
 from __future__ import annotations
 
 import json

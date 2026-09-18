@@ -1,5 +1,3 @@
-"""NASA FIRMS active-fire detections (CSV area API)."""
-
 from __future__ import annotations
 
 import csv

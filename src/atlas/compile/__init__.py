@@ -1,10 +1,3 @@
-"""Consolidation layer: fan-out search, scene selection, and mosaic rendering.
-
-Turns a single AOI + time window into one provenance-tracked `CompiledProduct`
-spanning every satellite source. Agent-agnostic — the same entry points back
-both interactive tool calls and batch precompute.
-"""
-
 from __future__ import annotations
 
 from atlas.compile.aggregate import aggregate
