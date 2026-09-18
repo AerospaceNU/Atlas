@@ -290,6 +290,42 @@ async def test_download_assets_writes_raw_bytes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_download_assets_isolates_sign_timeout(tmp_path: Path) -> None:
+    payload = b"II*\x00ok"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=payload,
+            headers={"content-type": "image/tiff; application=geotiff"},
+        )
+
+    visual = Asset(
+        href="https://example.com/visual.tif",
+        media_type="image/tiff; application=geotiff",
+        roles=["visual"],
+    )
+    ok = _scene(id="ok-1", source="ok", assets={"visual": visual})
+    bad = _scene(id="bad-1", source="bad", assets={"visual": visual})
+
+    class TimeoutSignClient(FakePullClient):
+        async def sign_href(self, href: str) -> str:
+            raise httpx.ReadTimeout("sas")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        saved = await download_assets(
+            [bad, ok],
+            tmp_path,
+            http=http,
+            clients={"bad": TimeoutSignClient(), "ok": FakePullClient()},
+            concurrency=2,
+        )
+    assert saved["bad"] == []
+    assert saved["ok"][0].read_bytes() == payload
+
+
+@pytest.mark.asyncio
 async def test_download_assets_skips_browse_only_scene(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"GET should not run: {request.url}")

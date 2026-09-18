@@ -136,25 +136,30 @@ async def download_assets(
     sem = asyncio.Semaphore(max(1, concurrency))
 
     async def one(scene: Scene) -> None:
+        path: Path | None = None
         try:
             picked = pick_asset(scene, asset_name)
+            if picked is None:
+                return
+            key, asset = picked
+            dest_dir = out / scene.source
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            async with sem:
+                href = await _signed_href(clients.get(scene.source), asset.href)
+                async with http.stream("GET", href, follow_redirects=True) as response:
+                    response.raise_for_status()
+                    suffix = asset_suffix(asset, response.headers.get("content-type"))
+                    path = dest_dir / scene_filename(scene.id, key, suffix)
+                    with path.open("wb") as handle:
+                        async for chunk in response.aiter_bytes():
+                            handle.write(chunk)
         except BrowseAssetError:
             return
-        if picked is None:
-            return
-        key, asset = picked
-        href = await _signed_href(clients.get(scene.source), asset.href)
-        dest_dir = out / scene.source
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            async with sem, http.stream("GET", href, follow_redirects=True) as response:
-                response.raise_for_status()
-                suffix = asset_suffix(asset, response.headers.get("content-type"))
-                path = dest_dir / scene_filename(scene.id, key, suffix)
-                with path.open("wb") as handle:
-                    async for chunk in response.aiter_bytes():
-                        handle.write(chunk)
         except (httpx.HTTPError, OSError, TypeError):
+            if path is not None:
+                path.unlink(missing_ok=True)
+            return
+        if path is None:
             return
         async with lock:
             saved[scene.source].append(path)
@@ -172,9 +177,18 @@ async def _signed_href(client: DataPullClient | None, href: str) -> str:
     sign = getattr(client, "sign_href", None)
     if sign is None:
         return href
-    signed = sign(href)
-    if asyncio.iscoroutine(signed):
-        signed = await signed
-    if not isinstance(signed, str):
-        raise TypeError(f"sign_href must return str, got {type(signed)}")
-    return signed
+    last_error: httpx.HTTPError | None = None
+    for attempt in range(3):
+        try:
+            signed = sign(href)
+            if asyncio.iscoroutine(signed):
+                signed = await signed
+            if not isinstance(signed, str):
+                raise TypeError(f"sign_href must return str, got {type(signed)}")
+            return signed
+        except httpx.HTTPError as exc:
+            last_error = exc
+            await asyncio.sleep(0.4 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+    return href
