@@ -283,10 +283,11 @@ async def test_download_assets_writes_raw_bytes(tmp_path: Path) -> None:
     )
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as http:
-        saved = await download_assets([scene], tmp_path, http=http, clients={})
-    path = saved["sentinel2"][0]
+        report = await download_assets([scene], tmp_path, http=http, clients={})
+    path = report.saved_paths()["sentinel2"][0]
     assert path.name == "chip-1_visual.tif"
     assert path.read_bytes() == payload
+    assert report.outcomes[0].status == "saved"
 
 
 @pytest.mark.asyncio
@@ -314,15 +315,15 @@ async def test_download_assets_isolates_sign_timeout(tmp_path: Path) -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as http:
-        saved = await download_assets(
+        report = await download_assets(
             [bad, ok],
             tmp_path,
             http=http,
             clients={"bad": TimeoutSignClient(), "ok": FakePullClient()},
             concurrency=2,
         )
-    assert saved["bad"] == []
-    assert saved["ok"][0].read_bytes() == payload
+    assert [item.status for item in report.for_source("bad")] == ["failed"]
+    assert report.saved_paths()["ok"][0].read_bytes() == payload
 
 
 @pytest.mark.asyncio
@@ -336,8 +337,45 @@ async def test_download_assets_skips_browse_only_scene(tmp_path: Path) -> None:
     )
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as http:
-        saved = await download_assets([scene], tmp_path, http=http, clients={})
-    assert saved["sentinel2"] == []
+        report = await download_assets([scene], tmp_path, http=http, clients={})
+    assert report.saved_paths() == {}
+    assert report.outcomes[0].status == "no_asset"
+
+
+@pytest.mark.asyncio
+async def test_download_assets_skips_existing_file(tmp_path: Path) -> None:
+    scene = _scene(
+        id="chip-1",
+        assets={
+            "visual": Asset(
+                href="https://example.com/visual.tif",
+                media_type="image/tiff; application=geotiff",
+                roles=["visual"],
+            )
+        },
+    )
+    dest = tmp_path / "sentinel2" / "chip-1_visual.tif"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"already-here")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"GET should not run: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        report = await download_assets([scene], tmp_path, http=http, clients={})
+    assert report.outcomes[0].status == "skipped"
+    assert dest.read_bytes() == b"already-here"
+
+
+def test_run_data_prints_error_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    clients = {"bad": FakePullClient(error="boom")}
+    args = _pull_args(tmp_path, search_only=True)
+    assert run_data(args, clients=clients) == 1
+    err = capsys.readouterr().err
+    assert "SEARCH" in err
+    assert "error" in err
+    assert "boom" in err
 
 
 def test_run_data_isolates_source_errors(tmp_path: Path) -> None:

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import defaultdict
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -23,6 +25,34 @@ _RASTER_SUFFIXES = frozenset(
 
 class BrowseAssetError(ValueError):
     """Raised when the requested asset is a preview or thumbnail."""
+
+
+@dataclass
+class DownloadOutcome:
+    """One scene's download attempt."""
+
+    source: str
+    scene_id: str
+    status: str
+    path: Path | None = None
+    error: str | None = None
+
+
+@dataclass
+class DownloadReport:
+    """Per-scene results grouped for the CLI summary and manifest."""
+
+    outcomes: list[DownloadOutcome] = field(default_factory=list)
+
+    def saved_paths(self) -> dict[str, list[Path]]:
+        grouped: dict[str, list[Path]] = defaultdict(list)
+        for item in self.outcomes:
+            if item.status in {"saved", "skipped"} and item.path is not None:
+                grouped[item.source].append(item.path)
+        return dict(grouped)
+
+    def for_source(self, name: str) -> list[DownloadOutcome]:
+        return [item for item in self.outcomes if item.source == name]
 
 
 def is_browse_asset(key: str, asset: Asset) -> bool:
@@ -118,11 +148,11 @@ async def download_assets(
     concurrency: int = 8,
     asset_name: str | None = None,
     on_progress: Callable[[str, int, int], None] | None = None,
-) -> dict[str, list[Path]]:
+) -> DownloadReport:
     """GET one native-resolution asset per scene, streamed to disk.
 
-    Browse assets are skipped (or raise if ``asset_name`` is browse). A failed
-    GET skips that scene and does not abort the rest.
+    Existing non-empty files are skipped. Browse assets are not downloaded.
+    A failed GET records ``failed`` and does not abort the rest.
     """
     if asset_name and is_forbidden_asset_name(asset_name):
         raise BrowseAssetError(f"{asset_name!r} is a preview/thumbnail and cannot be downloaded")
@@ -130,20 +160,50 @@ async def download_assets(
     totals: dict[str, int] = {}
     for scene in scenes:
         totals[scene.source] = totals.get(scene.source, 0) + 1
-    saved_counts: dict[str, int] = dict.fromkeys(totals, 0)
-    saved: dict[str, list[Path]] = {name: [] for name in totals}
+    done_counts: dict[str, int] = dict.fromkeys(totals, 0)
+    report = DownloadReport()
     lock = asyncio.Lock()
     sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def record(outcome: DownloadOutcome) -> None:
+        async with lock:
+            report.outcomes.append(outcome)
+            done_counts[outcome.source] = done_counts.get(outcome.source, 0) + 1
+            if on_progress is not None:
+                on_progress(
+                    outcome.source,
+                    done_counts[outcome.source],
+                    totals.get(outcome.source, done_counts[outcome.source]),
+                )
 
     async def one(scene: Scene) -> None:
         path: Path | None = None
         try:
             picked = pick_asset(scene, asset_name)
             if picked is None:
+                await record(
+                    DownloadOutcome(
+                        source=scene.source,
+                        scene_id=scene.id,
+                        status="no_asset",
+                        error="no native-resolution asset",
+                    )
+                )
                 return
             key, asset = picked
             dest_dir = out / scene.source
             dest_dir.mkdir(parents=True, exist_ok=True)
+            planned = dest_dir / scene_filename(scene.id, key, asset_suffix(asset))
+            if planned.is_file() and planned.stat().st_size > 0:
+                await record(
+                    DownloadOutcome(
+                        source=scene.source,
+                        scene_id=scene.id,
+                        status="skipped",
+                        path=planned,
+                    )
+                )
+                return
             async with sem:
                 href = await _signed_href(clients.get(scene.source), asset.href)
                 async with http.stream("GET", href, follow_redirects=True) as response:
@@ -153,22 +213,38 @@ async def download_assets(
                     with path.open("wb") as handle:
                         async for chunk in response.aiter_bytes():
                             handle.write(chunk)
-        except BrowseAssetError:
+        except BrowseAssetError as exc:
+            await record(
+                DownloadOutcome(
+                    source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
+                )
+            )
             return
-        except (httpx.HTTPError, OSError, TypeError):
+        except (httpx.HTTPError, OSError, TypeError) as exc:
             if path is not None:
                 path.unlink(missing_ok=True)
+            await record(
+                DownloadOutcome(
+                    source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
+                )
+            )
             return
         if path is None:
+            await record(
+                DownloadOutcome(
+                    source=scene.source,
+                    scene_id=scene.id,
+                    status="failed",
+                    error="download produced no file",
+                )
+            )
             return
-        async with lock:
-            saved[scene.source].append(path)
-            saved_counts[scene.source] += 1
-            if on_progress is not None:
-                on_progress(scene.source, saved_counts[scene.source], totals[scene.source])
+        await record(
+            DownloadOutcome(source=scene.source, scene_id=scene.id, status="saved", path=path)
+        )
 
     await asyncio.gather(*(one(scene) for scene in scenes))
-    return saved
+    return report
 
 
 async def _signed_href(client: DataPullClient | None, href: str) -> str:

@@ -82,6 +82,7 @@ class RichReporter:
         self._n_searched = 0
         self._saved: dict[str, int] = {}
         self._totals: dict[str, int] = {}
+        self._stopped = False
         self._progress.start()
 
     def source_start(self, name: str) -> None:
@@ -130,6 +131,9 @@ class RichReporter:
             )
 
     def close(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
         self._progress.stop()
 
 

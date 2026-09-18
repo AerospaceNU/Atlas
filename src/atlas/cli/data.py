@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 from rich.console import Console
+from rich.table import Table
 
 from atlas.cli.catalog import (
     CatalogError,
@@ -20,7 +21,12 @@ from atlas.cli.catalog import (
     render_satellite_tree,
     resolve_sources,
 )
-from atlas.cli.download import BrowseAssetError, download_assets, is_forbidden_asset_name
+from atlas.cli.download import (
+    BrowseAssetError,
+    DownloadReport,
+    download_assets,
+    is_forbidden_asset_name,
+)
 from atlas.cli.progress import ProgressReporter, pick_reporter
 from atlas.compile.aggregate import aggregate
 from atlas.compile.product import SceneCatalog
@@ -215,7 +221,7 @@ async def execute_pull(
                 src.source, scenes=len(src.scenes), error=src.error
             ),
         )
-        saved: dict[str, list[Path]] = {src.source: [] for src in catalog.sources}
+        report = DownloadReport()
         if not search_only:
             to_pull = [
                 scene for src in catalog.sources if src.error is None for scene in src.scenes
@@ -224,7 +230,7 @@ async def execute_pull(
                 if src.error is None:
                     reporter.source_pull(src.source, saved=0, total=len(src.scenes))
             try:
-                pulled = await download_assets(
+                report = await download_assets(
                     to_pull,
                     out_dir,
                     http=live_http,
@@ -238,11 +244,11 @@ async def execute_pull(
             except BrowseAssetError as exc:
                 print(str(exc), file=sys.stderr)
                 return 2
-            for name, paths in pulled.items():
-                saved[name] = paths
         for src in catalog.sources:
             reporter.source_done(src.source)
-        _write_manifest(out_dir, catalog, saved)
+        _write_manifest(out_dir, catalog, report)
+        reporter.close()
+        _print_run_summary(catalog, report, search_only=search_only)
         if catalog.sources and all(src.error for src in catalog.sources):
             return 1
         return 0
@@ -257,7 +263,7 @@ async def execute_pull(
 def _write_manifest(
     out_dir: Path,
     catalog: SceneCatalog,
-    saved: Mapping[str, list[Path]],
+    report: DownloadReport,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -269,12 +275,67 @@ def _write_manifest(
                 "error": src.error,
                 "n_scenes": len(src.scenes),
                 "scene_ids": [scene.id for scene in src.scenes],
-                "saved": [_rel(out_dir, path) for path in saved.get(src.source, [])],
+                "saved": [
+                    _rel(out_dir, item.path)
+                    for item in report.for_source(src.source)
+                    if item.status == "saved" and item.path is not None
+                ],
+                "skipped": [
+                    _rel(out_dir, item.path)
+                    for item in report.for_source(src.source)
+                    if item.status == "skipped" and item.path is not None
+                ],
+                "failed": [
+                    {"id": item.scene_id, "error": item.error}
+                    for item in report.for_source(src.source)
+                    if item.status in {"failed", "no_asset"}
+                ],
             }
             for src in catalog.sources
         ],
     }
     (out_dir / "manifest.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _print_run_summary(
+    catalog: SceneCatalog,
+    report: DownloadReport,
+    *,
+    search_only: bool,
+) -> None:
+    """Print per-source search/pull totals after the progress bar stops."""
+    console = Console(stderr=True, highlight=False)
+    table = Table(title="atlas data", box=None, pad_edge=False, header_style="bold dim")
+    table.add_column("SOURCE", style="cyan")
+    table.add_column("SEARCH")
+    table.add_column("SCENES", justify="right")
+    table.add_column("SAVED", justify="right")
+    table.add_column("SKIPPED", justify="right")
+    table.add_column("FAILED", justify="right")
+    failure_lines: list[str] = []
+    for src in catalog.sources:
+        items = report.for_source(src.source)
+        n_saved = sum(1 for item in items if item.status == "saved")
+        n_skipped = sum(1 for item in items if item.status == "skipped")
+        n_failed = sum(1 for item in items if item.status in {"failed", "no_asset"})
+        search_status = "error" if src.error else "ok"
+        table.add_row(
+            src.source,
+            search_status,
+            str(len(src.scenes)),
+            "—" if search_only else str(n_saved),
+            "—" if search_only else str(n_skipped),
+            "—" if search_only else str(n_failed),
+        )
+        if src.error:
+            failure_lines.append(f"{src.source}: search {src.error}")
+        for item in items:
+            if item.status in {"failed", "no_asset"}:
+                failure_lines.append(f"{src.source} {item.scene_id}: {item.error}")
+    console.print()
+    console.print(table)
+    for line in failure_lines:
+        console.print(f"[red]{line}[/red]")
 
 
 def _rel(out_dir: Path, path: Path) -> str:
