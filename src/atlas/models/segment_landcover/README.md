@@ -20,16 +20,15 @@ weight = "segment_landcover/model.json"
 ```
 
 Resolved as `ATLAS_WEIGHTS_DIR` or `<repo>/weights`. Never put a machine
-absolute path in the manifest. The agent never runs `acquire.sh`, `train.py`,
-or `export.py`.
+absolute path in the manifest. The agent never runs `train.py` or `export.py`.
 
 ## Train
 
-Default acquire pulls Sentinel-2 L2A true-color previews from Planetary
-Computer (weak labels by place). `--synthetic` writes solid-color PNGs.
+Training reads RGB PNG chips from `local/models/segment_landcover/{train,val}/<class>/`.
+How those chips are sourced is being reworked, so populate that layout yourself
+for now.
 
 ```bash
-bash src/atlas/models/segment_landcover/acquire.sh
 uv run python src/atlas/models/segment_landcover/train.py
 uv run python src/atlas/models/segment_landcover/export.py
 uv run python src/atlas/models/segment_landcover/preview.py

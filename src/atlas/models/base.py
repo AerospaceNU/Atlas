@@ -90,8 +90,7 @@ def read_weight_bytes(spec: PluginSpec) -> bytes:
     path = weight_path(spec)
     if not path.is_file():
         raise FileNotFoundError(
-            f"Weight {spec.weight} is missing. Run acquire.sh, train.py, and "
-            f"export.py or set {_WEIGHTS_ENV}."
+            f"Weight {spec.weight} is missing. Run train.py and export.py or set {_WEIGHTS_ENV}."
         )
     data = path.read_bytes()
     expected = spec.sha256.strip().lower()
