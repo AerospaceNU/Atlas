@@ -14,6 +14,7 @@ class DeaS2ArdClient(StacApiClient):
 
     search_url: ClassVar[str] = DEA_SEARCH
     default_collection: ClassVar[str] = "ga_s2am_ard_3"
+    satellite: ClassVar[str] = "sentinel2"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = 10.0
 
@@ -23,5 +24,6 @@ class DeAfricaS2Client(StacApiClient):
 
     search_url: ClassVar[str] = DEAfrica_SEARCH
     default_collection: ClassVar[str] = "s2_l2a"
+    satellite: ClassVar[str] = "sentinel2"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = 10.0

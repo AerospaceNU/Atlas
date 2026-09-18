@@ -32,6 +32,7 @@ class FirmsClient(DataPullClient):
     source: ClassVar[str] = "VIIRS_SNPP_NRT"
     platform_name: ClassVar[str] = "Suomi-NPP"
     instrument_name: ClassVar[str] = "VIIRS"
+    satellite: ClassVar[str] = "viirs"
     scene_kind: ClassVar[SceneKind] = SceneKind.detection
     nominal_gsd_m: ClassVar[float | None] = 375.0
 
@@ -65,7 +66,10 @@ class FirmsClient(DataPullClient):
             raise ValueError("FIRMS_MAP_KEY is not set")
         bbox = f"{request.bbox.west},{request.bbox.south},{request.bbox.east},{request.bbox.north}"
         scenes: list[Scene] = []
-        for start, days in _chunk_days(request.start_date, request.end_date):
+        start_date, end_date = _nrt_window(request.start_date, request.end_date)
+        if start_date > end_date:
+            return PullResult(request=request, scenes=[])
+        for start, days in _chunk_days(start_date, end_date):
             if len(scenes) >= request.limit:
                 break
             url = FIRMS_AREA_URL.format(
@@ -76,6 +80,9 @@ class FirmsClient(DataPullClient):
                 date=start.isoformat(),
             )
             resp = await self._client.get(url)
+            if resp.status_code == 400:
+                # NRT rejects "today" / future dates depending on FIRMS' calendar.
+                continue
             resp.raise_for_status()
             for scene in _rows_to_scenes(
                 resp.text,
@@ -92,16 +99,19 @@ class FirmsClient(DataPullClient):
 
 
 class FirmsViirsNoaa20Client(FirmsClient):
+    satellite: ClassVar[str] = "viirs"
     source: ClassVar[str] = "VIIRS_NOAA20_NRT"
     platform_name: ClassVar[str] = "NOAA-20"
 
 
 class FirmsViirsNoaa21Client(FirmsClient):
+    satellite: ClassVar[str] = "viirs"
     source: ClassVar[str] = "VIIRS_NOAA21_NRT"
     platform_name: ClassVar[str] = "NOAA-21"
 
 
 class FirmsModisClient(FirmsClient):
+    satellite: ClassVar[str] = "modis"
     source: ClassVar[str] = "MODIS_NRT"
     platform_name: ClassVar[str] = "Terra/Aqua"
     instrument_name: ClassVar[str] = "MODIS"
@@ -109,10 +119,17 @@ class FirmsModisClient(FirmsClient):
 
 
 class FirmsLandsatClient(FirmsClient):
+    satellite: ClassVar[str] = "landsat"
     source: ClassVar[str] = "LANDSAT_NRT"
     platform_name: ClassVar[str] = "Landsat"
     instrument_name: ClassVar[str] = "OLI"
     nominal_gsd_m: ClassVar[float | None] = 30.0
+
+
+def _nrt_window(start: date, end: date, *, today_utc: date | None = None) -> tuple[date, date]:
+    """Clamp NRT queries so the end date is not FIRMS' un-published 'today'."""
+    latest = (today_utc or datetime.now(UTC).date()) - timedelta(days=1)
+    return start, min(end, latest)
 
 
 def _chunk_days(start: date, end: date) -> list[tuple[date, int]]:

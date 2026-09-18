@@ -14,11 +14,13 @@ class UsgsStacClient(StacApiClient):
 
 class UsgsLandsatC2L1Client(UsgsStacClient):
     default_collection: ClassVar[str] = "landsat-c2l1"
+    satellite: ClassVar[str] = "landsat"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = 30.0
 
 
 class UsgsLandsatC2L2SrClient(UsgsStacClient):
     default_collection: ClassVar[str] = "landsat-c2l2-sr"
+    satellite: ClassVar[str] = "landsat"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = 30.0

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 from urllib.parse import urljoin
 
 import httpx
@@ -15,6 +15,9 @@ MAXAR_ROOT = "https://maxar-opendata.s3.amazonaws.com/events/catalog.json"
 
 
 class MaxarOpenDataClient(DataPullClient):
+    satellite: ClassVar[str] = "maxar"
+    scene_kind: ClassVar[SceneKind] = SceneKind.optical
+
     def __init__(
         self,
         *,

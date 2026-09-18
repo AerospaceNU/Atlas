@@ -8,6 +8,7 @@ from atlas.data.planetary_computer import PlanetaryComputerClient
 
 class Landsat9Client(PlanetaryComputerClient):
     default_collection: ClassVar[str] = "landsat-c2-l2"
+    satellite: ClassVar[str] = "landsat9"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = 30.0
 

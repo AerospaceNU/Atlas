@@ -58,8 +58,8 @@ async def _search(name: str, request: PullRequest) -> PullResult:
         ("cdse_sentinel5p_no2", _req(NORTH_ITALY, *days60)),
         ("gibs_modis_truecolor", _req(BOSTON, *week, limit=3)),
         ("gibs_viirs_truecolor", _req(BOSTON, *week, limit=3)),
-        ("goes", _req(BOSTON, today - timedelta(days=1), today, limit=3)),
-        ("goes", _req(LOS_ANGELES, today - timedelta(days=1), today, limit=3)),
+        ("goes", _req(BOSTON, today - timedelta(days=3), today, limit=3)),
+        ("goes", _req(LOS_ANGELES, today - timedelta(days=3), today, limit=3)),
         ("aster", _req(BOSTON, date(2005, 1, 1), date(2020, 1, 1))),
         ("esa_worldcover", _req(BOSTON, date(2000, 1, 1), today)),
         ("pc_modis_14a1", _req(BOSTON, *days60)),
@@ -111,9 +111,11 @@ async def test_live_firms_accepts_arbitrary_bbox_when_keyed() -> None:
     if not os.environ.get("FIRMS_MAP_KEY"):
         pytest.skip("FIRMS_MAP_KEY is not set")
     # Detections are sparse; a successful parse (zero or more scenes) is enough.
+    nrt_end = today - timedelta(days=1)
+    nrt_week = (nrt_end - timedelta(days=7), nrt_end)
     result = await _search(
         "firms_viirs",
-        _req(BBox(west=-124.5, south=32.5, east=-114.0, north=42.0), *week, limit=20),
+        _req(BBox(west=-124.5, south=32.5, east=-114.0, north=42.0), *nrt_week, limit=20),
     )
     for scene in result.scenes:
         assert scene.properties.get("latitude") is not None

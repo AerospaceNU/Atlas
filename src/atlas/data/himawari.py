@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, date, datetime, timedelta
-from typing import Self
+from typing import ClassVar, Self
 from xml.etree import ElementTree
 
 import httpx
@@ -29,6 +29,9 @@ HIMAWARI_PRODUCT = "AHI-L1b-FLDK"
 
 class HimawariClient(DataPullClient):
     """List recent AHI full-disk slots. Imagery covers the Asia-Pacific disk, not the Americas."""
+
+    satellite: ClassVar[str] = "himawari"
+    scene_kind: ClassVar[SceneKind] = SceneKind.optical
 
     def __init__(
         self,

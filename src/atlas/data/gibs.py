@@ -85,36 +85,42 @@ class GibsClient(DataPullClient):
 
 
 class GibsModisTrueColorClient(GibsClient):
+    satellite: ClassVar[str] = "modis"
     layer: ClassVar[str] = "MODIS_Terra_CorrectedReflectance_TrueColor"
     platform_name: ClassVar[str] = "Terra"
     instrument_name: ClassVar[str] = "MODIS"
 
 
 class GibsViirsTrueColorClient(GibsClient):
+    satellite: ClassVar[str] = "viirs"
     layer: ClassVar[str] = "VIIRS_SNPP_CorrectedReflectance_TrueColor"
     platform_name: ClassVar[str] = "Suomi-NPP"
     instrument_name: ClassVar[str] = "VIIRS"
 
 
 class GibsNightLightsClient(GibsClient):
+    satellite: ClassVar[str] = "viirs"
     layer: ClassVar[str] = "VIIRS_SNPP_DayNightBand_At_Sensor_Radiance"
     platform_name: ClassVar[str] = "Suomi-NPP"
     instrument_name: ClassVar[str] = "VIIRS"
 
 
 class GibsBlackMarbleClient(GibsClient):
+    satellite: ClassVar[str] = "viirs"
     layer: ClassVar[str] = "VIIRS_Black_Marble"
     platform_name: ClassVar[str] = "Suomi-NPP"
     instrument_name: ClassVar[str] = "VIIRS"
 
 
 class GibsFlood3DayClient(GibsClient):
+    satellite: ClassVar[str] = "modis"
     layer: ClassVar[str] = "MODIS_Combined_Flood_3-Day"
     platform_name: ClassVar[str] = "Terra/Aqua"
     instrument_name: ClassVar[str] = "MODIS"
 
 
 class GibsSnowCoverClient(GibsClient):
+    satellite: ClassVar[str] = "modis"
     layer: ClassVar[str] = "MODIS_Terra_NDSI_Snow_Cover"
     platform_name: ClassVar[str] = "Terra"
     instrument_name: ClassVar[str] = "MODIS"
@@ -124,10 +130,12 @@ class GibsThermalAnomaliesClient(GibsClient):
     layer: ClassVar[str] = "VIIRS_NOAA20_Thermal_Anomalies_375m_All"
     platform_name: ClassVar[str] = "NOAA-20"
     instrument_name: ClassVar[str] = "VIIRS"
+    satellite: ClassVar[str] = "viirs"
     scene_kind: ClassVar[SceneKind] = SceneKind.thermal
 
 
 class GibsAquaTrueColorClient(GibsClient):
+    satellite: ClassVar[str] = "modis"
     layer: ClassVar[str] = "MODIS_Aqua_CorrectedReflectance_TrueColor"
     platform_name: ClassVar[str] = "Aqua"
     instrument_name: ClassVar[str] = "MODIS"

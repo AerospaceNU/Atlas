@@ -11,6 +11,7 @@ class CopDemGlo30Client(PlanetaryComputerClient):
 
     default_collection: ClassVar[str] = "cop-dem-glo-30"
     include_datetime: ClassVar[bool] = False
+    satellite: ClassVar[str] = "copernicus"
     scene_kind: ClassVar[SceneKind] = SceneKind.dem
     nominal_gsd_m: ClassVar[float | None] = 30.0
 
@@ -20,5 +21,6 @@ class CopDemGlo90Client(PlanetaryComputerClient):
 
     default_collection: ClassVar[str] = "cop-dem-glo-90"
     include_datetime: ClassVar[bool] = False
+    satellite: ClassVar[str] = "copernicus"
     scene_kind: ClassVar[SceneKind] = SceneKind.dem
     nominal_gsd_m: ClassVar[float | None] = 90.0
