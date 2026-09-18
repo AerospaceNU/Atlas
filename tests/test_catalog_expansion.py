@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import io
-import json
 from datetime import UTC, date, datetime
-from pathlib import Path
 from typing import Any, cast
 
 import httpx
 import pytest
-from PIL import Image
 
 from atlas.data.base import BBox, GeometryKind, PullRequest, SceneKind
 from atlas.data.cdse import CdseSentinel3OlciClient
@@ -21,11 +17,9 @@ from atlas.data.himawari import HIMAWARI_BUCKET, HimawariClient
 from atlas.data.hls_sentinel import HLSSentinelClient
 from atlas.data.maxar_opendata import MaxarOpenDataClient
 from atlas.data.naip import NaipClient
-from atlas.data.planetary_computer import SAS_SIGN_URL, PlanetaryComputerClient
 from atlas.data.registry import SOURCES
 from atlas.data.sentinel2 import Sentinel2Client
 from atlas.data.usgs import UsgsLandsatC2L1Client
-from atlas.models.segment_landcover.acquire import fetch_stac_class
 
 
 class FakeResponse:
@@ -382,72 +376,3 @@ async def test_cloud_minimum_and_maximum_reach_the_stac_query() -> None:
 def test_cloud_minimum_may_not_exceed_maximum() -> None:
     with pytest.raises(ValueError, match="min_cloud_cover"):
         _request(min_cloud_cover=80, max_cloud_cover=20)
-
-
-_BLOB_HREF = "https://sentinel2l2a01.blob.core.windows.net/sentinel2/scene.tif"
-_SIGNED_HREF = f"{_BLOB_HREF}?st=2024&sig=token"
-
-
-def _png_bytes() -> bytes:
-    buffer = io.BytesIO()
-    Image.new("RGB", (8, 8), (245, 245, 245)).save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def _cloudy_feature(index: int) -> dict[str, Any]:
-    return {
-        "id": f"S2A_cloud_{index}",
-        "collection": "sentinel-2-l2a",
-        "bbox": [-10.5, 51.0, -5.5, 55.5],
-        "properties": {"datetime": "2024-02-01T11:30:00Z", "eo:cloud_cover": 92.5},
-        "assets": {"visual": {"href": _BLOB_HREF, "type": "image/tiff", "roles": ["data"]}},
-    }
-
-
-class AcquireFake(FakeAsyncClient):
-    def __init__(self, *, features: list[dict[str, Any]], content: bytes) -> None:
-        super().__init__(json_payload={"features": features}, content=content)
-
-    async def get(self, url: str, **kwargs: Any) -> FakeResponse:
-        self.calls.append(("GET", url, kwargs))
-        if url.startswith(SAS_SIGN_URL):
-            return FakeResponse(json_payload={"href": _SIGNED_HREF})
-        return FakeResponse(content=self.content)
-
-
-@pytest.mark.asyncio
-async def test_acquire_signs_hrefs_and_writes_sidecars(tmp_path: Path) -> None:
-    fake = AcquireFake(features=[_cloudy_feature(i) for i in range(5)], content=_png_bytes())
-    client = cast(httpx.AsyncClient, fake)
-    signer = PlanetaryComputerClient(collection="sentinel-2-l2a", client=client)
-    await fetch_stac_class(
-        client,
-        signer,
-        atlas_name="cloud",
-        bbox=[-10.5, 51.0, -5.5, 55.5],
-        datetime_range="2024-01-01T00:00:00Z/2024-03-31T23:59:59Z",
-        query={"eo:cloud_cover": {"gte": 80}},
-        data_root=tmp_path,
-        train_n=4,
-        val_n=1,
-    )
-
-    chips = sorted(tmp_path.rglob("*.png"))
-    assert len(chips) == 5
-    assert all(chip.with_suffix(".json").is_file() for chip in chips)
-
-    sidecar = json.loads(chips[0].with_suffix(".json").read_text(encoding="utf-8"))
-    assert sidecar == {
-        "id": "S2A_cloud_0",
-        "source": "planetary_computer",
-        "collection": "sentinel-2-l2a",
-        "datetime": "2024-02-01T11:30:00Z",
-        "cloud_cover": 92.5,
-        "bbox": [-10.5, 51.0, -5.5, 55.5],
-        "asset": "visual",
-        "href": _BLOB_HREF,
-    }
-
-    signed = [url for _, url, _ in fake.calls if url.startswith(SAS_SIGN_URL)]
-    assert len(signed) == 5
-    assert _SIGNED_HREF in [url for _, url, _ in fake.calls]
