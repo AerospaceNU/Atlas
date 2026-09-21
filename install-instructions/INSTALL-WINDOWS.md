@@ -78,7 +78,7 @@ uv run pytest
 
 `atlas data` lists satellites and downloads scenes. `atlas sentinel2 optical ...` is shorthand for `atlas data sentinel2 optical ...`.
 
-The TUI reads `OPENROUTER_API_KEY` from the environment or from this repo's `.env`. The model comes from `<workspace>/.atlas/agent.toml` (`model`). When that key is missing, the default is `google/gemini-3.8-flash`. `ATLAS_MODEL` or `--model` overrides the file for one launch.
+The TUI reads `OPENROUTER_API_KEY` from the environment or from this repo's `.env`. The first `atlas` launch writes `<workspace>/.atlas/agent.toml` when that file is missing, with `model` set to `google/gemini-3.8-flash`. Edit that file to change the model. `ATLAS_MODEL` or `--model` overrides it for one launch.
 
 ## Troubleshooting
 

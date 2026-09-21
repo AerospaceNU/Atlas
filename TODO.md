@@ -14,13 +14,6 @@ only to bound memory).
 - **Output:** label map `H×W` uint8 (class index), RGB overlay `H×W×3`, JSON
   pixel fractions
 
-## detect_objects
-
-Locate ships, aircraft, and vehicles on high-res chips (NAIP / Maxar-looking
-PNG). Nano YOLO only.
-
-- **Input:** RGB PNG tile, `640×640×3` uint8
-- **Output:** `N×6` boxes `(x1, y1, x2, y2, score, class_id)` in pixel coords
 
 ## rgb_change
 
