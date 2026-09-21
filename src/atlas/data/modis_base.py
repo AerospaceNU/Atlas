@@ -66,11 +66,11 @@ class MODISClient(DataPullClient):
             ),
             "page_size": request.limit,
         }
-        if request.max_cloud_cover is not None and self.scene_kind in {
-            SceneKind.optical,
-            SceneKind.browse,
-        }:
-            params["cloud_cover"] = f"0,{request.max_cloud_cover:g}"
+        cloud_bounded = request.min_cloud_cover is not None or request.max_cloud_cover is not None
+        if cloud_bounded and self.scene_kind in {SceneKind.optical, SceneKind.browse}:
+            low = request.min_cloud_cover if request.min_cloud_cover is not None else 0.0
+            high = request.max_cloud_cover if request.max_cloud_cover is not None else 100.0
+            params["cloud_cover"] = f"{low:g},{high:g}"
 
         resp = await self._client.get(CMR_SEARCH_URL, params=params)
         resp.raise_for_status()

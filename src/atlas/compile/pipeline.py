@@ -36,7 +36,11 @@ async def consolidate(
     render_targets: list[tuple[str, SourceScenes]] = []
 
     for src in catalog.ok_sources:
-        chosen = select(src.scenes, max_cloud=request.max_cloud_cover)
+        chosen = select(
+            src.scenes,
+            min_cloud=request.min_cloud_cover,
+            max_cloud=request.max_cloud_cover,
+        )
         if not chosen:
             continue
         scene_ids[src.source] = [s.id for s in chosen]
