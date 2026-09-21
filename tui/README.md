@@ -10,10 +10,18 @@ authority; this crate only renders and forwards messages.
 ## Run
 
 ```bash
-cargo run --manifest-path tui/Cargo.toml
+atlas
 ```
 
-`cargo` comes from a Rust install. A user-local toolchain is at `~/.cargo/bin`.
+That opens the TUI. `atlas data` and `atlas <satellite>` stay on the data CLI.
+`~/.local/bin` needs to be on `PATH`, which it is after a normal uv install.
+From this checkout, `uv tool install --editable --force .` keeps that `atlas`
+command pointed at the current source.
+The first launch builds `tui/target/release/atlas-tui` when `cargo` is on
+`PATH` or at `~/.cargo/bin`. Later launches use that binary.
+
+`atlas tui --workspace PATH` forwards the extra arguments. `ATLAS_TUI` can
+point at a binary you built yourself.
 
 Options:
 
@@ -24,19 +32,27 @@ Options:
   text contains `name = "atlas"`).
 
 `OPENROUTER_API_KEY` is read from the environment, or from `<repo>/.env` when
-the repo root is found. `ATLAS_MODEL` optionally overrides the model id.
+the repo root is found. The model id comes from `<workspace>/.atlas/agent.toml`
+(`model`). A missing key uses `google/gemini-3.8-flash`. `ATLAS_MODEL` or
+`--model` on the Python session overrides the file.
 
 Keys: `enter` sends the input line, `ctrl-r` resumes a turn that stopped at the
-tool-round limit, `ctrl-c` / `esc` quits. `PageUp` / `PageDown` scroll.
+tool-call limit, `ctrl-c` / `esc` quits. `PageUp` / `PageDown` scroll.
 
 ## Adding a tool
 
 A new safe tool is a concrete `Tool` subclass in a module directly inside
-`src/atlas/agent/builtins/`. It needs a string `name`, a description, a
+`src/atlas/agent/tools/`. It needs a string `name`, a description, a
 Pydantic `input_model`, a `run` method, and a constructor with no arguments.
-Discovery picks it up without editing `default_registry()`. The TUI lists it
-in the header once the session sends `ready`.
+Discovery picks it up without editing `default_registry()`. The session
+advertises it on the `ready` message. `src/atlas/agent/tools/read_file.py` is the
+worked example to copy.
 
-Set `trust = "opt_in"` when the tool must stay off unless a caller asks for
-it. Script proposals use that. A duplicate `name` is an error that names both
-classes. Discovery does not load tools from the workspace or from entry points.
+Set `trust = "opt_in"` when the tool must stay off unless a caller passes
+`include_opt_in=True` to `build_registry`. A duplicate `name` is an error that
+names both classes. Discovery does not load tools from the workspace or from
+entry points.
+
+The default tool-call budget is 256. A workspace overrides it in
+`<workspace>/.atlas/agent.toml` with `max_tool_calls` set to an integer >= 1.
+The same file sets `model` to an OpenRouter model id.

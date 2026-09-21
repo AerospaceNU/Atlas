@@ -8,10 +8,19 @@ from atlas.cli.catalog import is_known_target
 from atlas.cli.data import add_data_parser, run_data
 
 _ROOT = frozenset({"data", "-h", "--help"})
+_TUI_FLAGS = frozenset({"--workspace", "--repo"})
+_HELP = """examples:
+  atlas                          open the agent TUI
+  atlas data                     list satellites
+  atlas sentinel2 optical ...    search one collection
+"""
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the ``atlas`` CLI.
+
+    No arguments open the Rust agent TUI. ``atlas data`` and a bare satellite
+    name stay on the data commands.
 
     Args:
         argv: Arguments without the program name. ``None`` reads ``sys.argv``.
@@ -20,8 +29,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit code.
     """
     tokens = list(argv) if argv is not None else sys.argv[1:]
+    if _is_tui_invocation(tokens):
+        from atlas.cli.tui import launch_tui
+
+        tui_args = tokens[1:] if tokens and tokens[0] == "tui" else tokens
+        return launch_tui(tui_args)
     tokens = _attach_negative_option_values(_inject_data_command(tokens))
-    parser = argparse.ArgumentParser(prog="atlas")
+    parser = argparse.ArgumentParser(
+        prog="atlas",
+        description="Open the agent TUI, or search satellite data.",
+        epilog=_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sub = parser.add_subparsers(dest="group")
     add_data_parser(sub)
     args = parser.parse_args(tokens)
@@ -29,6 +48,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_data(args)
     parser.print_help()
     return 0
+
+
+def _is_tui_invocation(tokens: list[str]) -> bool:
+    """True when this command should replace the process with the Rust TUI."""
+    if not tokens:
+        return True
+    head = tokens[0]
+    return head == "tui" or head in _TUI_FLAGS
 
 
 _VALUE_FLAGS = frozenset({"--coords", "--date", "--out", "--limit", "--max-cloud-cover", "--asset"})
