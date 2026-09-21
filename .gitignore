@@ -31,6 +31,9 @@ build/
 logs/
 local/
 
+# Rust TUI build output
+tui/target/
+
 # Exported model weights (ATLAS_WEIGHTS_DIR or <repo>/weights)
 weights/*
 !weights/.gitkeep
