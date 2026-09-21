@@ -353,3 +353,26 @@ async def test_maxar_walks_event_catalog() -> None:
         result = await client.search(_request())
     assert result.scenes[0].id == "item-1"
     assert result.scenes[0].platform == "worldview-3"
+
+
+@pytest.mark.asyncio
+async def test_cloud_minimum_and_maximum_reach_the_stac_query() -> None:
+    fake = FakeAsyncClient(json_payload=_stac_payload())
+    async with _client(Sentinel2Client, fake) as client:
+        await client.search(_request(min_cloud_cover=80))
+    assert fake.calls[0][2]["json"]["query"] == {"eo:cloud_cover": {"gte": 80}}
+
+    both = FakeAsyncClient(json_payload=_stac_payload())
+    async with _client(Sentinel2Client, both) as client:
+        await client.search(_request(min_cloud_cover=60, max_cloud_cover=90))
+    assert both.calls[0][2]["json"]["query"] == {"eo:cloud_cover": {"gte": 60, "lte": 90}}
+
+    neither = FakeAsyncClient(json_payload=_stac_payload())
+    async with _client(Sentinel2Client, neither) as client:
+        await client.search(_request())
+    assert "query" not in neither.calls[0][2]["json"]
+
+
+def test_cloud_minimum_may_not_exceed_maximum() -> None:
+    with pytest.raises(ValueError, match="min_cloud_cover"):
+        _request(min_cloud_cover=80, max_cloud_cover=20)

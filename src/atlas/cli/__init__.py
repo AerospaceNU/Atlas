@@ -31,7 +31,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-_VALUE_FLAGS = frozenset({"--coords", "--date", "--out", "--limit", "--max-cloud-cover", "--asset"})
+_VALUE_FLAGS = frozenset(
+    {"--coords", "--date", "--out", "--limit", "--min-cloud-cover", "--max-cloud-cover", "--asset"}
+)
 
 
 def _inject_data_command(argv: list[str]) -> list[str]:

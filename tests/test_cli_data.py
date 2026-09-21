@@ -432,7 +432,13 @@ def test_search_only_does_not_get(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("**/*.png"))
 
 
-def _pull_args(tmp_path: Path, *, search_only: bool) -> argparse.Namespace:
+def _pull_args(
+    tmp_path: Path,
+    *,
+    search_only: bool,
+    min_cloud_cover: float | None = None,
+    max_cloud_cover: float | None = None,
+) -> argparse.Namespace:
     return argparse.Namespace(
         list_catalog=False,
         satellite="sentinel2",
@@ -441,8 +447,76 @@ def _pull_args(tmp_path: Path, *, search_only: bool) -> argparse.Namespace:
         coords="-71.12,42.32,-71.02,42.40",
         out=tmp_path,
         limit=10,
-        max_cloud_cover=None,
+        min_cloud_cover=min_cloud_cover,
+        max_cloud_cover=max_cloud_cover,
         concurrency=2,
         search_only=search_only,
         asset=None,
     )
+
+
+def _parse_pull_args(tokens: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="atlas")
+    sub = parser.add_subparsers(dest="group")
+    add_data_parser(sub)
+    return parser.parse_args(_attach_negative_option_values(_inject_data_command(tokens)))
+
+
+def _request_pull_args(tmp_path: Path, *extra: str) -> argparse.Namespace:
+    return _parse_pull_args(
+        [
+            "data",
+            "sentinel2",
+            "optical",
+            "--date",
+            "2024-07-01:2024-07-07",
+            "--coords",
+            "-71.12,42.32,-71.02,42.40",
+            "--out",
+            str(tmp_path),
+            "--search-only",
+            *extra,
+        ]
+    )
+
+
+class RecordingPullClient(FakePullClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[PullRequest] = []
+
+    async def search(self, request: PullRequest) -> PullResult:
+        self.requests.append(request)
+        return await super().search(request)
+
+
+def test_min_cloud_cover_reaches_request(tmp_path: Path) -> None:
+    client = RecordingPullClient()
+    args = _request_pull_args(tmp_path, "--min-cloud-cover", "80")
+    assert args.min_cloud_cover == 80.0
+    assert run_data(args, clients={"sentinel2": client}) == 0
+    assert [request.min_cloud_cover for request in client.requests] == [80.0]
+
+
+def test_min_and_max_cloud_cover_reach_request(tmp_path: Path) -> None:
+    client = RecordingPullClient()
+    args = _request_pull_args(tmp_path, "--min-cloud-cover", "20", "--max-cloud-cover", "80")
+    assert run_data(args, clients={"sentinel2": client}) == 0
+    request = client.requests[0]
+    assert request.min_cloud_cover == 20.0
+    assert request.max_cloud_cover == 80.0
+
+
+def test_max_cloud_cover_still_reaches_request(tmp_path: Path) -> None:
+    client = RecordingPullClient()
+    args = _request_pull_args(tmp_path, "--max-cloud-cover", "50")
+    assert run_data(args, clients={"sentinel2": client}) == 0
+    request = client.requests[0]
+    assert request.max_cloud_cover == 50.0
+    assert request.min_cloud_cover is None
+
+
+def test_inverted_cloud_bounds_exit_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    args = _request_pull_args(tmp_path, "--min-cloud-cover", "80", "--max-cloud-cover", "20")
+    assert run_data(args, clients={"sentinel2": RecordingPullClient()}) == 2
+    assert "min_cloud_cover" in capsys.readouterr().err

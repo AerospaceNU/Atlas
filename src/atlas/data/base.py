@@ -69,6 +69,7 @@ class PullRequest(BaseModel):
     start_date: date
     end_date: date
     bbox: BBox
+    min_cloud_cover: float | None = Field(default=None, ge=0, le=100)
     max_cloud_cover: float | None = Field(default=None, ge=0, le=100)
     limit: int = Field(default=100, ge=1, le=1000)
 
@@ -76,6 +77,16 @@ class PullRequest(BaseModel):
     def _validate_dates(self) -> Self:
         if self.end_date < self.start_date:
             raise ValueError("end_date must be on or after start_date")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cloud_bounds(self) -> Self:
+        if (
+            self.min_cloud_cover is not None
+            and self.max_cloud_cover is not None
+            and self.max_cloud_cover < self.min_cloud_cover
+        ):
+            raise ValueError("max_cloud_cover must be greater than or equal to min_cloud_cover")
         return self
 
 

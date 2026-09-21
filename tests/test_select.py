@@ -39,6 +39,45 @@ def test_select_keeps_sar_when_cloud_capped() -> None:
     assert [s.id for s in chosen] == ["s1"]
 
 
+def test_filter_cloud_minimum_keeps_only_cloudy_optical() -> None:
+    optical_clear = _scene(id="a", kind=SceneKind.optical, cloud_cover=5)
+    optical_cloudy = _scene(id="b", kind=SceneKind.optical, cloud_cover=85)
+    unknown = _scene(id="c", kind=SceneKind.optical, cloud_cover=None)
+    sar = _scene(id="d", kind=SceneKind.sar, cloud_cover=None)
+    kept = filter_cloud([optical_clear, optical_cloudy, unknown, sar], None, min_cloud=80)
+    assert {s.id for s in kept} == {"b", "c", "d"}
+
+
+def test_filter_cloud_honors_both_bounds() -> None:
+    scenes = [
+        _scene(id="low", kind=SceneKind.optical, cloud_cover=10),
+        _scene(id="mid", kind=SceneKind.optical, cloud_cover=70),
+        _scene(id="high", kind=SceneKind.optical, cloud_cover=95),
+    ]
+    kept = filter_cloud(scenes, 90, min_cloud=60)
+    assert [s.id for s in kept] == ["mid"]
+
+
+def test_filter_cloud_at_bounds_is_inclusive() -> None:
+    scenes = [
+        _scene(id="floor", kind=SceneKind.optical, cloud_cover=80),
+        _scene(id="ceiling", kind=SceneKind.optical, cloud_cover=90),
+    ]
+    kept = filter_cloud(scenes, 90, min_cloud=80)
+    assert [s.id for s in kept] == ["floor", "ceiling"]
+
+
+def test_select_forwards_cloud_minimum() -> None:
+    chosen = select(
+        [
+            _scene(id="clear", kind=SceneKind.optical, cloud_cover=5),
+            _scene(id="cloudy", kind=SceneKind.optical, cloud_cover=88),
+        ],
+        min_cloud=80,
+    )
+    assert [s.id for s in chosen] == ["cloudy"]
+
+
 def test_representative_cloud_ignores_non_optical() -> None:
     assert (
         representative_cloud(
