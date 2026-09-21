@@ -79,7 +79,18 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help="Output directory (default: .atlas/data)",
     )
     data.add_argument("--limit", type=int, default=100, help="Max scenes per source (1-1000)")
-    data.add_argument("--max-cloud-cover", type=float, default=None)
+    data.add_argument(
+        "--min-cloud-cover",
+        type=float,
+        default=None,
+        help="Minimum scene cloud cover percentage (0-100)",
+    )
+    data.add_argument(
+        "--max-cloud-cover",
+        type=float,
+        default=None,
+        help="Maximum scene cloud cover percentage (0-100)",
+    )
     data.add_argument(
         "--concurrency",
         type=int,
@@ -138,6 +149,7 @@ def run_data(
             start_date=start,
             end_date=end,
             bbox=parse_coords(args.coords),
+            min_cloud_cover=args.min_cloud_cover,
             max_cloud_cover=args.max_cloud_cover,
             limit=args.limit,
         )

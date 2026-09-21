@@ -58,7 +58,17 @@ def _is_tui_invocation(tokens: list[str]) -> bool:
     return head == "tui" or head in _TUI_FLAGS
 
 
-_VALUE_FLAGS = frozenset({"--coords", "--date", "--out", "--limit", "--max-cloud-cover", "--asset"})
+_VALUE_FLAGS = frozenset(
+    {
+        "--coords",
+        "--date",
+        "--out",
+        "--limit",
+        "--min-cloud-cover",
+        "--max-cloud-cover",
+        "--asset",
+    }
+)
 
 
 def _inject_data_command(argv: list[str]) -> list[str]:

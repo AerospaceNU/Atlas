@@ -83,7 +83,9 @@ def render_preview(
     for name in classes:
         chips = _list_chips(data_dir / name)
         if not chips:
-            raise FileNotFoundError(f"No val scenes for {name}. Run acquire.sh then train/export.")
+            raise FileNotFoundError(
+                f"No val scenes for {name}. Populate {data_dir} then run train/export."
+            )
         if fixtures is not None:
             fixtures.mkdir(parents=True, exist_ok=True)
             with Image.open(chips[0]) as first:
