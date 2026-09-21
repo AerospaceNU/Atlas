@@ -30,6 +30,7 @@ build/
 .atlas/
 logs/
 local/
+tmp/
 
 # Rust TUI build output
 tui/target/
