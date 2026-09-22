@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image
-
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import ChatMessage, ModelResponse, ToolCall, ToolDefinition
+from atlas.agent.contracts import (
+    ChatMessage,
+    ModelResponse,
+    ToolCall,
+    ToolDefinition,
+    default_registry,
+)
 from atlas.agent.runtime import Agent
-from atlas.agent.tools import default_registry
 
 
 class ScriptedModel:
@@ -22,24 +25,24 @@ class ScriptedModel:
 
 def test_agent_uses_registry_tool_then_returns_answer(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
-    Image.new("RGB", (20, 10), "blue").save(tmp_path / "coast.png")
+    (tmp_path / "notes.txt").write_text("the coast is clear", encoding="utf-8")
     model = ScriptedModel(
         [
             ModelResponse(
                 tool_calls=[
-                    ToolCall(id="call-1", name="inspect_image", arguments={"path": "coast.png"})
+                    ToolCall(id="call-1", name="read_file", arguments={"path": "notes.txt"})
                 ]
             ),
-            ModelResponse(content="The image is 20 by 10 pixels."),
+            ModelResponse(content="The notes say the coast is clear."),
         ]
     )
     agent = Agent(model, default_registry(), store)
 
-    result = agent.run("What are the image dimensions?")
+    result = agent.run("What do the notes say?")
 
-    assert result.response == "The image is 20 by 10 pixels."
+    assert result.response == "The notes say the coast is clear."
     assert result.steps[0].result is not None
-    assert "20x10" in result.steps[0].result.text
+    assert "the coast is clear" in result.steps[0].result.text
     assert model.requests[1][0][-1].role == "tool"
 
 

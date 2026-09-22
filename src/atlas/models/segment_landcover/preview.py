@@ -9,7 +9,7 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.tools import default_registry
+from atlas.agent.contracts import default_registry
 from atlas.models.base import parse_plugin_toml, repo_root
 
 _PLUGIN = Path(__file__).with_name("plugin.toml")
