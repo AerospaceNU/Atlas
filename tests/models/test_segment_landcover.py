@@ -7,7 +7,7 @@ import pytest
 from PIL import Image
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.tools import default_registry
+from atlas.agent.contracts import default_registry
 from atlas.models.base import parse_plugin_toml, read_weight_bytes
 
 _CLASSES = ["bare", "built-up", "water", "vegetation", "cloud"]

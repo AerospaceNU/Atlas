@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from atlas.agent.contracts import ChatMessage, ToolDefinition
+from atlas.agent.contracts import ChatMessage, Role, ToolDefinition
 from atlas.agent.model import ModelConfig, OpenRouterModel
 
 
@@ -58,7 +58,7 @@ def test_complete_advertises_and_parses_native_tool_calls() -> None:
         parameters={"type": "object", "properties": {"path": {"type": "string"}}},
     )
 
-    response = model.complete([ChatMessage(role="user", content="Inspect coast.png")], [tool])
+    response = model.complete([ChatMessage(role=Role.USER, content="Inspect coast.png")], [tool])
 
     assert response.content is None
     assert response.tool_calls[0].arguments == {"path": "coast.png"}

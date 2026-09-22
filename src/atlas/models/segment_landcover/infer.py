@@ -7,7 +7,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.tools import Tool, ToolResult
+from atlas.agent.contracts import Tool, ToolResult
 from atlas.models.base import (
     PluginSpec,
     class_fractions,

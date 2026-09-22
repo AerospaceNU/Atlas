@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from importlib.resources import files
 
-from atlas.agent.tools import ToolRegistry
+from atlas.agent.contracts import ToolRegistry
 from atlas.models.base import PluginSpec, parse_plugin_toml
 from atlas.models.segment_landcover.infer import SegmentLandcoverTool
 

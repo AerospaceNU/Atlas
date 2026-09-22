@@ -6,7 +6,7 @@ from typing import Any, Self
 
 import httpx
 
-from atlas.agent.contracts import ChatMessage, ModelResponse, ToolCall, ToolDefinition
+from atlas.agent.contracts import ChatMessage, ModelResponse, Role, ToolCall, ToolDefinition
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -28,7 +28,7 @@ class OpenRouterModel:
         self._owns_client = client is None
 
     def __call__(self, prompt: str) -> str:
-        self.history.append(ChatMessage(role="user", content=prompt))
+        self.history.append(ChatMessage(role=Role.USER, content=prompt))
         try:
             response = self.complete(self.history, [])
             content = response.content
@@ -37,7 +37,7 @@ class OpenRouterModel:
         except Exception:
             self.history.pop()
             raise
-        self.history.append(ChatMessage(role="assistant", content=content))
+        self.history.append(ChatMessage(role=Role.ASSISTANT, content=content))
         return content
 
     def complete(self, messages: list[ChatMessage], tools: list[ToolDefinition]) -> ModelResponse:
@@ -100,7 +100,7 @@ class OpenRouterModel:
 
 
 def _serialize_message(message: ChatMessage) -> dict[str, Any]:
-    data: dict[str, Any] = {"role": message.role}
+    data: dict[str, Any] = {"role": message.role.value}
     if message.content is not None:
         data["content"] = message.content
     if message.tool_call_id is not None:

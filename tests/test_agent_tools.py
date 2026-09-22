@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PIL import Image
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.tools import default_registry
+from atlas.agent.contracts import default_registry
+from atlas.agent.tools.read_file import ReadFileTool
 
 
 def test_store_rejects_paths_outside_root(tmp_path: Path) -> None:
@@ -16,54 +16,63 @@ def test_store_rejects_paths_outside_root(tmp_path: Path) -> None:
         store.resolve("../outside.png")
 
 
-def test_contact_sheet_is_a_local_visual_artifact(tmp_path: Path) -> None:
+def test_read_file_returns_relative_text_contents(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
-    Image.new("RGB", (40, 20), "red").save(tmp_path / "one.png")
-    Image.new("RGB", (20, 40), "green").save(tmp_path / "two.png")
+    (tmp_path / "notes.txt").write_text("hello workspace", encoding="utf-8")
 
-    result = default_registry().execute(
-        "create_contact_sheet",
-        {"paths": ["one.png", "two.png"], "output_path": "artifacts/sheet.png", "columns": 2},
-        store,
-    )
+    result = default_registry().execute("read_file", {"path": "notes.txt"}, store)
 
-    assert result.artifacts == ["artifacts/sheet.png"]
-    sheet = tmp_path / "artifacts/sheet.png"
-    assert sheet.is_file()
-    with Image.open(sheet) as image:
-        assert image.format == "PNG"
-        assert image.width > image.height
+    assert result.text == "hello workspace"
 
 
-def test_script_proposal_is_staged_but_not_in_default_registry(tmp_path: Path) -> None:
+def test_read_file_returns_empty_text_for_an_empty_file(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
-    registry = default_registry(allow_script_proposals=True)
+    (tmp_path / "empty.txt").write_text("", encoding="utf-8")
 
-    result = registry.execute(
-        "stage_script_proposal",
-        {"name": "histogram_helper", "source": "print('not executed')\n", "description": "draft"},
-        store,
-    )
+    result = ReadFileTool().run({"path": "empty.txt"}, store)
 
-    assert (tmp_path / "proposals/histogram_helper.py").read_text() == "print('not executed')\n"
-    assert "not executable" in result.text
-    assert "stage_script_proposal" not in [tool.name for tool in default_registry().definitions]
+    assert result.text == ""
+    assert result.artifacts == []
 
 
-def test_script_review_writes_static_report_without_execution(tmp_path: Path) -> None:
+def test_read_file_rejects_escaping_path(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
-    registry = default_registry(allow_script_proposals=True)
-    registry.execute(
-        "stage_script_proposal",
-        {
-            "name": "network_helper",
-            "source": "import socket\nprint('not executed')\n",
-            "description": "draft",
-        },
-        store,
-    )
+    (tmp_path.parent / "outside.txt").write_text("outside", encoding="utf-8")
 
-    result = registry.execute("review_script_proposals", {}, store)
+    with pytest.raises(ValueError, match="escapes"):
+        ReadFileTool().run({"path": "../outside.txt"}, store)
 
-    assert result.artifacts == ["proposals/review.json"]
-    assert "Imports socket" in (tmp_path / "proposals/review.json").read_text()
+
+def test_read_file_rejects_absolute_path(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path / "notes.txt").write_text("hello", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="relative"):
+        ReadFileTool().run({"path": str(tmp_path / "notes.txt")}, store)
+
+
+def test_read_file_missing_file_hides_the_host_path(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        ReadFileTool().run({"path": "missing.txt"}, store)
+
+    message = str(excinfo.value)
+    assert "missing.txt" in message
+    assert str(tmp_path) not in message
+
+
+def test_read_file_rejects_oversized_file(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path / "big.txt").write_bytes(b"x" * 100_001)
+
+    with pytest.raises(ValueError, match="100000"):
+        ReadFileTool().run({"path": "big.txt"}, store)
+
+
+def test_read_file_rejects_non_utf8_file(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path / "binary.txt").write_bytes(b"\xff")
+
+    with pytest.raises(ValueError, match="UTF-8"):
+        ReadFileTool().run({"path": "binary.txt"}, store)
