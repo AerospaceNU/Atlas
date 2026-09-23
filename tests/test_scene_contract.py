@@ -29,6 +29,17 @@ def test_scene_kind_and_geometry_are_enums() -> None:
         )
 
 
+def test_from_corners_across_antimeridian_stays_narrow() -> None:
+    box = BBox.from_corners(170, -10, -170, -20)
+    assert box.as_list() == [170, -20, -170, -10]
+    assert box.lon_span == 20
+
+
+def test_from_corners_without_wrap_keeps_min_max() -> None:
+    box = BBox.from_corners(-70.9, 42.5, -71.2, 42.2)
+    assert box.as_list() == [-71.2, 42.2, -70.9, 42.5]
+
+
 def test_asset_rejects_relative_and_s3_hrefs() -> None:
     assert Asset.try_new(href="./visual.tif") is None
     assert Asset.try_new(href="s3://bucket") is None

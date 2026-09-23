@@ -204,7 +204,7 @@ def _bbox_from_polygons(geometry: dict[str, Any]) -> BBox | None:
                 continue
     if not lons or not lats:
         return None
-    return BBox(west=min(lons), south=min(lats), east=max(lons), north=max(lats))
+    return BBox.enclosing(lons, lats)
 
 
 def _platform(umm: dict[str, Any]) -> tuple[str, str | None]:

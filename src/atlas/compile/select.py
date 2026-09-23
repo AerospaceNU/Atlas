@@ -97,9 +97,11 @@ def coverage_fraction(scenes: list[Scene], aoi: BBox, *, grid: int = 16) -> floa
     hits = 0
     total = grid * grid
     for i in range(grid):
-        lon = aoi.west + (aoi.east - aoi.west) * (i + 0.5) / grid
+        lon = aoi.west + aoi.lon_span * (i + 0.5) / grid
+        if lon > 180:
+            lon -= 360
         for j in range(grid):
             lat = aoi.south + (aoi.north - aoi.south) * (j + 0.5) / grid
-            if any(b.west <= lon <= b.east and b.south <= lat <= b.north for b in boxes):
+            if any(b.contains(lon, lat) for b in boxes):
                 hits += 1
     return hits / total
