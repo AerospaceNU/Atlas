@@ -109,3 +109,15 @@ def test_coverage_skips_points_and_request_footprints() -> None:
     assert coverage_fraction([point, snapshot, lidar], AOI) == 0.0
     frac = coverage_fraction([raster], AOI)
     assert 0 < frac <= 1
+
+
+def test_coverage_of_antimeridian_aoi_by_matching_scene() -> None:
+    pacific = BBox(west=170, south=-20, east=-170, north=-10)
+    scene = _scene(id="fiji", kind=SceneKind.optical, bbox=pacific)
+    assert coverage_fraction([scene], pacific) == 1.0
+
+
+def test_coverage_of_antimeridian_aoi_by_scene_on_one_side() -> None:
+    pacific = BBox(west=170, south=-20, east=-170, north=-10)
+    east_half = _scene(id="west", bbox=BBox(west=-180, south=-20, east=-170, north=-10))
+    assert coverage_fraction([east_half], pacific) == 0.5
