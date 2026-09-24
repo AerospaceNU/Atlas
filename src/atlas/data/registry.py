@@ -66,6 +66,7 @@ from atlas.data.pc_more import (
 )
 from atlas.data.sentinel1 import Sentinel1Client
 from atlas.data.sentinel2 import Sentinel2Client
+from atlas.data.sources.fldas import FldasClient
 from atlas.data.usgs import UsgsLandsatC2L1Client, UsgsLandsatC2L2SrClient
 
 # Registry of known satellite data sources by stable name. The consolidation
@@ -121,6 +122,7 @@ SOURCES: dict[str, type[DataPullClient]] = {
     "firms_viirs_noaa21": FirmsViirsNoaa21Client,
     "firms_modis": FirmsModisClient,
     "firms_landsat": FirmsLandsatClient,
+    "fldas": FldasClient,
     "gibs_modis_truecolor": GibsModisTrueColorClient,
     "gibs_viirs_truecolor": GibsViirsTrueColorClient,
     "gibs_aqua_truecolor": GibsAquaTrueColorClient,
