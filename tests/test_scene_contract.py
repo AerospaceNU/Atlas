@@ -94,14 +94,104 @@ def test_item_to_scene_point_without_bbox() -> None:
     assert scene.kind is SceneKind.detection
 
 
-def test_item_to_scene_drops_unparseable_bbox_even_with_point() -> None:
+def test_item_to_scene_keeps_3d_bbox_with_point() -> None:
     feature = {
         "id": "pt",
-        "bbox": [-71, 42, -70, 43, 0, 1],
+        "bbox": [-71, 42, 0, -70, 43, 1],
         "geometry": {"type": "Point", "coordinates": [-71.08, 42.35]},
         "properties": {"datetime": "2024-07-01T00:00:00Z"},
     }
-    assert item_to_scene(feature) is None
+    scene = item_to_scene(feature)
+    assert scene is not None
+    assert scene.bbox.as_list() == [-71, 42, -70, 43]
+    assert scene.geometry_kind is GeometryKind.point
+    assert scene.lon == pytest.approx(-71.08)
+    assert scene.lat == pytest.approx(42.35)
+
+
+def test_item_to_scene_keeps_3d_bbox_with_polygon() -> None:
+    feature = {
+        "id": "gedi",
+        "bbox": [-71, 42, -120.5, -70, 43, 850.0],
+        "geometry": {"type": "Polygon", "coordinates": []},
+        "properties": {"datetime": "2024-07-01T00:00:00Z"},
+    }
+    scene = item_to_scene(feature, kind=SceneKind.lidar)
+    assert scene is not None
+    assert scene.bbox.as_list() == [-71, 42, -70, 43]
+    assert scene.geometry_kind is GeometryKind.polygon
+
+
+def test_item_to_scene_unreadable_bbox_falls_back_to_point() -> None:
+    feature = {
+        "id": "pt",
+        "bbox": [-71, 42, -70],
+        "geometry": {"type": "Point", "coordinates": [-71.08, 42.35]},
+        "properties": {"datetime": "2024-07-01T00:00:00Z"},
+    }
+    scene = item_to_scene(feature)
+    assert scene is not None
+    assert scene.geometry_kind is GeometryKind.point
+    assert scene.bbox.as_list() == pytest.approx([-71.09, 42.34, -71.07, 42.36])
+
+
+def _cloud_item(cloud: object) -> dict[str, object]:
+    return {
+        "id": "item-1",
+        "bbox": [-1, -1, 1, 1],
+        "properties": {"datetime": "2024-07-01T00:00:00Z", "eo:cloud_cover": cloud},
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("12.5", 12.5),
+        (12.5, 12.5),
+        (120, 100.0),
+        (-3, 0.0),
+        ("cloudy", None),
+        ("nan", None),
+        (True, None),
+        (None, None),
+    ],
+)
+def test_item_to_scene_cloud_cover_parsed_without_dropping_scene(
+    raw: object, expected: float | None
+) -> None:
+    scene = item_to_scene(_cloud_item(raw))
+    assert scene is not None
+    assert scene.cloud_cover == expected
+
+
+def test_item_to_scene_prefers_const_platform() -> None:
+    feature = {
+        "id": "item-1",
+        "bbox": [-1, -1, 1, 1],
+        "properties": {
+            "datetime": "2024-07-01T00:00:00Z",
+            "const:platform": "ISS",
+            "platform": "other",
+        },
+    }
+    scene = item_to_scene(feature, default_platform="GEDI02_A_002")
+    assert scene is not None
+    assert scene.platform == "ISS"
+
+
+def test_item_to_scene_platform_falls_back_to_platform_then_default() -> None:
+    feature = {
+        "id": "item-1",
+        "bbox": [-1, -1, 1, 1],
+        "properties": {"datetime": "2024-07-01T00:00:00Z", "platform": ["landsat-9"]},
+    }
+    scene = item_to_scene(feature, default_platform="collection-id")
+    assert scene is not None
+    assert scene.platform == "landsat-9"
+    feature["properties"] = {"datetime": "2024-07-01T00:00:00Z"}
+    fallback = item_to_scene(feature, default_platform="collection-id")
+    assert fallback is not None
+    assert fallback.platform == "collection-id"
 
 
 def test_item_to_scene_bad_point_does_not_raise() -> None:
