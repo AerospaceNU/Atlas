@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from datetime import date
 from datetime import datetime as DateTime
 from enum import StrEnum
+from itertools import pairwise
 from typing import Any, ClassVar, Self
 from urllib.parse import urlparse
 
@@ -31,6 +33,13 @@ class GeometryKind(StrEnum):
 
 
 class BBox(BaseModel):
+    """West/south/east/north box in degrees.
+
+    Boxes may cross the antimeridian. ``west > east`` means the box runs east
+    from ``west`` through 180° to ``east``, as in RFC 7946 and STAC. Geometry
+    helpers must handle wrapping boxes instead of splitting or rejecting them.
+    """
+
     west: float = Field(..., ge=-180, le=180)
     south: float = Field(..., ge=-90, le=90)
     east: float = Field(..., ge=-180, le=180)
@@ -38,12 +47,19 @@ class BBox(BaseModel):
 
     @classmethod
     def from_corners(cls, lon1: float, lat1: float, lon2: float, lat2: float) -> Self:
-        return cls(
-            west=min(lon1, lon2),
-            south=min(lat1, lat2),
-            east=max(lon1, lon2),
-            north=max(lat1, lat2),
-        )
+        return cls.enclosing([lon1, lon2], [lat1, lat2])
+
+    @classmethod
+    def enclosing(cls, lons: Sequence[float], lats: Sequence[float]) -> Self:
+        ordered = sorted(lons)
+        west, east = ordered[0], ordered[-1]
+        # The box is the circle minus its widest empty gap; start with the gap across 180°.
+        widest_gap = 360.0 - (east - west)
+        for left, right in pairwise(ordered):
+            if right - left > widest_gap:
+                widest_gap = right - left
+                west, east = right, left
+        return cls(west=west, south=min(lats), east=east, north=max(lats))
 
     @classmethod
     def from_point(cls, lon: float, lat: float, *, pad: float = 0.01) -> Self:
@@ -53,6 +69,18 @@ class BBox(BaseModel):
             east=min(180.0, lon + pad),
             north=min(90.0, lat + pad),
         )
+
+    @property
+    def lon_span(self) -> float:
+        span = self.east - self.west
+        return span + 360.0 if span < 0 else span
+
+    def contains(self, lon: float, lat: float) -> bool:
+        if not self.south <= lat <= self.north:
+            return False
+        if self.west > self.east:
+            return lon >= self.west or lon <= self.east
+        return self.west <= lon <= self.east
 
     def as_list(self) -> list[float]:
         return [self.west, self.south, self.east, self.north]

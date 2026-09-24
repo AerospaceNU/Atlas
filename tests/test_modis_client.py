@@ -127,6 +127,22 @@ def test_gpolygons_bbox_and_https_data_not_s3() -> None:
     assert scene.collection == "MOD13A2"
 
 
+def test_gpolygons_crossing_antimeridian_keep_narrow_envelope() -> None:
+    item = _gpolygon_item()
+    geometry = item["umm"]["SpatialExtent"]["HorizontalSpatialDomain"]["Geometry"]
+    geometry["GPolygons"][0]["Boundary"]["Points"] = [
+        {"Longitude": 175.0, "Latitude": -20.0},
+        {"Longitude": -175.0, "Latitude": -20.0},
+        {"Longitude": -176.0, "Latitude": -10.0},
+        {"Longitude": 176.0, "Latitude": -10.0},
+        {"Longitude": 175.0, "Latitude": -20.0},
+    ]
+    scene = _client()._granule_to_scene(item)
+    assert scene is not None
+    assert scene.bbox.as_list() == [175.0, -20.0, -175.0, -10.0]
+    assert scene.bbox.lon_span == pytest.approx(10.0)
+
+
 def test_bounding_rectangles_preferred_when_present() -> None:
     item = {
         "meta": {"concept-id": "G-RECT"},
