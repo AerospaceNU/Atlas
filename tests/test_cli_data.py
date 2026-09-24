@@ -253,6 +253,8 @@ def test_help_example_text(capsys: pytest.CaptureFixture[str]) -> None:
         main(["data", "--help"])
     out = capsys.readouterr().out
     assert "atlas data sentinel2 optical --date" in out
+    assert "atlas data fldas landsurface --date" in out
+    assert "training table" in out
     assert "--coords" in out
     assert "--no-tui" not in out
     assert "uv run" not in out
