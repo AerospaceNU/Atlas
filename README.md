@@ -12,6 +12,28 @@ ATLAS is a research project in **harness engineering** at the intersection of
 aerospace and computer science: automated, cost-efficient satellite imagery
 analysis, in part with LLMs. The official focus is satellite data analysis focused on geographical and environmental changes across available data.
 
+## Data CLI
+
+`atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`.
+
+```bash
+atlas data                         # catalog
+atlas data sentinel2               # kinds for one satellite
+
+atlas data sentinel2 optical \
+  --date 2024-07-01:2024-07-07 \
+  --coords -71.12,42.32,-71.02,42.40
+
+atlas data fldas landsurface \
+  --date 2023-01-01:2024-12-31 \
+  --coords -71.2,42.2,-70.9,42.5 \
+  --out .atlas/data/fldas
+```
+
+Scene pulls download native assets under `.atlas/data` and write `manifest.json`. `--search-only` skips the download. `--limit` caps scenes per source (default 100).
+
+`fldas landsurface` writes `.atlas/data/fldas/fldas.csv`: one row per 0.1° cell per month (January 1982 through the latest published month). Set `EARTHDATA_TOKEN` in `.env` and approve **Hyrax in the cloud** and **NASA GESDISC DATA ARCHIVE**. See `.env.example`.
+
 ## Contribute!
 
 ### Set up
