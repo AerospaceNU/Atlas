@@ -1,6 +1,6 @@
 [project]
 name = "atlas"
-version = "0.6.1"
+version = "0.6.2"
 description = "Local AI agent deployment"
 readme = "README.md"
 authors = [
