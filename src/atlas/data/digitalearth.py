@@ -10,10 +10,20 @@ DEAfrica_SEARCH = "https://explorer.digitalearth.africa/stac/search"
 
 
 class DeaS2ArdClient(StacApiClient):
-    """Digital Earth Australia Sentinel-2 analysis-ready data."""
+    """Digital Earth Australia Sentinel-2A ARD. DEA splits ARD by satellite."""
 
     search_url: ClassVar[str] = DEA_SEARCH
     default_collection: ClassVar[str] = "ga_s2am_ard_3"
+    satellite: ClassVar[str] = "sentinel2"
+    scene_kind: ClassVar[SceneKind] = SceneKind.optical
+    nominal_gsd_m: ClassVar[float | None] = 10.0
+
+
+class DeaS2BmArdClient(StacApiClient):
+    """Digital Earth Australia Sentinel-2B ARD."""
+
+    search_url: ClassVar[str] = DEA_SEARCH
+    default_collection: ClassVar[str] = "ga_s2bm_ard_3"
     satellite: ClassVar[str] = "sentinel2"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = 10.0

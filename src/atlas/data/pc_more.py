@@ -7,7 +7,12 @@ from atlas.data.planetary_computer import PlanetaryComputerClient
 
 
 class LandsatC2L1Client(PlanetaryComputerClient):
-    """USGS Landsat Collection 2 Level-1 (includes older missions)."""
+    """USGS Landsat Collection 2 Level-1.
+
+    No ``platform`` filter by design, unlike the L8/L9 L2 clients: this
+    collection spans Landsat 1-5 and 7, and pinning one mission would hide the
+    archive. Filter on ``Scene.platform`` downstream.
+    """
 
     default_collection: ClassVar[str] = "landsat-c2-l1"
     satellite: ClassVar[str] = "landsat"
