@@ -4,9 +4,11 @@ import asyncio
 from collections.abc import Mapping
 from pathlib import Path
 
+import httpx
+
 from atlas.compile.aggregate import aggregate
 from atlas.compile.mosaic import build_mosaic
-from atlas.compile.product import CompiledProduct, MosaicResult, SourceScenes
+from atlas.compile.product import CompiledProduct, MosaicResult, MosaicSkip, SourceScenes
 from atlas.compile.select import coverage_fraction, representative_cloud, select
 from atlas.data.base import DataPullClient, PullRequest
 from atlas.data.planetary_computer import PlanetaryComputerClient
@@ -50,8 +52,9 @@ async def consolidate(
         render_targets.append((src.source, src))
 
     mosaics: list[MosaicResult] = []
+    skipped: list[MosaicSkip] = []
     if render and out_dir is not None:
-        mosaics = await _render_all(request, clients, render_targets, out_dir)
+        mosaics, skipped = await _render_all(request, clients, render_targets, out_dir)
 
     return CompiledProduct(
         request=request,
@@ -61,6 +64,7 @@ async def consolidate(
         cloud_cover=cloud_cover,
         coverage=coverage,
         mosaics=mosaics,
+        skipped_mosaics=skipped,
     )
 
 
@@ -69,23 +73,43 @@ async def _render_all(
     clients: Mapping[str, DataPullClient],
     targets: list[tuple[str, SourceScenes]],
     out_dir: Path,
-) -> list[MosaicResult]:
-    """Render each source's mosaic concurrently (off the event loop thread)."""
+) -> tuple[list[MosaicResult], list[MosaicSkip]]:
+    """Render each source's mosaic concurrently (off the event loop thread).
 
-    def render_one(source: str, src: SourceScenes) -> MosaicResult | None:
+    Returns the mosaics plus a skip, with a reason, for every target that
+    produced none.
+    """
+
+    def render_one(source: str, src: SourceScenes) -> MosaicResult | MosaicSkip:
         client = clients[source]
         if not isinstance(client, PlanetaryComputerClient):
-            return None  # mosaic path only supports the PC API for now
+            return MosaicSkip(
+                source=source,
+                collection=src.collection,
+                reason=(
+                    f"mosaic rendering supports the Planetary Computer API only; "
+                    f"{type(client).__name__} is not a PlanetaryComputerClient"
+                ),
+            )
         # The clearest scene also carries the render recipe we want.
         sample = min(
             src.scenes,
             key=lambda s: s.cloud_cover if s.cloud_cover is not None else float("inf"),
         )
-        return build_mosaic(
-            client, request, sample, source=source, out_path=out_dir / f"{source}.png"
-        )
+        try:
+            return build_mosaic(
+                client, request, sample, source=source, out_path=out_dir / f"{source}.png"
+            )
+        except (httpx.HTTPError, ValueError, OSError) as exc:
+            return MosaicSkip(
+                source=source,
+                collection=src.collection,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
 
     results = await asyncio.gather(
         *(asyncio.to_thread(render_one, source, src) for source, src in targets)
     )
-    return [r for r in results if r is not None]
+    mosaics = [r for r in results if isinstance(r, MosaicResult)]
+    skips = [r for r in results if isinstance(r, MosaicSkip)]
+    return mosaics, skips
