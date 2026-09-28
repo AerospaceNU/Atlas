@@ -221,6 +221,79 @@ def test_item_to_scene_skips_bad_asset_keeps_scene() -> None:
     assert scene.collection == "sentinel-2-l2a"
 
 
+def test_item_to_scene_populates_band_aliases() -> None:
+    feature = {
+        "id": "HLS.S30.T19TCG",
+        "bbox": [-71.2, 42.2, -70.9, 42.5],
+        "properties": {"datetime": "2024-07-01T15:00:00Z"},
+        "assets": {
+            "B04": {
+                "href": "https://example.com/B04.tif",
+                "eo:bands": [{"common_name": "red", "center_wavelength": 0.6645}],
+            },
+            "B08": {
+                "href": "https://example.com/B08.tif",
+                "eo:bands": [{"common_name": "nir", "center_wavelength": 0.8351}],
+            },
+            "B8A": {
+                "href": "https://example.com/B8A.tif",
+                "eo:bands": [{"center_wavelength": 0.8648}],
+            },
+        },
+    }
+    scene = item_to_scene(feature, collection="hls2-s30")
+    assert scene is not None
+    assert scene.band_aliases == {"red": "B04", "nir": "B8A"}
+    assert scene.assets[scene.band_aliases["nir"]].href.endswith("B8A.tif")
+
+
+def test_item_to_scene_drops_aliases_for_rejected_assets() -> None:
+    feature = {
+        "id": "item-1",
+        "bbox": [-71.2, 42.2, -70.9, 42.5],
+        "properties": {"datetime": "2024-07-01T15:00:00Z"},
+        "assets": {
+            "B04": {
+                "href": "./relative.tif",
+                "eo:bands": [{"common_name": "red", "center_wavelength": 0.6645}],
+            },
+            "B8A": {
+                "href": "https://example.com/B8A.tif",
+                "eo:bands": [{"center_wavelength": 0.8648}],
+            },
+        },
+    }
+    scene = item_to_scene(feature, collection="hls2-s30")
+    assert scene is not None
+    assert scene.band_aliases == {"nir": "B8A"}
+
+
+def test_item_to_scene_without_band_metadata_has_no_aliases() -> None:
+    feature = {
+        "id": "item-1",
+        "bbox": [-71.2, 42.2, -70.9, 42.5],
+        "properties": {"datetime": "2024-07-01T15:00:00Z"},
+        "assets": {"visual": {"href": "https://example.com/a.tif", "roles": ["data"]}},
+    }
+    scene = item_to_scene(feature)
+    assert scene is not None
+    assert scene.band_aliases == {}
+
+
+def test_scene_rejects_alias_to_a_missing_asset() -> None:
+    assert (
+        Scene.try_new(
+            id="s",
+            datetime=datetime(2024, 7, 1, tzinfo=UTC),
+            bbox=BBox(west=-1, south=-1, east=1, north=1),
+            platform="x",
+            assets={},
+            band_aliases={"red": "B04"},
+        )
+        is None
+    )
+
+
 def test_item_to_scene_inverted_interval_returns_none() -> None:
     feature = {
         "id": "item-1",
