@@ -31,7 +31,20 @@ def filter_cloud(
 
 
 def dedup(scenes: list[Scene]) -> list[Scene]:
-    """Remove duplicate scenes by id, preserving order."""
+    """Remove duplicate scenes by id, preserving order.
+
+    Matching is id-only, not source-plus-id. Catalogs that serve the same
+    observation under their own ids (Landsat via Planetary Computer,
+    LandsatLook and HLS; MODIS and GOES via two backends each) survive as
+    separate entries.
+
+    Args:
+        scenes: Scenes to filter, in the order they should be kept.
+
+    Returns:
+        The scenes with later repeats of an id dropped. Group on
+        ``(platform, datetime)`` downstream for one row per acquisition.
+    """
     seen: set[str] = set()
     out: list[Scene] = []
     for s in scenes:

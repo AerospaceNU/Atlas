@@ -18,7 +18,7 @@ from atlas.data.cmr_stac import (
     ViirsVnp09gaClient,
 )
 from atlas.data.cop_dem import CopDemGlo30Client, CopDemGlo90Client
-from atlas.data.digitalearth import DeAfricaS2Client, DeaS2ArdClient
+from atlas.data.digitalearth import DeAfricaS2Client, DeaS2ArdClient, DeaS2BmArdClient
 from atlas.data.earth_search import EarthSearchSentinel1GrdClient
 from atlas.data.firms import (
     FirmsClient,
@@ -113,6 +113,7 @@ SOURCES: dict[str, type[DataPullClient]] = {
     "icesat2_atl03": IceSat2Atl03Client,
     "smap_l3": SmapL3PassiveClient,
     "dea_s2_ard": DeaS2ArdClient,
+    "dea_s2b_ard": DeaS2BmArdClient,
     "deafrica_s2": DeAfricaS2Client,
     "cbers4_mux": Cbers4MuxClient,
     "amazonia1_wfi": Amazonia1WfiClient,

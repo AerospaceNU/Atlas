@@ -42,6 +42,21 @@ class MosaicResult(BaseModel):
     path: str  # where the PNG was written
 
 
+class MosaicSkip(BaseModel):
+    """Why one source contributed scenes but no rendered mosaic.
+
+    Attributes:
+        source: Registry name of the source that was not rendered.
+        collection: Collection the source searched.
+        reason: Why the render did not happen, either an unsupported backend
+            or the error that ended the attempt.
+    """
+
+    source: str
+    collection: str
+    reason: str
+
+
 class CompiledProduct(BaseModel):
     """Consolidated output for one AOI + time window across sources."""
 
@@ -52,3 +67,4 @@ class CompiledProduct(BaseModel):
     cloud_cover: dict[str, float | None] = Field(default_factory=dict)
     coverage: dict[str, float] = Field(default_factory=dict)  # AOI fraction, 0..1
     mosaics: list[MosaicResult] = Field(default_factory=list)
+    skipped_mosaics: list[MosaicSkip] = Field(default_factory=list)

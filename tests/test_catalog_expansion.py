@@ -6,6 +6,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
+import atlas.data as atlas_data
 from atlas.data.base import BBox, GeometryKind, PullRequest, SceneKind
 from atlas.data.cdse import CdseSentinel3OlciClient
 from atlas.data.cop_dem import CopDemGlo30Client
@@ -376,3 +377,18 @@ async def test_cloud_minimum_and_maximum_reach_the_stac_query() -> None:
 def test_cloud_minimum_may_not_exceed_maximum() -> None:
     with pytest.raises(ValueError, match="min_cloud_cover"):
         _request(min_cloud_cover=80, max_cloud_cover=20)
+
+
+def test_registry_classes_are_all_publicly_exported() -> None:
+    exported = set(atlas_data.__all__)
+    registered = {cls.__name__ for cls in SOURCES.values()}
+    assert not registered - exported, "registered clients missing from __all__"
+    assert all(hasattr(atlas_data, name) for name in exported)
+
+
+def test_dea_covers_both_sentinel2_satellites() -> None:
+    collections = {
+        SOURCES[name].default_collection  # type: ignore[attr-defined]
+        for name in ("dea_s2_ard", "dea_s2b_ard")
+    }
+    assert collections == {"ga_s2am_ard_3", "ga_s2bm_ard_3"}
