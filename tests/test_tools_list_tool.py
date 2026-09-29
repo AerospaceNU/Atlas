@@ -8,7 +8,7 @@ from typing import ClassVar, Literal
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolDefinition, ToolRegistry, ToolResult, default_registry
-from atlas.agent.tools._list_tools import ListToolsTool
+from atlas.agent.tools.list_tools import ListToolsTool
 import json
 
 
