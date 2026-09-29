@@ -147,9 +147,8 @@ def item_to_scene(
             )
             if asset is not None:
                 assets[str(name)] = asset
-        # `eo:bands` only exists on the raw specs, so resolve before it is
-        # dropped. Aliases for assets the loop rejected are discarded, since
-        # Scene requires every alias to name an asset it kept.
+        # `eo:bands` lives only on the raw specs, so resolve before the loop
+        # above drops it. Rejected assets cannot keep an alias: Scene rejects one.
         band_aliases = {
             alias: key for alias, key in resolve_bands(raw_assets).items() if key in assets
         }

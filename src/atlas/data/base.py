@@ -160,8 +160,7 @@ class Scene(BaseModel):
     footprint_is_request: bool = False
     assets: dict[str, Asset] = Field(default_factory=dict)
     # Common band name to a key in `assets`. Catalogs name the same band
-    # differently (S30 NIR is B8A, L30 NIR is B05), so callers that want a
-    # band rather than a specific product read it through here.
+    # differently: S30 NIR is B8A, L30 NIR is B05.
     band_aliases: dict[str, str] = Field(default_factory=dict)
     properties: dict[str, Any] = Field(default_factory=dict)
 
