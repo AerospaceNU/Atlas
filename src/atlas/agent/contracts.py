@@ -188,7 +188,11 @@ def build_registry(
 def default_registry() -> ToolRegistry:
     """Build the normal tool allow-list for one agent session."""
     registry = build_registry(("atlas.agent.tools",))
-    from atlas.models.registry import register_model_tools
 
+    # Register the list-tools tool with registry access
+    from atlas.agent.tools._list_tools import ListToolsTool
+    registry.register(ListToolsTool(lambda: registry.definitions))
+
+    from atlas.models.registry import register_model_tools
     register_model_tools(registry)
     return registry
