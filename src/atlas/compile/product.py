@@ -43,7 +43,14 @@ class MosaicResult(BaseModel):
 
 
 class MosaicSkip(BaseModel):
-    """Why one source contributed scenes but no rendered mosaic."""
+    """Why one source contributed scenes but no rendered mosaic.
+
+    Attributes:
+        source: Registry name of the source that was not rendered.
+        collection: Collection the source searched.
+        reason: Why the render did not happen, either an unsupported backend
+            or the error that ended the attempt.
+    """
 
     source: str
     collection: str

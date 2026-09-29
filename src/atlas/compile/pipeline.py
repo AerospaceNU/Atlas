@@ -23,8 +23,20 @@ async def consolidate(
 ) -> CompiledProduct:
     """Search all sources, select scenes, and (optionally) render mosaics.
 
-    `out_dir` is required when `render=True` (mosaics are written there as
-    `<source>.png`). Set `render=False` for a metadata-only consolidation.
+    Args:
+        request: The AOI and time window to consolidate.
+        clients: Search clients by source name.
+        out_dir: Directory for rendered mosaics, written as ``<source>.png``.
+            Required when ``render`` is true.
+        render: Whether to render mosaics. False gives a metadata-only
+            consolidation.
+
+    Returns:
+        The consolidated product. Sources selected for render that produced no
+        mosaic appear in ``skipped_mosaics`` with a reason.
+
+    Raises:
+        ValueError: If ``render`` is true and ``out_dir`` is None.
     """
     if render and out_dir is None:
         raise ValueError("out_dir is required when render=True")
@@ -76,8 +88,17 @@ async def _render_all(
 ) -> tuple[list[MosaicResult], list[MosaicSkip]]:
     """Render each source's mosaic concurrently (off the event loop thread).
 
-    Returns the mosaics plus a skip, with a reason, for every target that
-    produced none.
+    Args:
+        request: The AOI and time window being rendered.
+        clients: Search clients by source name; only
+            ``PlanetaryComputerClient`` instances can be rendered.
+        targets: Source name and scenes for each source that survived
+            selection.
+        out_dir: Directory that receives one ``<source>.png`` per render.
+
+    Returns:
+        The rendered mosaics, and a ``MosaicSkip`` carrying a reason for every
+        target that produced none.
     """
 
     def render_one(source: str, src: SourceScenes) -> MosaicResult | MosaicSkip:
@@ -100,7 +121,9 @@ async def _render_all(
             return build_mosaic(
                 client, request, sample, source=source, out_path=out_dir / f"{source}.png"
             )
-        except (httpx.HTTPError, ValueError, OSError) as exc:
+        # KeyError and TypeError come from _register_search when Planetary
+        # Computer answers 200 with a missing or non-string searchid.
+        except (httpx.HTTPError, KeyError, OSError, TypeError, ValueError) as exc:
             return MosaicSkip(
                 source=source,
                 collection=src.collection,

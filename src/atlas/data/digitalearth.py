@@ -10,7 +10,11 @@ DEAfrica_SEARCH = "https://explorer.digitalearth.africa/stac/search"
 
 
 class DeaS2ArdClient(StacApiClient):
-    """Digital Earth Australia Sentinel-2A ARD. DEA splits ARD by satellite."""
+    """Digital Earth Australia Sentinel-2A analysis-ready data.
+
+    DEA splits ARD into one collection per satellite; see
+    :class:`DeaS2BmArdClient` for Sentinel-2B.
+    """
 
     search_url: ClassVar[str] = DEA_SEARCH
     default_collection: ClassVar[str] = "ga_s2am_ard_3"
@@ -20,7 +24,7 @@ class DeaS2ArdClient(StacApiClient):
 
 
 class DeaS2BmArdClient(StacApiClient):
-    """Digital Earth Australia Sentinel-2B ARD."""
+    """Digital Earth Australia Sentinel-2B analysis-ready data."""
 
     search_url: ClassVar[str] = DEA_SEARCH
     default_collection: ClassVar[str] = "ga_s2bm_ard_3"
