@@ -75,9 +75,8 @@ def pick_asset(scene: Scene, name: str | None = None) -> tuple[str, Asset] | Non
     """Choose one native-resolution asset. Never returns a preview or thumbnail.
 
     Prefers ``visual`` (full-res RGB COG) when it is not browse, then any ``data``
-    role, then the first remaining non-browse asset. ``name`` pins a key, and
-    falls back to the scene's band aliases so ``red`` or ``nir`` resolves to
-    whichever key that catalog uses.
+    role, then the first remaining non-browse asset. ``name`` pins a key, or a
+    band alias such as ``red``.
 
     Raises:
         BrowseAssetError: if ``name`` is a preview/thumbnail key or asset.
