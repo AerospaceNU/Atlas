@@ -24,6 +24,7 @@ class SceneKind(StrEnum):
     altimetry = "altimetry"
     precipitation = "precipitation"
     landcover = "landcover"
+    landsurface = "landsurface"
 
 
 class GeometryKind(StrEnum):

@@ -44,6 +44,13 @@ from atlas.data.planetary_computer import PlanetaryComputerClient
 from atlas.data.registry import SOURCES, all_sources, sources
 from atlas.data.sentinel1 import Sentinel1Client
 from atlas.data.sentinel2 import Sentinel2Client
+from atlas.data.sources.fldas import (
+    FldasAuthError,
+    FldasClient,
+    FldasError,
+    FldasRequestError,
+    TrainingTable,
+)
 from atlas.data.usgs import UsgsLandsatC2L1Client
 
 __all__ = [
@@ -65,6 +72,10 @@ __all__ = [
     "FirmsModisClient",
     "FirmsViirsNoaa20Client",
     "FirmsViirsNoaa21Client",
+    "FldasAuthError",
+    "FldasClient",
+    "FldasError",
+    "FldasRequestError",
     "GediL2AClient",
     "GeometryKind",
     "GibsFlood3DayClient",
@@ -94,6 +105,7 @@ __all__ = [
     "Sentinel1Client",
     "Sentinel2Client",
     "SmapL3PassiveClient",
+    "TrainingTable",
     "UsgsLandsatC2L1Client",
     "all_sources",
     "sources",

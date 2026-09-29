@@ -55,9 +55,11 @@ _KIND_STYLE: dict[SceneKind, str] = {
     SceneKind.altimetry: "bright_blue",
     SceneKind.precipitation: "bright_cyan",
     SceneKind.landcover: "bright_green",
+    SceneKind.landsurface: "bright_yellow",
 }
 
 _PULL_HINT = "atlas data <satellite> <kind> --date START:END --coords W,S,E,N"
+_FLDAS_HINT = "atlas data fldas landsurface --date START:END --coords W,S,E,N"
 
 
 class CatalogError(ValueError):
@@ -238,6 +240,8 @@ def render_catalog(
     console.print()
     console.print(Text("atlas <satellite> --list   kinds and sources", style="dim"))
     console.print(Text(_PULL_HINT, style="dim"))
+    if any(info.name == "fldas" for info in infos):
+        console.print(Text(_FLDAS_HINT, style="dim"))
 
 
 def format_catalog(registry: Mapping[str, type[DataPullClient]] | None = None) -> str:
@@ -269,9 +273,7 @@ def render_satellite_tree(
     _add_kinds(tree, info, kinds)
     console.print(tree)
     console.print()
-    console.print(
-        Text(f"atlas data {info.name} <kind> --date START:END --coords W,S,E,N", style="dim")
-    )
+    console.print(Text(satellite_pull_hint(info), style="dim"))
 
 
 def render_satellite(
@@ -301,9 +303,27 @@ def render_satellite(
             expand=False,
         )
     )
-    console.print(
-        Text(f"atlas data {info.name} <kind> --date START:END --coords W,S,E,N", style="dim")
-    )
+    console.print(Text(satellite_pull_hint(info), style="dim"))
+
+
+def satellite_pull_hint(info: SatelliteInfo) -> str:
+    """Command hint for one satellite. FLDAS shows the training-table pull."""
+    kind = info.kinds[0].value if len(info.kinds) == 1 else "<kind>"
+    if info.name == "fldas":
+        return _FLDAS_HINT
+    return f"atlas data {info.name} {kind} --date START:END --coords W,S,E,N"
+
+
+def only_kind(name: str, registry: Mapping[str, type[DataPullClient]] | None = None) -> str | None:
+    """Return the kind value when ``name`` has exactly one kind.
+
+    ``None`` means the caller should keep asking for a kind. An unknown name
+    raises ``CatalogError``.
+    """
+    info = _find_satellite(name, registry)
+    if len(info.kinds) != 1:
+        return None
+    return info.kinds[0].value
 
 
 def is_known_target(
