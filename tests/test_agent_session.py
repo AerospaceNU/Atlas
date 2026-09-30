@@ -21,7 +21,12 @@ from atlas.agent.contracts import (
     ToolRegistry,
     ToolResult,
 )
-from atlas.agent.layout import resolve_openrouter_key
+from atlas.agent.layout import (
+    ensure_project_layout,
+    ensure_user_layout,
+    resolve_openrouter_key,
+    write_user_key,
+)
 from atlas.agent.model import (
     MISSING_KEY_MESSAGE,
     ModelConfig,
@@ -557,6 +562,7 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     assert done[0]["total_tokens"] == 12
     assert done[0]["spend"] == 0.01
     assert done[0]["tokens_per_second"] == 4.0
+    assert "4.0 tok/s" in done[0]["status_line"]
     assert done[0]["http_status"] == 200
     assert done[0]["elapsed_seconds"] == 0.5
     assert done[0]["context_used"] == 10
@@ -571,7 +577,7 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     line = done[1]["status_line"]
     assert "prompt 30" in line
     assert "completion 8" in line
-    assert "tok/s" in line
+    assert "12.0 tok/s" in line
     assert "http 200" in line
     assert "latency 0.50s" in line
     assert "test-key" not in json.dumps(events)
@@ -705,3 +711,192 @@ def test_session_key_overrides_the_user_key_and_is_not_stored_in_the_project(
     user_key = home / ".atlas" / "keys" / "openrouter_api_key"
     assert user_key.is_file()
     assert user_key.read_text(encoding="utf-8").strip() == "user-key"
+
+
+class _HeaderResponse:
+    def __init__(
+        self, payload: dict[str, Any], *, status_code: int, elapsed_seconds: float
+    ) -> None:
+        self.payload = payload
+        self.status_code = status_code
+        self.elapsed_seconds = elapsed_seconds
+        self.time_to_first_token_seconds = None
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
+
+
+class _HeaderClient:
+    """Records OpenRouter headers and returns one canned catalog or completion."""
+
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        *,
+        status_code: int = 200,
+        elapsed_seconds: float = 0.0,
+    ) -> None:
+        self.payload = payload
+        self.status_code = status_code
+        self.elapsed_seconds = elapsed_seconds
+        self.gets: list[dict[str, Any]] = []
+        self.posts: list[dict[str, Any]] = []
+
+    def get(self, url: str, **kwargs: Any) -> _HeaderResponse:
+        self.gets.append({"url": url, **kwargs})
+        return _HeaderResponse(
+            self.payload,
+            status_code=self.status_code,
+            elapsed_seconds=self.elapsed_seconds,
+        )
+
+    def post(self, url: str, **kwargs: Any) -> _HeaderResponse:
+        self.posts.append({"url": url, **kwargs})
+        return _HeaderResponse(
+            {
+                "usage": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 2,
+                    "total_tokens": 6,
+                    "cost": 0.01,
+                },
+                "choices": [{"message": {"content": "ok", "tool_calls": []}}],
+            },
+            status_code=200,
+            elapsed_seconds=0.5,
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def test_catalog_fetch_failure_uses_openrouter_and_keeps_the_model(tmp_path: Path) -> None:
+    client = _HeaderClient(
+        {"error": {"message": "down"}},
+        status_code=500,
+        elapsed_seconds=0.3,
+    )
+    model = OpenRouterModel(ModelConfig(model="keep-me", api_key="catalog-key"), client)
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
+    session.model_id = "keep-me"
+    session.totals.model = "keep-me"
+    session.totals.context_limit = 111
+    session.fetch_models = model.list_models
+
+    events = _run_protocol(['{"type":"models"}'], session)
+
+    assert session.model_id == "keep-me"
+    assert model.config.model == "keep-me"
+    assert session.totals.context_limit == 111
+    assert events[1]["type"] == "models"
+    assert events[1]["ok"] is False
+    assert "500" in events[1]["message"]
+    assert "down" in events[1]["message"]
+    assert client.gets[0]["headers"]["Authorization"] == "Bearer catalog-key"
+    assert client.posts == []
+    assert "catalog-key" not in json.dumps(events)
+
+
+def test_session_key_is_what_the_next_completion_sends(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    client = _HeaderClient({"data": []})
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key=""), client)
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(project)))
+    session.home = home
+    session.workspace = project
+    session.requires_api_key = True
+
+    events = _run_protocol(
+        [
+            '{"type":"set_key","scope":"user","key":"user-key"}',
+            '{"type":"set_key","scope":"session","key":"session-key"}',
+            '{"type":"set_key","scope":"user","key":"later-user-key"}',
+            '{"type":"user","text":"hi"}',
+        ],
+        session,
+    )
+
+    assert client.posts[0]["headers"]["Authorization"] == "Bearer session-key"
+    assert model.config.api_key == "session-key"
+    assert session.session_key == "session-key"
+    done = [event for event in events if event["type"] == "done"]
+    assert done[0]["tokens_per_second"] == 4.0
+    assert "4.0 tok/s" in done[0]["status_line"]
+    dumped = json.dumps(events)
+    assert "user-key" not in dumped
+    assert "session-key" not in dumped
+    assert "later-user-key" not in dumped
+    user_key = home / ".atlas" / "keys" / "openrouter_api_key"
+    assert user_key.read_text(encoding="utf-8").strip() == "later-user-key"
+    assert "session-key" not in user_key.read_text(encoding="utf-8")
+    for path in (project / ".atlas").rglob("*"):
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+            assert "session-key" not in text
+            assert "user-key" not in text
+            assert "later-user-key" not in text
+
+
+def test_protocol_remove_confirms_and_stays_inside_the_root(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    ensure_project_layout(project)
+    ensure_user_layout(home)
+    session_dir = project / ".atlas" / "sessions" / "s1"
+    artifact = project / ".atlas" / "artifacts" / "s1"
+    session_dir.mkdir()
+    artifact.mkdir()
+    (artifact / "chip.txt").write_text("chip", encoding="utf-8")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("nope", encoding="utf-8")
+    key = write_user_key("user-key", home)
+    weight = home / ".atlas" / "weights" / "model.json"
+    weight.write_text("{}", encoding="utf-8")
+    data = project / ".atlas" / "data" / "keep.txt"
+    data.write_text("table", encoding="utf-8")
+
+    session = _session(ScriptedModel([]), tmp_path=project)
+    session.home = home
+    session.workspace = project
+
+    denied = _run_protocol(
+        [
+            '{"type":"remove","scope":"project","kind":"sessions","name":"s1"}',
+        ],
+        session,
+    )
+    assert denied[1]["type"] == "error"
+    assert "confirmation required" in denied[1]["message"]
+    assert session_dir.is_dir()
+    assert artifact.is_dir()
+
+    escaped = _run_protocol(
+        [
+            '{"type":"remove","scope":"project","kind":"sessions",'
+            '"name":"../secret.txt","confirm":true}',
+        ],
+        session,
+    )
+    assert escaped[1]["type"] == "error"
+    assert "escapes" in escaped[1]["message"]
+    assert outside.is_file()
+    assert key.is_file()
+    assert weight.is_file()
+
+    removed = _run_protocol(
+        [
+            '{"type":"remove","scope":"project","kind":"sessions","name":"s1","confirm":true}',
+        ],
+        session,
+    )
+    assert removed[1]["type"] == "removed"
+    assert removed[1]["scope"] == "project"
+    assert removed[1]["name"] == "s1"
+    assert not session_dir.exists()
+    assert not artifact.exists()
+    assert data.is_file()
+    assert key.read_text(encoding="utf-8").strip() == "user-key"
+    assert weight.is_file()
+    assert "user-key" not in json.dumps(removed)

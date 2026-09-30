@@ -148,7 +148,7 @@ enum Status {
     Stopped,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Mode {
     Compose,
     ModelWait,
@@ -520,13 +520,7 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
         }
         Mode::ConfirmRemove { scope, kind, name } => {
             if key.code == KeyCode::Enter {
-                child.send(serde_json::json!({
-                    "type": "remove",
-                    "scope": scope,
-                    "kind": kind,
-                    "name": name,
-                    "confirm": true
-                }))?;
+                child.send(confirmed_remove_message(&scope, &kind, &name))?;
                 app.mode = Mode::Compose;
             }
         }
@@ -595,12 +589,8 @@ fn handle_picker_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> 
             app.picker_index = 0;
         }
         KeyCode::Enter => {
-            let chosen = app
-                .filtered_models()
-                .get(app.picker_index)
-                .map(|model| model.id.clone());
-            if let Some(id) = chosen {
-                child.send(serde_json::json!({"type": "select_model", "id": id}))?;
+            if let Some(payload) = picker_selection(app) {
+                child.send(payload)?;
             }
         }
         KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -642,6 +632,17 @@ fn handle_secret_key(
 }
 
 fn handle_slash(app: &mut App, child: &mut ChildProcess, text: &str) -> Result<()> {
+    if let Some(payload) = slash_outcome(app, text) {
+        child.send(payload)?;
+    }
+    Ok(())
+}
+
+/// Apply a slash command and return the protocol line to send, if any.
+///
+/// `/model` only asks for the catalog. `/rm` without `--yes` waits for Enter
+/// and does not send a removal.
+fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
     let mut parts = text.split_whitespace();
     let command = parts.next().unwrap_or("");
     match command {
@@ -650,7 +651,6 @@ fn handle_slash(app: &mut App, child: &mut ChildProcess, text: &str) -> Result<(
             app.picker_filter = query.to_string();
             app.picker_index = 0;
             app.mode = Mode::ModelWait;
-            child.send(serde_json::json!({"type": "models"}))?;
             let suffix = if query.is_empty() {
                 String::new()
             } else {
@@ -658,6 +658,7 @@ fn handle_slash(app: &mut App, child: &mut ChildProcess, text: &str) -> Result<(
             };
             app.transcript
                 .push(TranscriptLine::Tool(format!("fetching models{suffix}")));
+            Some(serde_json::json!({"type": "models"}))
         }
         "/key" => {
             let scope = parts.next().unwrap_or("");
@@ -673,6 +674,7 @@ fn handle_slash(app: &mut App, child: &mut ChildProcess, text: &str) -> Result<(
                     "usage: /key session | /key user".to_string(),
                 ));
             }
+            None
         }
         "/scope" => {
             let scope = parts.next().unwrap_or("");
@@ -685,21 +687,18 @@ fn handle_slash(app: &mut App, child: &mut ChildProcess, text: &str) -> Result<(
                     "usage: /scope project | /scope user".to_string(),
                 ));
             }
+            None
         }
-        "/sessions" => {
-            child.send(serde_json::json!({
-                "type": "list",
-                "scope": app.scope_root,
-                "kind": "sessions"
-            }))?;
-        }
-        "/artifacts" => {
-            child.send(serde_json::json!({
-                "type": "list",
-                "scope": app.scope_root,
-                "kind": "artifacts"
-            }))?;
-        }
+        "/sessions" => Some(serde_json::json!({
+            "type": "list",
+            "scope": app.scope_root,
+            "kind": "sessions"
+        })),
+        "/artifacts" => Some(serde_json::json!({
+            "type": "list",
+            "scope": app.scope_root,
+            "kind": "artifacts"
+        })),
         "/rm" => {
             let kind_word = parts.next().unwrap_or("");
             let name = parts.next().unwrap_or("");
@@ -715,14 +714,9 @@ fn handle_slash(app: &mut App, child: &mut ChildProcess, text: &str) -> Result<(
                 app.transcript.push(TranscriptLine::Tool(
                     "usage: /rm session NAME [--yes]".to_string(),
                 ));
+                None
             } else if flag == "--yes" {
-                child.send(serde_json::json!({
-                    "type": "remove",
-                    "scope": app.scope_root,
-                    "kind": kind,
-                    "name": name,
-                    "confirm": true
-                }))?;
+                Some(confirmed_remove_message(&app.scope_root, kind, name))
             } else {
                 app.transcript.push(TranscriptLine::Tool(format!(
                     "Remove {kind} {name} from {}? Enter confirms, Esc cancels.",
@@ -733,14 +727,31 @@ fn handle_slash(app: &mut App, child: &mut ChildProcess, text: &str) -> Result<(
                     kind: kind.to_string(),
                     name: name.to_string(),
                 };
+                None
             }
         }
         _ => {
             app.transcript
                 .push(TranscriptLine::Tool(format!("unknown command {command}")));
+            None
         }
     }
-    Ok(())
+}
+
+fn picker_selection(app: &App) -> Option<serde_json::Value> {
+    app.filtered_models()
+        .get(app.picker_index)
+        .map(|model| serde_json::json!({"type": "select_model", "id": model.id}))
+}
+
+fn confirmed_remove_message(scope: &str, kind: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "remove",
+        "scope": scope,
+        "kind": kind,
+        "name": name,
+        "confirm": true
+    })
 }
 
 fn wait_for_any_key() {
@@ -1114,10 +1125,130 @@ fn note_session_closed(app: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::wrap_text;
+    use super::{
+        confirmed_remove_message, picker_selection, slash_outcome, wrap_text, App, Mode,
+        TranscriptLine,
+    };
+    use crate::protocol::{CatalogEntry, ServerMessage, StatusSnapshot};
+
+    fn tool_text(app: &App) -> String {
+        app.transcript
+            .iter()
+            .filter_map(|line| match line {
+                TranscriptLine::Tool(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn wraps_on_word_boundaries() {
         assert_eq!(wrap_text("one two three", 7), vec!["one two", "three"]);
+    }
+
+    #[test]
+    fn model_fetch_failure_keeps_the_selected_model() {
+        let mut app = App::new();
+        app.model_id = "keep-me".to_string();
+        app.mode = Mode::ModelWait;
+        app.apply(ServerMessage::Models {
+            ok: false,
+            message: "OpenRouter HTTP 500: down".to_string(),
+            models: Vec::new(),
+        });
+
+        assert_eq!(app.model_id, "keep-me");
+        assert_eq!(app.mode, Mode::Compose);
+        let text = tool_text(&app);
+        assert!(text.contains("model list failed"));
+        assert!(text.contains("500"));
+    }
+
+    #[test]
+    fn selecting_a_model_updates_the_status_speed() {
+        let mut app = App::new();
+        app.model_id = "old".to_string();
+        app.mode = Mode::ModelPicker;
+        app.apply(ServerMessage::ModelSelected {
+            id: "google/gemini".to_string(),
+            context_length: Some(128_000),
+            status: StatusSnapshot {
+                status_line: "model google/gemini  context 12/128000  tokens 16 (prompt 12 completion 4)  spend $0.02  8.0 tok/s  http 200  latency 0.50s  ttft n/a  recent 200 0.50s".to_string(),
+                model: "google/gemini".to_string(),
+                context_used: 12,
+                context_limit: Some(128_000),
+                tokens_per_second: Some(8.0),
+                ..StatusSnapshot::default()
+            },
+        });
+
+        assert_eq!(app.model_id, "google/gemini");
+        assert_eq!(app.mode, Mode::Compose);
+        assert!(app.status_line.contains("context 12/128000"));
+        assert!(app.status_line.contains("8.0 tok/s"));
+    }
+
+    #[test]
+    fn model_command_fetches_without_changing_the_selection() {
+        let mut app = App::new();
+        app.model_id = "keep-me".to_string();
+        let payload = slash_outcome(&mut app, "/model gemini").expect("models request");
+
+        assert_eq!(payload["type"], "models");
+        assert_eq!(app.mode, Mode::ModelWait);
+        assert_eq!(app.picker_filter, "gemini");
+        assert_eq!(app.model_id, "keep-me");
+        assert!(tool_text(&app).contains("fetching models matching gemini"));
+    }
+
+    #[test]
+    fn picker_filters_then_selects_the_visible_row() {
+        let mut app = App::new();
+        app.picker_filter = "gem".to_string();
+        app.picker_models = vec![
+            CatalogEntry {
+                id: "other/model".to_string(),
+                context_length: None,
+                prompt_price: None,
+                completion_price: None,
+            },
+            CatalogEntry {
+                id: "google/gemini".to_string(),
+                context_length: Some(128_000),
+                prompt_price: Some("0.1".to_string()),
+                completion_price: Some("0.2".to_string()),
+            },
+        ];
+
+        let payload = picker_selection(&app).expect("filtered row");
+        assert_eq!(payload["type"], "select_model");
+        assert_eq!(payload["id"], "google/gemini");
+    }
+
+    #[test]
+    fn remove_waits_for_confirmation_and_stays_in_scope() {
+        let mut app = App::new();
+        app.scope_root = "project".to_string();
+        assert!(slash_outcome(&mut app, "/rm session s1").is_none());
+        assert_eq!(
+            app.mode,
+            Mode::ConfirmRemove {
+                scope: "project".to_string(),
+                kind: "sessions".to_string(),
+                name: "s1".to_string(),
+            }
+        );
+
+        let payload = confirmed_remove_message("project", "sessions", "s1");
+        assert_eq!(payload["type"], "remove");
+        assert_eq!(payload["scope"], "project");
+        assert_eq!(payload["kind"], "sessions");
+        assert_eq!(payload["name"], "s1");
+        assert_eq!(payload["confirm"], true);
+
+        let mut flagged = App::new();
+        let sent = slash_outcome(&mut flagged, "/rm session s1 --yes").expect("flagged remove");
+        assert_eq!(sent, payload);
     }
 }
