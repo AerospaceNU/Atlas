@@ -738,6 +738,19 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
     }
 }
 
+const PICKER_PAGE: usize = 6;
+
+/// Slice of the filtered catalog that stays on screen around `index`.
+fn picker_window(len: usize, index: usize, page: usize) -> std::ops::Range<usize> {
+    if len == 0 || page == 0 {
+        return 0..0;
+    }
+    let page = page.min(len);
+    let index = index.min(len - 1);
+    let start = index.saturating_add(1).saturating_sub(page).min(len - page);
+    start..(start + page)
+}
+
 fn picker_selection(app: &App) -> Option<serde_json::Value> {
     app.filtered_models()
         .get(app.picker_index)
@@ -773,7 +786,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     let composer_height = composer_rows(app, outer.width);
     let picker_height = picker_rows(app);
-    let status_height = 3;
+    let status_height = status_block_rows(&app.status_line, outer.width);
     let [transcript_area, picker_area, composer_area, status_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(picker_height),
@@ -790,11 +803,22 @@ fn draw(frame: &mut Frame, app: &mut App) {
     render_status(frame, app, status_area);
 }
 
+/// State row, every wrapped metrics row, and the hint row.
+///
+/// A fixed 3-row block keeps only the first metrics line, so spend, speed,
+/// HTTP, latency, time to first token, and recent calls fall outside an
+/// 80-column status rect.
+fn status_block_rows(status_line: &str, width: u16) -> u16 {
+    let text_width = usize::from(width.max(1));
+    let metrics = wrap_text(status_line, text_width).len().clamp(1, 8) as u16;
+    metrics.saturating_add(2)
+}
+
 fn picker_rows(app: &App) -> u16 {
     match app.mode {
         Mode::ModelWait => 1,
         Mode::ModelPicker => {
-            let count = app.filtered_models().len().clamp(1, 6) as u16;
+            let count = app.filtered_models().len().clamp(1, PICKER_PAGE) as u16;
             count.saturating_add(1)
         }
         _ => 0,
@@ -931,7 +955,13 @@ fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(YELLOW).bg(BG_BASE),
             )));
         }
-        for (index, model) in models.iter().take(6).enumerate() {
+        let window = picker_window(models.len(), app.picker_index, PICKER_PAGE);
+        for (index, model) in models
+            .iter()
+            .enumerate()
+            .skip(window.start)
+            .take(window.len())
+        {
             let context = model
                 .context_length
                 .map(|value| value.to_string())
@@ -1126,7 +1156,7 @@ fn note_session_closed(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirmed_remove_message, picker_selection, slash_outcome, wrap_text, App, Mode,
+        confirmed_remove_message, draw, picker_selection, slash_outcome, wrap_text, App, Mode,
         TranscriptLine,
     };
     use crate::protocol::{CatalogEntry, ServerMessage, StatusSnapshot};
@@ -1250,5 +1280,74 @@ mod tests {
         let mut flagged = App::new();
         let sent = slash_outcome(&mut flagged, "/rm session s1 --yes").expect("flagged remove");
         assert_eq!(sent, payload);
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn status_on_an_80_column_terminal_keeps_the_metrics() {
+        let mut app = App::new();
+        app.model_id = "example/model".to_string();
+        app.status_line = "model example/model  context 12/128000  tokens 16 (prompt 12 completion 4)  spend $0.02  8.0 tok/s  http 200  latency 0.50s  ttft 0.10s  recent 200 0.50s".to_string();
+
+        let painted = screen(&mut app, 80, 24);
+        let flat = painted.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        for field in [
+            "spend $0.02",
+            "8.0 tok/s",
+            "http 200",
+            "latency 0.50s",
+            "ttft 0.10s",
+            "recent 200 0.50s",
+        ] {
+            assert!(
+                flat.contains(field),
+                "missing {field} in status rect:\n{painted}"
+            );
+        }
+    }
+
+    #[test]
+    fn picker_highlights_the_row_enter_would_select() {
+        let mut app = App::new();
+        app.mode = Mode::ModelPicker;
+        app.picker_index = 6;
+        app.picker_models = (0..8)
+            .map(|index| CatalogEntry {
+                id: format!("model-{index}"),
+                context_length: Some(128_000),
+                prompt_price: Some("0.1".to_string()),
+                completion_price: Some("0.2".to_string()),
+            })
+            .collect();
+
+        let selected = picker_selection(&app).expect("selected model");
+        let painted = screen(&mut app, 80, 24);
+        let highlighted: Vec<&str> = painted.lines().filter(|line| line.contains('>')).collect();
+
+        assert_eq!(selected["id"], "model-6");
+        assert!(
+            highlighted.iter().any(|line| line.contains("model-6")),
+            "highlighted rows were {highlighted:?}\n{painted}"
+        );
+        assert!(
+            !painted.contains("model-0"),
+            "hidden first row was painted:\n{painted}"
+        );
     }
 }

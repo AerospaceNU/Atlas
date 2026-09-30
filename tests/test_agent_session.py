@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import queue
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1066,3 +1069,173 @@ def test_protocol_lists_the_chosen_root_and_names_a_weight(tmp_path: Path) -> No
     assert (project / ".atlas" / "sessions" / "s1").is_dir()
     assert (project / ".atlas" / "data").is_dir()
     assert "user-key" not in json.dumps(listed + removed)
+
+
+class _ProtocolIn:
+    """Blocking stdin so a test can answer after ``main`` creates the session."""
+
+    def __init__(self) -> None:
+        self._lines: queue.Queue[str] = queue.Queue()
+
+    def push(self, line: str) -> None:
+        self._lines.put(line)
+
+    def __iter__(self) -> _ProtocolIn:
+        return self
+
+    def __next__(self) -> str:
+        return self._lines.get()
+
+
+class _CollectOut:
+    def __init__(self) -> None:
+        self._chunks: list[str] = []
+        self._lock = threading.Lock()
+
+    def write(self, text: str) -> int:
+        with self._lock:
+            self._chunks.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+    def text(self) -> str:
+        with self._lock:
+            return "".join(self._chunks)
+
+
+class _ScriptResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.status_code = 200
+        self.elapsed_seconds = 0.2
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
+
+
+class _ScriptClient:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        self.posts = 0
+
+    def post(self, _url: str, **_kwargs: Any) -> _ScriptResponse:
+        self.posts += 1
+        if self.posts == 1:
+            payload: dict[str, Any] = {
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": json.dumps(
+                                            {"path": "note.txt", "content": "from-main"}
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+            }
+        else:
+            payload = {
+                "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10},
+                "choices": [{"message": {"content": "wrote it", "tool_calls": []}}],
+            }
+        return _ScriptResponse(payload)
+
+    def close(self) -> None:
+        return None
+
+
+def _wait_until(predicate: Any, detail: str) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError(detail)
+
+
+def test_main_writes_tools_into_the_session_artifact_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-session-key")
+    monkeypatch.setattr("atlas.agent.model.httpx.Client", _ScriptClient)
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    weight = home / ".atlas" / "weights" / "keep.json"
+    weight.parent.mkdir(parents=True)
+    weight.write_text("{}", encoding="utf-8")
+    data = workspace / ".atlas" / "data" / "keep.txt"
+    data.parent.mkdir(parents=True)
+    data.write_text("table", encoding="utf-8")
+    monkeypatch.setattr("atlas.agent.session.Path.home", lambda: home)
+    monkeypatch.chdir(workspace)
+    protocol = _ProtocolIn()
+    stdout = _CollectOut()
+    monkeypatch.setattr(sys, "stdin", protocol)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    holder: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            holder["code"] = main(["--workspace", str(workspace)])
+        except Exception as exc:  # pragma: no cover - failure path for the assertion
+            holder["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        sessions = workspace / ".atlas" / "sessions"
+        _wait_until(
+            lambda: any(sessions.glob("*/meta.json")),
+            f"main did not create a session: {stdout.text()}",
+        )
+        session_id = next(path.parent.name for path in sessions.glob("*/meta.json"))
+        note = workspace / ".atlas" / "artifacts" / session_id / "note.txt"
+
+        protocol.push('{"type":"user","text":"save a note"}')
+        _wait_until(lambda: note.is_file(), f"tool did not write {note}: {stdout.text()}")
+        assert note.read_text(encoding="utf-8") == "from-main"
+        assert not (workspace / "note.txt").exists()
+        assert str(note.resolve()) not in stdout.text()
+
+        protocol.push(
+            json.dumps(
+                {
+                    "type": "remove",
+                    "scope": "project",
+                    "kind": "sessions",
+                    "name": session_id,
+                    "confirm": True,
+                }
+            )
+        )
+        session_dir = sessions / session_id
+        _wait_until(
+            lambda: not note.exists() and not session_dir.exists(),
+            f"session remove left files behind: {stdout.text()}",
+        )
+    finally:
+        protocol.push('{"type":"quit"}')
+    thread.join(timeout=5)
+
+    assert holder.get("error") is None
+    assert holder.get("code") == 0
+    assert not thread.is_alive()
+    assert data.read_text(encoding="utf-8") == "table"
+    assert weight.read_text(encoding="utf-8") == "{}"
+    assert "env-session-key" not in stdout.text()
+    events = [json.loads(line) for line in stdout.text().splitlines()]
+    steps = [event for event in events if event["type"] == "step"]
+    assert steps[0]["name"] == "write_file"
+    assert steps[0]["artifacts"] == ["note.txt"]

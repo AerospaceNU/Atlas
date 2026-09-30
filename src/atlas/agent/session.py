@@ -551,10 +551,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         or ""
     )
     model_id = resolve_model(workspace, args.model)
-    _remember_session(workspace, model_id)
+    session_id = _remember_session(workspace, model_id)
+    # Tool paths stay inside this session's artifact directory. Removing the
+    # session removes those files and cannot write the workspace root.
+    artifact_root = project_atlas_root(workspace) / "artifacts" / session_id
     model = OpenRouterModel(ModelConfig(model=model_id, api_key=api_key))
     try:
-        agent = Agent(model, default_registry(), LocalArtifactStore(workspace))
+        agent = Agent(model, default_registry(), LocalArtifactStore(artifact_root))
         session = AgentSession(agent)
         session.requires_api_key = True
         session.home = home
