@@ -9,18 +9,18 @@ from pydantic import BaseModel, ValidationError
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolDefinition, ToolRegistry, ToolResult, default_registry
-from atlas.agent.tools.list_tools import ListToolsTool
+from atlas.agent.tools._list_tools import ListToolsTool
 
 tool_def1 = ToolDefinition(
-                name="read_file",
-                description="Read a UTF-8 text file.",
-                parameters={"type": "object", "properties": {"path": {"type": "string"}}},
-            )
+    name="read_file",
+    description="Read a UTF-8 text file.",
+    parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+)
 tool_def2 = ToolDefinition(
-                name="bash_tool",
-                description="Run a shell command.",
-                parameters={"type": "object", "properties": {}},
-            )
+    name="bash_tool",
+    description="Run a shell command.",
+    parameters={"type": "object", "properties": {}},
+)
 
 
 def test_tools_list_correctly_reads_as_json_format(tmp_path: Path) -> None:
@@ -35,7 +35,10 @@ def test_tools_list_correctly_reads_as_json_format(tmp_path: Path) -> None:
     result_tool1 = result_list[0]
     assert result_tool1.get("name") == "read_file"
     assert result_tool1.get("description") == "Read a UTF-8 text file."
-    assert result_tool1.get("parameters") == {"type": "object", "properties": {"path": {"type": "string"}}}
+    assert result_tool1.get("parameters") == {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+    }
 
 
 def test_tools_list_returns_info_for_each_current_definition(tmp_path: Path) -> None:
@@ -53,10 +56,7 @@ def test_tools_list_returns_info_for_each_current_definition(tmp_path: Path) -> 
         "properties": {"path": {"type": "string"}},
     }
 
-    assert by_name["bash_tool"]["parameters"] == {
-        "type": "object",
-        "properties": {}
-    }
+    assert by_name["bash_tool"]["parameters"] == {"type": "object", "properties": {}}
 
 
 def test_tools_list_looks_up_definitions_for_each_run(tmp_path: Path) -> None:
@@ -81,7 +81,7 @@ def test_tools_list_looks_up_definitions_for_each_run(tmp_path: Path) -> None:
 def test_tools_list_rejects_non_object_arguments(tmp_path: Path) -> None:
     tool = ListToolsTool(lambda: [])
     with pytest.raises(ValidationError):
-        tool.run([], LocalArtifactStore(tmp_path)) # type: ignore
+        tool.run([], LocalArtifactStore(tmp_path))  # type: ignore
 
 
 def test_tools_list_updates_with_registry(tmp_path: Path) -> None:

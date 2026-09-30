@@ -31,8 +31,5 @@ class ListToolsTool(Tool):
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         ListToolsInput.model_validate(arguments)
 
-        definitions = [
-            definition.model_dump()
-            for definition in self._definitions()
-        ]
+        definitions = [definition.model_dump() for definition in self._definitions()]
         return ToolResult(text=json.dumps(definitions))

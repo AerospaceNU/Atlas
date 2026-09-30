@@ -179,8 +179,6 @@ def build_registry(
     for cls in discover_tool_classes(packages):
         if not include_opt_in and cls.trust == "opt_in":
             continue
-        if cls.name == "list_tools":    # already registered
-            continue
         registry.register(cls())
     for tool in extra:
         registry.register(tool)
@@ -191,10 +189,12 @@ def default_registry() -> ToolRegistry:
     """Build the normal tool allow-list for one agent session."""
     registry = build_registry(("atlas.agent.tools",))
 
-    # Register the list-tools tool with registry access
-    from atlas.agent.tools.list_tools import ListToolsTool
+    # Private module so discovery does not call cls(). This tool needs the live registry.
+    from atlas.agent.tools._list_tools import ListToolsTool
+
     registry.register(ListToolsTool(lambda: registry.definitions))
 
     from atlas.models.registry import register_model_tools
+
     register_model_tools(registry)
     return registry
