@@ -6,6 +6,7 @@ from typing import Any, ClassVar, Self
 
 import httpx
 
+from atlas.data.bands import resolve_bands
 from atlas.data.base import (
     Asset,
     BBox,
@@ -131,6 +132,7 @@ def item_to_scene(
     bbox, geometry_kind, lon, lat = parsed
 
     assets: dict[str, Asset] = {}
+    band_aliases: dict[str, str] = {}
     raw_assets = feature.get("assets")
     if isinstance(raw_assets, dict):
         for name, spec in raw_assets.items():
@@ -145,6 +147,11 @@ def item_to_scene(
             )
             if asset is not None:
                 assets[str(name)] = asset
+        # `eo:bands` lives only on the raw specs, so resolve before the loop
+        # above drops it. Rejected assets cannot keep an alias: Scene rejects one.
+        band_aliases = {
+            alias: key for alias, key in resolve_bands(raw_assets).items() if key in assets
+        }
 
     instruments = props.get("instruments")
     instrument: str | None = None
@@ -175,6 +182,7 @@ def item_to_scene(
         instrument=instrument,
         cloud_cover=_stac_cloud_cover(props.get("eo:cloud_cover")),
         assets=assets,
+        band_aliases=band_aliases,
         properties=props,
     )
 

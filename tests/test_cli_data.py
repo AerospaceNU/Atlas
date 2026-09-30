@@ -158,6 +158,32 @@ def test_pick_asset_skips_browse_and_prefers_visual() -> None:
     assert pick_asset(scene, "missing") is None
 
 
+def test_pick_asset_resolves_band_aliases() -> None:
+    scene = _scene(
+        assets={
+            "B04": Asset(href="https://example.com/B04.tif", roles=["data"]),
+            "B8A": Asset(href="https://example.com/B8A.tif", roles=["data"]),
+        },
+        band_aliases={"red": "B04", "nir": "B8A"},
+    )
+    # The native key comes back, not the alias, so the file on disk records
+    # which band was fetched.
+    assert pick_asset(scene, "nir") == ("B8A", scene.assets["B8A"])
+    assert pick_asset(scene, "NIR ") == ("B8A", scene.assets["B8A"])
+    assert pick_asset(scene, "B8A") == ("B8A", scene.assets["B8A"])
+    assert pick_asset(scene, "swir16") is None
+    assert pick_asset(_scene(assets=scene.assets), "nir") is None
+
+
+def test_pick_asset_alias_cannot_smuggle_a_browse_asset() -> None:
+    scene = _scene(
+        assets={"preview_rgb": Asset(href="https://example.com/p.png", roles=["overview"])},
+        band_aliases={"red": "preview_rgb"},
+    )
+    with pytest.raises(BrowseAssetError):
+        pick_asset(scene, "red")
+
+
 def test_resolve_satellite_kind() -> None:
     assert resolve_sources("sentinel2", "optical") == ["sentinel2"]
     assert resolve_sources("s2", "l2a") == ["sentinel2"]
