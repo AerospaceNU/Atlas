@@ -84,6 +84,7 @@ def test_default_registry_has_discovered_tools_only() -> None:
 
     assert "read_file" in names
     assert "segment_landcover" in names
+    assert "list_tools" in names
     assert "list_images" not in names
     assert "inspect_image" not in names
     assert "create_contact_sheet" not in names
