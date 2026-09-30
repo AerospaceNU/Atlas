@@ -23,6 +23,7 @@ def test_status_line_shows_context_tokens_spend_and_http() -> None:
             context_limit=128000,
             last_http_status=200,
             last_elapsed_seconds=0.5,
+            last_ttft_seconds=0.1,
             tokens_per_second=8.0,
             recent=["200 0.50s"],
         )
@@ -36,6 +37,7 @@ def test_status_line_shows_context_tokens_spend_and_http() -> None:
     assert "8.0 tok/s" in text
     assert "http 200" in text
     assert "latency 0.50s" in text
+    assert "ttft 0.10s" in text
     assert "recent 200 0.50s" in text
 
 
@@ -48,6 +50,7 @@ def test_status_line_does_not_invent_a_context_window() -> None:
     assert "tok/s" in text
     assert "http —" in text
     assert "latency n/a" in text
+    assert "ttft n/a" in text
 
 
 def test_bare_atlas_opens_the_tui(monkeypatch: pytest.MonkeyPatch) -> None:

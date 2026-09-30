@@ -491,11 +491,17 @@ def test_main_without_key_prompts_instead_of_a_stack_trace(
 
 class _QueueResponse:
     def __init__(
-        self, payload: dict[str, Any], *, status_code: int, elapsed_seconds: float
+        self,
+        payload: dict[str, Any],
+        *,
+        status_code: int,
+        elapsed_seconds: float,
+        time_to_first_token_seconds: float | None = None,
     ) -> None:
         self.payload = payload
         self.status_code = status_code
         self.elapsed_seconds = elapsed_seconds
+        self.time_to_first_token_seconds = time_to_first_token_seconds
 
     def json(self) -> dict[str, Any]:
         return self.payload
@@ -508,16 +514,19 @@ class _QueueClient:
         *,
         status_code: int = 200,
         elapsed_seconds: float = 0.5,
+        time_to_first_token_seconds: float | None = None,
     ) -> None:
         self.payloads = list(payloads)
         self.status_code = status_code
         self.elapsed_seconds = elapsed_seconds
+        self.time_to_first_token_seconds = time_to_first_token_seconds
 
     def post(self, _url: str, **_kwargs: Any) -> _QueueResponse:
         return _QueueResponse(
             self.payloads.pop(0),
             status_code=self.status_code,
             elapsed_seconds=self.elapsed_seconds,
+            time_to_first_token_seconds=self.time_to_first_token_seconds,
         )
 
     def close(self) -> None:
@@ -545,7 +554,8 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
                 },
                 "choices": [{"message": {"content": "two", "tool_calls": []}}],
             },
-        ]
+        ],
+        time_to_first_token_seconds=0.1,
     )
     model = OpenRouterModel(ModelConfig(model="example/model", api_key="test-key"), client)
     session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
@@ -565,6 +575,10 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     assert "4.0 tok/s" in done[0]["status_line"]
     assert done[0]["http_status"] == 200
     assert done[0]["elapsed_seconds"] == 0.5
+    assert done[0]["time_to_first_token_seconds"] == 0.1
+    assert done[0]["recent"] == ["200 0.50s"]
+    assert "ttft 0.10s" in done[0]["status_line"]
+    assert "recent 200 0.50s" in done[0]["status_line"]
     assert done[0]["context_used"] == 10
     assert done[0]["context_limit"] is None
     assert "context 10/unknown" in done[0]["status_line"]
@@ -580,6 +594,9 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     assert "12.0 tok/s" in line
     assert "http 200" in line
     assert "latency 0.50s" in line
+    assert done[1]["recent"] == ["200 0.50s", "200 0.50s"]
+    assert "recent 200 0.50s, 200 0.50s" in line
+    assert "ttft 0.10s" in line
     assert "test-key" not in json.dumps(events)
 
 
@@ -697,6 +714,8 @@ def test_session_key_overrides_the_user_key_and_is_not_stored_in_the_project(
         resolve_openrouter_key(session_key=session.session_key, env_key="env-key", home=home)
         == "session-key"
     )
+    assert resolve_openrouter_key(session_key=None, env_key="env-key", home=home) == "env-key"
+    assert resolve_openrouter_key(session_key="  ", env_key=None, home=home) == "user-key"
     assert resolve_openrouter_key(session_key=None, env_key=None, home=home) == "user-key"
     dumped = json.dumps(events)
     assert "user-key" not in dumped
@@ -900,3 +919,150 @@ def test_protocol_remove_confirms_and_stays_inside_the_root(tmp_path: Path) -> N
     assert key.read_text(encoding="utf-8").strip() == "user-key"
     assert weight.is_file()
     assert "user-key" not in json.dumps(removed)
+
+
+def test_omitted_provider_cost_stays_unset(tmp_path: Path) -> None:
+    client = _QueueClient(
+        [
+            {
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+                "choices": [{"message": {"content": "ok", "tool_calls": []}}],
+            }
+        ],
+        elapsed_seconds=0.25,
+        time_to_first_token_seconds=0.05,
+    )
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test-key"), client)
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
+
+    events = _run_protocol(['{"type":"user","text":"hi"}'], session, redact="test-key")
+
+    done = next(event for event in events if event["type"] == "done")
+    assert done["spend"] is None
+    assert done["prompt_tokens"] == 3
+    assert done["completion_tokens"] == 1
+    assert done["total_tokens"] == 4
+    assert done["tokens_per_second"] == 4.0
+    assert done["time_to_first_token_seconds"] == 0.05
+    assert done["recent"] == ["200 0.25s"]
+    assert "spend n/a" in done["status_line"]
+    assert "ttft 0.05s" in done["status_line"]
+    assert "test-key" not in json.dumps(events)
+
+
+def test_turn_after_select_uses_the_catalog_context_limit(tmp_path: Path) -> None:
+    client = _QueueClient(
+        [
+            {
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 1,
+                    "total_tokens": 10,
+                    "cost": 0.02,
+                },
+                "choices": [{"message": {"content": "changed", "tool_calls": []}}],
+            }
+        ],
+        elapsed_seconds=0.5,
+    )
+    model = OpenRouterModel(ModelConfig(model="a", api_key="test-key"), client)
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
+    session.catalog = [
+        CatalogModel(id="a", context_length=111, prompt_price="0.1", completion_price="0.2"),
+        CatalogModel(id="b", context_length=222, prompt_price="0.3", completion_price="0.4"),
+    ]
+    session.model_id = "a"
+    session.totals.model = "a"
+    session.totals.context_limit = 111
+
+    events = _run_protocol(
+        ['{"type":"select_model","id":"b"}', '{"type":"user","text":"look"}'],
+        session,
+        redact="test-key",
+    )
+
+    selected = next(event for event in events if event["type"] == "model")
+    done = next(event for event in events if event["type"] == "done")
+    assert selected["id"] == "b"
+    assert selected["context_length"] == 222
+    assert model.config.model == "b"
+    assert done["context_used"] == 9
+    assert done["context_limit"] == 222
+    assert "context 9/222" in done["status_line"]
+    assert "128000" not in done["status_line"]
+    assert "test-key" not in json.dumps(events)
+
+
+def test_main_accepts_the_environment_key_without_printing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-session-key")
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr("atlas.agent.session.Path.home", lambda: home)
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"type":"quit"}\n'))
+
+    code = main(["--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    events = [json.loads(line) for line in captured.out.splitlines()]
+    assert events[0]["type"] == "ready"
+    assert events[0]["key_set"] is True
+    assert "context 0/unknown" in events[0]["status_line"]
+    assert "env-session-key" not in captured.out
+    assert "env-session-key" not in captured.err
+    assert not (home / ".atlas" / "keys" / "openrouter_api_key").exists()
+    assert (home / ".atlas" / "weights").is_dir()
+    assert (home / ".atlas" / "defaults").is_dir()
+    for path in (workspace / ".atlas").rglob("*"):
+        if path.is_file():
+            assert "env-session-key" not in path.read_text(encoding="utf-8")
+
+
+def test_protocol_lists_the_chosen_root_and_names_a_weight(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    ensure_project_layout(project)
+    ensure_user_layout(home)
+    (project / ".atlas" / "sessions" / "s1").mkdir()
+    (project / ".atlas" / "artifacts" / "s1").mkdir()
+    (home / ".atlas" / "sessions" / "user-only").mkdir(parents=True)
+    weight = home / ".atlas" / "weights" / "model.json"
+    weight.write_text("{}", encoding="utf-8")
+    key = write_user_key("user-key", home)
+    session = _session(ScriptedModel([]), tmp_path=project)
+    session.home = home
+    session.workspace = project
+
+    listed = _run_protocol(
+        [
+            '{"type":"list","scope":"project","kind":"sessions"}',
+            '{"type":"list","scope":"project","kind":"artifacts"}',
+            '{"type":"list","scope":"user","kind":"sessions"}',
+            '{"type":"list","scope":"project","kind":"keys"}',
+        ],
+        session,
+    )
+
+    assert listed[1]["type"] == "listing"
+    assert listed[1]["names"] == ["s1"]
+    assert listed[2]["names"] == ["s1"]
+    assert listed[3]["scope"] == "user"
+    assert listed[3]["names"] == ["user-only"]
+    assert listed[4]["type"] == "error"
+    assert "sessions" in listed[4]["message"]
+
+    removed = _run_protocol(
+        ['{"type":"remove","scope":"user","kind":"weights","name":"model.json","confirm":true}'],
+        session,
+    )
+    assert removed[1]["type"] == "removed"
+    assert removed[1]["scope"] == "user"
+    assert not weight.exists()
+    assert key.is_file()
+    assert (project / ".atlas" / "sessions" / "s1").is_dir()
+    assert (project / ".atlas" / "data").is_dir()
+    assert "user-key" not in json.dumps(listed + removed)

@@ -38,12 +38,20 @@ def test_remove_rejects_escape_and_keeps_the_user_store(tmp_path: Path) -> None:
     ensure_user_layout(home)
     assert data.read_text(encoding="utf-8") == "table"
     assert weight.read_text(encoding="utf-8") == "{}"
+    assert (project / ".atlas" / "sessions").is_dir()
+    assert (project / ".atlas" / "artifacts").is_dir()
+    assert (project / ".atlas" / "data").is_dir()
+    assert (home / ".atlas" / "keys").is_dir()
+    assert (home / ".atlas" / "weights").is_dir()
+    assert (home / ".atlas" / "defaults").is_dir()
 
     session = project / ".atlas" / "sessions" / "s1"
     artifact = project / ".atlas" / "artifacts" / "s1"
     session.mkdir()
     artifact.mkdir()
     (artifact / "chip.txt").write_text("chip", encoding="utf-8")
+    assert list_entries(project / ".atlas", "sessions") == ["s1"]
+    assert list_entries(project / ".atlas", "artifacts") == ["s1"]
     outside = tmp_path / "secret.txt"
     outside.write_text("nope", encoding="utf-8")
     key = write_user_key("user-key", home)
@@ -68,6 +76,11 @@ def test_remove_rejects_escape_and_keeps_the_user_store(tmp_path: Path) -> None:
     assert key.read_text(encoding="utf-8").strip() == "user-key"
     assert weight.is_file()
     assert list_entries(project / ".atlas", "sessions") == []
+    assert list_entries(project / ".atlas", "artifacts") == []
+    remove_entry(home / ".atlas", "weights", "model.json", confirm=True)
+    assert not weight.exists()
+    assert key.is_file()
+    assert data.is_file()
     assert "user-key" not in "\n".join(
         path.read_text(encoding="utf-8")
         for path in (project / ".atlas").rglob("*")
