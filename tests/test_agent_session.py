@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import (
+    CatalogModel,
     ChatMessage,
     ModelResponse,
     Role,
@@ -18,6 +20,13 @@ from atlas.agent.contracts import (
     ToolDefinition,
     ToolRegistry,
     ToolResult,
+)
+from atlas.agent.layout import resolve_openrouter_key
+from atlas.agent.model import (
+    MISSING_KEY_MESSAGE,
+    ModelConfig,
+    OpenRouterHTTPError,
+    OpenRouterModel,
 )
 from atlas.agent.runtime import (
     DEFAULT_MAX_TOOL_CALLS,
@@ -444,21 +453,255 @@ def test_protocol_redacts_api_key(tmp_path: Path) -> None:
     assert "***" in events[1]["response"]
 
 
-def test_main_without_key_returns_one(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+def test_main_without_key_prompts_instead_of_a_stack_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    home = tmp_path / "home"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    monkeypatch.setattr("atlas.agent.session.Path.home", lambda: home)
     monkeypatch.chdir(workspace)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO('{"type":"user","text":"hi"}\n{"type":"quit"}\n'),
+    )
 
     code = main(["--workspace", str(workspace)])
 
     captured = capsys.readouterr()
-    assert code == 1
+    assert code == 0
     assert (workspace / ".atlas" / "agent.toml").is_file()
     assert load_model(workspace) == DEFAULT_MODEL
+    assert "Traceback" not in captured.out
+    assert "httpx" not in captured.out
     events = [json.loads(line) for line in captured.out.splitlines()]
-    assert events[0]["type"] == "error"
-    assert events[0]["message"] == "OPENROUTER_API_KEY is not set"
-    assert all(event["type"] != "ready" for event in events)
+    assert events[0]["type"] == "ready"
+    assert events[0]["key_set"] is False
+    assert "context 0/unknown" in events[0]["status_line"]
+    assert events[1]["type"] == "error"
+    assert events[1]["message"] == MISSING_KEY_MESSAGE
+
+
+class _QueueResponse:
+    def __init__(
+        self, payload: dict[str, Any], *, status_code: int, elapsed_seconds: float
+    ) -> None:
+        self.payload = payload
+        self.status_code = status_code
+        self.elapsed_seconds = elapsed_seconds
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
+
+
+class _QueueClient:
+    def __init__(
+        self,
+        payloads: list[dict[str, Any]],
+        *,
+        status_code: int = 200,
+        elapsed_seconds: float = 0.5,
+    ) -> None:
+        self.payloads = list(payloads)
+        self.status_code = status_code
+        self.elapsed_seconds = elapsed_seconds
+
+    def post(self, _url: str, **_kwargs: Any) -> _QueueResponse:
+        return _QueueResponse(
+            self.payloads.pop(0),
+            status_code=self.status_code,
+            elapsed_seconds=self.elapsed_seconds,
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
+    client = _QueueClient(
+        [
+            {
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                    "cost": 0.01,
+                },
+                "choices": [{"message": {"content": "one", "tool_calls": []}}],
+            },
+            {
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 6,
+                    "total_tokens": 26,
+                    "cost": 0.03,
+                },
+                "choices": [{"message": {"content": "two", "tool_calls": []}}],
+            },
+        ]
+    )
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test-key"), client)
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
+
+    events = _run_protocol(
+        ['{"type":"user","text":"one"}', '{"type":"user","text":"two"}'],
+        session,
+        redact="test-key",
+    )
+
+    done = [event for event in events if event["type"] == "done"]
+    assert done[0]["prompt_tokens"] == 10
+    assert done[0]["completion_tokens"] == 2
+    assert done[0]["total_tokens"] == 12
+    assert done[0]["spend"] == 0.01
+    assert done[0]["tokens_per_second"] == 4.0
+    assert done[0]["http_status"] == 200
+    assert done[0]["elapsed_seconds"] == 0.5
+    assert done[0]["context_used"] == 10
+    assert done[0]["context_limit"] is None
+    assert "context 10/unknown" in done[0]["status_line"]
+    assert done[1]["prompt_tokens"] == 30
+    assert done[1]["completion_tokens"] == 8
+    assert done[1]["total_tokens"] == 38
+    assert done[1]["spend"] == pytest.approx(0.04)
+    assert done[1]["context_used"] == 20
+    assert done[1]["tokens_per_second"] == 12.0
+    line = done[1]["status_line"]
+    assert "prompt 30" in line
+    assert "completion 8" in line
+    assert "tok/s" in line
+    assert "http 200" in line
+    assert "latency 0.50s" in line
+    assert "test-key" not in json.dumps(events)
+
+
+def test_http_error_keeps_status_and_short_body(tmp_path: Path) -> None:
+    client = _QueueClient(
+        [{"error": {"message": "slow down"}}],
+        status_code=429,
+        elapsed_seconds=0.25,
+    )
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test-key"), client)
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
+
+    events = _run_protocol(['{"type":"user","text":"hi"}'], session, redact="test-key")
+
+    assert events[1]["type"] == "error"
+    assert events[1]["http_status"] == 429
+    assert events[1]["elapsed_seconds"] == 0.25
+    assert events[1]["error_body"] == "slow down"
+    assert "http 429" in events[1]["status_line"]
+    assert "latency 0.25s" in events[1]["status_line"]
+    dumped = json.dumps(events)
+    assert "Traceback" not in dumped
+    assert "test-key" not in dumped
+
+
+def test_model_fetch_failure_keeps_the_selected_model(tmp_path: Path) -> None:
+    session = _session(ScriptedModel([]), tmp_path=tmp_path)
+    session.model_id = "keep-me"
+    session.totals.model = "keep-me"
+    session.totals.context_limit = 111
+
+    def fail() -> list[CatalogModel]:
+        raise OpenRouterHTTPError(500, "down", 0.3)
+
+    session.fetch_models = fail
+    events = _run_protocol(['{"type":"models"}'], session)
+
+    assert session.model_id == "keep-me"
+    assert session.totals.context_limit == 111
+    assert events[1]["type"] == "models"
+    assert events[1]["ok"] is False
+    assert "500" in events[1]["message"]
+    assert "down" in events[1]["message"]
+
+
+def test_select_model_updates_context_limit_and_rejects_unknown(tmp_path: Path) -> None:
+    class Configurable:
+        def __init__(self) -> None:
+            self.config = ModelConfig(model="a", api_key="test-key")
+
+        def complete(
+            self, messages: list[ChatMessage], tools: list[ToolDefinition]
+        ) -> ModelResponse:
+            return ModelResponse(content=self.config.model)
+
+    model = Configurable()
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
+    session.catalog = [
+        CatalogModel(id="a", context_length=111, prompt_price="0.1", completion_price="0.2"),
+        CatalogModel(id="b", context_length=222, prompt_price="0.3", completion_price="0.4"),
+    ]
+    session.model_id = "a"
+    session.totals.model = "a"
+    session.totals.context_limit = 111
+    session.totals.context_used = 10
+
+    missing = _run_protocol(['{"type":"select_model","id":"missing"}'], session)
+    assert session.model_id == "a"
+    assert session.totals.context_limit == 111
+    assert model.config.model == "a"
+    assert missing[1]["type"] == "error"
+
+    selected = _run_protocol(['{"type":"select_model","id":"b"}'], session)
+    assert session.model_id == "b"
+    assert model.config.model == "b"
+    assert session.totals.context_limit == 222
+    assert session.totals.context_used == 10
+    assert selected[1]["type"] == "model"
+    assert selected[1]["context_length"] == 222
+    assert "context 10/222" in selected[1]["status_line"]
+
+
+def test_session_key_overrides_the_user_key_and_is_not_stored_in_the_project(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+
+    class Configurable:
+        def __init__(self) -> None:
+            self.config = ModelConfig(model="example/model", api_key="")
+
+        def complete(
+            self, messages: list[ChatMessage], tools: list[ToolDefinition]
+        ) -> ModelResponse:
+            return ModelResponse(content="ok")
+
+    model = Configurable()
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(project)))
+    session.home = home
+    session.workspace = project
+    session.requires_api_key = True
+    events = _run_protocol(
+        [
+            '{"type":"set_key","scope":"user","key":"user-key"}',
+            '{"type":"set_key","scope":"session","key":"session-key"}',
+            '{"type":"user","text":"hi"}',
+        ],
+        session,
+    )
+
+    assert model.config.api_key == "session-key"
+    assert (
+        resolve_openrouter_key(session_key=session.session_key, env_key="env-key", home=home)
+        == "session-key"
+    )
+    assert resolve_openrouter_key(session_key=None, env_key=None, home=home) == "user-key"
+    dumped = json.dumps(events)
+    assert "user-key" not in dumped
+    assert "session-key" not in dumped
+    assert events[1]["type"] == "key"
+    assert events[1]["scope"] == "user"
+    assert events[2]["scope"] == "session"
+    for path in (project / ".atlas").rglob("*"):
+        if path.is_file():
+            assert "user-key" not in path.read_text(encoding="utf-8")
+            assert "session-key" not in path.read_text(encoding="utf-8")
+    user_key = home / ".atlas" / "keys" / "openrouter_api_key"
+    assert user_key.is_file()
+    assert user_key.read_text(encoding="utf-8").strip() == "user-key"

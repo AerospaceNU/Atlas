@@ -6,8 +6,48 @@ from pathlib import Path
 
 import pytest
 
+from atlas.agent.metrics import SessionTotals, format_tui_status
 from atlas.cli import main
 from atlas.cli.tui import TuiLaunchError, ensure_tui_binary, launch_tui
+
+
+def test_status_line_shows_context_tokens_spend_and_http() -> None:
+    text = format_tui_status(
+        SessionTotals(
+            model="example/model",
+            prompt_tokens=12,
+            completion_tokens=4,
+            total_tokens=16,
+            cost=0.02,
+            context_used=12,
+            context_limit=128000,
+            last_http_status=200,
+            last_elapsed_seconds=0.5,
+            tokens_per_second=8.0,
+            recent=["200 0.50s"],
+        )
+    )
+
+    assert "context 12/128000" in text
+    assert "prompt 12" in text
+    assert "completion 4" in text
+    assert "tokens 16" in text
+    assert "spend $0.02" in text
+    assert "8.0 tok/s" in text
+    assert "http 200" in text
+    assert "latency 0.50s" in text
+    assert "recent 200 0.50s" in text
+
+
+def test_status_line_does_not_invent_a_context_window() -> None:
+    text = format_tui_status(SessionTotals(context_used=9))
+
+    assert "context 9/unknown" in text
+    assert "128000" not in text
+    assert "spend n/a" in text
+    assert "tok/s" in text
+    assert "http —" in text
+    assert "latency n/a" in text
 
 
 def test_bare_atlas_opens_the_tui(monkeypatch: pytest.MonkeyPatch) -> None:

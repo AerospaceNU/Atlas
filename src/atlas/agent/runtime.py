@@ -11,12 +11,14 @@ from pydantic import BaseModel, Field, ValidationError
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import (
     ChatMessage,
+    ModelCall,
     Role,
     ToolCall,
     ToolCapableModel,
     ToolRegistry,
     ToolResult,
 )
+from atlas.agent.metrics import observe_model_call
 
 DEFAULT_MAX_TOOL_CALLS = 256
 DEFAULT_MODEL = "google/gemini-3.8-flash"
@@ -46,6 +48,7 @@ class AgentRun(BaseModel):
     response: str
     steps: list[AgentStep] = Field(default_factory=list)
     stopped_for_limit: bool = False
+    calls: list[ModelCall] = Field(default_factory=list)
 
 
 def _load_agent_config(root: Path) -> dict[str, object]:
@@ -164,9 +167,13 @@ class Agent:
         gets a tool message so every ``tool_call_id`` is answered.
         """
         steps: list[AgentStep] = []
+        calls: list[ModelCall] = []
         executed = 0
         while executed < self.max_tool_calls:
             response = self.model.complete(messages, self.tools.definitions)
+            observed = observe_model_call(response)
+            if observed is not None:
+                calls.append(observed)
             messages.append(
                 ChatMessage(
                     role=Role.ASSISTANT,
@@ -175,7 +182,7 @@ class Agent:
                 )
             )
             if not response.tool_calls:
-                return AgentRun(response=response.content or "", steps=steps)
+                return AgentRun(response=response.content or "", steps=steps, calls=calls)
             hit_limit = False
             for call in response.tool_calls:
                 if executed < self.max_tool_calls:
@@ -199,11 +206,13 @@ class Agent:
                     response=_STOPPED_RESPONSE,
                     steps=steps,
                     stopped_for_limit=True,
+                    calls=calls,
                 )
         return AgentRun(
             response=_STOPPED_RESPONSE,
             steps=steps,
             stopped_for_limit=True,
+            calls=calls,
         )
 
     def _execute(self, call: ToolCall) -> AgentStep:

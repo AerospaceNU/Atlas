@@ -49,11 +49,51 @@ class ChatMessage(BaseModel):
     tool_call_id: str | None = None
 
 
+class TokenUsage(BaseModel):
+    """Provider token counts and optional spend for one completion."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cost: float | None = None
+
+
+class CallTiming(BaseModel):
+    """HTTP status and measured duration for one model call.
+
+    ``time_to_first_token_seconds`` is set only when the transport reports it.
+    A non-streaming body leaves it empty.
+    """
+
+    http_status: int
+    elapsed_seconds: float
+    time_to_first_token_seconds: float | None = None
+    error_body: str | None = None
+
+
+class ModelCall(BaseModel):
+    """Usage and timing captured from one completion."""
+
+    usage: TokenUsage = Field(default_factory=TokenUsage)
+    timing: CallTiming | None = None
+
+
+class CatalogModel(BaseModel):
+    """One row from the OpenRouter models catalog."""
+
+    id: str
+    context_length: int | None = None
+    prompt_price: str | None = None
+    completion_price: str | None = None
+
+
 class ModelResponse(BaseModel):
     """The subset of a model response needed by the runtime."""
 
     content: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    usage: TokenUsage = Field(default_factory=TokenUsage)
+    timing: CallTiming | None = None
 
 
 class ToolCapableModel(Protocol):
