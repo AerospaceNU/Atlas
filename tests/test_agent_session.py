@@ -1178,6 +1178,12 @@ def test_main_writes_tools_into_the_session_artifact_dir(
     data = workspace / ".atlas" / "data" / "keep.txt"
     data.parent.mkdir(parents=True)
     data.write_text("table", encoding="utf-8")
+    other_note = workspace / ".atlas" / "artifacts" / "other" / "keep.txt"
+    other_session = workspace / ".atlas" / "sessions" / "other"
+    other_note.parent.mkdir(parents=True)
+    other_session.mkdir(parents=True)
+    other_note.write_text("keep", encoding="utf-8")
+    (other_session / "meta.json").write_text('{"id":"other"}\n', encoding="utf-8")
     monkeypatch.setattr("atlas.agent.session.Path.home", lambda: home)
     monkeypatch.chdir(workspace)
     protocol = _ProtocolIn()
@@ -1197,11 +1203,14 @@ def test_main_writes_tools_into_the_session_artifact_dir(
     try:
         sessions = workspace / ".atlas" / "sessions"
         _wait_until(
-            lambda: any(sessions.glob("*/meta.json")),
+            lambda: any(path.parent.name != "other" for path in sessions.glob("*/meta.json")),
             f"main did not create a session: {stdout.text()}",
         )
-        session_id = next(path.parent.name for path in sessions.glob("*/meta.json"))
+        session_id = next(
+            path.parent.name for path in sessions.glob("*/meta.json") if path.parent.name != "other"
+        )
         note = workspace / ".atlas" / "artifacts" / session_id / "note.txt"
+        artifact_dir = note.parent
 
         protocol.push('{"type":"user","text":"save a note"}')
         _wait_until(lambda: note.is_file(), f"tool did not write {note}: {stdout.text()}")
@@ -1222,9 +1231,13 @@ def test_main_writes_tools_into_the_session_artifact_dir(
         )
         session_dir = sessions / session_id
         _wait_until(
-            lambda: not note.exists() and not session_dir.exists(),
+            lambda: not artifact_dir.exists() and not session_dir.exists(),
             f"session remove left files behind: {stdout.text()}",
         )
+        assert other_note.read_text(encoding="utf-8") == "keep"
+        assert other_session.is_dir()
+        assert data.is_file()
+        assert weight.is_file()
     finally:
         protocol.push('{"type":"quit"}')
     thread.join(timeout=5)
