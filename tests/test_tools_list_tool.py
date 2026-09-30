@@ -1,16 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import ClassVar, Literal
 
 import pytest
-from pydantic import ValidationError, BaseModel
-from typing import ClassVar, Literal
+from pydantic import BaseModel, ValidationError
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolDefinition, ToolRegistry, ToolResult, default_registry
 from atlas.agent.tools.list_tools import ListToolsTool
-import json
-
 
 tool_def1 = ToolDefinition(
                 name="read_file",
@@ -55,7 +54,7 @@ def test_tools_list_returns_info_for_each_current_definition(tmp_path: Path) -> 
     }
 
     assert by_name["bash_tool"]["parameters"] == {
-        "type": "object", 
+        "type": "object",
         "properties": {}
     }
 
@@ -120,7 +119,7 @@ def test_tools_list_updates_with_registry(tmp_path: Path) -> None:
     registry = ToolRegistry()
     registry.register(test_tool1)
     assert len(registry.definitions) == 1
-    
+
     list_tool = ListToolsTool(lambda: registry.definitions)
     store = LocalArtifactStore(tmp_path)
     assert len(json.loads(list_tool.run({}, store).text)) == 1
@@ -129,7 +128,7 @@ def test_tools_list_updates_with_registry(tmp_path: Path) -> None:
     assert len(registry.definitions) == 2
     assert len(json.loads(list_tool.run({}, store).text)) == 2
 
-    
+
 def test_default_registry_registers_list_tools(tmp_path: Path) -> None:
     registry = default_registry()
 

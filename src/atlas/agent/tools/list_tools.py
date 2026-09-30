@@ -1,16 +1,15 @@
-"""Agent tool to list other available tools"""
+"""Agent tool to list other available tools."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any, ClassVar, Literal
-
-import json
 
 from pydantic import BaseModel
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import ToolDefinition, Tool, ToolResult
+from atlas.agent.contracts import Tool, ToolDefinition, ToolResult
 
 
 class ListToolsInput(BaseModel):
