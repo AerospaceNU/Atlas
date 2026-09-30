@@ -1252,3 +1252,120 @@ def test_main_writes_tools_into_the_session_artifact_dir(
     steps = [event for event in events if event["type"] == "step"]
     assert steps[0]["name"] == "write_file"
     assert steps[0]["artifacts"] == ["note.txt"]
+
+
+class _TwoCallClient:
+    """One completion that asks for two writes, then a plain answer."""
+
+    posts = 0
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def post(self, _url: str, **_kwargs: Any) -> _ScriptResponse:
+        type(self).posts += 1
+        if type(self).posts == 1:
+            payload: dict[str, Any] = {
+                "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4},
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": json.dumps(
+                                            {"path": "note.txt", "content": "one"}
+                                        ),
+                                    },
+                                },
+                                {
+                                    "id": "c2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": json.dumps(
+                                            {"path": "other.txt", "content": "two"}
+                                        ),
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                ],
+            }
+        else:
+            payload = {
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+                "choices": [{"message": {"content": "done", "tool_calls": []}}],
+            }
+        return _ScriptResponse(payload)
+
+    def close(self) -> None:
+        return None
+
+
+def test_main_uses_the_workspace_tool_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-session-key")
+    _TwoCallClient.posts = 0
+    monkeypatch.setattr("atlas.agent.model.httpx.Client", _TwoCallClient)
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = workspace / ".atlas"
+    config.mkdir()
+    (config / "agent.toml").write_text("max_tool_calls = 1\n", encoding="utf-8")
+    monkeypatch.setattr("atlas.agent.session.Path.home", lambda: home)
+    monkeypatch.chdir(workspace)
+    protocol = _ProtocolIn()
+    stdout = _CollectOut()
+    monkeypatch.setattr(sys, "stdin", protocol)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    holder: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            holder["code"] = main(["--workspace", str(workspace)])
+        except Exception as exc:  # pragma: no cover - failure path for the assertion
+            holder["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        sessions = workspace / ".atlas" / "sessions"
+        _wait_until(
+            lambda: any(sessions.glob("*/meta.json")),
+            f"main did not create a session: {stdout.text()}",
+        )
+        session_id = next(path.parent.name for path in sessions.glob("*/meta.json"))
+        note = workspace / ".atlas" / "artifacts" / session_id / "note.txt"
+        other = workspace / ".atlas" / "artifacts" / session_id / "other.txt"
+        protocol.push('{"type":"user","text":"write two files"}')
+        _wait_until(
+            lambda: "stopped_for_limit" in stdout.text(),
+            f"turn did not finish: {stdout.text()}",
+        )
+        assert note.read_text(encoding="utf-8") == "one"
+        assert not other.exists()
+        assert _TwoCallClient.posts == 1
+    finally:
+        protocol.push('{"type":"quit"}')
+    thread.join(timeout=5)
+
+    assert holder.get("error") is None
+    assert holder.get("code") == 0
+    events = [json.loads(line) for line in stdout.text().splitlines()]
+    steps = [event for event in events if event["type"] == "step"]
+    done = [event for event in events if event["type"] == "done"]
+    assert [step["name"] for step in steps] == ["write_file", "write_file"]
+    assert steps[0]["ok"] is True
+    assert steps[0]["error_kind"] is None
+    assert steps[1]["ok"] is False
+    assert steps[1]["error_kind"] == "limit"
+    assert done[0]["stopped_for_limit"] is True
+    assert "env-session-key" not in stdout.text()

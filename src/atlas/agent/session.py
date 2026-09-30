@@ -37,6 +37,7 @@ from atlas.agent.runtime import (
     AgentRun,
     AgentStep,
     ensure_agent_config,
+    load_max_tool_calls,
     load_model,
 )
 
@@ -557,7 +558,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     artifact_root = project_atlas_root(workspace) / "artifacts" / session_id
     model = OpenRouterModel(ModelConfig(model=model_id, api_key=api_key))
     try:
-        agent = Agent(model, default_registry(), LocalArtifactStore(artifact_root))
+        agent = Agent(
+            model,
+            default_registry(),
+            LocalArtifactStore(artifact_root),
+            # The store root is the session artifact directory, which has no
+            # agent.toml. The budget lives in the workspace config.
+            max_tool_calls=load_max_tool_calls(workspace),
+        )
         session = AgentSession(agent)
         session.requires_api_key = True
         session.home = home
