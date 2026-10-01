@@ -4,7 +4,11 @@ version = "0.8.0"
 description = "Local AI agent deployment"
 readme = "README.md"
 authors = [
-    { name = "CodeKnight314", email = "tang.ri@northeastern.edu" }
+    { name = "CodeKnight314", email = "tang.ri@northeastern.edu" },
+    { name = "Liam Marcovitz", email = "marcovitz.l@northeastern.edu" },
+    { name = "Luc Sciammetta", email = "sciammetta.l@northeastern.edu" },
+    { name = "Sunny Shen", email = "shen.su@northeastern.edu" },
+    { name = "Mason King", email = "king.mas@northeastern.edu" }
 ]
 requires-python = ">=3.12"
 dependencies = [
