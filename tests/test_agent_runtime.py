@@ -46,6 +46,30 @@ def test_agent_uses_registry_tool_then_returns_answer(tmp_path: Path) -> None:
     assert model.requests[1][0][-1].role == "tool"
 
 
+def test_agent_records_a_sandbox_denial_in_the_audit_log(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="call-1", name="read_file", arguments={"path": "../outside.txt"})
+                ]
+            ),
+            ModelResponse(content="I could not read that file."),
+        ]
+    )
+    agent = Agent(model, default_registry(), store)
+
+    result = agent.run("read a file outside the workspace")
+
+    assert result.steps[0].error_kind == "tool_failure"
+    audit_log = tmp_path / ".atlas" / "sandbox_audit.log"
+    assert audit_log.is_file()
+    contents = audit_log.read_text(encoding="utf-8")
+    assert "DENIED read_file" in contents
+    assert "escapes" in contents
+
+
 def test_agent_reports_unknown_tool_without_executing_it(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
