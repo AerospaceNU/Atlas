@@ -73,21 +73,27 @@ class AgentSession:
         request: str,
         *,
         on_step: Callable[[AgentStep], None] | None = None,
+        on_phase: Callable[[str, str | None], None] | None = None,
     ) -> AgentRun:
         """Append the user message and advance the shared history one turn."""
         self._require_key()
         self.messages.append(ChatMessage(role=Role.USER, content=request))
-        run = self.agent.advance(self.messages, on_step=on_step)
+        run = self.agent.advance(self.messages, on_step=on_step, on_phase=on_phase)
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
         return run
 
-    def resume(self, *, on_step: Callable[[AgentStep], None] | None = None) -> AgentRun:
+    def resume(
+        self,
+        *,
+        on_step: Callable[[AgentStep], None] | None = None,
+        on_phase: Callable[[str, str | None], None] | None = None,
+    ) -> AgentRun:
         """Continue a turn that stopped at the tool-call limit, with a fresh budget."""
         self._require_key()
         if not self.stopped_for_limit:
             raise RuntimeError("Session is not stopped for the tool-call limit")
-        run = self.agent.advance(self.messages, on_step=on_step)
+        run = self.agent.advance(self.messages, on_step=on_step, on_phase=on_phase)
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
         return run
@@ -207,8 +213,9 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
         )
         return
     on_step = _step_writer(stdout, session.secrets)
+    on_phase = _phase_writer(stdout, session.secrets)
     try:
-        run = session.turn(text, on_step=on_step)
+        run = session.turn(text, on_step=on_step, on_phase=on_phase)
     except MissingOpenRouterKey as exc:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
@@ -227,8 +234,9 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
 
 def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
     on_step = _step_writer(stdout, session.secrets)
+    on_phase = _phase_writer(stdout, session.secrets)
     try:
-        run = session.resume(on_step=on_step)
+        run = session.resume(on_step=on_step, on_phase=on_phase)
     except MissingOpenRouterKey as exc:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
@@ -434,6 +442,16 @@ def _public_error(exc: Exception) -> str:
 def _step_writer(stdout: IO[str], secrets: list[str]) -> Callable[[AgentStep], None]:
     def write(step: AgentStep) -> None:
         _write_line(stdout, _step_event(step), secrets)
+
+    return write
+
+
+def _phase_writer(stdout: IO[str], secrets: list[str]) -> Callable[[str, str | None], None]:
+    def write(phase: str, name: str | None) -> None:
+        payload: dict[str, Any] = {"type": "phase", "phase": phase}
+        if name:
+            payload["name"] = name
+        _write_line(stdout, payload, secrets)
 
     return write
 

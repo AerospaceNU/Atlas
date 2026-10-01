@@ -57,6 +57,10 @@ pub enum ServerMessage {
         kind: String,
         name: String,
     },
+    Phase {
+        phase: String,
+        name: Option<String>,
+    },
     /// A line we do not understand yet.
     Unknown,
 }
@@ -194,6 +198,12 @@ enum RawMessage {
         #[serde(default)]
         names: Vec<String>,
     },
+    #[serde(rename = "phase")]
+    Phase {
+        phase: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
     #[serde(rename = "removed")]
     Removed {
         #[serde(default)]
@@ -299,6 +309,7 @@ impl From<RawMessage> for ServerMessage {
             RawMessage::Removed { scope, kind, name } => {
                 ServerMessage::Removed { scope, kind, name }
             }
+            RawMessage::Phase { phase, name } => ServerMessage::Phase { phase, name },
         }
     }
 }

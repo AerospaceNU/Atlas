@@ -405,14 +405,16 @@ def test_protocol_ready_step_done_and_second_turn(tmp_path: Path) -> None:
 
     assert events[0]["type"] == "ready"
     assert any(tool["name"] == "echo" for tool in events[0]["tools"])
-    assert events[1]["type"] == "step"
-    assert events[1]["name"] == "echo"
-    assert events[1]["ok"] is True
-    assert events[1]["text"] == "echo:4"
-    assert events[2]["type"] == "done"
-    assert events[2]["response"] == "first done"
-    assert events[3]["type"] == "done"
-    assert events[3]["response"] == "second done"
+    steps = [event for event in events if event["type"] == "step"]
+    dones = [event for event in events if event["type"] == "done"]
+    phases = [event["phase"] for event in events if event["type"] == "phase"]
+    assert steps[0]["name"] == "echo"
+    assert steps[0]["ok"] is True
+    assert steps[0]["text"] == "echo:4"
+    assert dones[0]["response"] == "first done"
+    assert dones[1]["response"] == "second done"
+    assert phases[:4] == ["thinking", "tool_calling", "tool_executing", "thinking"]
+    assert events[events.index(steps[0]) - 1]["phase"] == "tool_executing"
 
 
 def test_protocol_invalid_json_continues(tmp_path: Path) -> None:
@@ -424,9 +426,9 @@ def test_protocol_invalid_json_continues(tmp_path: Path) -> None:
         session,
     )
 
-    assert events[1]["type"] == "error"
-    assert events[2]["type"] == "done"
     assert events[0]["type"] == "ready"
+    assert events[1]["type"] == "error"
+    assert any(event["type"] == "done" for event in events)
 
 
 def test_protocol_unknown_type_is_recoverable(tmp_path: Path) -> None:
@@ -445,9 +447,10 @@ def test_protocol_resume_before_limit_is_error(tmp_path: Path) -> None:
 
     events = _run_protocol(['{"type":"user","text":"hi"}', '{"type":"resume"}'], session)
 
-    assert events[1]["type"] == "done"
-    assert events[2]["type"] == "error"
-    assert "not stopped" in events[2]["message"]
+    dones = [event for event in events if event["type"] == "done"]
+    errors = [event for event in events if event["type"] == "error"]
+    assert dones[0]["response"] == "ok"
+    assert "not stopped" in errors[0]["message"]
 
 
 def test_protocol_redacts_api_key(tmp_path: Path) -> None:
@@ -458,7 +461,8 @@ def test_protocol_redacts_api_key(tmp_path: Path) -> None:
     events = _run_protocol(['{"type":"user","text":"hi"}'], session, redact=api_key)
 
     assert api_key not in json.dumps(events)
-    assert "***" in events[1]["response"]
+    done = next(event for event in events if event["type"] == "done")
+    assert "***" in done["response"]
 
 
 def test_main_without_key_prompts_instead_of_a_stack_trace(
@@ -617,12 +621,13 @@ def test_http_error_keeps_status_and_short_body(tmp_path: Path) -> None:
 
     events = _run_protocol(['{"type":"user","text":"hi"}'], session, redact="test-key")
 
-    assert events[1]["type"] == "error"
-    assert events[1]["http_status"] == 429
-    assert events[1]["elapsed_seconds"] == 0.25
-    assert events[1]["error_body"] == "slow down"
-    assert "http" not in events[1]["status_line"]
-    assert "latency" not in events[1]["status_line"]
+    error = next(event for event in events if event["type"] == "error")
+    assert error["http_status"] == 429
+    assert error["elapsed_seconds"] == 0.25
+    assert error["error_body"] == "slow down"
+    assert "http" not in error["status_line"]
+    assert "latency" not in error["status_line"]
+    assert any(event.get("phase") == "thinking" for event in events)
     dumped = json.dumps(events)
     assert "Traceback" not in dumped
     assert "test-key" not in dumped

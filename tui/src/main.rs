@@ -1,5 +1,6 @@
 //! Minimal terminal client for the Atlas agent session protocol.
 
+mod markdown;
 mod protocol;
 mod theme;
 
@@ -12,15 +13,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use markdown::{render_lines, Mark, Piece};
 use protocol::{default_status_line, parse_line, status_text, CatalogEntry, ServerMessage};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
@@ -180,6 +185,18 @@ struct App {
     /// Ask the session for the catalog once so the dashboard can show the
     /// active model's context window without opening the picker.
     lookup_context: bool,
+    /// Last wrapped row the transcript can scroll to. Updated while drawing.
+    scroll_max: u16,
+    ticks: u32,
+    activity: Option<Activity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Activity {
+    Thinking,
+    Working,
+    ToolCalling(String),
+    ToolExecuting(String),
 }
 
 enum TranscriptLine {
@@ -209,6 +226,9 @@ impl App {
             menu_index: 0,
             scope_root: "project".to_string(),
             lookup_context: false,
+            scroll_max: 0,
+            ticks: 0,
+            activity: None,
         }
     }
 
@@ -225,20 +245,12 @@ impl App {
                     self.lookup_context = true;
                 }
             }
-            ServerMessage::Step {
-                name,
-                ok,
-                text,
-                error,
-                ..
-            } => {
-                let detail = if ok {
-                    text.unwrap_or_default()
-                } else {
-                    error.unwrap_or_else(|| "failed".to_string())
-                };
-                self.transcript
-                    .push(TranscriptLine::Tool(format!("tool {name}: {detail}")));
+            ServerMessage::Step { name, ok, .. } => {
+                let label = if ok { name } else { format!("{name} failed") };
+                self.transcript.push(TranscriptLine::Tool(label));
+            }
+            ServerMessage::Phase { phase, name } => {
+                self.activity = activity_from(&phase, name.as_deref());
             }
             ServerMessage::Done {
                 response,
@@ -249,6 +261,7 @@ impl App {
                     self.transcript.push(TranscriptLine::Assistant(response));
                 }
                 self.adopt_status(&status);
+                self.activity = None;
                 self.waiting_from_stopped = false;
                 self.status = if stopped_for_limit {
                     Status::Stopped
@@ -266,6 +279,7 @@ impl App {
                 if !status_line.is_empty() {
                     self.status_line = status_line;
                 }
+                self.activity = None;
                 self.status = if self.waiting_from_stopped {
                     Status::Stopped
                 } else {
@@ -439,7 +453,14 @@ fn run() -> Result<()> {
 fn enter_ui() -> Result<ratatui::DefaultTerminal> {
     enable_raw_mode().context("atlas-tui needs an interactive terminal")?;
     let mut stdout = io::stdout();
-    if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+    // The alternate screen plus mouse capture keeps wheel events inside Atlas.
+    // Without capture, the wheel scrolls the shell that was on screen before launch.
+    if let Err(err) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        EnableMouseCapture
+    ) {
         let _ = disable_raw_mode();
         return Err(err).context("atlas-tui needs an interactive terminal");
     }
@@ -453,7 +474,7 @@ fn enter_ui() -> Result<ratatui::DefaultTerminal> {
 }
 
 fn leave_ui() {
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
 
@@ -506,12 +527,21 @@ fn event_loop(
         }
 
         if event::poll(TICK)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && handle_key(app, child, key)? {
-                    return Ok(());
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if handle_key(app, child, key)? {
+                        return Ok(());
+                    }
                 }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => nudge_scroll(app, -3),
+                    MouseEventKind::ScrollDown => nudge_scroll(app, 3),
+                    _ => {}
+                },
+                _ => {}
             }
         }
+        app.ticks = app.ticks.wrapping_add(1);
     }
 }
 
@@ -566,6 +596,8 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
                 app.menu_index += 1;
             }
         }
+        KeyCode::Up => nudge_scroll(app, -1),
+        KeyCode::Down => nudge_scroll(app, 1),
         KeyCode::Tab if menu_open => {
             if let MenuAction::Complete(prefix, replacement) =
                 menu_action(&app.input, app.menu_index, false)
@@ -584,7 +616,9 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
                                 child.shutdown();
                                 return Ok(true);
                             }
-                            handle_slash(app, child, &run)?;
+                            if !run_local_command(app, &run) {
+                                handle_slash(app, child, &run)?;
+                            }
                         }
                         MenuAction::Complete(prefix, replacement) => {
                             apply_completion(app, &prefix, &replacement);
@@ -597,7 +631,9 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
                                 child.shutdown();
                                 return Ok(true);
                             }
-                            handle_slash(app, child, &text)?;
+                            if !run_local_command(app, &text) {
+                                handle_slash(app, child, &text)?;
+                            }
                         }
                     }
                 } else {
@@ -614,13 +650,8 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
             app.input.pop();
             app.menu_index = 0;
         }
-        KeyCode::PageUp => {
-            app.follow = false;
-            app.scroll = app.scroll.saturating_sub(5);
-        }
-        KeyCode::PageDown => {
-            app.scroll = app.scroll.saturating_add(5);
-        }
+        KeyCode::PageUp => nudge_scroll(app, -5),
+        KeyCode::PageDown => nudge_scroll(app, 5),
         KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.input.push(ch);
             app.menu_index = 0;
@@ -632,6 +663,94 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
 
 fn is_quit_command(text: &str) -> bool {
     matches!(text.trim(), "/quit" | "/exit")
+}
+
+fn run_local_command(app: &mut App, text: &str) -> bool {
+    if text.trim() != "/copy" {
+        return false;
+    }
+    match last_reply(app) {
+        Some(reply) => {
+            let note = if copy_to_clipboard(reply) {
+                "copied"
+            } else {
+                "copy failed"
+            };
+            app.transcript.push(TranscriptLine::Tool(note.to_string()));
+        }
+        None => {
+            app.transcript
+                .push(TranscriptLine::Tool("nothing to copy".to_string()));
+        }
+    }
+    app.follow = true;
+    true
+}
+
+fn last_reply(app: &App) -> Option<&str> {
+    app.transcript.iter().rev().find_map(|line| match line {
+        TranscriptLine::Assistant(text) if !text.is_empty() => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+fn copy_to_clipboard(text: &str) -> bool {
+    for (program, args) in [
+        ("pbcopy", &[][..]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("clip", &[]),
+    ] {
+        let Ok(mut child) = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            continue;
+        };
+        if stdin.write_all(text.as_bytes()).is_err() {
+            continue;
+        }
+        drop(stdin);
+        if child.wait().map(|status| status.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+fn nudge_scroll(app: &mut App, delta: i32) {
+    if delta < 0 {
+        let step = delta.unsigned_abs().min(u32::from(u16::MAX)) as u16;
+        app.follow = false;
+        app.scroll = app.scroll.saturating_sub(step);
+        return;
+    }
+    let step = u16::try_from(delta).unwrap_or(u16::MAX);
+    let next = app.scroll.saturating_add(step);
+    if next >= app.scroll_max {
+        app.scroll = app.scroll_max;
+        app.follow = true;
+    } else {
+        app.follow = false;
+        app.scroll = next;
+    }
+}
+
+fn activity_from(phase: &str, name: Option<&str>) -> Option<Activity> {
+    let name = name.unwrap_or("").to_string();
+    match phase {
+        "thinking" => Some(Activity::Thinking),
+        "working" => Some(Activity::Working),
+        "tool_calling" => Some(Activity::ToolCalling(name)),
+        "tool_executing" => Some(Activity::ToolExecuting(name)),
+        _ => None,
+    }
 }
 
 fn apply_completion(app: &mut App, prefix: &str, replacement: &str) {
@@ -763,7 +882,7 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
     }
 }
 
-const PICKER_PAGE: usize = 6;
+const PICKER_PAGE: usize = 8;
 
 /// Slice of the filtered catalog that stays on screen around `index`.
 fn picker_window(len: usize, index: usize, page: usize) -> std::ops::Range<usize> {
@@ -787,10 +906,14 @@ struct MenuItem {
 /// Command or fixed-argument options that match `text`, or an empty list when
 /// the menu should stay hidden (free text after a finished command).
 fn menu_options(text: &str) -> Vec<MenuItem> {
-    const COMMANDS: [MenuItem; 6] = [
+    const COMMANDS: [MenuItem; 7] = [
         MenuItem {
             token: "/model",
             description: "Choose a model",
+        },
+        MenuItem {
+            token: "/copy",
+            description: "Copy the last reply",
         },
         MenuItem {
             token: "/key",
@@ -951,8 +1074,10 @@ fn menu_action(text: &str, index: usize, run: bool) -> MenuAction {
 /// Commands `slash_outcome` accepts without showing a usage error.
 fn is_finished_command(text: &str) -> bool {
     let trimmed = text.trim_end();
-    if trimmed == "/sessions" || trimmed == "/artifacts" || trimmed == "/quit" || trimmed == "/exit"
-    {
+    if matches!(
+        trimmed,
+        "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy"
+    ) {
         return true;
     }
     let mut words = trimmed.split_whitespace();
@@ -1149,16 +1274,22 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     let composer_height = composer_rows(app, outer.width);
     let picker_height = picker_rows(app);
+    let activity_height = u16::from(app.in_flight());
     let status_height = status_block_rows(&app.status_line, outer.width);
-    let [transcript_area, picker_area, composer_area, status_area] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(picker_height),
-        Constraint::Length(composer_height),
-        Constraint::Length(status_height),
-    ])
-    .areas(outer);
+    let [transcript_area, activity_area, picker_area, composer_area, status_area] =
+        Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(activity_height),
+            Constraint::Length(picker_height),
+            Constraint::Length(composer_height),
+            Constraint::Length(status_height),
+        ])
+        .areas(outer);
 
     render_transcript(frame, app, transcript_area);
+    if activity_height > 0 {
+        render_activity(frame, app, activity_area);
+    }
     if picker_height > 0 {
         render_picker(frame, app, picker_area);
     }
@@ -1214,6 +1345,7 @@ fn render_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows = transcript_rows(app, area.width as usize);
     let height = area.height as usize;
     let max_scroll = rows.len().saturating_sub(height) as u16;
+    app.scroll_max = max_scroll;
     if app.follow {
         app.scroll = max_scroll;
     }
@@ -1237,6 +1369,9 @@ enum PaintedRow {
         first: bool,
         text: String,
     },
+    Rich {
+        pieces: Vec<Piece>,
+    },
 }
 
 fn transcript_rows(app: &App, width: usize) -> Vec<PaintedRow> {
@@ -1246,23 +1381,33 @@ fn transcript_rows(app: &App, width: usize) -> Vec<PaintedRow> {
         if index > 0 {
             rows.push(PaintedRow::Gap);
         }
-        let (kind, text) = match line {
-            TranscriptLine::User(text) => (RowKind::User, text.as_str()),
-            TranscriptLine::Assistant(text) => (RowKind::Assistant, text.as_str()),
-            TranscriptLine::Tool(text) => (RowKind::Tool, text.as_str()),
-        };
-        let wrapped = wrap_text(text, content_width);
-        let wrapped = if wrapped.is_empty() {
-            vec![String::new()]
-        } else {
-            wrapped
-        };
-        for (line_index, chunk) in wrapped.into_iter().enumerate() {
-            rows.push(PaintedRow::Text {
-                kind,
-                first: line_index == 0,
-                text: chunk,
-            });
+        match line {
+            TranscriptLine::Assistant(text) => {
+                for rich in render_lines(text) {
+                    for pieces in wrap_rich(&rich, content_width) {
+                        rows.push(PaintedRow::Rich { pieces });
+                    }
+                }
+            }
+            TranscriptLine::User(text) | TranscriptLine::Tool(text) => {
+                let kind = match line {
+                    TranscriptLine::User(_) => RowKind::User,
+                    _ => RowKind::Tool,
+                };
+                let wrapped = wrap_text(text, content_width);
+                let wrapped = if wrapped.is_empty() {
+                    vec![String::new()]
+                } else {
+                    wrapped
+                };
+                for (line_index, chunk) in wrapped.into_iter().enumerate() {
+                    rows.push(PaintedRow::Text {
+                        kind,
+                        first: line_index == 0,
+                        text: chunk,
+                    });
+                }
+            }
         }
     }
     rows
@@ -1271,17 +1416,24 @@ fn transcript_rows(app: &App, width: usize) -> Vec<PaintedRow> {
 #[derive(Clone, Copy)]
 enum RowKind {
     User,
-    Assistant,
     Tool,
 }
 
 fn paint_row(frame: &mut Frame, area: Rect, row: &PaintedRow) {
+    if let PaintedRow::Rich { pieces, .. } = row {
+        frame.render_widget(Block::default().style(Style::default().bg(BG_BASE)), area);
+        let mut spans = vec![Span::styled("  ", Style::default().fg(FG).bg(BG_BASE))];
+        for piece in pieces {
+            spans.push(Span::styled(piece.text.as_str(), rich_style(piece.mark)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let PaintedRow::Text { kind, first, text } = row else {
         return;
     };
     let (background, prefix, color) = match kind {
         RowKind::User => (BG_LIGHT, if *first { "› " } else { "  " }, FG),
-        RowKind::Assistant => (BG_BASE, "  ", FG),
         RowKind::Tool => (BG_BASE, if *first { "◆ " } else { "  " }, GRAY_BRIGHT),
     };
     frame.render_widget(
@@ -1293,6 +1445,76 @@ fn paint_row(frame: &mut Frame, area: Rect, row: &PaintedRow) {
         Span::styled(text.as_str(), Style::default().fg(color).bg(background)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn rich_style(mark: Mark) -> Style {
+    let base = Style::default().fg(FG).bg(BG_BASE);
+    match mark {
+        Mark::Plain => base,
+        Mark::Strong | Mark::Heading => base.add_modifier(Modifier::BOLD),
+        Mark::Emphasis => base.add_modifier(Modifier::ITALIC),
+        Mark::Code => base.fg(MAGENTA),
+    }
+}
+
+fn wrap_rich(pieces: &[Piece], width: usize) -> Vec<Vec<Piece>> {
+    if width == 0 {
+        return vec![vec![]];
+    }
+    let mut lines: Vec<Vec<Piece>> = vec![Vec::new()];
+    let mut column = 0;
+    for piece in pieces {
+        let mut rest = piece.text.as_str();
+        while !rest.is_empty() {
+            if column == width {
+                lines.push(Vec::new());
+                column = 0;
+            }
+            let room = width - column;
+            let take: String = rest.chars().take(room).collect();
+            let bytes = take.len();
+            column += take.chars().count();
+            rest = &rest[bytes..];
+            lines.last_mut().expect("line").push(Piece {
+                text: take,
+                mark: piece.mark,
+            });
+        }
+    }
+    if lines.last().is_some_and(Vec::is_empty) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push(vec![]);
+    }
+    lines
+}
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
+    let activity = app.activity.clone().unwrap_or(Activity::Working);
+    let frame_index = (app.ticks as usize / 2) % SPINNER.len();
+    let label = match &activity {
+        Activity::Thinking => "thinking".to_string(),
+        Activity::Working => "model working".to_string(),
+        Activity::ToolCalling(name) => format!("tool calling {name}"),
+        Activity::ToolExecuting(name) => format!("tool executing {name}"),
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            SPINNER[frame_index],
+            Style::default().fg(MAGENTA).bg(BG_BASE),
+        ),
+        Span::styled(
+            format!(" {label}"),
+            Style::default().fg(FG_SECONDARY).bg(BG_BASE),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(BG_BASE)),
+        area,
+    );
 }
 
 fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
@@ -1433,7 +1655,12 @@ fn status_label(app: &App) -> (&'static str, Color) {
     }
     match app.status {
         Status::Ready => ("ready", GRAY_BRIGHT),
-        Status::Waiting => ("waiting", MAGENTA),
+        Status::Waiting => match app.activity {
+            Some(Activity::Thinking) => ("thinking", MAGENTA),
+            Some(Activity::ToolCalling(_)) => ("tool calling", MAGENTA),
+            Some(Activity::ToolExecuting(_)) => ("tool executing", MAGENTA),
+            _ => ("model working", MAGENTA),
+        },
         Status::Stopped => ("stopped for tool limit", YELLOW),
     }
 }
@@ -1521,8 +1748,8 @@ fn note_session_closed(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        draw, format_context, menu_action, menu_options, picker_selection, price_per_million,
-        slash_outcome, wrap_text, App, MenuAction, Mode, TranscriptLine,
+        draw, format_context, menu_action, menu_options, nudge_scroll, picker_selection,
+        price_per_million, slash_outcome, wrap_text, App, MenuAction, Mode, Status, TranscriptLine,
     };
     use crate::protocol::{CatalogEntry, ServerMessage, StatusSnapshot};
 
@@ -1726,6 +1953,7 @@ mod tests {
         let painted = screen(&mut app, 80, 24);
         for name in [
             "/model",
+            "/copy",
             "/key",
             "/sessions",
             "/artifacts",
@@ -1737,6 +1965,61 @@ mod tests {
         assert!(!painted.contains("/rm"), "{painted}");
         assert!(!painted.contains("/scope"), "{painted}");
         assert!(painted.contains("↑↓ move  tab complete  enter run  esc close"));
+    }
+
+    #[test]
+    fn assistant_markdown_is_not_painted_raw() {
+        let mut app = App::new();
+        app.transcript
+            .push(TranscriptLine::Assistant("**bold** and `code`".to_string()));
+        let painted = screen(&mut app, 80, 24);
+        assert!(painted.contains("bold"), "{painted}");
+        assert!(painted.contains("code"), "{painted}");
+        assert!(!painted.contains("**"), "{painted}");
+        assert!(!painted.contains('`'), "{painted}");
+    }
+
+    #[test]
+    fn tool_step_hides_the_raw_result() {
+        let mut app = App::new();
+        app.apply(ServerMessage::Step {
+            name: "read_file".to_string(),
+            call_id: "1".to_string(),
+            ok: true,
+            text: Some("SECRET_FILE_BODY".to_string()),
+            error: None,
+            error_kind: None,
+            artifacts: Vec::new(),
+        });
+        let painted = screen(&mut app, 80, 24);
+        assert!(painted.contains("read_file"), "{painted}");
+        assert!(!painted.contains("SECRET_FILE_BODY"), "{painted}");
+    }
+
+    #[test]
+    fn tool_phase_paints_an_executing_spinner() {
+        let mut app = App::new();
+        app.status = Status::Waiting;
+        app.apply(ServerMessage::Phase {
+            phase: "tool_executing".to_string(),
+            name: Some("read_file".to_string()),
+        });
+        let painted = screen(&mut app, 80, 24);
+        assert!(painted.contains("tool executing read_file"), "{painted}");
+    }
+
+    #[test]
+    fn scrolling_up_stops_following_the_tail() {
+        let mut app = App::new();
+        app.scroll_max = 20;
+        app.scroll = 20;
+        app.follow = true;
+        nudge_scroll(&mut app, -3);
+        assert!(!app.follow);
+        assert_eq!(app.scroll, 17);
+        nudge_scroll(&mut app, 100);
+        assert!(app.follow);
+        assert_eq!(app.scroll, 20);
     }
 
     #[test]
@@ -1861,8 +2144,8 @@ mod tests {
     fn picker_highlights_the_row_enter_would_select() {
         let mut app = App::new();
         app.mode = Mode::ModelPicker;
-        app.picker_index = 6;
-        app.picker_models = (0..8)
+        app.picker_index = 10;
+        app.picker_models = (0..12)
             .map(|index| CatalogEntry {
                 id: format!("model-{index}"),
                 context_length: Some(128_000),
@@ -1875,9 +2158,9 @@ mod tests {
         let painted = screen(&mut app, 80, 24);
         let highlighted: Vec<&str> = painted.lines().filter(|line| line.contains('>')).collect();
 
-        assert_eq!(selected["id"], "model-6");
+        assert_eq!(selected["id"], "model-10");
         assert!(
-            highlighted.iter().any(|line| line.contains("model-6")),
+            highlighted.iter().any(|line| line.contains("model-10")),
             "highlighted rows were {highlighted:?}\n{painted}"
         );
         assert!(

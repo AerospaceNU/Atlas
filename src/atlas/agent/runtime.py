@@ -158,6 +158,7 @@ class Agent:
         messages: list[ChatMessage],
         *,
         on_step: Callable[[AgentStep], None] | None = None,
+        on_phase: Callable[[str, str | None], None] | None = None,
     ) -> AgentRun:
         """Continue ``messages`` in place while the tool-call budget lasts.
 
@@ -169,7 +170,18 @@ class Agent:
         steps: list[AgentStep] = []
         calls: list[ModelCall] = []
         executed = 0
+
+        def emit(phase: str, name: str | None = None) -> None:
+            if on_phase is not None:
+                on_phase(phase, name)
+
         while executed < self.max_tool_calls:
+            # Reasoning stays on unless the model config turns it off. The
+            # request is one blocking call, so this is the whole wait, not a
+            # separate stream of thought tokens.
+            config = getattr(self.model, "config", None)
+            reasoning = True if config is None else bool(getattr(config, "reasoning", True))
+            emit("thinking" if reasoning else "working")
             response = self.model.complete(messages, self.tools.definitions)
             observed = observe_model_call(response)
             if observed is not None:
@@ -185,7 +197,9 @@ class Agent:
                 return AgentRun(response=response.content or "", steps=steps, calls=calls)
             hit_limit = False
             for call in response.tool_calls:
+                emit("tool_calling", call.name)
                 if executed < self.max_tool_calls:
+                    emit("tool_executing", call.name)
                     step = self._execute(call)
                     executed += 1
                 else:
