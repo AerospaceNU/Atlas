@@ -45,7 +45,12 @@ def observe_model_call(response: ModelResponse) -> ModelCall | None:
 
 
 def tokens_per_second(completion_tokens: int, elapsed_seconds: float) -> float | None:
-    """Completion tokens divided by the measured elapsed seconds."""
+    """Output tokens divided by that model request's duration.
+
+    ``elapsed_seconds`` is the completion HTTP call only. Tool execution
+    between calls is not part of it. A call with no output tokens does not
+    produce a rate.
+    """
     if completion_tokens <= 0 or elapsed_seconds <= 0:
         return None
     return completion_tokens / elapsed_seconds
@@ -68,9 +73,9 @@ def apply_call(totals: SessionTotals, call: ModelCall) -> SessionTotals:
         totals.last_ttft_seconds = timing.time_to_first_token_seconds
         totals.recent.append(_recent_label(timing))
         del totals.recent[:-_RECENT_LIMIT]
-        totals.tokens_per_second = tokens_per_second(
-            usage.completion_tokens, timing.elapsed_seconds
-        )
+        speed = tokens_per_second(usage.completion_tokens, timing.elapsed_seconds)
+        if speed is not None:
+            totals.tokens_per_second = speed
     return totals
 
 
@@ -90,25 +95,72 @@ def apply_http_error(
     return apply_call(totals, ModelCall(usage=TokenUsage(), timing=timing))
 
 
+def format_token_count(value: int) -> str:
+    """Three significant figures, in K, M, or B once the count reaches that unit.
+
+    ``355`` stays ``355``, ``128000`` is ``128K``, ``1048576`` is ``1.05M``,
+    and ``1500000000`` is ``1.50B``.
+    """
+    if value <= 0:
+        return "0"
+    rounded = _round_sig3(value)
+    if rounded >= 1_000_000_000:
+        return f"{_sig_coeff(rounded, 1_000_000_000)}B"
+    if rounded >= 1_000_000:
+        return f"{_sig_coeff(rounded, 1_000_000)}M"
+    if rounded >= 1_000:
+        return f"{_sig_coeff(rounded, 1_000)}K"
+    return str(rounded)
+
+
 def format_tui_status(totals: SessionTotals) -> str:
-    """One status line: context, tokens, spend, speed, and the latest HTTP call."""
-    limit = "unknown" if totals.context_limit is None else str(totals.context_limit)
+    """One status line: model, context window, tokens, spend, and output speed."""
+    limit = "unknown" if totals.context_limit is None else format_token_count(totals.context_limit)
     model = totals.model or "unset"
     spend = "n/a" if totals.cost is None else _format_spend(totals.cost)
     speed = "n/a" if totals.tokens_per_second is None else f"{totals.tokens_per_second:.1f}"
-    http = "—" if totals.last_http_status is None else str(totals.last_http_status)
-    latency = (
-        "n/a" if totals.last_elapsed_seconds is None else f"{totals.last_elapsed_seconds:.2f}s"
-    )
-    ttft = "n/a" if totals.last_ttft_seconds is None else f"{totals.last_ttft_seconds:.2f}s"
-    recent = ", ".join(totals.recent) if totals.recent else "none"
     return (
-        f"model {model}  context {totals.context_used}/{limit}  "
-        f"tokens {totals.total_tokens} (prompt {totals.prompt_tokens} "
-        f"completion {totals.completion_tokens})  "
-        f"spend {spend}  {speed} tok/s  http {http}  latency {latency}  "
-        f"ttft {ttft}  recent {recent}"
+        f"model {model}  context {format_token_count(totals.context_used)}/{limit}  "
+        f"tokens {format_token_count(totals.total_tokens)}  "
+        f"spend {spend}  {speed} tok/s"
     )
+
+
+def _round_sig3(value: int) -> int:
+    digits = _decimal_digits(value)
+    if digits <= 3:
+        return value
+    factor = _pow10(digits - 3)
+    head, rem = divmod(value, factor)
+    rounded = head + int(rem * 2 >= factor)
+    if rounded >= 1000:
+        rounded //= 10
+        factor *= 10
+    return rounded * factor
+
+
+def _pow10(exponent: int) -> int:
+    result = 1
+    for _ in range(exponent):
+        result *= 10
+    return result
+
+
+def _decimal_digits(value: int) -> int:
+    digits = 1
+    while value >= 10:
+        value //= 10
+        digits += 1
+    return digits
+
+
+def _sig_coeff(rounded: int, unit: int) -> str:
+    whole, frac = divmod(rounded, unit)
+    if whole >= 100:
+        return str(whole)
+    if whole >= 10:
+        return f"{whole}.{frac // (unit // 10)}"
+    return f"{whole}.{frac // (unit // 100):02d}"
 
 
 def _format_spend(cost: float) -> str:

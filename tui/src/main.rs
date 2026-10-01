@@ -153,14 +153,7 @@ enum Mode {
     Compose,
     ModelWait,
     ModelPicker,
-    Key {
-        scope: String,
-    },
-    ConfirmRemove {
-        scope: String,
-        kind: String,
-        name: String,
-    },
+    Key { scope: String },
 }
 
 struct App {
@@ -180,8 +173,13 @@ struct App {
     picker_filter: String,
     picker_index: usize,
     picker_models: Vec<CatalogEntry>,
-    /// `project` or `user`. Remove and list stay inside that root.
+    /// Highlighted row in the slash menu; reset when the filter token changes.
+    menu_index: usize,
+    /// `project` or `user`. Listing stays inside that root.
     scope_root: String,
+    /// Ask the session for the catalog once so the dashboard can show the
+    /// active model's context window without opening the picker.
+    lookup_context: bool,
 }
 
 enum TranscriptLine {
@@ -208,7 +206,9 @@ impl App {
             picker_filter: String::new(),
             picker_index: 0,
             picker_models: Vec::new(),
+            menu_index: 0,
             scope_root: "project".to_string(),
+            lookup_context: false,
         }
     }
 
@@ -221,6 +221,9 @@ impl App {
             ServerMessage::Ready { tools, status, .. } => {
                 self.tools = tools.into_iter().map(|tool| tool.name).collect();
                 self.adopt_status(&status);
+                if status.context_limit.is_none() {
+                    self.lookup_context = true;
+                }
             }
             ServerMessage::Step {
                 name,
@@ -275,21 +278,30 @@ impl App {
                 ok,
                 message,
                 models,
+                status,
             } => {
+                if !status.status_line.is_empty() {
+                    self.adopt_status(&status);
+                }
+                let user_asked = matches!(self.mode, Mode::ModelWait | Mode::ModelPicker);
                 if !ok {
-                    self.transcript.push(TranscriptLine::Tool(format!(
-                        "model list failed: {message}"
-                    )));
-                    if self.mode == Mode::ModelWait {
-                        self.mode = Mode::Compose;
+                    if user_asked {
+                        self.transcript.push(TranscriptLine::Tool(format!(
+                            "model list failed: {message}"
+                        )));
+                        if self.mode == Mode::ModelWait {
+                            self.mode = Mode::Compose;
+                        }
                     }
-                } else if self.mode == Mode::ModelWait || self.mode == Mode::ModelPicker {
+                } else if user_asked {
                     self.picker_models = models;
                     self.picker_index = 0;
                     self.mode = Mode::ModelPicker;
                     let count = self.filtered_models().len();
                     self.transcript
                         .push(TranscriptLine::Tool(format!("models: {count}")));
+                } else {
+                    self.picker_models = models;
                 }
             }
             ServerMessage::ModelSelected { id, status, .. } => {
@@ -473,7 +485,13 @@ fn event_loop(
                         .transcript
                         .push(TranscriptLine::Tool(format!("unparsable: {line}"))),
                 },
-                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    if app.lookup_context {
+                        app.lookup_context = false;
+                        child.send(serde_json::json!({"type": "models"}))?;
+                    }
+                    break;
+                }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     stdout_closed = true;
                     break;
@@ -503,7 +521,8 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
         child.shutdown();
         return Ok(true);
     }
-    if key.code == KeyCode::Esc && matches!(app.mode, Mode::Compose) {
+    if key.code == KeyCode::Esc && matches!(app.mode, Mode::Compose) && !app.input.starts_with('/')
+    {
         child.shutdown();
         return Ok(true);
     }
@@ -518,19 +537,18 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
         Mode::Key { scope } => {
             handle_secret_key(app, child, key, &scope)?;
         }
-        Mode::ConfirmRemove { scope, kind, name } => {
-            if key.code == KeyCode::Enter {
-                child.send(confirmed_remove_message(&scope, &kind, &name))?;
-                app.mode = Mode::Compose;
+        Mode::ModelWait => {}
+        Mode::Compose => {
+            if handle_compose_key(app, child, key)? {
+                return Ok(true);
             }
         }
-        Mode::ModelWait => {}
-        Mode::Compose => handle_compose_key(app, child, key)?,
     }
     Ok(false)
 }
 
-fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<()> {
+fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<bool> {
+    let menu_open = !menu_options(&app.input).is_empty();
     match key.code {
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.session_open && app.status == Status::Stopped && !app.in_flight() {
@@ -539,12 +557,51 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
                 app.status = Status::Waiting;
             }
         }
+        KeyCode::Up if menu_open => {
+            app.menu_index = app.menu_index.saturating_sub(1);
+        }
+        KeyCode::Down if menu_open => {
+            let count = menu_options(&app.input).len();
+            if count > 0 && app.menu_index + 1 < count {
+                app.menu_index += 1;
+            }
+        }
+        KeyCode::Tab if menu_open => {
+            if let MenuAction::Complete(prefix, replacement) =
+                menu_action(&app.input, app.menu_index, false)
+            {
+                apply_completion(app, &prefix, &replacement);
+            }
+        }
         KeyCode::Enter => {
             if app.session_open && !app.input.is_empty() && !app.in_flight() {
-                let text = std::mem::take(&mut app.input);
-                if text.starts_with('/') {
-                    handle_slash(app, child, &text)?;
+                if app.input.starts_with('/') {
+                    let text = app.input.clone();
+                    match menu_action(&text, app.menu_index, true) {
+                        MenuAction::Run(run) => {
+                            app.input.clear();
+                            if is_quit_command(&run) {
+                                child.shutdown();
+                                return Ok(true);
+                            }
+                            handle_slash(app, child, &run)?;
+                        }
+                        MenuAction::Complete(prefix, replacement) => {
+                            apply_completion(app, &prefix, &replacement);
+                        }
+                        MenuAction::None => {
+                            // No rows (unknown command or free text): keep the
+                            // existing slash behavior.
+                            app.input.clear();
+                            if is_quit_command(&text) {
+                                child.shutdown();
+                                return Ok(true);
+                            }
+                            handle_slash(app, child, &text)?;
+                        }
+                    }
                 } else {
+                    let text = std::mem::take(&mut app.input);
                     child.send(serde_json::json!({"type": "user", "text": text}))?;
                     app.transcript.push(TranscriptLine::User(text));
                     app.waiting_from_stopped = false;
@@ -555,6 +612,7 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
         }
         KeyCode::Backspace => {
             app.input.pop();
+            app.menu_index = 0;
         }
         KeyCode::PageUp => {
             app.follow = false;
@@ -565,10 +623,22 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
         }
         KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.input.push(ch);
+            app.menu_index = 0;
         }
         _ => {}
     }
-    Ok(())
+    Ok(false)
+}
+
+fn is_quit_command(text: &str) -> bool {
+    matches!(text.trim(), "/quit" | "/exit")
+}
+
+fn apply_completion(app: &mut App, prefix: &str, replacement: &str) {
+    if let Some(rest) = app.input.strip_prefix(prefix) {
+        app.input = format!("{replacement}{rest}");
+    }
+    app.menu_index = 0;
 }
 
 fn handle_picker_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<()> {
@@ -640,8 +710,7 @@ fn handle_slash(app: &mut App, child: &mut ChildProcess, text: &str) -> Result<(
 
 /// Apply a slash command and return the protocol line to send, if any.
 ///
-/// `/model` only asks for the catalog. `/rm` without `--yes` waits for Enter
-/// and does not send a removal.
+/// `/model` only asks for the catalog.
 fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
     let mut parts = text.split_whitespace();
     let command = parts.next().unwrap_or("");
@@ -676,19 +745,6 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
             }
             None
         }
-        "/scope" => {
-            let scope = parts.next().unwrap_or("");
-            if scope == "project" || scope == "user" {
-                app.scope_root = scope.to_string();
-                app.transcript
-                    .push(TranscriptLine::Tool(format!("scope {scope}")));
-            } else {
-                app.transcript.push(TranscriptLine::Tool(
-                    "usage: /scope project | /scope user".to_string(),
-                ));
-            }
-            None
-        }
         "/sessions" => Some(serde_json::json!({
             "type": "list",
             "scope": app.scope_root,
@@ -699,37 +755,6 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
             "scope": app.scope_root,
             "kind": "artifacts"
         })),
-        "/rm" => {
-            let kind_word = parts.next().unwrap_or("");
-            let name = parts.next().unwrap_or("");
-            let flag = parts.next().unwrap_or("");
-            let kind = match kind_word {
-                "session" => "sessions",
-                "artifact" => "artifacts",
-                "key" => "keys",
-                "weight" | "weights" => "weights",
-                other => other,
-            };
-            if name.is_empty() || kind.is_empty() {
-                app.transcript.push(TranscriptLine::Tool(
-                    "usage: /rm session NAME [--yes]".to_string(),
-                ));
-                None
-            } else if flag == "--yes" {
-                Some(confirmed_remove_message(&app.scope_root, kind, name))
-            } else {
-                app.transcript.push(TranscriptLine::Tool(format!(
-                    "Remove {kind} {name} from {}? Enter confirms, Esc cancels.",
-                    app.scope_root
-                )));
-                app.mode = Mode::ConfirmRemove {
-                    scope: app.scope_root.clone(),
-                    kind: kind.to_string(),
-                    name: name.to_string(),
-                };
-                None
-            }
-        }
         _ => {
             app.transcript
                 .push(TranscriptLine::Tool(format!("unknown command {command}")));
@@ -751,20 +776,358 @@ fn picker_window(len: usize, index: usize, page: usize) -> std::ops::Range<usize
     start..(start + page)
 }
 
+const MENU_HEADER: &str = "↑↓ move  tab complete  enter run  esc close";
+
+#[derive(Clone, Copy)]
+struct MenuItem {
+    token: &'static str,
+    description: &'static str,
+}
+
+/// Command or fixed-argument options that match `text`, or an empty list when
+/// the menu should stay hidden (free text after a finished command).
+fn menu_options(text: &str) -> Vec<MenuItem> {
+    const COMMANDS: [MenuItem; 6] = [
+        MenuItem {
+            token: "/model",
+            description: "Choose a model",
+        },
+        MenuItem {
+            token: "/key",
+            description: "Set an OpenRouter key",
+        },
+        MenuItem {
+            token: "/sessions",
+            description: "List sessions",
+        },
+        MenuItem {
+            token: "/artifacts",
+            description: "List artifacts",
+        },
+        MenuItem {
+            token: "/quit",
+            description: "Quit Atlas",
+        },
+        MenuItem {
+            token: "/exit",
+            description: "Quit Atlas",
+        },
+    ];
+    const KEY_ARGS: [MenuItem; 2] = [
+        MenuItem {
+            token: "session",
+            description: "Key for this session",
+        },
+        MenuItem {
+            token: "user",
+            description: "Saved for this user",
+        },
+    ];
+
+    if !text.starts_with('/') {
+        return Vec::new();
+    }
+    let mut words = text.split_whitespace();
+    let command = words.next().unwrap_or("");
+    let rest: Vec<&str> = words.collect();
+
+    if !text.contains(char::is_whitespace) {
+        // One command token: filter commands whose name contains it.
+        let query = command.to_lowercase();
+        return COMMANDS
+            .into_iter()
+            .filter(|item| item.token.contains(&query))
+            .collect();
+    }
+    // Once a fixed set is exhausted and free text follows, show nothing.
+    if !rest.is_empty() && text.ends_with(char::is_whitespace) {
+        return Vec::new();
+    }
+
+    match command {
+        "/model" => Vec::new(),
+        "/sessions" | "/artifacts" => Vec::new(),
+        "/key" => {
+            if rest.len() > 1 {
+                Vec::new()
+            } else {
+                filter_args(&KEY_ARGS, rest.first().copied().unwrap_or(""))
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn filter_args(options: &[MenuItem], query: &str) -> Vec<MenuItem> {
+    let query = query.to_lowercase();
+    options
+        .iter()
+        .filter(|item| item.token.contains(&query))
+        .copied()
+        .collect()
+}
+
+/// Text the active token occupies, replaced wholesale on completion.
+fn menu_prefix(text: &str) -> Option<String> {
+    if !text.starts_with('/') {
+        return None;
+    }
+    if !text.contains(char::is_whitespace) {
+        return Some(text.to_string());
+    }
+    let (head, tail) = text.rsplit_once(' ')?;
+    if tail.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(format!("{head} {tail}"))
+}
+
+/// The line to write when the highlighted `option` is accepted, or `None`.
+fn menu_completion(text: &str, option: &str) -> Option<String> {
+    if !text.starts_with('/') {
+        return None;
+    }
+    if option.starts_with('/') {
+        // Command options only apply while one command token is being typed.
+        if text.contains(char::is_whitespace) {
+            return None;
+        }
+        return Some(option.to_string());
+    }
+    let (head, _tail) = text.rsplit_once(' ')?;
+    Some(format!("{head} {option}"))
+}
+
+/// What Enter or Tab should do while the slash menu is visible.
+#[derive(Debug, PartialEq, Eq)]
+enum MenuAction {
+    /// Run `text` through `slash_outcome`.
+    Run(String),
+    /// Replace `prefix` with `replacement`, then leave the menu open.
+    Complete(String, String),
+    /// Do nothing: no completion is possible.
+    None,
+}
+
+/// Decide Enter (`run`) or Tab for the highlighted menu row.
+fn menu_action(text: &str, index: usize, run: bool) -> MenuAction {
+    let options = menu_options(text);
+    if options.is_empty() {
+        return MenuAction::None;
+    }
+    if is_finished_command(text) {
+        return if run {
+            MenuAction::Run(text.to_string())
+        } else {
+            MenuAction::None
+        };
+    }
+
+    let option = options[index.min(options.len() - 1)].token;
+    let Some(prefix) = menu_prefix(text) else {
+        return MenuAction::None;
+    };
+    let Some(replacement) = menu_completion(text, option) else {
+        return MenuAction::None;
+    };
+    let finished = is_finished_command(&replacement);
+
+    // Enter accepts the highlighted row once it is a command slash_outcome can run.
+    if run && finished {
+        return MenuAction::Run(replacement);
+    }
+    // Otherwise complete the token, leaving a space when more is expected.
+    let replacement = if finished {
+        replacement
+    } else {
+        format!("{replacement} ")
+    };
+    if replacement == text {
+        return MenuAction::None;
+    }
+    MenuAction::Complete(prefix, replacement)
+}
+
+/// Commands `slash_outcome` accepts without showing a usage error.
+fn is_finished_command(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    if trimmed == "/sessions" || trimmed == "/artifacts" || trimmed == "/quit" || trimmed == "/exit"
+    {
+        return true;
+    }
+    let mut words = trimmed.split_whitespace();
+    let command = words.next().unwrap_or("");
+    match command {
+        "/model" => text.starts_with("/model"),
+        "/key" => matches!(words.next(), Some("session") | Some("user")),
+        _ => false,
+    }
+}
+
+fn menu_rows(app: &App) -> u16 {
+    if app.mode != Mode::Compose {
+        return 0;
+    }
+    let options = menu_options(&app.input);
+    if options.is_empty() {
+        return 0;
+    }
+    let count = options.len().clamp(1, PICKER_PAGE) as u16;
+    count.saturating_add(1)
+}
+
+fn render_menu(frame: &mut Frame, app: &App, area: Rect) {
+    let options = menu_options(&app.input);
+    let mut lines = vec![Line::from(Span::styled(
+        MENU_HEADER,
+        Style::default().fg(GRAY).bg(BG_BASE),
+    ))];
+    let window = picker_window(options.len(), app.menu_index, PICKER_PAGE);
+    for (index, option) in options
+        .iter()
+        .enumerate()
+        .skip(window.start)
+        .take(window.len())
+    {
+        let selected = index == app.menu_index;
+        let mark = if selected { ">" } else { " " };
+        let style = if selected {
+            Style::default().fg(FG).bg(BG_LIGHT)
+        } else {
+            Style::default().fg(FG_SECONDARY).bg(BG_BASE)
+        };
+        let content = menu_row_text(mark, option, area.width as usize);
+        lines.push(Line::from(Span::styled(content, style)));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// One menu row: mark, option on the left, description toward the right.
+fn menu_row_text(mark: &str, option: &MenuItem, width: usize) -> String {
+    let left = format!("{mark} {}", option.token);
+    let description = option.description;
+    let gap = width.saturating_sub(left.chars().count() + description.chars().count());
+    let text = if gap >= 2 {
+        format!("{left}{}{description}", " ".repeat(gap))
+    } else {
+        format!("{left}  {description}")
+    };
+    text.chars().take(width).collect()
+}
+
 fn picker_selection(app: &App) -> Option<serde_json::Value> {
     app.filtered_models()
         .get(app.picker_index)
         .map(|model| serde_json::json!({"type": "select_model", "id": model.id}))
 }
 
-fn confirmed_remove_message(scope: &str, kind: &str, name: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "remove",
-        "scope": scope,
-        "kind": kind,
-        "name": name,
-        "confirm": true
-    })
+/// Convert a per-token USD decimal string to USD per 1M tokens.
+///
+/// The decimal point moves six places by shifting digit characters, so values
+/// like `0.0000000198` stay exact; multiplying the parsed `f64` would round it.
+/// Returns `None` for empty, negative, or non-decimal text.
+fn price_per_million(token_price: &str) -> Option<String> {
+    let text = token_price.trim();
+    let text = text.strip_prefix('+').unwrap_or(text);
+    let (int_part, frac_part) = match text.split_once('.') {
+        Some((int_part, frac_part)) => (int_part, frac_part),
+        None => (text, ""),
+    };
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part.bytes().all(|byte| byte.is_ascii_digit())
+        || !frac_part.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    // Six fractional digits move across the decimal point; shorter fractions
+    // pad with zeros, longer ones stay fractional.
+    let mut frac = frac_part.to_string();
+    while frac.len() < 6 {
+        frac.push('0');
+    }
+    let integer = format!("{int_part}{}", &frac[..6]);
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    let fraction = frac[6..].trim_end_matches('0');
+    let result = if fraction.is_empty() {
+        integer.to_string()
+    } else {
+        format!("{integer}.{fraction}")
+    };
+    Some(result)
+}
+
+/// Token count in K, M, or B, rounded to three significant figures.
+///
+/// `1_048_576` is `1.05M`, `128_000` is `128K`, `1_500_000_000` is `1.50B`,
+/// and values under 1,000 stay plain integers.
+fn format_context(tokens: i64) -> String {
+    if tokens <= 0 {
+        return "0".to_string();
+    }
+    let rounded = round_sig3(tokens as u64);
+    if rounded >= 1_000_000_000 {
+        format!("{}B", format_sig_coeff(rounded, 1_000_000_000))
+    } else if rounded >= 1_000_000 {
+        format!("{}M", format_sig_coeff(rounded, 1_000_000))
+    } else if rounded >= 1_000 {
+        format!("{}K", format_sig_coeff(rounded, 1_000))
+    } else {
+        rounded.to_string()
+    }
+}
+
+/// `rounded` is already on a three-significant-figure boundary, so the
+/// remainder against `unit` (1_000 or 1_000_000) is the fractional digits.
+fn format_sig_coeff(rounded: u64, unit: u64) -> String {
+    let whole = rounded / unit;
+    let frac = rounded % unit;
+    if whole >= 100 {
+        whole.to_string()
+    } else if whole >= 10 {
+        let digit = frac / (unit / 10);
+        format!("{whole}.{digit}")
+    } else {
+        let digits = frac / (unit / 100);
+        format!("{whole}.{digits:02}")
+    }
+}
+
+fn round_sig3(n: u64) -> u64 {
+    let digits = decimal_digits(n);
+    if digits <= 3 {
+        return n;
+    }
+    let shift = digits - 3;
+    let factor = 10u64.pow(shift);
+    let head = n / factor;
+    let rem = n % factor;
+    let mut rounded = head + u64::from(rem >= factor / 2);
+    let mut result_shift = shift;
+    if rounded >= 1_000 {
+        rounded /= 10;
+        result_shift += 1;
+    }
+    rounded * 10u64.pow(result_shift)
+}
+
+fn decimal_digits(n: u64) -> u32 {
+    let mut digits = 1;
+    let mut value = n;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// `input $2/M` or `input n/a` for one price side.
+fn price_field(label: &str, price: Option<&str>) -> String {
+    match price.and_then(price_per_million) {
+        Some(amount) => format!("{label} ${amount}/M"),
+        None => format!("{label} n/a"),
+    }
 }
 
 fn wait_for_any_key() {
@@ -821,6 +1184,7 @@ fn picker_rows(app: &App) -> u16 {
             let count = app.filtered_models().len().clamp(1, PICKER_PAGE) as u16;
             count.saturating_add(1)
         }
+        Mode::Compose => menu_rows(app),
         _ => 0,
     }
 }
@@ -932,6 +1296,10 @@ fn paint_row(frame: &mut Frame, area: Rect, row: &PaintedRow) {
 }
 
 fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
+    if app.mode == Mode::Compose && !menu_options(&app.input).is_empty() {
+        render_menu(frame, app, area);
+        return;
+    }
     let mut lines = Vec::new();
     if app.mode == Mode::ModelWait {
         lines.push(Line::from(Span::styled(
@@ -964,10 +1332,10 @@ fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
         {
             let context = model
                 .context_length
-                .map(|value| value.to_string())
+                .map(format_context)
                 .unwrap_or_else(|| "unknown".to_string());
-            let prompt = model.prompt_price.as_deref().unwrap_or("n/a");
-            let completion = model.completion_price.as_deref().unwrap_or("n/a");
+            let input = price_field("input", model.prompt_price.as_deref());
+            let output = price_field("output", model.completion_price.as_deref());
             let mark = if index == app.picker_index { ">" } else { " " };
             let style = if index == app.picker_index {
                 Style::default().fg(FG).bg(BG_LIGHT)
@@ -975,10 +1343,7 @@ fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(FG_SECONDARY).bg(BG_BASE)
             };
             lines.push(Line::from(Span::styled(
-                format!(
-                    "{mark} {}  ctx {context}  ${prompt} / ${completion}",
-                    model.id
-                ),
+                format!("{mark} {}  ctx {context}  {input}  {output}", model.id),
                 style,
             )));
         }
@@ -1029,7 +1394,7 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let (label, color) = status_label(app);
     let hint = if app.session_open {
-        "enter send  /model /key /rm  ctrl-r resume  ctrl-c quit"
+        "enter send  /model /key /quit  ctrl-r resume  ctrl-c quit"
     } else {
         "ctrl-c quit"
     };
@@ -1156,8 +1521,8 @@ fn note_session_closed(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirmed_remove_message, draw, picker_selection, slash_outcome, wrap_text, App, Mode,
-        TranscriptLine,
+        draw, format_context, menu_action, menu_options, picker_selection, price_per_million,
+        slash_outcome, wrap_text, App, MenuAction, Mode, TranscriptLine,
     };
     use crate::protocol::{CatalogEntry, ServerMessage, StatusSnapshot};
 
@@ -1186,6 +1551,7 @@ mod tests {
             ok: false,
             message: "OpenRouter HTTP 500: down".to_string(),
             models: Vec::new(),
+            status: crate::protocol::StatusSnapshot::default(),
         });
 
         assert_eq!(app.model_id, "keep-me");
@@ -1257,29 +1623,201 @@ mod tests {
     }
 
     #[test]
-    fn remove_waits_for_confirmation_and_stays_in_scope() {
+    fn context_uses_k_and_m_at_three_sigfigs() {
+        assert_eq!(format_context(1_048_576), "1.05M");
+        assert_eq!(format_context(1_000_000), "1.00M");
+        assert_eq!(format_context(999_500), "1.00M");
+        assert_eq!(format_context(128_000), "128K");
+        assert_eq!(format_context(200_000), "200K");
+        assert_eq!(format_context(32_768), "32.8K");
+        assert_eq!(format_context(10_000), "10.0K");
+        assert_eq!(format_context(8_192), "8.19K");
+        assert_eq!(format_context(4_096), "4.10K");
+        assert_eq!(format_context(1_500_000_000), "1.50B");
+        assert_eq!(format_context(12_300_000_000), "12.3B");
+        assert_eq!(format_context(512), "512");
+        assert_eq!(format_context(0), "0");
+    }
+
+    #[test]
+    fn price_per_million_shifts_the_decimal_point() {
+        assert_eq!(price_per_million("0.000002").as_deref(), Some("2"));
+        assert_eq!(price_per_million("0.00001").as_deref(), Some("10"));
+        assert_eq!(price_per_million("0.0000000198").as_deref(), Some("0.0198"));
+        assert_eq!(price_per_million("0.000000396").as_deref(), Some("0.396"));
+        assert_eq!(price_per_million("0.00000015").as_deref(), Some("0.15"));
+        assert_eq!(price_per_million("0.0000025").as_deref(), Some("2.5"));
+        assert_eq!(price_per_million("2.").as_deref(), Some("2000000"));
+        assert_eq!(price_per_million(".5").as_deref(), Some("500000"));
+        assert_eq!(price_per_million("+0.000002").as_deref(), Some("2"));
+        assert_eq!(price_per_million("0").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn price_per_million_rejects_non_decimals() {
+        for text in ["", "-1", "abc", "1e9", "n/a"] {
+            assert_eq!(price_per_million(text), None, "accepted {text:?}");
+        }
+    }
+
+    #[test]
+    fn picker_paints_prices_per_million() {
         let mut app = App::new();
-        app.scope_root = "project".to_string();
+        app.mode = Mode::ModelPicker;
+        app.picker_models = vec![CatalogEntry {
+            id: "vendor/model".to_string(),
+            context_length: Some(1_000_000),
+            prompt_price: Some("0.000002".to_string()),
+            completion_price: Some("0.00001".to_string()),
+        }];
+        let painted = screen(&mut app, 80, 24);
+        assert!(painted.contains("ctx 1.00M"), "{painted}");
+        assert!(painted.contains("input $2/M"), "{painted}");
+        assert!(painted.contains("output $10/M"), "{painted}");
+    }
+
+    #[test]
+    fn picker_paints_fractional_prices() {
+        let mut app = App::new();
+        app.mode = Mode::ModelPicker;
+        app.picker_models = vec![CatalogEntry {
+            id: "vendor/model".to_string(),
+            context_length: Some(1_000_000),
+            prompt_price: Some("0.0000000198".to_string()),
+            completion_price: Some("0.000000396".to_string()),
+        }];
+        let painted = screen(&mut app, 80, 24);
+        assert!(painted.contains("input $0.0198/M"), "{painted}");
+        assert!(painted.contains("output $0.396/M"), "{painted}");
+    }
+
+    #[test]
+    fn picker_paints_missing_prices_without_a_dollar_sign() {
+        let mut app = App::new();
+        app.mode = Mode::ModelPicker;
+        app.picker_models = vec![CatalogEntry {
+            id: "vendor/model".to_string(),
+            context_length: None,
+            prompt_price: None,
+            completion_price: None,
+        }];
+        let painted = screen(&mut app, 80, 24);
+        assert!(painted.contains("input n/a"), "{painted}");
+        assert!(painted.contains("output n/a"), "{painted}");
+        assert!(!painted.contains("input $"), "{painted}");
+        assert!(!painted.contains("output $"), "{painted}");
+    }
+
+    #[test]
+    fn removed_commands_fall_through_to_unknown() {
+        let mut app = App::new();
         assert!(slash_outcome(&mut app, "/rm session s1").is_none());
+        assert!(slash_outcome(&mut app, "/scope user").is_none());
+        assert_eq!(app.mode, Mode::Compose);
+        let text = tool_text(&app);
+        assert!(text.contains("unknown command /rm"));
+        assert!(text.contains("unknown command /scope"));
+    }
+
+    #[test]
+    fn slash_menu_lists_every_command() {
+        let mut app = App::new();
+        app.input = "/".to_string();
+        let painted = screen(&mut app, 80, 24);
+        for name in [
+            "/model",
+            "/key",
+            "/sessions",
+            "/artifacts",
+            "/quit",
+            "/exit",
+        ] {
+            assert!(painted.contains(name), "missing {name} in:\n{painted}");
+        }
+        assert!(!painted.contains("/rm"), "{painted}");
+        assert!(!painted.contains("/scope"), "{painted}");
+        assert!(painted.contains("↑↓ move  tab complete  enter run  esc close"));
+    }
+
+    #[test]
+    fn slash_menu_filters_to_the_matching_command() {
+        let mut app = App::new();
+        app.input = "/se".to_string();
+        let painted = screen(&mut app, 80, 24);
+        assert!(painted.contains("/sessions"), "{painted}");
+        assert!(!painted.contains("/artifacts"), "{painted}");
+    }
+
+    #[test]
+    fn slash_menu_marks_the_highlighted_row() {
+        let mut app = App::new();
+        app.input = "/se".to_string();
+        let painted = screen(&mut app, 80, 24);
+        let highlighted: Vec<&str> = painted.lines().filter(|line| line.contains('>')).collect();
+        assert!(
+            highlighted.iter().any(|line| line.contains("/sessions")),
+            "highlighted rows {highlighted:?}:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn slash_menu_shows_key_arguments() {
+        let mut app = App::new();
+        app.input = "/key ".to_string();
+        let painted = screen(&mut app, 80, 24);
+        assert!(painted.contains("session"), "{painted}");
+        assert!(painted.contains("user"), "{painted}");
+    }
+
+    #[test]
+    fn partial_model_completes_before_running() {
+        // Tab fills `/model`. Enter runs it, since the command needs nothing else.
         assert_eq!(
-            app.mode,
-            Mode::ConfirmRemove {
-                scope: "project".to_string(),
-                kind: "sessions".to_string(),
-                name: "s1".to_string(),
-            }
+            menu_action("/mo", 0, false),
+            MenuAction::Complete("/mo".to_string(), "/model".to_string())
+        );
+        assert_eq!(
+            menu_action("/mo", 0, true),
+            MenuAction::Run("/model".to_string())
+        );
+        assert_eq!(
+            menu_action("/", 0, true),
+            MenuAction::Run("/model".to_string())
+        );
+        assert_eq!(
+            menu_action("/key", 0, true),
+            MenuAction::Complete("/key".to_string(), "/key ".to_string())
         );
 
-        let payload = confirmed_remove_message("project", "sessions", "s1");
-        assert_eq!(payload["type"], "remove");
-        assert_eq!(payload["scope"], "project");
-        assert_eq!(payload["kind"], "sessions");
-        assert_eq!(payload["name"], "s1");
-        assert_eq!(payload["confirm"], true);
+        // A finished command runs unchanged.
+        assert_eq!(
+            menu_action("/model", 0, true),
+            MenuAction::Run("/model".to_string())
+        );
+    }
 
-        let mut flagged = App::new();
-        let sent = slash_outcome(&mut flagged, "/rm session s1 --yes").expect("flagged remove");
-        assert_eq!(sent, payload);
+    #[test]
+    fn choosing_a_final_argument_runs_it() {
+        assert_eq!(
+            menu_action("/key s", 0, true),
+            MenuAction::Run("/key session".to_string())
+        );
+        // Tab still completes rather than running, and leaves a space so the
+        // argument rows appear.
+        assert_eq!(
+            menu_action("/key", 0, false),
+            MenuAction::Complete("/key".to_string(), "/key ".to_string())
+        );
+    }
+
+    #[test]
+    fn free_text_hides_the_menu() {
+        assert!(menu_options("/model gemini").is_empty());
+        assert!(menu_options("/key session x").is_empty());
+        assert!(menu_options("/nope").is_empty());
+        assert!(menu_options("/sessions extra").is_empty());
+        // A single exact command still shows itself.
+        assert_eq!(menu_options("/sessions").len(), 1);
     }
 
     fn screen(app: &mut App, width: u16, height: u16) -> String {
@@ -1302,24 +1840,21 @@ mod tests {
     fn status_on_an_80_column_terminal_keeps_the_metrics() {
         let mut app = App::new();
         app.model_id = "example/model".to_string();
-        app.status_line = "model example/model  context 12/128000  tokens 16 (prompt 12 completion 4)  spend $0.02  8.0 tok/s  http 200  latency 0.50s  ttft 0.10s  recent 200 0.50s".to_string();
+        app.status_line = "model example/model  context 12/128000  tokens 16 (prompt 12 completion 4)  spend $0.02  8.0 tok/s".to_string();
 
         let painted = screen(&mut app, 80, 24);
         let flat = painted.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        for field in [
-            "spend $0.02",
-            "8.0 tok/s",
-            "http 200",
-            "latency 0.50s",
-            "ttft 0.10s",
-            "recent 200 0.50s",
-        ] {
+        for field in ["spend $0.02", "8.0 tok/s"] {
             assert!(
                 flat.contains(field),
                 "missing {field} in status rect:\n{painted}"
             );
         }
+        assert!(!flat.contains("http"));
+        assert!(!flat.contains("latency"));
+        assert!(!flat.contains("ttft"));
+        assert!(!flat.contains("recent"));
     }
 
     #[test]

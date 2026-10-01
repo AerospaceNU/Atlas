@@ -6,12 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from atlas.agent.metrics import SessionTotals, format_tui_status
+from atlas.agent.contracts import CallTiming, ModelCall, TokenUsage
+from atlas.agent.metrics import SessionTotals, apply_call, format_token_count, format_tui_status
 from atlas.cli import main
 from atlas.cli.tui import TuiLaunchError, ensure_tui_binary, launch_tui
 
 
-def test_status_line_shows_context_tokens_spend_and_http() -> None:
+def test_status_line_shows_context_tokens_spend_and_speed() -> None:
     text = format_tui_status(
         SessionTotals(
             model="example/model",
@@ -29,16 +30,16 @@ def test_status_line_shows_context_tokens_spend_and_http() -> None:
         )
     )
 
-    assert "context 12/128000" in text
-    assert "prompt 12" in text
-    assert "completion 4" in text
+    assert "context 12/128K" in text
     assert "tokens 16" in text
+    assert "prompt" not in text
+    assert "completion" not in text
     assert "spend $0.02" in text
     assert "8.0 tok/s" in text
-    assert "http 200" in text
-    assert "latency 0.50s" in text
-    assert "ttft 0.10s" in text
-    assert "recent 200 0.50s" in text
+    assert "http" not in text
+    assert "latency" not in text
+    assert "ttft" not in text
+    assert "recent" not in text
 
 
 def test_status_line_does_not_invent_a_context_window() -> None:
@@ -48,9 +49,49 @@ def test_status_line_does_not_invent_a_context_window() -> None:
     assert "128000" not in text
     assert "spend n/a" in text
     assert "tok/s" in text
-    assert "http —" in text
-    assert "latency n/a" in text
-    assert "ttft n/a" in text
+    assert "http" not in text
+    assert "latency" not in text
+    assert "ttft" not in text
+    assert "recent" not in text
+
+
+def test_output_speed_stays_when_a_later_call_writes_no_tokens() -> None:
+    totals = SessionTotals(tokens_per_second=8.0)
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(),
+            timing=CallTiming(http_status=200, elapsed_seconds=4.0),
+        ),
+    )
+
+    assert totals.tokens_per_second == 8.0
+    assert "8.0 tok/s" in format_tui_status(totals)
+
+
+def test_token_counts_use_three_sigfigs_in_k_m_and_b() -> None:
+    assert format_token_count(355) == "355"
+    assert format_token_count(380) == "380"
+    assert format_token_count(128_000) == "128K"
+    assert format_token_count(1_048_576) == "1.05M"
+    assert format_token_count(1_500_000_000) == "1.50B"
+    assert format_token_count(12_300_000_000) == "12.3B"
+    text = format_tui_status(
+        SessionTotals(
+            model="google/gemini-3.8-flash",
+            prompt_tokens=355,
+            completion_tokens=25,
+            total_tokens=380,
+            context_used=355,
+            context_limit=1_048_576,
+            cost=0.00036,
+            tokens_per_second=15.2,
+        )
+    )
+    assert "context 355/1.05M" in text
+    assert "tokens 380" in text
+    assert "prompt" not in text
+    assert "completion" not in text
 
 
 def test_bare_atlas_opens_the_tui(monkeypatch: pytest.MonkeyPatch) -> None:

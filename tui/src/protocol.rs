@@ -36,6 +36,7 @@ pub enum ServerMessage {
         ok: bool,
         message: String,
         models: Vec<CatalogEntry>,
+        status: StatusSnapshot,
     },
     ModelSelected {
         id: String,
@@ -166,6 +167,8 @@ enum RawMessage {
         message: String,
         #[serde(default)]
         models: Vec<CatalogEntry>,
+        #[serde(flatten)]
+        status: StatusSnapshot,
     },
     #[serde(rename = "model")]
     Model {
@@ -273,10 +276,12 @@ impl From<RawMessage> for ServerMessage {
                 ok,
                 message,
                 models,
+                status,
             } => ServerMessage::Models {
                 ok,
                 message,
                 models,
+                status,
             },
             RawMessage::Model {
                 id,
@@ -303,7 +308,7 @@ impl From<RawMessage> for ServerMessage {
 /// The words match `format_tui_status` for an empty session so the first
 /// frame is never a blank status row.
 pub fn default_status_line() -> String {
-    "model unset  context 0/unknown  tokens 0 (prompt 0 completion 0)  spend n/a  n/a tok/s  http —  latency n/a  ttft n/a  recent none".to_string()
+    "model unset  context 0/unknown  tokens 0  spend n/a  n/a tok/s".to_string()
 }
 
 pub fn status_text(status: &StatusSnapshot) -> String {
@@ -393,12 +398,15 @@ mod tests {
     fn default_status_is_not_blank() {
         let text = default_status_line();
         assert!(text.contains("context 0/unknown"));
-        assert!(text.contains("prompt 0"));
-        assert!(text.contains("completion 0"));
+        assert!(text.contains("tokens 0"));
+        assert!(!text.contains("prompt"));
+        assert!(!text.contains("completion"));
         assert!(text.contains("spend n/a"));
         assert!(text.contains("tok/s"));
-        assert!(text.contains("http —"));
-        assert!(text.contains("latency n/a"));
+        assert!(!text.contains("http"));
+        assert!(!text.contains("latency"));
+        assert!(!text.contains("ttft"));
+        assert!(!text.contains("recent"));
     }
 
     #[test]
@@ -439,6 +447,7 @@ mod tests {
                 ok,
                 message,
                 models,
+                ..
             }) => {
                 assert!(!ok);
                 assert!(message.contains("500"));

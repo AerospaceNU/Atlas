@@ -580,8 +580,10 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     assert done[0]["elapsed_seconds"] == 0.5
     assert done[0]["time_to_first_token_seconds"] == 0.1
     assert done[0]["recent"] == ["200 0.50s"]
-    assert "ttft 0.10s" in done[0]["status_line"]
-    assert "recent 200 0.50s" in done[0]["status_line"]
+    assert "http" not in done[0]["status_line"]
+    assert "latency" not in done[0]["status_line"]
+    assert "ttft" not in done[0]["status_line"]
+    assert "recent" not in done[0]["status_line"]
     assert done[0]["context_used"] == 10
     assert done[0]["context_limit"] is None
     assert "context 10/unknown" in done[0]["status_line"]
@@ -592,14 +594,15 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     assert done[1]["context_used"] == 20
     assert done[1]["tokens_per_second"] == 12.0
     line = done[1]["status_line"]
-    assert "prompt 30" in line
-    assert "completion 8" in line
+    assert "tokens 38" in line
+    assert "prompt" not in line
+    assert "completion" not in line
     assert "12.0 tok/s" in line
-    assert "http 200" in line
-    assert "latency 0.50s" in line
+    assert "http" not in line
+    assert "latency" not in line
     assert done[1]["recent"] == ["200 0.50s", "200 0.50s"]
-    assert "recent 200 0.50s, 200 0.50s" in line
-    assert "ttft 0.10s" in line
+    assert "ttft" not in line
+    assert "recent" not in line
     assert "test-key" not in json.dumps(events)
 
 
@@ -618,8 +621,8 @@ def test_http_error_keeps_status_and_short_body(tmp_path: Path) -> None:
     assert events[1]["http_status"] == 429
     assert events[1]["elapsed_seconds"] == 0.25
     assert events[1]["error_body"] == "slow down"
-    assert "http 429" in events[1]["status_line"]
-    assert "latency 0.25s" in events[1]["status_line"]
+    assert "http" not in events[1]["status_line"]
+    assert "latency" not in events[1]["status_line"]
     dumped = json.dumps(events)
     assert "Traceback" not in dumped
     assert "test-key" not in dumped
@@ -680,6 +683,29 @@ def test_select_model_updates_context_limit_and_rejects_unknown(tmp_path: Path) 
     assert selected[1]["type"] == "model"
     assert selected[1]["context_length"] == 222
     assert "context 10/222" in selected[1]["status_line"]
+
+
+def test_catalog_fills_the_active_model_context_on_the_dashboard(tmp_path: Path) -> None:
+    session = _session(ScriptedModel([]), tmp_path=tmp_path)
+    session.model_id = "google/gemini-3.8-flash"
+    session.totals.model = "google/gemini-3.8-flash"
+    session.totals.context_used = 355
+    session.totals.prompt_tokens = 355
+    session.totals.completion_tokens = 25
+    session.totals.total_tokens = 380
+    session.fetch_models = lambda: [
+        CatalogModel(id="google/gemini-3.8-flash", context_length=1_048_576),
+        CatalogModel(id="other/model", context_length=8_192),
+    ]
+
+    events = _run_protocol(['{"type":"models"}'], session)
+
+    assert session.totals.context_limit == 1_048_576
+    line = events[1]["status_line"]
+    assert "context 355/1.05M" in line
+    assert "tokens 380" in line
+    assert "prompt" not in line
+    assert "completion" not in line
 
 
 def test_session_key_overrides_the_user_key_and_is_not_stored_in_the_project(
@@ -949,7 +975,8 @@ def test_omitted_provider_cost_stays_unset(tmp_path: Path) -> None:
     assert done["time_to_first_token_seconds"] == 0.05
     assert done["recent"] == ["200 0.25s"]
     assert "spend n/a" in done["status_line"]
-    assert "ttft 0.05s" in done["status_line"]
+    assert "ttft" not in done["status_line"]
+    assert "recent" not in done["status_line"]
     assert "test-key" not in json.dumps(events)
 
 

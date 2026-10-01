@@ -272,16 +272,15 @@ def _handle_models(session: AgentSession, stdout: IO[str]) -> None:
         )
         return
     session.catalog = catalog
-    _write_line(
-        stdout,
-        {
-            "type": "models",
-            "ok": True,
-            "message": "",
-            "models": [model.model_dump() for model in catalog],
-        },
-        session.secrets,
-    )
+    _apply_known_context_limit(session)
+    payload: dict[str, Any] = {
+        "type": "models",
+        "ok": True,
+        "message": "",
+        "models": [model.model_dump() for model in catalog],
+    }
+    payload.update(_status_fields(session))
+    _write_line(stdout, payload, session.secrets)
 
 
 def _handle_select_model(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
@@ -445,7 +444,22 @@ def _key_set(session: AgentSession) -> bool:
     return bool(session.active_key and session.active_key.strip())
 
 
+def _apply_known_context_limit(session: AgentSession) -> None:
+    """Copy the active model's catalog window onto the dashboard totals.
+
+    The limit stays unset when the catalog has not been loaded or has no row
+    for the model. A known window replaces ``unknown`` on the next status line.
+    """
+    model_id = session.totals.model or session.model_id
+    if not model_id:
+        return
+    chosen = next((item for item in session.catalog if item.id == model_id), None)
+    if chosen is not None and chosen.context_length is not None:
+        session.totals.context_limit = chosen.context_length
+
+
 def _status_fields(session: AgentSession) -> dict[str, Any]:
+    _apply_known_context_limit(session)
     totals = session.totals
     return {
         "status_line": format_tui_status(totals),
