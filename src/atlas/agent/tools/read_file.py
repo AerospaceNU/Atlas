@@ -4,7 +4,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
-from atlas.agent.artifacts import LocalArtifactStore
+from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
 from atlas.agent.contracts import Tool, ToolResult
 
 
@@ -39,7 +39,7 @@ class ReadFileTool(Tool):
         if not path.is_file():
             raise FileNotFoundError(f"File does not exist: {request.path}")
         if path.stat().st_size > self.max_bytes:
-            raise ValueError(f"File {request.path} exceeds the {self.max_bytes} byte read limit")
+            raise SandboxDenied(f"File {request.path} exceeds the {self.max_bytes} byte read limit")
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:

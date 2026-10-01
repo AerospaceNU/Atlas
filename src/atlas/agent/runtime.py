@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from atlas.agent.artifacts import LocalArtifactStore
+from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied, record_denial
 from atlas.agent.contracts import (
     ChatMessage,
     ModelCall,
@@ -246,7 +246,10 @@ class Agent:
         try:
             result = self.tools.execute(call.name, call.arguments, self.artifacts)
         except Exception as exc:
-            return AgentStep(call=call, error=f"{type(exc).__name__}: {exc}", error_kind=_kind(exc))
+            error = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, SandboxDenied):
+                record_denial(self.artifacts.root, call.name, error)
+            return AgentStep(call=call, error=error, error_kind=_kind(exc))
         return AgentStep(call=call, result=result)
 
 
