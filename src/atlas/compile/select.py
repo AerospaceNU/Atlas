@@ -98,6 +98,7 @@ def select(
     min_cloud: float | None = None,
     max_cloud: float | None = None,
     limit: int | None = None,
+    limit_mode: LimitMode | None = None,
 ) -> list[Scene]:
     """Filter by cloud range, dedup, order clearest-first, and optionally cap count.
 
@@ -105,8 +106,11 @@ def select(
     cloud-seeking request returns the least cloudy scenes that still clear the
     floor. Pass a larger ``limit`` if you want the cloudiest end.
     """
-    chosen = sort_clearest(dedup(filter_cloud(scenes, max_cloud, min_cloud=min_cloud)))
-    return chosen[:limit] if limit is not None else chosen
+    
+    chosen = dedup(filter_cloud(scenes, max_cloud, min_cloud=min_cloud))
+    if limit is None:
+            return sort_clearest(chosen)
+    return pick_my_mode(sort_by_datetime(chosen), limit, limit_mode)
 
 
 def representative_cloud(scenes: list[Scene]) -> float | None:
