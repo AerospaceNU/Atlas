@@ -148,10 +148,11 @@ def item_to_scene(
             if asset is not None:
                 assets[str(name)] = asset
         # `eo:bands` lives only on the raw specs, so resolve before the loop
-        # above drops it. Rejected assets cannot keep an alias: Scene rejects one.
-        band_aliases = {
-            alias: key for alias, key in resolve_bands(raw_assets).items() if key in assets
-        }
+        # above drops it -- but only over assets the loop kept, or a rejected
+        # one could win the match and shadow a usable band.
+        band_aliases = resolve_bands(
+            {name: spec for name, spec in raw_assets.items() if str(name) in assets}
+        )
 
     instruments = props.get("instruments")
     instrument: str | None = None

@@ -268,6 +268,26 @@ def test_item_to_scene_drops_aliases_for_rejected_assets() -> None:
     assert scene.band_aliases == {"nir": "B8A"}
 
 
+def test_item_to_scene_rejected_asset_does_not_shadow_a_kept_band() -> None:
+    # The rejected href sits closer to the red target, but it is not a usable
+    # asset; the kept band is still inside the tolerance and must win.
+    feature = {
+        "id": "item-1",
+        "bbox": [-71.2, 42.2, -70.9, 42.5],
+        "properties": {"datetime": "2024-07-01T15:00:00Z"},
+        "assets": {
+            "bad": {"href": "./relative.tif", "eo:bands": [{"center_wavelength": 0.665}]},
+            "B04": {
+                "href": "https://example.com/B04.tif",
+                "eo:bands": [{"center_wavelength": 0.650}],
+            },
+        },
+    }
+    scene = item_to_scene(feature, collection="hls2-l30")
+    assert scene is not None
+    assert scene.band_aliases == {"red": "B04"}
+
+
 def test_item_to_scene_without_band_metadata_has_no_aliases() -> None:
     feature = {
         "id": "item-1",
