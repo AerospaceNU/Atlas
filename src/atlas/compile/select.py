@@ -54,7 +54,9 @@ def dedup(scenes: list[Scene]) -> list[Scene]:
     return out
 
 
-def pick_my_mode(scene, limit, limit_mode):
+def pick_my_mode(
+    scene: list[Scene], limit: int | None, limit_mode: LimitMode | None
+) -> list[Scene]:
     if limit is None:
         return scene
     if len(scene) <= limit:
