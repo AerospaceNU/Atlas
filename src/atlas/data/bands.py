@@ -94,8 +94,12 @@ def _match_by_wavelength(candidates: list[Candidate], spec: BandSpec) -> str | N
 
 
 def _match_by_name(candidates: list[Candidate], spec: BandSpec) -> str | None:
-    """Return the candidate whose common name is accepted by `spec`."""
-    matches = [c.key for c in candidates if c.name is not None and c.name in spec.names]
+    """Return the candidate with no wavelength whose common name `spec` accepts."""
+    matches = [
+        c.key
+        for c in candidates
+        if c.wavelength is None and c.name is not None and c.name in spec.names
+    ]
     return min(matches) if matches else None
 
 

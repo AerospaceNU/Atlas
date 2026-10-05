@@ -75,8 +75,8 @@ def pick_asset(scene: Scene, name: str | None = None) -> tuple[str, Asset] | Non
     """Choose one native-resolution asset. Never returns a preview or thumbnail.
 
     Prefers ``visual`` (full-res RGB COG) when it is not browse, then any ``data``
-    role, then the first remaining non-browse asset. ``name`` pins a key, or a
-    band alias such as ``red``.
+    role, then the first remaining non-browse asset. ``name`` pins a band alias
+    such as ``red``, otherwise a literal asset key.
 
     Raises:
         BrowseAssetError: if ``name`` is a preview/thumbnail key or asset.
@@ -84,7 +84,9 @@ def pick_asset(scene: Scene, name: str | None = None) -> tuple[str, Asset] | Non
     if name:
         if is_forbidden_asset_name(name):
             raise BrowseAssetError(f"{name!r} is a preview/thumbnail and cannot be downloaded")
-        key = name if name in scene.assets else scene.band_aliases.get(name.strip().lower(), name)
+        # Band names are reserved and beat a literal key of the same name, so
+        # `nir` is ~865 nm everywhere. Earth Search keys B08 (0.842) as `nir`.
+        key = scene.band_aliases.get(name.strip().lower(), name)
         asset = scene.assets.get(key)
         if asset is None:
             return None

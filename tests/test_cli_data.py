@@ -175,6 +175,19 @@ def test_pick_asset_resolves_band_aliases() -> None:
     assert pick_asset(_scene(assets=scene.assets), "nir") is None
 
 
+def test_pick_asset_band_alias_beats_a_literal_key_of_the_same_name() -> None:
+    # Earth Search keys B08 (0.842) as `nir` and B8A (0.865) as `nir08`. Taking
+    # the literal key would make `--asset nir` a different band per catalog.
+    scene = _scene(
+        assets={
+            "nir": Asset(href="https://example.com/B08.tif", roles=["data"]),
+            "nir08": Asset(href="https://example.com/B8A.tif", roles=["data"]),
+        },
+        band_aliases={"nir": "nir08"},
+    )
+    assert pick_asset(scene, "nir") == ("nir08", scene.assets["nir08"])
+
+
 def test_pick_asset_alias_cannot_smuggle_a_browse_asset() -> None:
     scene = _scene(
         assets={"preview_rgb": Asset(href="https://example.com/p.png", roles=["overview"])},

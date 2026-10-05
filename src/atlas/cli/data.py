@@ -124,7 +124,11 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     data.add_argument(
         "--asset",
         default=None,
-        help="Asset key to download (default: visual COG, then data). Previews/thumbnails are rejected.",
+        help=(
+            "Band name (red, nir) or asset key to download; band names win over a "
+            "literal key of the same name. Default: visual COG, then data. "
+            "Previews/thumbnails are rejected."
+        ),
     )
     data.add_argument(
         "--table",

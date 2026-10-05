@@ -133,5 +133,9 @@ def test_common_names_are_matched_case_insensitively() -> None:
     assert resolve_bands({"x": _band(common_name="  NIR08 ")})["nir"] == "x"
 
 
+def test_out_of_tolerance_band_does_not_resolve_by_name() -> None:
+    assert resolve_bands({"B07": _band(0.79, "nir")}) == {}
+
+
 def test_empty_assets() -> None:
     assert resolve_bands({}) == {}
