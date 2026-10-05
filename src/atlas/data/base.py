@@ -32,10 +32,12 @@ class GeometryKind(StrEnum):
     bbox = "bbox"
     polygon = "polygon"
 
+
 class LimitMode(StrEnum):
     first = "first"
     last = "last"
     even = "even"
+
 
 class BBox(BaseModel):
     """West/south/east/north box in degrees.

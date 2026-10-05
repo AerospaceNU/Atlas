@@ -5,6 +5,7 @@ from atlas.data.base import BBox, GeometryKind, LimitMode, Scene, SceneKind
 _CLOUD_KINDS = frozenset({SceneKind.optical, SceneKind.browse})
 _COVERAGE_SKIP_KINDS = frozenset({SceneKind.browse, SceneKind.lidar, SceneKind.altimetry})
 
+
 def _within_cloud_bounds(scene: Scene, min_cloud: float | None, max_cloud: float | None) -> bool:
     if scene.kind not in _CLOUD_KINDS or scene.cloud_cover is None:
         return True
@@ -52,11 +53,14 @@ def dedup(scenes: list[Scene]) -> list[Scene]:
             out.append(s)
     return out
 
+
 def get_datetime(scene):
     return scene.datetime
 
+
 def sort_by_datetime(scenes: list[Scene]) -> list[Scene]:
     return sorted(scenes, key=get_datetime)
+
 
 def pick_my_mode(scene, limit, limit_mode):
     if limit is None:
@@ -64,7 +68,7 @@ def pick_my_mode(scene, limit, limit_mode):
     if len(scene) <= limit:
         return scene
     if limit_mode is None:
-        limit_mode= LimitMode.first
+        limit_mode = LimitMode.first
     if limit_mode is LimitMode.first:
         return scene[:limit]
     elif limit_mode is LimitMode.last:
@@ -72,13 +76,13 @@ def pick_my_mode(scene, limit, limit_mode):
     elif limit_mode is LimitMode.even:
         if limit == 1:
             return [scene[0]]
-        scene_count= len(scene)
+        scene_count = len(scene)
         result = []
         for i in range(limit):
             pick_index = round(i * (scene_count - 1) / (limit - 1))
             result.append(scene[pick_index])
         return result
-    
+
 
 def sort_clearest(scenes: list[Scene]) -> list[Scene]:
     """Order so the best pixels come first: lowest cloud, then most recent.
@@ -108,10 +112,9 @@ def select(
     cloud-seeking request returns the least cloudy scenes that still clear the
     floor. Pass a larger ``limit`` if you want the cloudiest end.
     """
-    
     chosen = dedup(filter_cloud(scenes, max_cloud, min_cloud=min_cloud))
     if limit is None:
-            return sort_clearest(chosen)
+        return sort_clearest(chosen)
     return pick_my_mode(sort_by_datetime(chosen), limit, limit_mode)
 
 
