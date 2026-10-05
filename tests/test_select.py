@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from atlas.compile.select import coverage_fraction, filter_cloud, representative_cloud, select
-from atlas.data.base import BBox, GeometryKind, Scene, SceneKind, LimitMode
+from atlas.data.base import BBox, GeometryKind, LimitMode, Scene, SceneKind
 
 AOI = BBox(west=-71.12, south=42.32, east=-71.02, north=42.40)
 
@@ -17,6 +17,7 @@ def _scene(**kwargs: object) -> Scene:
     }
     body.update(kwargs)
     return Scene.model_validate(body)
+
 
 def _timeline() -> list[Scene]:
     return [
@@ -46,17 +47,21 @@ def test_select_keeps_sar_when_cloud_capped() -> None:
     )
     assert [s.id for s in chosen] == ["s1"]
 
+
 def test_select_limit_mode_first_keeps_earliest() -> None:
     chosen = select(_timeline(), limit=2, limit_mode=LimitMode.first)
-    assert [s.id for s in chosen] == ["jan","feb"]
+    assert [s.id for s in chosen] == ["jan", "feb"]
+
 
 def test_select_limit_mode_last_keeps_latest() -> None:
     chosen = select(_timeline(), limit=2, limit_mode=LimitMode.last)
-    assert [s.id for s in chosen] == ["mar","apr"]
+    assert [s.id for s in chosen] == ["mar", "apr"]
+
 
 def test_select_limit_mode_even_spreads_with_endpoints() -> None:
     chosen = select(_timeline(), limit=3, limit_mode=LimitMode.even)
     assert [s.id for s in chosen] == ["jan", "mar", "apr"]
+
 
 def test_select_without_limit_returns_full_filtered_list() -> None:
     chosen = select(_timeline(), max_cloud=35)
