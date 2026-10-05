@@ -54,14 +54,6 @@ def dedup(scenes: list[Scene]) -> list[Scene]:
     return out
 
 
-def get_datetime(scene):
-    return scene.datetime
-
-
-def sort_by_datetime(scenes: list[Scene]) -> list[Scene]:
-    return sorted(scenes, key=get_datetime)
-
-
 def pick_my_mode(scene, limit, limit_mode):
     if limit is None:
         return scene
@@ -115,7 +107,7 @@ def select(
     chosen = dedup(filter_cloud(scenes, max_cloud, min_cloud=min_cloud))
     if limit is None:
         return sort_clearest(chosen)
-    return pick_my_mode(sort_by_datetime(chosen), limit, limit_mode)
+    return pick_my_mode(sorted(chosen, key=lambda s: s.datetime), limit, limit_mode)
 
 
 def representative_cloud(scenes: list[Scene]) -> float | None:
