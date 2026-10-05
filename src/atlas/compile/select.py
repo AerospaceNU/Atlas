@@ -61,6 +61,8 @@ def sort_by_datetime(scenes: list[Scene]) -> list[Scene]:
 def pick_my_mode(scene, limit, limit_mode):
     if limit is None:
         return scene
+    if len(scene) <= limit:
+        return scene
     if limit_mode is None:
         limit_mode= LimitMode.first
     if limit_mode is LimitMode.first:
