@@ -11,20 +11,22 @@ from pydantic import BaseModel, Field, ValidationError
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import (
     ChatMessage,
+    ModelCall,
     Role,
     ToolCall,
     ToolCapableModel,
     ToolRegistry,
     ToolResult,
 )
+from atlas.agent.metrics import observe_model_call, tokens_per_second
 
 DEFAULT_MAX_TOOL_CALLS = 256
-DEFAULT_MODEL = "google/gemini-3.8-flash"
+DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
 
 _SYSTEM_PROMPT = """You are Atlas, a local workspace assistant.
-Use tools when they help answer the request. All tool paths are relative to the
-artifact workspace. Do not claim to have read a file unless a tool has returned
-its contents."""
+Use tools when they help answer the request. Tool paths are relative to the
+artifact workspace; reads may also resolve files in the project workspace. Do
+not claim to have read a file unless a tool has returned its contents."""
 
 _STOPPED_RESPONSE = "Stopped after reaching the configured tool-use limit."
 
@@ -46,6 +48,7 @@ class AgentRun(BaseModel):
     response: str
     steps: list[AgentStep] = Field(default_factory=list)
     stopped_for_limit: bool = False
+    calls: list[ModelCall] = Field(default_factory=list)
 
 
 def _load_agent_config(root: Path) -> dict[str, object]:
@@ -155,6 +158,8 @@ class Agent:
         messages: list[ChatMessage],
         *,
         on_step: Callable[[AgentStep], None] | None = None,
+        on_phase: Callable[[str, str | None], None] | None = None,
+        on_thought: Callable[[str, float | None], None] | None = None,
     ) -> AgentRun:
         """Continue ``messages`` in place while the tool-call budget lasts.
 
@@ -164,21 +169,50 @@ class Agent:
         gets a tool message so every ``tool_call_id`` is answered.
         """
         steps: list[AgentStep] = []
+        calls: list[ModelCall] = []
         executed = 0
+
+        def emit(phase: str, name: str | None = None) -> None:
+            if on_phase is not None:
+                on_phase(phase, name)
+
         while executed < self.max_tool_calls:
+            # Reasoning stays on unless the model config turns it off. The
+            # request is one blocking call, so this is the whole wait, not a
+            # separate stream of thought tokens.
+            config = getattr(self.model, "config", None)
+            reasoning = True if config is None else bool(getattr(config, "reasoning", True))
+            emit("thinking" if reasoning else "working")
             response = self.model.complete(messages, self.tools.definitions)
+            observed = observe_model_call(response)
+            if observed is not None:
+                calls.append(observed)
             messages.append(
                 ChatMessage(
                     role=Role.ASSISTANT,
                     content=response.content,
                     tool_calls=response.tool_calls,
+                    reasoning=response.reasoning,
+                    reasoning_details=response.reasoning_details,
                 )
             )
+            # The call is blocking, so the thought arrives with the completion,
+            # ahead of this round's tool steps and ahead of the final answer.
+            if response.reasoning and on_thought is not None:
+                speed = None
+                if response.timing is not None:
+                    speed = tokens_per_second(
+                        response.usage.completion_tokens,
+                        response.timing.elapsed_seconds,
+                    )
+                on_thought(response.reasoning, speed)
             if not response.tool_calls:
-                return AgentRun(response=response.content or "", steps=steps)
+                return AgentRun(response=response.content or "", steps=steps, calls=calls)
             hit_limit = False
             for call in response.tool_calls:
+                emit("tool_calling", call.name)
                 if executed < self.max_tool_calls:
+                    emit("tool_executing", call.name)
                     step = self._execute(call)
                     executed += 1
                 else:
@@ -199,11 +233,13 @@ class Agent:
                     response=_STOPPED_RESPONSE,
                     steps=steps,
                     stopped_for_limit=True,
+                    calls=calls,
                 )
         return AgentRun(
             response=_STOPPED_RESPONSE,
             steps=steps,
             stopped_for_limit=True,
+            calls=calls,
         )
 
     def _execute(self, call: ToolCall) -> AgentStep:

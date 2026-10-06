@@ -46,6 +46,42 @@ def test_agent_uses_registry_tool_then_returns_answer(tmp_path: Path) -> None:
     assert model.requests[1][0][-1].role == "tool"
 
 
+def test_agent_emits_reasoning_before_tools_and_echoes_it(tmp_path: Path) -> None:
+    details = [{"type": "reasoning.text", "text": "read the notes"}]
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                reasoning="read the notes",
+                reasoning_details=details,
+                tool_calls=[
+                    ToolCall(id="call-1", name="read_file", arguments={"path": "notes.txt"})
+                ],
+            ),
+            ModelResponse(reasoning="enough", content="done"),
+        ]
+    )
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path / "notes.txt").write_text("hi", encoding="utf-8")
+    heard: list[tuple[str, float | None]] = []
+
+    def note(text: str, speed: float | None) -> None:
+        heard.append((text, speed))
+
+    agent = Agent(model, default_registry(), store)
+
+    result = agent.advance(
+        [ChatMessage(role="user", content="go")],
+        on_thought=note,
+    )
+
+    assert heard == [("read the notes", None), ("enough", None)]
+    assert result.response == "done"
+    assistant = model.requests[1][0][-2]
+    assert assistant.role == "assistant"
+    assert assistant.reasoning == "read the notes"
+    assert assistant.reasoning_details == details
+
+
 def test_agent_reports_unknown_tool_without_executing_it(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
