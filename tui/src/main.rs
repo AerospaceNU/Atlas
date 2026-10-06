@@ -834,6 +834,21 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
     let mut parts = text.split_whitespace();
     let command = parts.next().unwrap_or("");
     match command {
+        "/new" => {
+            if parts.next().is_some() {
+                app.transcript
+                    .push(TranscriptLine::Tool("usage: /new".to_string()));
+                None
+            } else {
+                app.transcript.clear();
+                app.status = Status::Ready;
+                app.waiting_from_stopped = false;
+                app.activity = None;
+                app.scroll = 0;
+                app.follow = true;
+                Some(serde_json::json!({"type": "new"}))
+            }
+        }
         "/model" => {
             let query = text.trim().trim_start_matches("/model").trim();
             app.picker_filter = query.to_string();
@@ -906,7 +921,11 @@ struct MenuItem {
 /// Command or fixed-argument options that match `text`, or an empty list when
 /// the menu should stay hidden (free text after a finished command).
 fn menu_options(text: &str) -> Vec<MenuItem> {
-    const COMMANDS: [MenuItem; 7] = [
+    const COMMANDS: [MenuItem; 8] = [
+        MenuItem {
+            token: "/new",
+            description: "Start a fresh conversation",
+        },
         MenuItem {
             token: "/model",
             description: "Choose a model",
@@ -1076,7 +1095,7 @@ fn is_finished_command(text: &str) -> bool {
     let trimmed = text.trim_end();
     if matches!(
         trimmed,
-        "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy"
+        "/new" | "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy"
     ) {
         return true;
     }
@@ -1616,7 +1635,7 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let (label, color) = status_label(app);
     let hint = if app.session_open {
-        "enter send  /model /key /quit  ctrl-r resume  ctrl-c quit"
+        "enter send  /new /model /key /quit  ctrl-r resume  ctrl-c quit"
     } else {
         "ctrl-c quit"
     };
@@ -1748,8 +1767,9 @@ fn note_session_closed(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        draw, format_context, menu_action, menu_options, nudge_scroll, picker_selection,
-        price_per_million, slash_outcome, wrap_text, App, MenuAction, Mode, Status, TranscriptLine,
+        draw, format_context, is_finished_command, menu_action, menu_options, nudge_scroll,
+        picker_selection, price_per_million, slash_outcome, wrap_text, Activity, App, MenuAction,
+        Mode, Status, TranscriptLine,
     };
     use crate::protocol::{CatalogEntry, ServerMessage, StatusSnapshot};
 
@@ -1947,11 +1967,47 @@ mod tests {
     }
 
     #[test]
+    fn new_command_resets_the_conversation() {
+        let mut app = App::new();
+        app.transcript
+            .push(TranscriptLine::Assistant("old reply".to_string()));
+        app.status = Status::Stopped;
+        app.waiting_from_stopped = true;
+        app.activity = Some(Activity::Thinking);
+        app.scroll = 5;
+        app.follow = false;
+
+        let payload = slash_outcome(&mut app, "/new").expect("new request");
+
+        assert_eq!(payload["type"], "new");
+        assert!(app.transcript.is_empty());
+        assert!(app.status == Status::Ready);
+        assert!(!app.waiting_from_stopped);
+        assert!(app.activity.is_none());
+        assert_eq!(app.scroll, 0);
+        assert!(app.follow);
+    }
+
+    #[test]
+    fn new_with_extra_tokens_shows_usage() {
+        let mut app = App::new();
+        assert!(slash_outcome(&mut app, "/new extra").is_none());
+        assert!(tool_text(&app).contains("usage: /new"));
+    }
+
+    #[test]
+    fn new_is_a_finished_command() {
+        assert!(is_finished_command("/new"));
+        assert!(!is_finished_command("/new extra"));
+    }
+
+    #[test]
     fn slash_menu_lists_every_command() {
         let mut app = App::new();
         app.input = "/".to_string();
         let painted = screen(&mut app, 80, 24);
         for name in [
+            "/new",
             "/model",
             "/copy",
             "/key",
@@ -2065,7 +2121,7 @@ mod tests {
         );
         assert_eq!(
             menu_action("/", 0, true),
-            MenuAction::Run("/model".to_string())
+            MenuAction::Run("/new".to_string())
         );
         assert_eq!(
             menu_action("/key", 0, true),

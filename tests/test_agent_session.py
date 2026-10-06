@@ -118,6 +118,70 @@ def test_second_turn_sees_full_history(tmp_path: Path) -> None:
     assert roles.count("system") == 1
 
 
+def test_start_fresh_clears_history_for_the_next_turn(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            ModelResponse(content="first answer"),
+            ModelResponse(content="second answer"),
+        ]
+    )
+    session = _session(model, tmp_path=tmp_path)
+
+    session.turn("first question")
+    session.start_fresh()
+    session.turn("second question")
+
+    messages = model.requests[1][0]
+    assert [message.role for message in messages] == ["system", "user"]
+    assert messages[0].content is not None
+    assert messages[0].content.startswith("You are Atlas")
+    assert messages[1].content == "second question"
+    assert session.stopped_for_limit is False
+
+
+def test_start_fresh_keeps_model_and_zeroes_totals(tmp_path: Path) -> None:
+    model = ScriptedModel([ModelResponse(content="hi")])
+    session = _session(model, tmp_path=tmp_path)
+    session.model_id = "keep/model"
+    session.totals.model = "keep/model"
+    session.totals.context_limit = 111
+    session.totals.total_tokens = 42
+    session.totals.cost = 0.05
+
+    events = _run_protocol(['{"type":"user","text":"hi"}', '{"type":"new"}'], session)
+
+    ready = events[-1]
+    assert ready["type"] == "ready"
+    assert ready["total_tokens"] == 0
+    assert ready["prompt_tokens"] == 0
+    assert ready["completion_tokens"] == 0
+    assert ready["spend"] is None
+    assert ready["tokens_per_second"] is None
+    assert ready["recent"] == []
+    assert ready["model"] == "keep/model"
+    assert ready["context_limit"] == 111
+    assert session.model_id == "keep/model"
+
+
+def test_start_fresh_moves_writes_to_a_new_session_directory(tmp_path: Path) -> None:
+    model = ScriptedModel([ModelResponse(content="ok")])
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    agent = Agent(
+        model,
+        ToolRegistry(),
+        LocalArtifactStore(tmp_path / "artifacts"),
+    )
+    session = AgentSession(agent)
+    session.workspace = workspace
+
+    previous = session.agent.artifacts.root
+    session.start_fresh()
+
+    assert session.agent.artifacts.root != previous
+    assert session.agent.artifacts.root.parent == (workspace / ".atlas" / "artifacts").resolve()
+
+
 def test_stopped_for_limit_and_resume_budget(tmp_path: Path) -> None:
     model = ScriptedModel(
         [

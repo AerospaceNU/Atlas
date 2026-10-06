@@ -98,6 +98,25 @@ class AgentSession:
         self._note(run)
         return run
 
+    def start_fresh(self) -> None:
+        """Start a new conversation without reopening the process.
+
+        History and running totals return to their initial state. The current
+        model id and context window are kept, and writes move to a new session
+        artifact directory inside the same workspace.
+        """
+        self.messages = [ChatMessage(role=Role.SYSTEM, content=_SYSTEM_PROMPT)]
+        self.stopped_for_limit = False
+        self.totals = SessionTotals(
+            model=self.model_id or self.totals.model,
+            context_limit=self.totals.context_limit,
+        )
+        if self.workspace is None:
+            return
+        session_id = _remember_session(self.workspace, self.model_id)
+        artifact_root = project_atlas_root(self.workspace) / "artifacts" / session_id
+        self.agent.artifacts = LocalArtifactStore(artifact_root)
+
     def _require_key(self) -> None:
         if self.requires_api_key and not (self.active_key and self.active_key.strip()):
             raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
@@ -180,6 +199,9 @@ def serve(
         if kind == "resume":
             _handle_resume(session, stdout)
             continue
+        if kind == "new":
+            _handle_new(session, stdout)
+            continue
         if kind == "models":
             _handle_models(session, stdout)
             continue
@@ -251,6 +273,12 @@ def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
         )
         return
     _write_line(stdout, _done_event(session, run), session.secrets)
+
+
+def _handle_new(session: AgentSession, stdout: IO[str]) -> None:
+    """Start a fresh conversation and report the reset status."""
+    session.start_fresh()
+    _write_line(stdout, _ready_event(session), session.secrets)
 
 
 def _handle_models(session: AgentSession, stdout: IO[str]) -> None:
