@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -19,6 +20,8 @@ from atlas.agent.contracts import (
     ToolResult,
 )
 from atlas.agent.metrics import observe_model_call, tokens_per_second
+
+_LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOOL_CALLS = 256
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
@@ -248,7 +251,10 @@ class Agent:
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             if isinstance(exc, SandboxDenied):
-                record_denial(self.artifacts.root, call.name, error)
+                try:
+                    record_denial(self.artifacts, call.name, error)
+                except Exception:
+                    _LOGGER.exception("Could not record a sandbox denial for %s", call.name)
             return AgentStep(call=call, error=error, error_kind=_kind(exc))
         return AgentStep(call=call, result=result)
 

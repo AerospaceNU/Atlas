@@ -24,7 +24,10 @@ _INHERITED_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "SHEL
 class BashInputModel(BaseModel):
     command: str = Field(description="The shell command to execute")
     timeout: int = Field(
-        default=30, description="Maximum seconds to allow the command to run before it's killed"
+        default=30,
+        ge=1,
+        le=300,
+        description="Seconds (1-300) to allow the command to run before it's killed",
     )
     working_directory: str = Field(
         default=".",
@@ -38,9 +41,11 @@ class BashTool(Tool):
     Three invariants hold: the working directory is resolved only through
     :class:`~atlas.agent.artifacts.LocalArtifactStore`, so the command starts
     inside the sandbox; the child runs with a minimal, explicit environment
-    rather than inheriting the host process's secrets; and a timeout kills
-    the whole process group, so a backgrounded or disowned child cannot
-    outlive it.
+    rather than inheriting the host process's secrets; and every call ends by
+    killing the whole process group, so a backgrounded or disowned child
+    cannot outlive it. Only the starting directory is confined: the command
+    itself runs with the user's privileges, and a child that calls
+    ``setsid()`` leaves the group. See docs/adr/0001-sandbox-model.md.
     """
 
     name = "bash_tool"
@@ -68,16 +73,26 @@ class BashTool(Tool):
             shell=True,
             cwd=cwd,
             env=env,
+            # The session's own stdin carries the user's protocol messages.
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            errors="replace",
             start_new_session=True,
         )
+        # start_new_session=True makes the shell the leader of a new process
+        # group whose id is its pid. Captured now because communicate() reaps
+        # the shell, and on macOS os.getpgid() fails once the leader has exited.
+        pgid = process.pid
         try:
             stdout, stderr = process.communicate(timeout=request.timeout)
         except subprocess.TimeoutExpired:
-            self._kill_process_group(process)
             return ToolResult(text=f"Command timed out after {request.timeout}s: {request.command}")
+        finally:
+            # A background child that redirects its stdio lets communicate()
+            # return normally, so the group is killed on every exit path.
+            self._kill_process_group(process, pgid)
 
         output = (
             f"exit_code: {process.returncode}\n"
@@ -97,17 +112,9 @@ class BashTool(Tool):
             return store.read_root or store.root
         return store.resolve_read(working_directory)
 
-    def _kill_process_group(self, process: subprocess.Popen[str]) -> None:
-        # start_new_session=True makes this process its own session and
-        # process-group leader, so its pid *is* the group id for as long as
-        # any member of the group is alive. We rely on that identity rather
-        # than re-querying os.getpgid() at kill time: on macOS, getpgid()
-        # raises ProcessLookupError once this particular pid has zombied
-        # (which happens almost immediately for a shell that only
-        # backgrounds a job and exits), even though other processes in the
-        # same group are still very much alive.
+    def _kill_process_group(self, process: subprocess.Popen[str], pgid: int) -> None:
         with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(pgid, signal.SIGKILL)
         process.wait()
 
     def _sanitize(self, text: str) -> str:

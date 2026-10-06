@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from atlas.agent.artifacts import LocalArtifactStore
+from atlas.agent.artifacts import LocalArtifactStore, record_denial
 from atlas.agent.contracts import (
     ChatMessage,
     ModelResponse,
@@ -10,7 +11,7 @@ from atlas.agent.contracts import (
     ToolDefinition,
     default_registry,
 )
-from atlas.agent.runtime import Agent
+from atlas.agent.runtime import Agent, AgentRun
 
 
 class ScriptedModel:
@@ -82,8 +83,7 @@ def test_agent_emits_reasoning_before_tools_and_echoes_it(tmp_path: Path) -> Non
     assert assistant.reasoning_details == details
 
 
-def test_agent_records_a_sandbox_denial_in_the_audit_log(tmp_path: Path) -> None:
-    store = LocalArtifactStore(tmp_path)
+def _run_denied_read(store: LocalArtifactStore) -> AgentRun:
     model = ScriptedModel(
         [
             ModelResponse(
@@ -94,9 +94,11 @@ def test_agent_records_a_sandbox_denial_in_the_audit_log(tmp_path: Path) -> None
             ModelResponse(content="I could not read that file."),
         ]
     )
-    agent = Agent(model, default_registry(), store)
+    return Agent(model, default_registry(), store).run("read a file outside the workspace")
 
-    result = agent.run("read a file outside the workspace")
+
+def test_agent_records_a_sandbox_denial_in_the_audit_log(tmp_path: Path) -> None:
+    result = _run_denied_read(LocalArtifactStore(tmp_path))
 
     assert result.steps[0].error_kind == "tool_failure"
     audit_log = tmp_path / ".atlas" / "sandbox_audit.log"
@@ -104,6 +106,67 @@ def test_agent_records_a_sandbox_denial_in_the_audit_log(tmp_path: Path) -> None
     contents = audit_log.read_text(encoding="utf-8")
     assert "DENIED read_file" in contents
     assert "escapes" in contents
+
+
+def test_audit_log_keeps_each_denial_on_one_line(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+
+    record_denial(store, "read_file", "big\n2026-01-01T00:00:00+00:00 DENIED forged: record")
+
+    lines = (tmp_path / ".atlas" / "sandbox_audit.log").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert "big\\n2026" in lines[0]
+
+
+def test_a_failed_audit_write_does_not_fail_the_turn(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path / ".atlas").write_text("a file where the audit directory should be", encoding="utf-8")
+
+    result = _run_denied_read(store)
+
+    assert result.response == "I could not read that file."
+    assert result.steps[0].error_kind == "tool_failure"
+
+
+def test_audit_log_does_not_follow_a_symlinked_audit_directory(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    store = LocalArtifactStore(workspace)
+    (workspace / ".atlas").symlink_to(outside_dir)
+
+    result = _run_denied_read(store)
+
+    assert result.response == "I could not read that file."
+    assert list(outside_dir.iterdir()) == []
+
+
+def test_audit_log_does_not_follow_a_symlinked_log_file(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("", encoding="utf-8")
+    store = LocalArtifactStore(workspace)
+    (workspace / ".atlas").mkdir()
+    (workspace / ".atlas" / "sandbox_audit.log").symlink_to(outside)
+
+    result = _run_denied_read(store)
+
+    assert result.response == "I could not read that file."
+    assert outside.read_text(encoding="utf-8") == ""
+
+
+def test_audit_log_refuses_a_hardlinked_log_file(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("", encoding="utf-8")
+    store = LocalArtifactStore(workspace)
+    (workspace / ".atlas").mkdir()
+    os.link(outside, workspace / ".atlas" / "sandbox_audit.log")
+
+    result = _run_denied_read(store)
+
+    assert result.response == "I could not read that file."
+    assert outside.read_text(encoding="utf-8") == ""
 
 
 def test_agent_reports_unknown_tool_without_executing_it(tmp_path: Path) -> None:

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
 from PIL import Image
+from pydantic import ValidationError
 
 from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
 from atlas.agent.contracts import default_registry
@@ -33,6 +37,34 @@ def test_store_rejects_paths_outside_root(tmp_path: Path) -> None:
     (tmp_path / "link.txt").symlink_to(outside)
     with pytest.raises(ValueError, match="escapes"):
         store.resolve("link.txt")
+
+    # A hardlink resolves to itself, so it is refused for having another name.
+    os.link(outside, tmp_path / "hardlink.txt")
+    with pytest.raises(ValueError, match="hardlinked"):
+        store.resolve("hardlink.txt")
+
+
+def test_read_file_rejects_a_hardlink_to_an_outside_file(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    store = LocalArtifactStore(workspace)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    os.link(outside, workspace / "notes.txt")
+
+    with pytest.raises(ValueError, match="hardlinked"):
+        ReadFileTool().run({"path": "notes.txt"}, store)
+
+
+def test_list_images_skips_a_hardlinked_image(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    store = LocalArtifactStore(workspace)
+    Image.new("RGB", (4, 4), "red").save(tmp_path / "secret.png")
+    os.link(tmp_path / "secret.png", workspace / "linked.png")
+    Image.new("RGB", (4, 4), "blue").save(workspace / "visible.png")
+
+    images = store.list_images()
+
+    assert [image.path for image in images] == ["visible.png"]
 
 
 def test_list_images_skips_a_symlinked_escape_instead_of_raising(tmp_path: Path) -> None:
@@ -236,6 +268,23 @@ def test_bash_timeout_kills_a_backgrounded_child_too(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+def test_bash_kills_a_detached_background_child_when_the_call_returns(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    marker = tmp_path / "still_running.marker"
+
+    result = BashTool().run(
+        {
+            "command": f"(sleep 1 && touch {marker}) >/dev/null 2>&1 </dev/null & echo launched",
+            "timeout": 10,
+        },
+        store,
+    )
+
+    assert "exit_code: 0" in result.text
+    time.sleep(2)
+    assert not marker.exists()
+
+
 def test_bash_scrubs_ambient_environment_variables(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -333,6 +382,18 @@ def test_read_file_still_rejects_escapes_and_absolute_paths_with_a_read_root(
         ReadFileTool().run({"path": str(workspace / "notes.txt")}, store)
 
 
+def test_read_file_rejects_a_hardlink_in_the_read_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    os.link(outside, workspace / "notes.txt")
+    store = LocalArtifactStore(tmp_path / "artifact", read_root=workspace)
+
+    with pytest.raises(SandboxDenied, match="hardlinked"):
+        ReadFileTool().run({"path": "notes.txt"}, store)
+
+
 def test_read_file_missing_file_with_read_root_hides_host_paths(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -358,3 +419,41 @@ def test_write_file_never_writes_to_the_read_root(tmp_path: Path) -> None:
 
     assert (artifact / "out.txt").is_file()
     assert not (workspace / "out.txt").exists()
+
+
+def test_bash_does_not_read_the_sessions_stdin(tmp_path: Path) -> None:
+    # The session reads the user's protocol messages from stdin, so run the
+    # tool in a child process whose stdin holds one such message.
+    script = (
+        "import sys; from pathlib import Path;"
+        "from atlas.agent.artifacts import LocalArtifactStore;"
+        "from atlas.agent.tools.BashTool import BashTool;"
+        "print(BashTool().run({'command': 'head -1'}, LocalArtifactStore(Path(sys.argv[1]))).text)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        input='{"type": "user", "text": "next message"}\n',
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert "exit_code: 0" in completed.stdout
+    assert "next message" not in completed.stdout
+
+
+@pytest.mark.parametrize("timeout", [0, -5, 301, 10**9])
+def test_bash_rejects_a_timeout_outside_the_allowed_range(tmp_path: Path, timeout: int) -> None:
+    store = LocalArtifactStore(tmp_path)
+
+    with pytest.raises(ValidationError):
+        BashTool().run({"command": "echo hi", "timeout": timeout}, store)
+
+
+def test_bash_reports_non_utf8_output_instead_of_raising(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+
+    result = BashTool().run({"command": "printf 'ok\\377'"}, store)
+
+    assert "exit_code: 0" in result.text
+    assert "ok�" in result.text
