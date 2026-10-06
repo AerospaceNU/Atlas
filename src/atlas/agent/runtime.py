@@ -18,15 +18,15 @@ from atlas.agent.contracts import (
     ToolRegistry,
     ToolResult,
 )
-from atlas.agent.metrics import observe_model_call
+from atlas.agent.metrics import observe_model_call, tokens_per_second
 
 DEFAULT_MAX_TOOL_CALLS = 256
-DEFAULT_MODEL = "google/gemini-3.8-flash"
+DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
 
 _SYSTEM_PROMPT = """You are Atlas, a local workspace assistant.
-Use tools when they help answer the request. All tool paths are relative to the
-artifact workspace. Do not claim to have read a file unless a tool has returned
-its contents."""
+Use tools when they help answer the request. Tool paths are relative to the
+artifact workspace; reads may also resolve files in the project workspace. Do
+not claim to have read a file unless a tool has returned its contents."""
 
 _STOPPED_RESPONSE = "Stopped after reaching the configured tool-use limit."
 
@@ -159,6 +159,7 @@ class Agent:
         *,
         on_step: Callable[[AgentStep], None] | None = None,
         on_phase: Callable[[str, str | None], None] | None = None,
+        on_thought: Callable[[str, float | None], None] | None = None,
     ) -> AgentRun:
         """Continue ``messages`` in place while the tool-call budget lasts.
 
@@ -191,8 +192,20 @@ class Agent:
                     role=Role.ASSISTANT,
                     content=response.content,
                     tool_calls=response.tool_calls,
+                    reasoning=response.reasoning,
+                    reasoning_details=response.reasoning_details,
                 )
             )
+            # The call is blocking, so the thought arrives with the completion,
+            # ahead of this round's tool steps and ahead of the final answer.
+            if response.reasoning and on_thought is not None:
+                speed = None
+                if response.timing is not None:
+                    speed = tokens_per_second(
+                        response.usage.completion_tokens,
+                        response.timing.elapsed_seconds,
+                    )
+                on_thought(response.reasoning, speed)
             if not response.tool_calls:
                 return AgentRun(response=response.content or "", steps=steps, calls=calls)
             hit_limit = False

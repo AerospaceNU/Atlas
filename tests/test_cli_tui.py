@@ -47,8 +47,8 @@ def test_status_line_does_not_invent_a_context_window() -> None:
 
     assert "context 9/unknown" in text
     assert "128000" not in text
-    assert "spend n/a" in text
-    assert "tok/s" in text
+    assert "spend $0" in text
+    assert "0.0 tok/s" in text
     assert "http" not in text
     assert "latency" not in text
     assert "ttft" not in text

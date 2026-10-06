@@ -14,10 +14,12 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import (
+    CallTiming,
     CatalogModel,
     ChatMessage,
     ModelResponse,
     Role,
+    TokenUsage,
     Tool,
     ToolCall,
     ToolDefinition,
@@ -163,14 +165,16 @@ def test_start_fresh_keeps_model_and_zeroes_totals(tmp_path: Path) -> None:
     assert session.model_id == "keep/model"
 
 
-def test_start_fresh_moves_writes_to_a_new_session_directory(tmp_path: Path) -> None:
+def test_start_fresh_moves_writes_but_keeps_reads(tmp_path: Path) -> None:
     model = ScriptedModel([ModelResponse(content="ok")])
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    read_root = tmp_path / "source"
+    read_root.mkdir()
     agent = Agent(
         model,
         ToolRegistry(),
-        LocalArtifactStore(tmp_path / "artifacts"),
+        LocalArtifactStore(tmp_path / "artifacts", read_root=read_root),
     )
     session = AgentSession(agent)
     session.workspace = workspace
@@ -178,8 +182,10 @@ def test_start_fresh_moves_writes_to_a_new_session_directory(tmp_path: Path) -> 
     previous = session.agent.artifacts.root
     session.start_fresh()
 
-    assert session.agent.artifacts.root != previous
-    assert session.agent.artifacts.root.parent == (workspace / ".atlas" / "artifacts").resolve()
+    artifacts = session.agent.artifacts
+    assert artifacts.root != previous
+    assert artifacts.root.parent == (workspace / ".atlas" / "artifacts").resolve()
+    assert artifacts.read_root == read_root
 
 
 def test_stopped_for_limit_and_resume_budget(tmp_path: Path) -> None:
@@ -333,7 +339,7 @@ def test_ensure_agent_config_writes_defaults_once(tmp_path: Path) -> None:
 
 def test_missing_config_uses_the_default_model(tmp_path: Path) -> None:
     assert load_model(tmp_path) == DEFAULT_MODEL
-    assert DEFAULT_MODEL == "google/gemini-3.8-flash"
+    assert DEFAULT_MODEL == "deepseek/deepseek-v4.1-flash"
 
 
 def test_workspace_config_sets_the_model(tmp_path: Path) -> None:
@@ -479,6 +485,37 @@ def test_protocol_ready_step_done_and_second_turn(tmp_path: Path) -> None:
     assert dones[1]["response"] == "second done"
     assert phases[:4] == ["thinking", "tool_calling", "tool_executing", "thinking"]
     assert events[events.index(steps[0]) - 1]["phase"] == "tool_executing"
+
+
+def test_protocol_emits_thoughts_before_steps_and_the_answer(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                reasoning="check the file",
+                usage=TokenUsage(completion_tokens=8),
+                timing=CallTiming(http_status=200, elapsed_seconds=0.5),
+                tool_calls=[ToolCall(id="1", name="echo", arguments={"value": 4})],
+            ),
+            ModelResponse(reasoning="that was enough", content="done"),
+        ]
+    )
+    session = _session(model, tmp_path=tmp_path)
+    session.agent.tools.register(EchoTool())
+
+    events = _run_protocol(['{"type":"user","text":"one"}'], session)
+
+    thoughts = [event for event in events if event["type"] == "thought"]
+    steps = [event for event in events if event["type"] == "step"]
+    dones = [event for event in events if event["type"] == "done"]
+    assert [event["text"] for event in thoughts] == ["check the file", "that was enough"]
+    assert thoughts[0]["tokens_per_second"] == 16.0
+    assert "tokens_per_second" not in thoughts[1]
+    assert events.index(thoughts[0]) < events.index(steps[0])
+    assert events.index(steps[0]) < events.index(thoughts[1])
+    assert events.index(thoughts[1]) < events.index(dones[0])
+    assert dones[0]["response"] == "done"
+    assistant = next(message for message in model.requests[1][0] if message.role == "assistant")
+    assert assistant.reasoning == "check the file"
 
 
 def test_protocol_invalid_json_continues(tmp_path: Path) -> None:
@@ -1043,7 +1080,7 @@ def test_omitted_provider_cost_stays_unset(tmp_path: Path) -> None:
     assert done["tokens_per_second"] == 4.0
     assert done["time_to_first_token_seconds"] == 0.05
     assert done["recent"] == ["200 0.25s"]
-    assert "spend n/a" in done["status_line"]
+    assert "spend $0" in done["status_line"]
     assert "ttft" not in done["status_line"]
     assert "recent" not in done["status_line"]
     assert "test-key" not in json.dumps(events)

@@ -1,8 +1,8 @@
 //! A small markdown renderer for assistant replies.
 //!
 //! It covers the marks models actually emit: headings, emphasis, inline and
-//! fenced code, links, lists, and quotes. Anything it does not understand is
-//! left as plain text without the marker characters it could parse.
+//! fenced code, links, lists, quotes, and pipe tables. Anything it does not
+//! understand is left as plain text without the marker characters it could parse.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mark {
@@ -11,6 +11,8 @@ pub enum Mark {
     Emphasis,
     Code,
     Heading,
+    /// Box-drawing rules around a table.
+    Border,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,51 +22,71 @@ pub struct Piece {
 }
 
 /// One visual line per entry. Fenced code stays one piece per source line.
-pub fn render_lines(source: &str) -> Vec<Vec<Piece>> {
+#[cfg(test)]
+fn render_lines(source: &str) -> Vec<Vec<Piece>> {
+    render_fitted(source, usize::MAX)
+}
+
+/// Like [`render_lines`], but a pipe table is fitted to `width` columns.
+pub fn render_fitted(source: &str, width: usize) -> Vec<Vec<Piece>> {
+    let raws: Vec<&str> = source.split('\n').collect();
     let mut lines = Vec::new();
+    let mut index = 0;
     let mut in_code = false;
-    for raw in source.split('\n') {
-        let line = raw.trim_end();
+    while index < raws.len() {
+        let line = raws[index].trim_end();
         if line.starts_with("```") {
             in_code = !in_code;
+            index += 1;
             continue;
         }
         if in_code {
             lines.push(vec![piece(line, Mark::Code)]);
+            index += 1;
             continue;
         }
-        if line.is_empty() {
-            lines.push(vec![piece("", Mark::Plain)]);
+        if let Some((consumed, rendered)) = try_table(&raws[index..], width) {
+            lines.extend(rendered);
+            index += consumed;
             continue;
         }
-        if let Some(title) = heading(line) {
-            lines.push(vec![piece(&title, Mark::Heading)]);
-            continue;
-        }
-        if let Some(body) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            let mut row = vec![piece("• ", Mark::Plain)];
-            row.extend(parse_inline(body));
-            lines.push(row);
-            continue;
-        }
-        if let Some((marker, body)) = numbered(line) {
-            let mut row = vec![piece(marker, Mark::Plain)];
-            row.extend(parse_inline(body));
-            lines.push(row);
-            continue;
-        }
-        if let Some(body) = line.strip_prefix("> ") {
-            let mut row = vec![piece("│ ", Mark::Plain)];
-            row.extend(parse_inline(body));
-            lines.push(row);
-            continue;
-        }
-        lines.push(parse_inline(line));
+        push_text_line(&mut lines, line);
+        index += 1;
     }
     if lines.is_empty() {
         lines.push(vec![piece("", Mark::Plain)]);
     }
     lines
+}
+
+fn push_text_line(lines: &mut Vec<Vec<Piece>>, line: &str) {
+    if line.is_empty() {
+        lines.push(vec![piece("", Mark::Plain)]);
+        return;
+    }
+    if let Some(title) = heading(line) {
+        lines.push(vec![piece(&title, Mark::Heading)]);
+        return;
+    }
+    if let Some(body) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        let mut row = vec![piece("• ", Mark::Plain)];
+        row.extend(parse_inline(body));
+        lines.push(row);
+        return;
+    }
+    if let Some((marker, body)) = numbered(line) {
+        let mut row = vec![piece(marker, Mark::Plain)];
+        row.extend(parse_inline(body));
+        lines.push(row);
+        return;
+    }
+    if let Some(body) = line.strip_prefix("> ") {
+        let mut row = vec![piece("│ ", Mark::Plain)];
+        row.extend(parse_inline(body));
+        lines.push(row);
+        return;
+    }
+    lines.push(parse_inline(line));
 }
 
 fn piece(text: &str, mark: Mark) -> Piece {
@@ -178,6 +200,296 @@ fn find_pair(chars: &[char], start: usize) -> Option<usize> {
     None
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Align {
+    Left,
+    Right,
+    Center,
+}
+
+fn try_table(raws: &[&str], width: usize) -> Option<(usize, Vec<Vec<Piece>>)> {
+    if raws.len() < 2 {
+        return None;
+    }
+    let header = split_cells(raws[0].trim_end())?;
+    let aligns = split_separator(raws[1].trim_end())?;
+    if header.len() < 2 || aligns.len() != header.len() {
+        return None;
+    }
+    let columns = header.len();
+    let mut rows = vec![header];
+    let mut consumed = 2;
+    for raw in raws.iter().skip(2) {
+        let line = raw.trim_end();
+        if line.is_empty() || split_separator(line).is_some() {
+            break;
+        }
+        let cells = split_cells(line)?;
+        rows.push(fit_cells(cells, columns));
+        consumed += 1;
+    }
+    let parsed: Vec<Vec<Vec<Piece>>> = rows
+        .iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            row.iter()
+                .map(|cell| {
+                    let pieces = parse_inline(cell);
+                    if row_index == 0 {
+                        bold_header(pieces)
+                    } else {
+                        pieces
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    Some((consumed, layout_table(&parsed, &aligns, width)))
+}
+
+fn split_cells(line: &str) -> Option<Vec<String>> {
+    let line = line.trim();
+    if !line.starts_with('|') {
+        return None;
+    }
+    let mut inner = line.strip_prefix('|').unwrap_or(line);
+    if let Some(rest) = inner.strip_suffix('|') {
+        inner = rest;
+    }
+    let cells: Vec<String> = inner
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect();
+    if cells.len() < 2 {
+        return None;
+    }
+    Some(cells)
+}
+
+fn split_separator(line: &str) -> Option<Vec<Align>> {
+    let cells = split_cells(line)?;
+    let mut aligns = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let token = cell.trim();
+        if token.is_empty() || !token.contains('-') {
+            return None;
+        }
+        if !token.chars().all(|ch| matches!(ch, '-' | ':')) {
+            return None;
+        }
+        let left = token.starts_with(':');
+        let right = token.ends_with(':');
+        aligns.push(match (left, right) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        });
+    }
+    Some(aligns)
+}
+
+fn fit_cells(mut cells: Vec<String>, columns: usize) -> Vec<String> {
+    if cells.len() > columns {
+        let tail = cells.split_off(columns - 1).join(" | ");
+        cells.push(tail);
+    }
+    cells.resize(columns, String::new());
+    cells
+}
+
+fn bold_header(pieces: Vec<Piece>) -> Vec<Piece> {
+    pieces
+        .into_iter()
+        .map(|mut piece| {
+            if piece.mark != Mark::Code {
+                piece.mark = Mark::Strong;
+            }
+            piece
+        })
+        .collect()
+}
+
+fn layout_table(rows: &[Vec<Vec<Piece>>], aligns: &[Align], width: usize) -> Vec<Vec<Piece>> {
+    let widths = column_widths(rows, width);
+    let mut lines = vec![rule(&widths, '┌', '┬', '┐')];
+    for (index, row) in rows.iter().enumerate() {
+        lines.extend(render_row(row, &widths, aligns));
+        if index == 0 {
+            lines.push(rule(&widths, '├', '┼', '┤'));
+        }
+    }
+    lines.push(rule(&widths, '└', '┴', '┘'));
+    lines
+}
+
+fn column_widths(rows: &[Vec<Vec<Piece>>], width: usize) -> Vec<usize> {
+    let columns = rows.first().map_or(0, Vec::len);
+    let mut widths = vec![1; columns];
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(piece_span(cell).max(1));
+        }
+    }
+    if width == usize::MAX || columns == 0 {
+        return widths;
+    }
+    let chrome = 3 * columns + 1;
+    if width <= chrome {
+        return vec![1; columns];
+    }
+    let budget = width - chrome;
+    while widths.iter().sum::<usize>() > budget {
+        let Some(index) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| **cell > 1)
+            .max_by_key(|(_, cell)| *cell)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        widths[index] -= 1;
+    }
+    widths
+}
+
+fn piece_span(pieces: &[Piece]) -> usize {
+    pieces.iter().map(|item| item.text.chars().count()).sum()
+}
+
+fn rule(widths: &[usize], left: char, junction: char, right: char) -> Vec<Piece> {
+    let mut text = String::new();
+    text.push(left);
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            text.push(junction);
+        }
+        text.extend(std::iter::repeat_n('─', width + 2));
+    }
+    text.push(right);
+    vec![piece(&text, Mark::Border)]
+}
+
+fn render_row(cells: &[Vec<Piece>], widths: &[usize], aligns: &[Align]) -> Vec<Vec<Piece>> {
+    let wrapped: Vec<Vec<Vec<Piece>>> = cells
+        .iter()
+        .zip(widths)
+        .zip(aligns)
+        .map(|((cell, width), align)| {
+            wrap_cell(cell, *width)
+                .into_iter()
+                .map(|line| pad_cell(&line, *width, *align))
+                .collect()
+        })
+        .collect();
+    let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    let mut lines = Vec::with_capacity(height);
+    for line_index in 0..height {
+        let row: Vec<Vec<Piece>> = wrapped
+            .iter()
+            .zip(widths)
+            .zip(aligns)
+            .map(|((cell, width), align)| {
+                cell.get(line_index)
+                    .cloned()
+                    .unwrap_or_else(|| pad_cell(&[], *width, *align))
+            })
+            .collect();
+        lines.push(content_line(&row));
+    }
+    lines
+}
+
+fn content_line(cells: &[Vec<Piece>]) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    for cell in cells {
+        pieces.push(piece("│", Mark::Border));
+        pieces.push(piece(" ", Mark::Plain));
+        pieces.extend(cell.clone());
+        pieces.push(piece(" ", Mark::Plain));
+    }
+    pieces.push(piece("│", Mark::Border));
+    pieces
+}
+
+fn pad_cell(cell: &[Piece], width: usize, align: Align) -> Vec<Piece> {
+    let used = piece_span(cell);
+    let pad = width.saturating_sub(used);
+    let (left, right) = match align {
+        Align::Left => (0, pad),
+        Align::Right => (pad, 0),
+        Align::Center => (pad / 2, pad - pad / 2),
+    };
+    let mut pieces = Vec::new();
+    if left > 0 {
+        pieces.push(piece(&" ".repeat(left), Mark::Plain));
+    }
+    pieces.extend(cell.iter().cloned());
+    if right > 0 {
+        pieces.push(piece(&" ".repeat(right), Mark::Plain));
+    }
+    pieces
+}
+
+fn wrap_cell(pieces: &[Piece], width: usize) -> Vec<Vec<Piece>> {
+    let width = width.max(1);
+    let mut lines: Vec<Vec<Piece>> = vec![Vec::new()];
+    let mut column = 0;
+    for item in pieces {
+        let mut rest = item.text.as_str();
+        while !rest.is_empty() {
+            if column >= width {
+                lines.push(Vec::new());
+                column = 0;
+            }
+            if column == 0 {
+                rest = rest.trim_start();
+                if rest.is_empty() {
+                    break;
+                }
+            }
+            let room = width - column;
+            let break_at = wrap_point(rest, room);
+            let take: String = rest.chars().take(break_at).collect();
+            let bytes = take.len();
+            rest = &rest[bytes..];
+            if take.chars().all(char::is_whitespace) && column == 0 {
+                continue;
+            }
+            column += take.chars().count();
+            lines
+                .last_mut()
+                .expect("line")
+                .push(piece(&take, item.mark));
+            if !rest.is_empty() && column >= width {
+                lines.push(Vec::new());
+                column = 0;
+            }
+        }
+    }
+    if lines.last().is_some_and(Vec::is_empty) && lines.len() > 1 {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+    lines
+}
+
+fn wrap_point(text: &str, room: usize) -> usize {
+    let count = text.chars().count();
+    if count <= room {
+        return count;
+    }
+    let head: String = text.chars().take(room).collect();
+    if let Some(space) = head.rfind(' ') {
+        if space > 0 {
+            return head[..space].chars().count();
+        }
+    }
+    room
+}
+
 fn link(chars: &[char], start: usize) -> Option<(String, usize)> {
     let label_end = chars[start + 1..].iter().position(|ch| *ch == ']')? + start + 1;
     if label_end + 1 >= chars.len() || chars[label_end + 1] != '(' {
@@ -228,5 +540,102 @@ mod tests {
         assert!(text.contains("• one"));
         assert!(text.contains("│ two"));
         assert!(!text.contains("- one"));
+    }
+
+    #[test]
+    fn a_pipe_table_is_drawn_with_borders() {
+        let source = "\
+| Item | Count | Notes |
+| --- | ---: | :--- |
+| `dist/` | 3 files | Built wheel |
+| caches | 116 dirs | regenerable |
+";
+        let lines = render_lines(source);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|item| item.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains('┌'), "{text}");
+        assert!(text.contains('├'), "{text}");
+        assert!(text.contains('└'), "{text}");
+        assert!(text.contains("Item"));
+        assert!(text.contains("dist/"));
+        assert!(text.contains("116 dirs"));
+        assert!(!text.contains("| --- |"), "{text}");
+        assert!(lines.iter().any(|line| {
+            line.iter()
+                .any(|item| item.text.contains("Item") && item.mark == Mark::Strong)
+        }));
+        assert!(lines.iter().any(|line| {
+            line.iter()
+                .any(|item| item.text.contains("dist/") && item.mark == Mark::Code)
+        }));
+        let count_row = lines
+            .iter()
+            .find(|line| line.iter().any(|item| item.text.contains("3 files")))
+            .expect("count");
+        let flat_count: String = count_row.iter().map(|item| item.text.as_str()).collect();
+        let header = lines
+            .iter()
+            .find(|line| line.iter().any(|item| item.text.contains("Count")))
+            .expect("header");
+        let flat_header: String = header.iter().map(|item| item.text.as_str()).collect();
+        let files_at = flat_count.find("3 files").expect("files");
+        let count_at = flat_header.find("Count").expect("count header");
+        let files_end = files_at + "3 files".len();
+        let count_end = count_at + "Count".len();
+        assert_eq!(files_end, count_end, "right edge:\n{text}");
+        assert!(
+            count_at > files_at,
+            "count header is right-aligned:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_table_wraps_inside_the_cells() {
+        let source = "\
+| Name | Notes |
+| --- | --- |
+| atlas | a long note that should wrap inside the cell |
+";
+        let lines = super::render_fitted(source, 36);
+        assert!(lines.len() > 4, "expected a wrapped body row");
+        for line in &lines {
+            let text: String = line.iter().map(|item| item.text.as_str()).collect();
+            if text.is_empty() {
+                continue;
+            }
+            assert!(text.chars().count() <= 36, "{text}");
+            assert!(
+                text.starts_with('┌')
+                    || text.starts_with('├')
+                    || text.starts_with('└')
+                    || text.starts_with('│'),
+                "{text}"
+            );
+        }
+        let body: String = lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|item| item.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("wrap"));
+        assert!(!body.contains("| --- |"));
+    }
+
+    #[test]
+    fn a_single_pipe_line_is_not_a_table() {
+        let text = flat("use a | b in prose\n| only one cell");
+        assert!(text.contains("use a | b"));
+        assert!(!text.contains('┌'));
     }
 }

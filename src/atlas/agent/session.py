@@ -74,11 +74,14 @@ class AgentSession:
         *,
         on_step: Callable[[AgentStep], None] | None = None,
         on_phase: Callable[[str, str | None], None] | None = None,
+        on_thought: Callable[[str, float | None], None] | None = None,
     ) -> AgentRun:
         """Append the user message and advance the shared history one turn."""
         self._require_key()
         self.messages.append(ChatMessage(role=Role.USER, content=request))
-        run = self.agent.advance(self.messages, on_step=on_step, on_phase=on_phase)
+        run = self.agent.advance(
+            self.messages, on_step=on_step, on_phase=on_phase, on_thought=on_thought
+        )
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
         return run
@@ -88,12 +91,15 @@ class AgentSession:
         *,
         on_step: Callable[[AgentStep], None] | None = None,
         on_phase: Callable[[str, str | None], None] | None = None,
+        on_thought: Callable[[str, float | None], None] | None = None,
     ) -> AgentRun:
         """Continue a turn that stopped at the tool-call limit, with a fresh budget."""
         self._require_key()
         if not self.stopped_for_limit:
             raise RuntimeError("Session is not stopped for the tool-call limit")
-        run = self.agent.advance(self.messages, on_step=on_step, on_phase=on_phase)
+        run = self.agent.advance(
+            self.messages, on_step=on_step, on_phase=on_phase, on_thought=on_thought
+        )
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
         return run
@@ -103,7 +109,8 @@ class AgentSession:
 
         History and running totals return to their initial state. The current
         model id and context window are kept, and writes move to a new session
-        artifact directory inside the same workspace.
+        artifact directory inside the same workspace. Reads keep the previous
+        read root, so this never widens write access to the workspace.
         """
         self.messages = [ChatMessage(role=Role.SYSTEM, content=_SYSTEM_PROMPT)]
         self.stopped_for_limit = False
@@ -115,7 +122,8 @@ class AgentSession:
             return
         session_id = _remember_session(self.workspace, self.model_id)
         artifact_root = project_atlas_root(self.workspace) / "artifacts" / session_id
-        self.agent.artifacts = LocalArtifactStore(artifact_root)
+        read_root = self.agent.artifacts.read_root
+        self.agent.artifacts = LocalArtifactStore(artifact_root, read_root=read_root)
 
     def _require_key(self) -> None:
         if self.requires_api_key and not (self.active_key and self.active_key.strip()):
@@ -236,8 +244,9 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
         return
     on_step = _step_writer(stdout, session.secrets)
     on_phase = _phase_writer(stdout, session.secrets)
+    on_thought = _thought_writer(stdout, session.secrets)
     try:
-        run = session.turn(text, on_step=on_step, on_phase=on_phase)
+        run = session.turn(text, on_step=on_step, on_phase=on_phase, on_thought=on_thought)
     except MissingOpenRouterKey as exc:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
@@ -257,8 +266,9 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
 def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
     on_step = _step_writer(stdout, session.secrets)
     on_phase = _phase_writer(stdout, session.secrets)
+    on_thought = _thought_writer(stdout, session.secrets)
     try:
-        run = session.resume(on_step=on_step, on_phase=on_phase)
+        run = session.resume(on_step=on_step, on_phase=on_phase, on_thought=on_thought)
     except MissingOpenRouterKey as exc:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
@@ -474,6 +484,18 @@ def _step_writer(stdout: IO[str], secrets: list[str]) -> Callable[[AgentStep], N
     return write
 
 
+def _thought_writer(stdout: IO[str], secrets: list[str]) -> Callable[[str, float | None], None]:
+    def write(text: str, speed: float | None) -> None:
+        if not text.strip():
+            return
+        payload: dict[str, Any] = {"type": "thought", "text": text}
+        if speed is not None and speed > 0:
+            payload["tokens_per_second"] = speed
+        _write_line(stdout, payload, secrets)
+
+    return write
+
+
 def _phase_writer(stdout: IO[str], secrets: list[str]) -> Callable[[str, str | None], None]:
     def write(phase: str, name: str | None) -> None:
         payload: dict[str, Any] = {"type": "phase", "phase": phase}
@@ -613,15 +635,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     model_id = resolve_model(workspace, args.model)
     session_id = _remember_session(workspace, model_id)
-    # Tool paths stay inside this session's artifact directory. Removing the
-    # session removes those files and cannot write the workspace root.
+    # Writes stay inside this session's artifact directory so removing the
+    # session removes them and cannot touch the workspace root. Reads may
+    # fall back to the project workspace via the store's read_root.
     artifact_root = project_atlas_root(workspace) / "artifacts" / session_id
     model = OpenRouterModel(ModelConfig(model=model_id, api_key=api_key))
     try:
         agent = Agent(
             model,
             default_registry(),
-            LocalArtifactStore(artifact_root),
+            LocalArtifactStore(artifact_root, read_root=workspace),
             # The store root is the session artifact directory, which has no
             # agent.toml. The budget lives in the workspace config.
             max_tool_calls=load_max_tool_calls(workspace),

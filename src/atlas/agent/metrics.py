@@ -117,8 +117,8 @@ def format_tui_status(totals: SessionTotals) -> str:
     """One status line: model, context window, tokens, spend, and output speed."""
     limit = "unknown" if totals.context_limit is None else format_token_count(totals.context_limit)
     model = totals.model or "unset"
-    spend = "n/a" if totals.cost is None else _format_spend(totals.cost)
-    speed = "n/a" if totals.tokens_per_second is None else f"{totals.tokens_per_second:.1f}"
+    spend = _format_spend(0.0 if totals.cost is None else totals.cost)
+    speed = "0.0" if totals.tokens_per_second is None else f"{totals.tokens_per_second:.1f}"
     return (
         f"model {model}  context {format_token_count(totals.context_used)}/{limit}  "
         f"tokens {format_token_count(totals.total_tokens)}  "

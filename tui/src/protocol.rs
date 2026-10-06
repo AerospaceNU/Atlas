@@ -15,10 +15,15 @@ pub enum ServerMessage {
         name: String,
         call_id: String,
         ok: bool,
+        arguments: Value,
         text: Option<String>,
         error: Option<String>,
         error_kind: Option<String>,
         artifacts: Vec<String>,
+    },
+    Thought {
+        text: String,
+        tokens_per_second: Option<f64>,
     },
     Done {
         response: String,
@@ -134,6 +139,8 @@ enum RawMessage {
         #[serde(default)]
         ok: bool,
         #[serde(default)]
+        arguments: Value,
+        #[serde(default)]
         text: Option<String>,
         #[serde(default)]
         error: Option<String>,
@@ -204,6 +211,13 @@ enum RawMessage {
         #[serde(default)]
         name: Option<String>,
     },
+    #[serde(rename = "thought")]
+    Thought {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        tokens_per_second: Option<f64>,
+    },
     #[serde(rename = "removed")]
     Removed {
         #[serde(default)]
@@ -247,6 +261,7 @@ impl From<RawMessage> for ServerMessage {
                 name,
                 call_id,
                 ok,
+                arguments,
                 text,
                 error,
                 error_kind,
@@ -255,6 +270,7 @@ impl From<RawMessage> for ServerMessage {
                 name,
                 call_id,
                 ok,
+                arguments,
                 text,
                 error,
                 error_kind,
@@ -310,6 +326,13 @@ impl From<RawMessage> for ServerMessage {
                 ServerMessage::Removed { scope, kind, name }
             }
             RawMessage::Phase { phase, name } => ServerMessage::Phase { phase, name },
+            RawMessage::Thought {
+                text,
+                tokens_per_second,
+            } => ServerMessage::Thought {
+                text,
+                tokens_per_second,
+            },
         }
     }
 }
@@ -319,7 +342,7 @@ impl From<RawMessage> for ServerMessage {
 /// The words match `format_tui_status` for an empty session so the first
 /// frame is never a blank status row.
 pub fn default_status_line() -> String {
-    "model unset  context 0/unknown  tokens 0  spend n/a  n/a tok/s".to_string()
+    "model unset  context 0/unknown  tokens 0  spend $0  0.0 tok/s".to_string()
 }
 
 pub fn status_text(status: &StatusSnapshot) -> String {
@@ -353,15 +376,39 @@ mod tests {
             Some(ServerMessage::Step {
                 name,
                 ok,
+                arguments,
                 text,
                 artifacts,
                 ..
             }) => {
                 assert_eq!(name, "inspect_image");
                 assert!(ok);
+                assert_eq!(arguments, serde_json::json!({}));
                 assert_eq!(text.as_deref(), Some("20x10"));
                 assert_eq!(artifacts, vec!["a.png".to_string()]);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_thought() {
+        let line = r#"{"type":"thought","text":"check the coast","tokens_per_second":12.5}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::Thought {
+                text,
+                tokens_per_second,
+            }) => {
+                assert_eq!(text, "check the coast");
+                assert_eq!(tokens_per_second, Some(12.5));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let plain = r#"{"type":"thought","text":"check the coast"}"#;
+        match parse_line(plain).unwrap() {
+            Some(ServerMessage::Thought {
+                tokens_per_second, ..
+            }) => assert_eq!(tokens_per_second, None),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -412,7 +459,8 @@ mod tests {
         assert!(text.contains("tokens 0"));
         assert!(!text.contains("prompt"));
         assert!(!text.contains("completion"));
-        assert!(text.contains("spend n/a"));
+        assert!(text.contains("spend $0"));
+        assert!(text.contains("0.0 tok/s"));
         assert!(text.contains("tok/s"));
         assert!(!text.contains("http"));
         assert!(!text.contains("latency"));

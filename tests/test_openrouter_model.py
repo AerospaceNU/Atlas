@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
+import httpx
 import pytest
 
 from atlas.agent.contracts import ChatMessage, Role, ToolDefinition
@@ -32,12 +34,29 @@ class FakeResponse:
         self.elapsed_seconds = elapsed_seconds
         self.time_to_first_token_seconds = time_to_first_token_seconds
         self.text = text
+        self.lines: list[str] | None = None
 
     def raise_for_status(self) -> None:
         return None
 
     def json(self) -> dict[str, Any]:
         return self.payload
+
+    def iter_lines(self) -> list[str]:
+        if self.lines is not None:
+            return self.lines
+        return [f"data: {json.dumps(self.payload)}", "data: [DONE]"]
+
+
+class _Opened:
+    def __init__(self, response: FakeResponse) -> None:
+        self.response = response
+
+    def __enter__(self) -> FakeResponse:
+        return self.response
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
 
 
 class FakeClient:
@@ -54,6 +73,18 @@ class FakeClient:
         self.status_code = status_code
         self.elapsed_seconds = elapsed_seconds
         self.time_to_first_token_seconds = time_to_first_token_seconds
+        self.lines: list[str] | None = None
+
+    def stream(self, _method: str, _url: str, **kwargs: Any) -> _Opened:
+        self.calls.append(kwargs)
+        response = FakeResponse(
+            self.response,
+            status_code=self.status_code,
+            elapsed_seconds=self.elapsed_seconds,
+            time_to_first_token_seconds=self.time_to_first_token_seconds,
+        )
+        response.lines = self.lines
+        return _Opened(response)
 
     def post(self, _url: str, **kwargs: Any) -> FakeResponse:
         self.calls.append(kwargs)
@@ -100,9 +131,112 @@ def test_complete_advertises_and_parses_native_tool_calls() -> None:
 
     assert response.content is None
     assert response.tool_calls[0].arguments == {"path": "coast.png"}
+    sent = client.calls[0]["json"]
+    assert sent["max_tokens"] == 64 * 1024
+    assert sent["stream"] is True
+    assert sent["stream_options"] == {"include_usage": True}
+    timeout = client.calls[0]["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read == 60.0
     advertised_tool = client.calls[0]["json"]["tools"][0]["function"]
     assert advertised_tool["name"] == "inspect_image"
     assert advertised_tool["parameters"] == tool.parameters
+
+
+def test_complete_joins_streamed_chunks_without_a_total_deadline() -> None:
+    client = FakeClient({"choices": []})
+    client.lines = [
+        'data: {"choices":[{"delta":{"reasoning":"look "}}]}',
+        'data: {"choices":[{"delta":{"reasoning":"closer","content":"hel"}}]}',
+        'data: {"choices":[{"delta":{"content":"lo","tool_calls":[{"index":0,"id":"tool-1","function":{"name":"inspect_image","arguments":"{\\"path\\":"}}]}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"coast.png\\"}"}}]}}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8,"cost":0.01}}',
+        "data: [DONE]",
+    ]
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test"), client)
+
+    response = model.complete([ChatMessage(role=Role.USER, content="look")], [])
+
+    assert response.content == "hello"
+    assert response.reasoning == "look closer"
+    assert response.tool_calls[0].name == "inspect_image"
+    assert response.tool_calls[0].arguments == {"path": "coast.png"}
+    assert response.usage.completion_tokens == 5
+    assert response.usage.cost == 0.01
+    assert client.calls[0]["timeout"].read == 60.0
+
+
+def test_complete_reads_reasoning_and_sends_it_back() -> None:
+    details = [{"type": "reasoning.text", "text": "look at the coast", "format": "x"}]
+    client = FakeClient(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "clear",
+                        "reasoning": "look at the coast",
+                        "reasoning_details": details,
+                        "tool_calls": [],
+                    }
+                }
+            ]
+        }
+    )
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test"), client)
+
+    parsed = model.complete([ChatMessage(role=Role.USER, content="look")], [])
+
+    assert parsed.reasoning == "look at the coast"
+    assert parsed.reasoning_details == details
+    echoed = ChatMessage(
+        role=Role.ASSISTANT,
+        content=parsed.content,
+        reasoning=parsed.reasoning,
+        reasoning_details=parsed.reasoning_details,
+    )
+    model.complete([ChatMessage(role=Role.USER, content="look"), echoed], [])
+    sent = client.calls[1]["json"]["messages"][1]
+    assert sent["reasoning"] == "look at the coast"
+    assert sent["reasoning_details"] == details
+    assert "reasoning" not in client.calls[0]["json"]["messages"][0]
+
+
+def test_complete_falls_back_when_reasoning_is_missing() -> None:
+    content_only = FakeClient(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "a",
+                        "reasoning_content": "deepseek thought",
+                        "tool_calls": [],
+                    }
+                }
+            ]
+        }
+    )
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test"), content_only)
+    assert model.complete([ChatMessage(role=Role.USER, content="look")], []).reasoning == (
+        "deepseek thought"
+    )
+
+    details_only = FakeClient(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "a",
+                        "reasoning": "  ",
+                        "reasoning_details": [{"type": "reasoning.text", "text": "from details"}],
+                        "tool_calls": [],
+                    }
+                }
+            ]
+        }
+    )
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test"), details_only)
+    parsed = model.complete([ChatMessage(role=Role.USER, content="look")], [])
+    assert parsed.reasoning == "from details"
+    assert parsed.reasoning_details[0]["text"] == "from details"
 
 
 def test_complete_keeps_usage_cost_status_and_elapsed_time() -> None:

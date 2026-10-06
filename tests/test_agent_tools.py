@@ -161,9 +161,11 @@ def test_bash_reports_stdout_and_a_zero_exit(tmp_path: Path) -> None:
 
 def test_bash_runs_in_the_requested_working_directory(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
-    (tmp_path / "notes.txt").write_text("hello workspace", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "notes.txt").write_text("hello workspace", encoding="utf-8")
 
-    result = BashTool().run({"command": "cat notes.txt", "working_directory": str(tmp_path)}, store)
+    result = BashTool().run({"command": "cat notes.txt", "working_directory": "sub"}, store)
 
     assert "exit_code: 0" in result.text
     assert "hello workspace" in result.text
@@ -188,9 +190,93 @@ def test_bash_reports_a_timeout(tmp_path: Path) -> None:
 
 def test_bash_reports_a_missing_working_directory(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
-    missing = tmp_path / "nope"
 
-    result = BashTool().run({"command": "echo hi", "working_directory": str(missing)}, store)
+    result = BashTool().run({"command": "echo hi", "working_directory": "nope"}, store)
 
     assert "Working directory not found" in result.text
-    assert str(missing) in result.text
+    assert "nope" in result.text
+    assert str(tmp_path) not in result.text
+
+
+def test_bash_rejects_absolute_or_escaping_working_directory(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+
+    absolute = BashTool().run({"command": "echo hi", "working_directory": "/etc"}, store)
+    escaping = BashTool().run({"command": "echo hi", "working_directory": "../outside"}, store)
+
+    assert "Invalid working directory" in absolute.text
+    assert "Invalid working directory" in escaping.text
+
+
+def test_bash_defaults_to_the_workspace_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "notes.txt").write_text("at workspace", encoding="utf-8")
+    store = LocalArtifactStore(tmp_path / "artifact", read_root=workspace)
+
+    result = BashTool().run({"command": "cat notes.txt"}, store)
+
+    assert "at workspace" in result.text
+
+
+def test_read_file_falls_back_to_the_read_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("project readme", encoding="utf-8")
+    store = LocalArtifactStore(tmp_path / "artifact", read_root=workspace)
+
+    result = ReadFileTool().run({"path": "README.md"}, store)
+
+    assert result.text == "project readme"
+
+
+def test_read_file_prefers_the_write_root_over_the_read_root(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact"
+    workspace = tmp_path / "workspace"
+    artifact.mkdir()
+    workspace.mkdir()
+    (artifact / "notes.txt").write_text("artifact", encoding="utf-8")
+    (workspace / "notes.txt").write_text("workspace", encoding="utf-8")
+    store = LocalArtifactStore(artifact, read_root=workspace)
+
+    assert ReadFileTool().run({"path": "notes.txt"}, store).text == "artifact"
+
+
+def test_read_file_still_rejects_escapes_and_absolute_paths_with_a_read_root(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = LocalArtifactStore(tmp_path / "artifact", read_root=workspace)
+
+    with pytest.raises(ValueError, match="escapes"):
+        ReadFileTool().run({"path": "../outside.txt"}, store)
+    with pytest.raises(ValueError, match="relative"):
+        ReadFileTool().run({"path": str(workspace / "notes.txt")}, store)
+
+
+def test_read_file_missing_file_with_read_root_hides_host_paths(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = LocalArtifactStore(tmp_path / "artifact", read_root=workspace)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        ReadFileTool().run({"path": "missing.txt"}, store)
+
+    message = str(excinfo.value)
+    assert "missing.txt" in message
+    assert str(tmp_path) not in message
+
+
+def test_write_file_never_writes_to_the_read_root(tmp_path: Path) -> None:
+    from atlas.agent.tools.write_file import WriteTool
+
+    artifact = tmp_path / "artifact"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = LocalArtifactStore(artifact, read_root=workspace)
+
+    WriteTool().run({"path": "out.txt", "content": "data"}, store)
+
+    assert (artifact / "out.txt").is_file()
+    assert not (workspace / "out.txt").exists()

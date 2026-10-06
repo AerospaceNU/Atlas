@@ -41,12 +41,18 @@ class ToolCall(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    """A portable chat-completions message."""
+    """A portable chat-completions message.
+
+    ``reasoning`` and ``reasoning_details`` are echoed on the next request when
+    the provider returned them. They are not part of ``content``.
+    """
 
     role: Role
     content: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
     tool_call_id: str | None = None
+    reasoning: str | None = None
+    reasoning_details: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TokenUsage(BaseModel):
@@ -88,12 +94,18 @@ class CatalogModel(BaseModel):
 
 
 class ModelResponse(BaseModel):
-    """The subset of a model response needed by the runtime."""
+    """The subset of a model response needed by the runtime.
+
+    ``reasoning`` is display text for the turn. ``reasoning_details`` is the
+    provider payload to send back unchanged on the next request.
+    """
 
     content: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
     usage: TokenUsage = Field(default_factory=TokenUsage)
     timing: CallTiming | None = None
+    reasoning: str | None = None
+    reasoning_details: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ToolCapableModel(Protocol):
