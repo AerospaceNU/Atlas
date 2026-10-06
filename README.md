@@ -12,6 +12,26 @@ ATLAS is a research project in **harness engineering** at the intersection of
 aerospace and computer science: automated, cost-efficient satellite imagery
 analysis, in part with LLMs. The official focus is satellite data analysis focused on geographical and environmental changes across available data.
 
+## Agent TUI
+
+From this checkout, put `atlas` on your PATH:
+
+```bash
+uv tool install --editable --force .
+```
+
+`~/.local/bin` must be on PATH. A normal uv install already adds it. The TUI also needs Rust (`cargo`, including `~/.cargo/bin` from rustup) and `OPENROUTER_API_KEY` in `.env`. Machine setup is in the install guides: [macOS](install-instructions/INSTALL-MAC.md), [Linux](install-instructions/INSTALL-LINUX.md), [Windows](install-instructions/INSTALL-WINDOWS.md).
+
+```bash
+atlas
+```
+
+That opens the agent TUI in the current directory. The first launch builds `tui/target/release/atlas-tui` and can take a few minutes. Later launches reuse that binary and rebuild only after Rust sources change.
+
+`atlas data` stays on the data CLI. `atlas tui --workspace PATH` opens the TUI on another directory.
+
+Enter sends a line. `/` opens commands. `/new` starts a fresh conversation in the same directory. `/quit` and `/exit` leave Atlas.
+
 ## Data CLI
 
 `atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`.

@@ -33,11 +33,12 @@ Options:
 
 `OPENROUTER_API_KEY` is read from the environment, or from `<repo>/.env` when
 the repo root is found. The first session writes `<workspace>/.atlas/agent.toml`
-when that file is missing, with `model` set to `google/gemini-3.8-flash`.
+when that file is missing, with `model` set to `deepseek/deepseek-v4.1-flash`.
 `ATLAS_MODEL` or `--model` on the Python session overrides the file.
 
 Keys: `enter` sends the input line, `ctrl-r` resumes a turn that stopped at the
-tool-call limit, `ctrl-c` / `esc` quits. `PageUp` / `PageDown` scroll.
+tool-call limit, `ctrl-c` / `esc` quits. `PageUp` / `PageDown` scroll. `/new`
+starts a fresh conversation and clears the transcript.
 
 ## Adding a tool
 

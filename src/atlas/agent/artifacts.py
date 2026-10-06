@@ -18,28 +18,66 @@ class ImageInfo(BaseModel):
     format: str | None
 
 
-class LocalArtifactStore:
-    """Constrain an agent's image work to one local directory.
+def _within(base: Path, relative_path: str) -> Path:
+    """Resolve ``relative_path`` under ``base``, rejecting escapes.
 
-    Paths passed through the tool interface are always relative to ``root``.
-    This prevents tools from reading or writing arbitrary locations on the host.
+    Absolute paths and ``..`` escapes raise ``ValueError``. The result is
+    always inside ``base``, so callers never receive a host path outside the
+    sandbox.
+
+    Args:
+        base: Directory that bounds the resolved path.
+        relative_path: Caller-supplied path, relative to ``base``.
+
+    Returns:
+        The resolved absolute path inside ``base``.
+
+    Raises:
+        ValueError: If ``relative_path`` is absolute or escapes ``base``.
+    """
+    path = Path(relative_path)
+    if path.is_absolute():
+        raise ValueError("Artifact paths must be relative to the artifact root")
+    candidate = (base / path).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError as exc:
+        raise ValueError("Artifact path escapes the artifact root") from exc
+    return candidate
+
+
+class LocalArtifactStore:
+    """Constrain an agent's work to one local directory.
+
+    Paths passed through the tool interface are always relative to ``root``
+    (the write sandbox). An optional ``read_root`` widens *reads* to a second
+    tree -- the project workspace -- so an agent can inspect source files and
+    inputs without gaining write access to them. Writes always stay in
+    ``root``, and both roots reject absolute paths and ``..`` escapes.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, read_root: Path | None = None) -> None:
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.read_root = read_root.resolve() if read_root is not None else None
 
     def resolve(self, relative_path: str) -> Path:
-        """Resolve a relative path and reject attempts to escape ``root``."""
-        path = Path(relative_path)
-        if path.is_absolute():
-            raise ValueError("Artifact paths must be relative to the artifact root")
-        candidate = (self.root / path).resolve()
-        try:
-            candidate.relative_to(self.root)
-        except ValueError as exc:
-            raise ValueError("Artifact path escapes the artifact root") from exc
-        return candidate
+        """Resolve a relative path for writing and reject attempts to escape ``root``."""
+        return _within(self.root, relative_path)
+
+    def resolve_read(self, relative_path: str) -> Path:
+        """Resolve a relative path for reading, preferring the write sandbox.
+
+        A path that exists under ``root`` wins. Otherwise, when ``read_root``
+        is set, the same relative path is tried there. A path that exists in
+        neither returns its ``root``-relative form, so the caller's error stays
+        root-relative and never leaks a host path.
+        """
+        primary = _within(self.root, relative_path)
+        if primary.exists() or self.read_root is None:
+            return primary
+        fallback = _within(self.read_root, relative_path)
+        return fallback if fallback.exists() else primary
 
     def relative(self, path: Path) -> str:
         """Return a root-relative, portable artifact path."""
