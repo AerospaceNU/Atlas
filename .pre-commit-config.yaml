@@ -31,6 +31,7 @@ repos:
         additional_dependencies:
           - pydantic
           - anthropic
+          - google-genai
           - httpx
           - pillow
           - numpy
