@@ -382,6 +382,21 @@ def test_read_file_still_rejects_escapes_and_absolute_paths_with_a_read_root(
         ReadFileTool().run({"path": str(workspace / "notes.txt")}, store)
 
 
+def test_read_file_rejects_a_symlink_in_the_read_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (workspace / "notes.txt").symlink_to(outside)
+    (workspace / "linked_dir").symlink_to(tmp_path)
+    store = LocalArtifactStore(tmp_path / "artifact", read_root=workspace)
+
+    with pytest.raises(SandboxDenied, match="escapes"):
+        ReadFileTool().run({"path": "notes.txt"}, store)
+    with pytest.raises(SandboxDenied, match="escapes"):
+        ReadFileTool().run({"path": "linked_dir/outside.txt"}, store)
+
+
 def test_read_file_rejects_a_hardlink_in_the_read_root(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
