@@ -16,8 +16,6 @@ from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import default_registry
 from atlas.agent.tools.rsicc_tool import RSICCTool
 
-_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-
 
 @dataclass
 class _FakeResponse:
@@ -50,7 +48,7 @@ class _FakeGemini:
 def gemini(monkeypatch: pytest.MonkeyPatch) -> _FakeGemini:
     fake = _FakeGemini(reply="  The lake in the before image is dry in the after image.\n")
     monkeypatch.setattr("google.genai.Client", fake)
-    monkeypatch.setenv("GEMMA_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     return fake
 
 
@@ -98,7 +96,6 @@ def test_sends_labelled_before_and_after_images_in_order(
     tmp_path: Path, gemini: _FakeGemini
 ) -> None:
     store = LocalArtifactStore(tmp_path)
-    # Different sizes tell the two images apart once they are re-encoded.
     before = _save(_rgb(40, 30), tmp_path / "before.png")
     after = _save(_rgb(20, 10), tmp_path / "after.png")
 
@@ -158,12 +155,12 @@ def test_path_outside_the_workspace_is_rejected(tmp_path: Path, gemini: _FakeGem
 def test_missing_api_key_raises(
     tmp_path: Path, gemini: _FakeGemini, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("GEMMA_API_KEY")
+    monkeypatch.delenv("GEMINI_API_KEY")
     store = LocalArtifactStore(tmp_path)
     before = _save(_rgb(8, 8), tmp_path / "before.png")
     after = _save(_rgb(8, 8), tmp_path / "after.png")
 
-    with pytest.raises(RuntimeError, match="GEMMA_API_KEY"):
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
         RSICCTool().run({"image1": before, "image2": after}, store)
 
     assert gemini.models.calls == []
@@ -188,69 +185,46 @@ def test_invalid_arguments_are_rejected(
         RSICCTool().run(arguments, LocalArtifactStore(tmp_path))
 
 
-def _gray8() -> Image.Image:
-    return _rgb(16, 12).convert("L")
-
-
 @pytest.mark.parametrize(
-    ("filename", "make"),
+    ("filename", "mime_type"),
     [
-        ("rgba.png", lambda: _rgb(16, 12).convert("RGBA")),
-        ("rgb.jpg", lambda: _rgb(16, 12)),
-        ("rgb.jpeg", lambda: _rgb(16, 12)),
-        ("palette.gif", lambda: _rgb(16, 12).convert("P")),
-        ("rgb.bmp", lambda: _rgb(16, 12)),
-        ("rgb.webp", lambda: _rgb(16, 12)),
-        ("rgb.tif", lambda: _rgb(16, 12)),
-        ("gray.tiff", _gray8),
-        ("UPPER.PNG", lambda: _rgb(16, 12)),
+        ("image.png", "image/png"),
+        ("image.jpg", "image/jpeg"),
+        ("image.jpeg", "image/jpeg"),
+        ("image.webp", "image/webp"),
+        ("image.heic", "image/heic"),
+        ("image.heif", "image/heif"),
+        ("IMAGE.PNG", "image/png"),
     ],
 )
-def test_supported_formats_reach_gemini_as_png(
-    tmp_path: Path, gemini: _FakeGemini, filename: str, make: Any
+def test_supported_values_are_sent_fine(
+    tmp_path: Path, gemini: _FakeGemini, filename: str, mime_type: str
 ) -> None:
     store = LocalArtifactStore(tmp_path)
-    name = _save(make(), tmp_path / filename)
 
-    RSICCTool().run({"image1": name, "image2": name}, store)
+    (tmp_path / filename).write_bytes(b"image bytes")
 
-    for part in _sent_images(gemini):
+    RSICCTool().run({"image1": filename, "image2": filename}, store)
+
+    parts = _sent_images(gemini)
+    assert len(parts) == 2
+    for part in parts:
         assert part.inline_data is not None
-        assert part.inline_data.mime_type == "image/png"
-        assert part.inline_data.data is not None
-        assert part.inline_data.data.startswith(_PNG_SIGNATURE)
-        assert _decode(part).size == (16, 12)
+        assert part.inline_data.mime_type == mime_type
+        assert part.inline_data.data == b"image bytes"
 
 
-@pytest.mark.xfail(strict=True, reason="PNG cannot hold float data; convert to 8-bit first")
-def test_float32_geotiff_is_supported(tmp_path: Path, gemini: _FakeGemini) -> None:
-    reflectance = np.random.default_rng(0).random((12, 16), dtype=np.float32)
+@pytest.mark.parametrize("filename", ["palette.gif", "rgb.bmp", "rgb.tif", "gray.tiff"])
+def test_unsupported_formats_are_rejected_without_calling_gemini(
+    tmp_path: Path, gemini: _FakeGemini, filename: str
+) -> None:
     store = LocalArtifactStore(tmp_path)
-    name = _save(Image.fromarray(reflectance), tmp_path / "reflectance.tif")
+    (tmp_path / filename).write_bytes(b"image bytes")
 
-    RSICCTool().run({"image1": name, "image2": name}, store)
+    with pytest.raises(ValueError, match="Unsupported image type"):
+        RSICCTool().run({"image1": filename, "image2": filename}, store)
 
-
-@pytest.mark.xfail(strict=True, reason="PNG cannot hold CMYK; convert to RGB first")
-def test_cmyk_jpeg_is_supported(tmp_path: Path, gemini: _FakeGemini) -> None:
-    store = LocalArtifactStore(tmp_path)
-    name = _save(_rgb(16, 12).convert("CMYK"), tmp_path / "print.jpg")
-
-    RSICCTool().run({"image1": name, "image2": name}, store)
-
-
-@pytest.mark.xfail(strict=True, reason="16-bit data is passed through unstretched and looks black")
-def test_16bit_tiff_is_stretched_to_visible_8bit(tmp_path: Path, gemini: _FakeGemini) -> None:
-    # Typical surface reflectance counts: 0-4000 out of a possible 65535.
-    counts = np.random.default_rng(0).integers(0, 4000, (12, 16), dtype=np.uint16)
-    store = LocalArtifactStore(tmp_path)
-    name = _save(Image.fromarray(counts), tmp_path / "counts.tif")
-
-    RSICCTool().run({"image1": name, "image2": name}, store)
-
-    sent = _decode(_sent_images(gemini)[0])
-    assert sent.mode in {"L", "RGB"}
-    assert np.asarray(sent).max() > 200
+    assert gemini.models.calls == []
 
 
 @pytest.mark.evals
@@ -258,8 +232,8 @@ def test_live_gemini_describes_an_obvious_change(tmp_path: Path) -> None:
     from dotenv import load_dotenv
 
     load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
-    if not os.environ.get("GEMMA_API_KEY"):
-        pytest.skip("GEMMA_API_KEY is not set")
+    if not os.environ.get("GEMINI_API_KEY"):
+        pytest.skip("GEMINI_API_KEY is not set")
 
     blank = np.full((128, 128, 3), 255, dtype=np.uint8)
     square = blank.copy()

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import io
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PIL import Image
 from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
@@ -20,6 +18,15 @@ _PROMPT = (
     "single sentence. Do not say what happened as if it is a news event. Do not search "
     "anything. Refer to the images strictly as the before image and the after image."
 )
+
+_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+}
 
 
 # pydantic model for the inputs to the tool
@@ -47,11 +54,13 @@ class RSICCTool(Tool):
     def _image_part(path: Path) -> types.Part:
         from google.genai import types
 
-        # Gemini accepts only PNG/JPEG/WEBP/HEIC/HEIF, so convert everything to PNG.
-        with Image.open(path) as image:
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-        return types.Part.from_bytes(data=buffer.getvalue(), mime_type="image/png")
+        mime_type = _MIME_TYPES.get(path.suffix.lower())
+        if mime_type is None:  # non-supported image type
+            raise ValueError(
+                f"Unsupported image type {path.suffix}. Supported types: {', '.join(_MIME_TYPES)}"
+            )
+
+        return types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type)
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         """Call Gemini to describe the differences between the two images."""
@@ -65,9 +74,9 @@ class RSICCTool(Tool):
             if not path.is_file():
                 raise FileNotFoundError(f"Image does not exist: {relative}")
 
-        api_key = os.getenv("GEMMA_API_KEY")
+        api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            raise RuntimeError("GEMMA_API_KEY is not set")
+            raise RuntimeError("GEMINI_API_KEY is not set")
 
         contents: list[types.PartUnionDict] = [
             "Before image:",
