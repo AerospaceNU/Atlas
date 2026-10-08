@@ -9,7 +9,12 @@ from atlas.agent.contracts import Tool, ToolResult
 
 
 class EditFileInput(BaseModel):
-    """The docstring should describe the three fields (workspace-relative path, exact text to find, replacement), not "Inputs the relative path..."."""
+    """Arguments for ``edit_file``.
+
+    ``path`` is relative to the artifact workspace. ``old_string`` is the exact
+    text to find, and must occur exactly once in the file. ``new_string`` is the
+    text that replaces it.
+    """
 
     path: str = Field(description="Path relative to the local artifact workspace.")
     old_string: str = Field(description="Exact old string to replace.")
