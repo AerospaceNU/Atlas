@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Self
 
@@ -150,10 +151,6 @@ def item_to_scene(
     if isinstance(instruments, list) and instruments and isinstance(instruments[0], str):
         instrument = instruments[0]
 
-    cloud = props.get("eo:cloud_cover")
-    cloud_cover = (
-        float(cloud) if isinstance(cloud, int | float) and not isinstance(cloud, bool) else None
-    )
     item_gsd = props.get("gsd")
     resolved_gsd = (
         float(item_gsd)
@@ -176,7 +173,7 @@ def item_to_scene(
         gsd_m=resolved_gsd,
         platform=_stac_platform(props, default_platform),
         instrument=instrument,
-        cloud_cover=cloud_cover,
+        cloud_cover=_stac_cloud_cover(props.get("eo:cloud_cover")),
         assets=assets,
         properties=props,
     )
@@ -189,11 +186,8 @@ def _parse_geometry(
     coords = geom.get("coordinates") if isinstance(geom, dict) else None
     geom_type = geom.get("type") if isinstance(geom, dict) else None
 
-    bbox_key = feature.get("bbox")
-    if isinstance(bbox_key, list):
-        bbox = _stac_bbox(feature)
-        if bbox is None:
-            return None
+    bbox = _stac_bbox(feature)
+    if bbox is not None:
         if geom_type == "Point" and isinstance(coords, list) and len(coords) >= 2:
             try:
                 return bbox, GeometryKind.point, float(coords[0]), float(coords[1])
@@ -234,17 +228,34 @@ def _stac_datetime(raw: object) -> datetime | None:
 
 def _stac_bbox(feature: dict[str, Any]) -> BBox | None:
     bbox_list = feature.get("bbox")
-    if not isinstance(bbox_list, list) or len(bbox_list) != 4:
+    if not isinstance(bbox_list, list) or len(bbox_list) not in {4, 6}:
         return None
+    # A 6-number bbox is [west, south, floor, east, north, ceiling].
+    half = len(bbox_list) // 2
     try:
         return BBox.try_new(
             west=float(bbox_list[0]),
             south=float(bbox_list[1]),
-            east=float(bbox_list[2]),
-            north=float(bbox_list[3]),
+            east=float(bbox_list[half]),
+            north=float(bbox_list[half + 1]),
         )
     except (TypeError, ValueError):
         return None
+
+
+def _stac_cloud_cover(raw: object) -> float | None:
+    if isinstance(raw, str):
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+    elif isinstance(raw, int | float) and not isinstance(raw, bool):
+        value = float(raw)
+    else:
+        return None
+    if not math.isfinite(value):
+        return None
+    return min(max(value, 0.0), 100.0)
 
 
 def _http_href(href: str) -> str:
@@ -259,9 +270,10 @@ def _http_href(href: str) -> str:
 
 
 def _stac_platform(props: dict[str, Any], default: str) -> str:
-    raw = props.get("platform")
-    if isinstance(raw, str) and raw:
-        return raw
-    if isinstance(raw, list) and raw and isinstance(raw[0], str) and raw[0]:
-        return raw[0]
+    for key in ("const:platform", "platform"):
+        raw = props.get(key)
+        if isinstance(raw, str) and raw:
+            return raw
+        if isinstance(raw, list) and raw and isinstance(raw[0], str) and raw[0]:
+            return raw[0]
     return default

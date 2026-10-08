@@ -24,6 +24,7 @@ class SceneKind(StrEnum):
     altimetry = "altimetry"
     precipitation = "precipitation"
     landcover = "landcover"
+    landsurface = "landsurface"
 
 
 class GeometryKind(StrEnum):
@@ -81,6 +82,28 @@ class BBox(BaseModel):
         if self.west > self.east:
             return lon >= self.west or lon <= self.east
         return self.west <= lon <= self.east
+
+    def intersects(self, other: BBox) -> bool:
+        """True if the boxes share any point, including boxes that cross 180°.
+
+        Args:
+            other: Box to test against this one.
+
+        Returns:
+            Whether the two boxes overlap or touch.
+        """
+        if self.north < other.south or other.north < self.south:
+            return False
+        return any(
+            west <= other_east and other_west <= east
+            for west, east in self._lon_ranges()
+            for other_west, other_east in other._lon_ranges()
+        )
+
+    def _lon_ranges(self) -> list[tuple[float, float]]:
+        if self.west > self.east:
+            return [(self.west, 180.0), (-180.0, self.east)]
+        return [(self.west, self.east)]
 
     def as_list(self) -> list[float]:
         return [self.west, self.south, self.east, self.north]

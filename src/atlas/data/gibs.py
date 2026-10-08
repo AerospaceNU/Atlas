@@ -51,6 +51,12 @@ class GibsClient(DataPullClient):
         await self.aclose()
 
     async def search(self, request: PullRequest) -> PullResult:
+        """Build one WMS preview per day without checking that the layer has data.
+
+        No HTTP request is made, so a day with no imagery still gets a scene (it
+        renders blank). Scenes are marked ``synthetic`` and never count toward
+        coverage.
+        """
         days = _dates_inclusive(request.start_date, request.end_date)[: request.limit]
         scenes: list[Scene] = []
         for day in days:
@@ -75,7 +81,7 @@ class GibsClient(DataPullClient):
                         roles=["overview", "visual"],
                     )
                 },
-                properties={"layer": self.layer, "time": day.isoformat()},
+                properties={"layer": self.layer, "time": day.isoformat(), "synthetic": True},
             )
             if scene is not None:
                 scenes.append(scene)

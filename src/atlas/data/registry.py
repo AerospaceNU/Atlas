@@ -18,7 +18,7 @@ from atlas.data.cmr_stac import (
     ViirsVnp09gaClient,
 )
 from atlas.data.cop_dem import CopDemGlo30Client, CopDemGlo90Client
-from atlas.data.digitalearth import DeAfricaS2Client, DeaS2ArdClient
+from atlas.data.digitalearth import DeAfricaS2Client, DeaS2ArdClient, DeaS2BmArdClient
 from atlas.data.earth_search import EarthSearchSentinel1GrdClient
 from atlas.data.firms import (
     FirmsClient,
@@ -66,6 +66,7 @@ from atlas.data.pc_more import (
 )
 from atlas.data.sentinel1 import Sentinel1Client
 from atlas.data.sentinel2 import Sentinel2Client
+from atlas.data.sources.fldas import FldasClient
 from atlas.data.usgs import UsgsLandsatC2L1Client, UsgsLandsatC2L2SrClient
 
 # Registry of known satellite data sources by stable name. The consolidation
@@ -112,6 +113,7 @@ SOURCES: dict[str, type[DataPullClient]] = {
     "icesat2_atl03": IceSat2Atl03Client,
     "smap_l3": SmapL3PassiveClient,
     "dea_s2_ard": DeaS2ArdClient,
+    "dea_s2b_ard": DeaS2BmArdClient,
     "deafrica_s2": DeAfricaS2Client,
     "cbers4_mux": Cbers4MuxClient,
     "amazonia1_wfi": Amazonia1WfiClient,
@@ -121,6 +123,7 @@ SOURCES: dict[str, type[DataPullClient]] = {
     "firms_viirs_noaa21": FirmsViirsNoaa21Client,
     "firms_modis": FirmsModisClient,
     "firms_landsat": FirmsLandsatClient,
+    "fldas": FldasClient,
     "gibs_modis_truecolor": GibsModisTrueColorClient,
     "gibs_viirs_truecolor": GibsViirsTrueColorClient,
     "gibs_aqua_truecolor": GibsAquaTrueColorClient,

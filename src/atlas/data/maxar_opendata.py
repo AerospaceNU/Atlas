@@ -42,22 +42,17 @@ class MaxarOpenDataClient(DataPullClient):
         await self.aclose()
 
     async def search(self, request: PullRequest) -> PullResult:
+        """Items inside the AOI and window; ``max_events`` counts matching events only."""
         root = await self._get_json(MAXAR_ROOT)
         scenes: list[Scene] = []
-        scanned = 0
-        for link in root.get("links") or []:
-            if not isinstance(link, dict) or link.get("rel") != "child":
-                continue
-            href = link.get("href")
-            if not isinstance(href, str):
-                continue
-            event_url = urljoin(MAXAR_ROOT, href)
-            scanned += 1
-            if scanned > self._max_events or len(scenes) >= request.limit:
+        matched = 0
+        for event_url in _child_urls(root, MAXAR_ROOT):
+            if matched >= self._max_events or len(scenes) >= request.limit:
                 break
             event = await self._get_json(event_url)
             if not _extent_overlaps(event.get("extent"), request):
                 continue
+            matched += 1
             for scene in await self._scenes_from_event(event_url, event, request):
                 scenes.append(scene)
                 if len(scenes) >= request.limit:
@@ -68,22 +63,11 @@ class MaxarOpenDataClient(DataPullClient):
         self, event_url: str, event: dict[str, Any], request: PullRequest
     ) -> list[Scene]:
         scenes: list[Scene] = []
-        for link in event.get("links") or []:
-            if not isinstance(link, dict) or link.get("rel") != "child":
-                continue
-            href = link.get("href")
-            if not isinstance(href, str):
-                continue
-            acq = await self._get_json(urljoin(event_url, href))
+        for acq_url in _child_urls(event, event_url):
+            acq = await self._get_json(acq_url)
             if not _extent_overlaps(acq.get("extent"), request):
                 continue
-            for item_link in acq.get("links") or []:
-                if not isinstance(item_link, dict) or item_link.get("rel") != "item":
-                    continue
-                item_href = item_link.get("href")
-                if not isinstance(item_href, str):
-                    continue
-                item_url = urljoin(urljoin(event_url, href), item_href)
+            for item_url in _child_urls(acq, acq_url, rel="item"):
                 item = await self._get_json(item_url)
                 _absolutize_asset_hrefs(item, item_url)
                 scene = item_to_scene(
@@ -93,7 +77,7 @@ class MaxarOpenDataClient(DataPullClient):
                     kind=SceneKind.optical,
                     gsd_m=0.5,
                 )
-                if scene is not None:
+                if scene is not None and _scene_matches(scene, request):
                     scenes.append(scene)
                 if len(scenes) >= request.limit:
                     return scenes
@@ -106,6 +90,19 @@ class MaxarOpenDataClient(DataPullClient):
         return payload if isinstance(payload, dict) else {}
 
 
+def _child_urls(node: dict[str, Any], base_url: str, *, rel: str = "child") -> list[str]:
+    urls: list[str] = []
+    for link in node.get("links") or []:
+        if isinstance(link, dict) and link.get("rel") == rel and isinstance(link.get("href"), str):
+            urls.append(urljoin(base_url, link["href"]))
+    return urls
+
+
+def _scene_matches(scene: Scene, request: PullRequest) -> bool:
+    day = scene.datetime.date()
+    return request.start_date <= day <= request.end_date and scene.bbox.intersects(request.bbox)
+
+
 def _absolutize_asset_hrefs(item: dict[str, Any], base_url: str) -> None:
     assets = item.get("assets")
     if not isinstance(assets, dict):
@@ -116,6 +113,7 @@ def _absolutize_asset_hrefs(item: dict[str, Any], base_url: str) -> None:
 
 
 def _extent_overlaps(extent: object, request: PullRequest) -> bool:
+    """False only when a declared extent misses the request; unknown extent passes."""
     if not isinstance(extent, dict):
         return True
     spatial = extent.get("spatial")
@@ -140,13 +138,11 @@ def _extent_overlaps(extent: object, request: PullRequest) -> bool:
 
 def _bbox_overlap(box: list[object], bbox: BBox) -> bool:
     try:
-        west = float(str(box[0]))
-        south = float(str(box[1]))
-        east = float(str(box[2]))
-        north = float(str(box[3]))
-    except (TypeError, ValueError, IndexError):
+        west, south, east, north = (float(str(v)) for v in box[:4])
+    except (TypeError, ValueError):
         return False
-    return not (east < bbox.west or west > bbox.east or north < bbox.south or south > bbox.north)
+    other = BBox.try_new(west=west, south=south, east=east, north=north)
+    return other is not None and other.intersects(bbox)
 
 
 def _interval_overlap(interval: object, start: date, end: date) -> bool:

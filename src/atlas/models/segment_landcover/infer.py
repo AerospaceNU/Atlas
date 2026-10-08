@@ -60,7 +60,7 @@ class SegmentLandcoverTool(Tool):
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request = SegmentInput.model_validate(arguments)
         relative_image = request.path
-        image_path = store.resolve(relative_image)
+        image_path = store.resolve_read(relative_image)
         labels_rel = request.labels_path or f"artifacts/{self.name}_labels.png"
         overlay_rel = request.overlay_path or f"artifacts/{self.name}_overlay.png"
         json_rel = request.json_path or f"artifacts/{self.name}.json"

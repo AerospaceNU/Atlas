@@ -24,8 +24,8 @@ class ProgressReporter(Protocol):
     def source_search_done(self, name: str, *, scenes: int, error: str | None) -> None:
         """Record search completion (or a captured source error)."""
 
-    def source_pull(self, name: str, *, saved: int, total: int) -> None:
-        """Update download counts while pulling rasters."""
+    def source_pull(self, name: str, *, saved: int, total: int, label: str = "downloading") -> None:
+        """Update download or extract counts for one source."""
 
     def source_done(self, name: str) -> None:
         """Mark a source fully finished."""
@@ -49,8 +49,8 @@ class LogReporter:
         else:
             print(f"{name}: {scenes} scenes", file=self._stream, flush=True)
 
-    def source_pull(self, name: str, *, saved: int, total: int) -> None:
-        print(f"{name}: pulling {saved}/{total}", file=self._stream, flush=True)
+    def source_pull(self, name: str, *, saved: int, total: int, label: str = "pulling") -> None:
+        print(f"{name}: {label} {saved}/{total}", file=self._stream, flush=True)
 
     def source_done(self, name: str) -> None:
         print(f"{name}: done", file=self._stream, flush=True)
@@ -80,6 +80,7 @@ class RichReporter:
         self._n_searched = 0
         self._saved: dict[str, int] = {}
         self._totals: dict[str, int] = {}
+        self._pull_label = "downloading"
         self._stopped = False
         self._progress.start()
 
@@ -102,19 +103,20 @@ class RichReporter:
             description=label,
         )
 
-    def source_pull(self, name: str, *, saved: int, total: int) -> None:
+    def source_pull(self, name: str, *, saved: int, total: int, label: str = "downloading") -> None:
         self._saved[name] = saved
         self._totals[name] = total
+        self._pull_label = label
         overall_saved = sum(self._saved.values())
         overall_total = sum(self._totals.values())
-        label = f"downloading {name}"
+        text = f"{label} {name}"
         if self._pull_id is None:
-            self._pull_id = self._progress.add_task(label, total=max(overall_total, 1))
+            self._pull_id = self._progress.add_task(text, total=max(overall_total, 1))
         self._progress.update(
             self._pull_id,
             completed=overall_saved,
             total=max(overall_total, 1),
-            description=label,
+            description=text,
         )
 
     def source_done(self, name: str) -> None:
@@ -125,7 +127,7 @@ class RichReporter:
                 self._pull_id,
                 completed=overall_saved,
                 total=max(overall_total, overall_saved, 1),
-                description="downloading",
+                description=self._pull_label,
             )
 
     def close(self) -> None:

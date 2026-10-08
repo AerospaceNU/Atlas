@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from datetime import UTC, date, datetime, timedelta
 from typing import ClassVar, Self
-from xml.etree import ElementTree
 
 import httpx
 
@@ -16,8 +15,8 @@ from atlas.data.base import (
     Scene,
     SceneKind,
 )
+from atlas.data.s3 import list_keys
 
-_S3_NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 _START_RE = re.compile(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})")
 
 GOES_EAST_BUCKET = "noaa-goes19"
@@ -30,7 +29,10 @@ _WEST_DISK = BBox(west=-180.0, south=-50.0, east=-105.0, north=60.0)
 
 
 class GoesClient(DataPullClient):
-    """Pick GOES-East or West from the AOI longitude; list recent ABI MCMIP NetCDFs."""
+    """Pick GOES-East or West from the AOI longitude; list ABI MCMIP NetCDFs.
+
+    Scene footprints are the whole CONUS or full-disk sector, not the AOI.
+    """
 
     satellite: ClassVar[str] = "goes"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
@@ -61,22 +63,21 @@ class GoesClient(DataPullClient):
     async def search(self, request: PullRequest) -> PullResult:
         bucket = _bucket_for_bbox(request.bbox)
         product = _product_for_bbox(request.bbox)
-        hours = _hours_in_range(request.start_date, request.end_date)[-request.limit :]
-        scenes: list[Scene] = []
-        for year, doy, hour in hours:
+        if not _footprint(bucket, product).intersects(request.bbox):
+            return PullResult(request=request, scenes=[])
+        hours = set(_hours_in_range(request.start_date, request.end_date))
+        days = sorted({(year, doy) for year, doy, _ in hours})
+        scenes: dict[str, Scene] = {}
+        for year, doy in reversed(days):
             if len(scenes) >= request.limit:
                 break
-            prefix = f"{product}/{year}/{doy:03d}/{hour:02d}/"
-            url = f"https://{bucket}.s3.amazonaws.com/?list-type=2&prefix={prefix}&max-keys=1"
-            resp = await self._client.get(url)
-            resp.raise_for_status()
-            for key in _parse_keys(resp.text):
+            for key in await list_keys(self._client, bucket, f"{product}/{year}/{doy:03d}/"):
                 scene = _key_to_scene(bucket, key, product)
-                if scene is not None:
-                    scenes.append(scene)
-                    if len(scenes) >= request.limit:
-                        break
-        return PullResult(request=request, scenes=scenes)
+                # Keep finished hours only.
+                if scene is not None and _hour_key(scene.datetime) in hours:
+                    scenes.setdefault(scene.id, scene)
+        newest = sorted(scenes.values(), key=lambda s: s.datetime)[-request.limit :]
+        return PullResult(request=request, scenes=newest)
 
 
 def _bucket_for_bbox(bbox: BBox) -> str:
@@ -112,16 +113,8 @@ def _hours_in_range(
     return hours
 
 
-def _parse_keys(xml_text: str) -> list[str]:
-    try:
-        root = ElementTree.fromstring(xml_text)
-    except ElementTree.ParseError:
-        return []
-    keys: list[str] = []
-    for node in root.findall("s3:Contents/s3:Key", _S3_NS):
-        if node.text:
-            keys.append(node.text)
-    return keys
+def _hour_key(when: datetime) -> tuple[int, int, int]:
+    return (when.year, when.timetuple().tm_yday, when.hour)
 
 
 def _footprint(bucket: str, product: str) -> BBox:

@@ -4,7 +4,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
-from atlas.agent.artifacts import LocalArtifactStore
+from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
 from atlas.agent.contracts import Tool, ToolResult
 
 
@@ -17,11 +17,15 @@ class ReadFileTool(Tool):
 
     Two invariants hold: the path is resolved only through
     :class:`~atlas.agent.artifacts.LocalArtifactStore`, so it cannot leave the
-    workspace root, and the file is read as text, never executed or imported.
+    sandbox, and the file is read as text, never executed or imported. Reads
+    prefer the session artifact directory and fall back to the project
+    workspace when one is mounted; writes never touch the fallback.
     """
 
     name = "read_file"
-    description = "Read a UTF-8 text file from the local artifact workspace."
+    description = (
+        "Read a UTF-8 text file from the local artifact workspace, then the project workspace."
+    )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     max_bytes: ClassVar[int] = 100_000
 
@@ -31,11 +35,11 @@ class ReadFileTool(Tool):
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request = ReadFileInput.model_validate(arguments)
-        path = store.resolve(request.path)
+        path = store.resolve_read(request.path)
         if not path.is_file():
             raise FileNotFoundError(f"File does not exist: {request.path}")
         if path.stat().st_size > self.max_bytes:
-            raise ValueError(f"File {request.path} exceeds the {self.max_bytes} byte read limit")
+            raise SandboxDenied(f"File {request.path} exceeds the {self.max_bytes} byte read limit")
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
