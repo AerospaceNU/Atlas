@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from functools import partial
 from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
@@ -10,6 +11,7 @@ import pytest
 
 import atlas.data as atlas_data
 from atlas.compile.select import coverage_fraction
+from atlas.data import goes
 from atlas.data.base import BBox, GeometryKind, PullRequest, SceneKind
 from atlas.data.cdse import CdseSentinel3OlciClient
 from atlas.data.cop_dem import CopDemGlo30Client
@@ -284,6 +286,31 @@ async def test_goes_lists_netcdf_from_s3() -> None:
     assert scene.bbox.as_list() != BOSTON.as_list()
     assert "max-keys=1" not in fake.calls[0][1]
     assert "continuation-token=page-2" in fake.calls[1][1]
+
+
+@pytest.mark.asyncio
+async def test_goes_drops_scans_from_the_hour_still_uploading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2024, 7, 1, 15, 30, tzinfo=UTC)
+    monkeypatch.setattr(goes, "_hours_in_range", partial(goes._hours_in_range, now=now))
+    day = "ABI-L2-MCMIPC/2024/183/"
+    name = "OR_ABI-L2-MCMIPC-M6_G19_s2024183{hhmm}182_e20241831503556_c20241831504063.nc"
+    fake = S3Fake(
+        {
+            day: _s3_listing(
+                keys=[
+                    day + "14/" + name.format(hhmm="1456"),
+                    day + "15/" + name.format(hhmm="1501"),
+                ]
+            )
+        }
+    )
+    async with _client(GoesClient, fake) as client:
+        result = await client.search(
+            _request(start_date=date(2024, 7, 1), end_date=date(2024, 7, 1))
+        )
+    assert [s.datetime.strftime("%H%M") for s in result.scenes] == ["1456"]
 
 
 @pytest.mark.asyncio

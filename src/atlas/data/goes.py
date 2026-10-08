@@ -65,7 +65,7 @@ class GoesClient(DataPullClient):
         product = _product_for_bbox(request.bbox)
         if not _footprint(bucket, product).intersects(request.bbox):
             return PullResult(request=request, scenes=[])
-        hours = _hours_in_range(request.start_date, request.end_date)
+        hours = set(_hours_in_range(request.start_date, request.end_date))
         days = sorted({(year, doy) for year, doy, _ in hours})
         scenes: dict[str, Scene] = {}
         for year, doy in reversed(days):
@@ -73,7 +73,8 @@ class GoesClient(DataPullClient):
                 break
             for key in await list_keys(self._client, bucket, f"{product}/{year}/{doy:03d}/"):
                 scene = _key_to_scene(bucket, key, product)
-                if scene is not None:
+                # Keep finished hours only.
+                if scene is not None and _hour_key(scene.datetime) in hours:
                     scenes.setdefault(scene.id, scene)
         newest = sorted(scenes.values(), key=lambda s: s.datetime)[-request.limit :]
         return PullResult(request=request, scenes=newest)
@@ -110,6 +111,10 @@ def _hours_in_range(
             hours.append((cursor.year, cursor.timetuple().tm_yday, cursor.hour))
         cursor += timedelta(hours=1)
     return hours
+
+
+def _hour_key(when: datetime) -> tuple[int, int, int]:
+    return (when.year, when.timetuple().tm_yday, when.hour)
 
 
 def _footprint(bucket: str, product: str) -> BBox:
