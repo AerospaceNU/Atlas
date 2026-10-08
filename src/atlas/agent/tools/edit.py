@@ -8,8 +8,8 @@ from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 
 
-class ReadFileInput(BaseModel):
-    """Inputs the relative path, the string to replace, and the new string to replace it with."""
+class EditFileInput(BaseModel):
+    """The docstring should describe the three fields (workspace-relative path, exact text to find, replacement), not "Inputs the relative path..."."""
 
     path: str = Field(description="Path relative to the local artifact workspace.")
     old_string: str = Field(description="Exact old string to replace.")
@@ -31,10 +31,10 @@ class EditFileTool(Tool):
 
     @property
     def input_model(self) -> type[BaseModel]:
-        return ReadFileInput
+        return EditFileInput
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
-        request = ReadFileInput.model_validate(arguments)
+        request = EditFileInput.model_validate(arguments)
         path = store.resolve(request.path)
         old_string = request.old_string
         new_string = request.new_string
@@ -52,14 +52,22 @@ class EditFileTool(Tool):
         except UnicodeDecodeError as exc:
             raise ValueError(f"File {request.path} is not valid UTF-8") from exc
 
-        if text.count(old_string) > 1:
-            raise ValueError(f"String '{old_string}' appears multiple times.")
+        count = text.count(old_string)
 
-        elif text.count(old_string) == 0:
-            raise ValueError(f"String '{old_string}' cannot be found.")
+        if count > 1:
+            raise ValueError("The input appears multiple times.")
+
+        elif count == 0:
+            raise ValueError("The input cannot be found.")
 
         else:
             new_text = text.replace(old_string, new_string, 1)
-            path.write_text(new_text, encoding="utf-8")
+            byte_count = len(new_text.encode())
 
-        return ToolResult(text=new_text)
+            if byte_count <= self.max_bytes:
+                path.write_text(new_text, encoding="utf-8")
+
+        return ToolResult(
+            text=f"File {request.path} edited successfully (bytes: {byte_count}).",
+            artifacts=[store.relative(path)],
+        )
