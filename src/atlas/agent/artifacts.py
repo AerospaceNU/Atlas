@@ -1,11 +1,49 @@
 from __future__ import annotations
 
+import datetime
+import logging
+import os
+import stat
 from pathlib import Path
 
 from PIL import Image
 from pydantic import BaseModel
 
 _IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"})
+
+_AUDIT_LOGGER = logging.getLogger("atlas.sandbox.audit")
+_AUDIT_LOG_PATH = ".atlas/sandbox_audit.log"
+
+
+class SandboxDenied(ValueError):
+    """A sandbox invariant rejected a path or a size (see docs/adr/0001)."""
+
+
+def record_denial(store: LocalArtifactStore, operation: str, detail: str) -> None:
+    """Log one denied access and append it as a single line to the workspace audit log.
+
+    The log path goes through ``store.resolve`` like any tool path, and the file
+    write is skipped if resolve denies it. Other write failures raise.
+    """
+    timestamp = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    # Escape control characters so a newline in a model-chosen path can't split
+    # or forge records.
+    record = f"{operation}: {detail}".encode("unicode_escape").decode("ascii")
+    line = f"{timestamp} DENIED {record}"
+    _AUDIT_LOGGER.warning(line)
+    try:
+        log_path = store.resolve(_AUDIT_LOG_PATH)
+    except SandboxDenied as exc:
+        _AUDIT_LOGGER.error("Skipped the audit file write to %s: %s", _AUDIT_LOG_PATH, exc)
+        return
+    log_path.parent.mkdir(exist_ok=True)
+    # A symlink or hardlink planted after resolve() returned is refused here.
+    fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(f"{_AUDIT_LOG_PATH} is not a single-link regular file")
+        handle.write(line + "\n")
 
 
 class ImageInfo(BaseModel):
@@ -21,9 +59,11 @@ class ImageInfo(BaseModel):
 def _within(base: Path, relative_path: str) -> Path:
     """Resolve ``relative_path`` under ``base``, rejecting escapes.
 
-    Absolute paths and ``..`` escapes raise ``ValueError``. The result is
-    always inside ``base``, so callers never receive a host path outside the
-    sandbox.
+    Absolute paths and ``..`` escapes raise ``SandboxDenied``. Resolution
+    follows symlinks before the containment check, so the result is always
+    inside ``base`` and callers never receive a host path outside the sandbox.
+    An existing regular file with more than one hardlink is refused too, since
+    its other name may be outside ``base``.
 
     Args:
         base: Directory that bounds the resolved path.
@@ -33,16 +73,23 @@ def _within(base: Path, relative_path: str) -> Path:
         The resolved absolute path inside ``base``.
 
     Raises:
-        ValueError: If ``relative_path`` is absolute or escapes ``base``.
+        SandboxDenied: If ``relative_path`` is absolute, escapes ``base``, or
+            names a hardlinked file.
     """
     path = Path(relative_path)
     if path.is_absolute():
-        raise ValueError("Artifact paths must be relative to the artifact root")
+        raise SandboxDenied("Artifact paths must be relative to the artifact root")
     candidate = (base / path).resolve()
     try:
         candidate.relative_to(base)
     except ValueError as exc:
-        raise ValueError("Artifact path escapes the artifact root") from exc
+        raise SandboxDenied("Artifact path escapes the artifact root") from exc
+    try:
+        info = candidate.stat()
+    except OSError:
+        return candidate
+    if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+        raise SandboxDenied("Artifact path is a hardlinked file that may lead outside the root")
     return candidate
 
 
@@ -62,7 +109,7 @@ class LocalArtifactStore:
         self.read_root = read_root.resolve() if read_root is not None else None
 
     def resolve(self, relative_path: str) -> Path:
-        """Resolve a relative path for writing and reject attempts to escape ``root``."""
+        """Resolve a relative path for writing, following symlinks, and reject escapes."""
         return _within(self.root, relative_path)
 
     def resolve_read(self, relative_path: str) -> Path:
@@ -84,14 +131,18 @@ class LocalArtifactStore:
         try:
             return path.resolve().relative_to(self.root).as_posix()
         except ValueError as exc:
-            raise ValueError("Path is outside the artifact root") from exc
+            raise SandboxDenied("Path is outside the artifact root") from exc
 
     def list_images(self) -> list[ImageInfo]:
-        """List readable image files recursively, ordered by path."""
+        """List readable image files recursively, skipping symlinks and hardlinks that may escape."""
         images: list[ImageInfo] = []
         for path in sorted(self.root.rglob("*")):
-            if path.is_file() and path.suffix.lower() in _IMAGE_SUFFIXES:
+            if not path.is_file() or path.suffix.lower() not in _IMAGE_SUFFIXES:
+                continue
+            try:
                 images.append(self.inspect(self.relative(path)))
+            except SandboxDenied:
+                continue
         return images
 
     def inspect(self, relative_path: str) -> ImageInfo:

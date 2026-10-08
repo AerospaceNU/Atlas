@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,18 @@ def test_write_file_rejects_escaping_path(tmp_path: Path) -> None:
         WriteTool().run({"path": "../outside.txt", "content": "nope"}, store)
 
     assert not (tmp_path / "outside.txt").exists()
+
+
+def test_write_file_does_not_write_through_a_hardlink(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path / "workspace")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("original", encoding="utf-8")
+    os.link(outside, tmp_path / "workspace" / "notes.txt")
+
+    with pytest.raises(ValueError, match="hardlinked"):
+        WriteTool().run({"path": "notes.txt", "content": "overwritten"}, store)
+
+    assert outside.read_text(encoding="utf-8") == "original"
 
 
 def test_write_file_rejects_absolute_path(tmp_path: Path) -> None:
