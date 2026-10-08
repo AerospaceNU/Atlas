@@ -12,7 +12,6 @@ from pydantic import ValidationError
 
 from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
 from atlas.agent.contracts import default_registry
-from atlas.agent.tools.edit_file import EditFileTool
 from atlas.agent.layout import (
     AtlasPathError,
     ensure_project_layout,
@@ -22,6 +21,7 @@ from atlas.agent.layout import (
     write_user_key,
 )
 from atlas.agent.tools.BashTool import BashTool
+from atlas.agent.tools.edit_file import EditFileTool
 from atlas.agent.tools.read_file import ReadFileTool
 
 # read_file tests
@@ -259,10 +259,12 @@ def test_edit_file_unique_replacement_successful(tmp_path: Path) -> None:
 def test_edit_file_missing_file_hides_the_host_path(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
 
-    with pytest.raises(FileNotFoundError) as excinfo:
+    with pytest.raises(FileNotFoundError):
         EditFileTool().run(
             {"path": "missing.txt", "old_string": "will", "new_string": "will not"}, store
         )
+
+
 def test_bash_reports_stdout_and_a_zero_exit(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
 
@@ -495,6 +497,8 @@ def test_edit_file_rejects_oversized_file(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="100000"):
         EditFileTool().run({"path": "notes.txt", "old_string": "", "new_string": "bye"}, store)
+
+
 def test_write_file_never_writes_to_the_read_root(tmp_path: Path) -> None:
     from atlas.agent.tools.write_file import WriteTool
 
