@@ -68,7 +68,7 @@ class FirmsClient(DataPullClient):
         if start_date > end_date:
             return PullResult(request=request, scenes=[])
         for start, days in _chunk_days(start_date, end_date):
-            if len(scenes) >= request.limit:
+            if request.limit is not None and len(scenes) >= request.limit:
                 break
             url = FIRMS_AREA_URL.format(
                 key=self._map_key,
@@ -91,7 +91,7 @@ class FirmsClient(DataPullClient):
                 gsd_m=self.nominal_gsd_m,
             ):
                 scenes.append(scene)
-                if len(scenes) >= request.limit:
+                if request.limit is not None and len(scenes) >= request.limit:
                     break
         return PullResult(request=request, scenes=scenes)
 

@@ -69,14 +69,16 @@ class GoesClient(DataPullClient):
         days = sorted({(year, doy) for year, doy, _ in hours})
         scenes: dict[str, Scene] = {}
         for year, doy in reversed(days):
-            if len(scenes) >= request.limit:
+            if request.limit is not None and len(scenes) >= request.limit:
                 break
             for key in await list_keys(self._client, bucket, f"{product}/{year}/{doy:03d}/"):
                 scene = _key_to_scene(bucket, key, product)
                 # Keep finished hours only.
                 if scene is not None and _hour_key(scene.datetime) in hours:
                     scenes.setdefault(scene.id, scene)
-        newest = sorted(scenes.values(), key=lambda s: s.datetime)[-request.limit :]
+        newest = sorted(scenes.values(), key=lambda s: s.datetime)
+        if request.limit is not None:
+            newest = newest[-request.limit :]
         return PullResult(request=request, scenes=newest)
 
 
