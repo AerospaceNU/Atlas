@@ -213,7 +213,7 @@ def test_read_file_rejects_non_utf8_file(tmp_path: Path) -> None:
 # edit_file tests
 
 
-def test_edit_file_rejects_escaping_path(tmp_path) -> None:
+def test_edit_file_rejects_escaping_path(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     (tmp_path.parent / "outside.txt").write_text("outside", encoding="utf-8")
 
@@ -224,7 +224,7 @@ def test_edit_file_rejects_escaping_path(tmp_path) -> None:
         )
 
 
-def test_edit_file_rejects_non_utf8_file(tmp_path) -> None:
+def test_edit_file_rejects_non_utf8_file(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     (tmp_path / "binary.txt").write_bytes(b"\xff")
 
@@ -254,6 +254,20 @@ def test_edit_file_unique_replacement_successful(tmp_path: Path) -> None:
     EditFileTool().run({"path": "notes.txt", "old_string": "will", "new_string": "will not"}, store)
 
     assert target.read_text(encoding="utf-8") == "my code will not work"
+
+
+def test_edit_file_rejects_missing_old_string(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    target = tmp_path / "notes.txt"
+    target.write_text("hello world", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cannot be found"):
+        EditFileTool().run(
+            {"path": "notes.txt", "old_string": "missing", "new_string": "bye"},
+            store,
+        )
+
+    assert target.read_text(encoding="utf-8") == "hello world"
 
 
 def test_edit_file_missing_file_hides_the_host_path(tmp_path: Path) -> None:
@@ -493,10 +507,32 @@ def test_empty_old_string(tmp_path: Path) -> None:
 
 def test_edit_file_rejects_oversized_file(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
-    (tmp_path / "notes.txt").write_bytes(b"x" * 100_001)
+    target = tmp_path / "notes.txt"
+    original = b"HEAD" + b"x" * (EditFileTool.max_bytes - len(b"HEAD") + 1)
+    target.write_bytes(original)
 
-    with pytest.raises(ValueError, match="100000"):
-        EditFileTool().run({"path": "notes.txt", "old_string": "", "new_string": "bye"}, store)
+    with pytest.raises(ValueError, match="read limit"):
+        EditFileTool().run(
+            {"path": "notes.txt", "old_string": "HEAD", "new_string": "TAIL"},
+            store,
+        )
+
+    assert target.read_bytes() == original
+
+
+def test_edit_file_rejects_replacement_over_max_bytes(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    target = tmp_path / "notes.txt"
+    original = "keep" + ("x" * (EditFileTool.max_bytes - len("keep")))
+    target.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Edited content exceeds"):
+        EditFileTool().run(
+            {"path": "notes.txt", "old_string": "keep", "new_string": "keep!"},
+            store,
+        )
+
+    assert target.read_text(encoding="utf-8") == original
 
 
 def test_write_file_never_writes_to_the_read_root(tmp_path: Path) -> None:

@@ -69,8 +69,9 @@ class EditFileTool(Tool):
             new_text = text.replace(old_string, new_string, 1)
             byte_count = len(new_text.encode())
 
-            if byte_count <= self.max_bytes:
-                path.write_text(new_text, encoding="utf-8")
+            if byte_count > self.max_bytes:
+                raise ValueError(f"Edited content exceeds the {self.max_bytes} byte limit")
+            path.write_text(new_text, encoding="utf-8")
 
         return ToolResult(
             text=f"File {request.path} edited successfully (bytes: {byte_count}).",
