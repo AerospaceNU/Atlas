@@ -21,7 +21,10 @@ from atlas.agent.layout import (
     write_user_key,
 )
 from atlas.agent.tools.BashTool import BashTool
+from atlas.agent.tools.edit_file import EditFileTool
 from atlas.agent.tools.read_file import ReadFileTool
+
+# read_file tests
 
 
 def test_store_rejects_paths_outside_root(tmp_path: Path) -> None:
@@ -205,6 +208,75 @@ def test_read_file_rejects_non_utf8_file(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="UTF-8"):
         ReadFileTool().run({"path": "binary.txt"}, store)
+
+
+# edit_file tests
+
+
+def test_edit_file_rejects_escaping_path(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path.parent / "outside.txt").write_text("outside", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="escapes"):
+        EditFileTool().run(
+            {"path": "../outside.txt", "old_string": "outside", "new_string": "inside"},
+            store,
+        )
+
+
+def test_edit_file_rejects_non_utf8_file(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path / "binary.txt").write_bytes(b"\xff")
+
+    with pytest.raises(ValueError, match="UTF-8"):
+        EditFileTool().run(
+            {"path": "binary.txt", "old_string": "a", "new_string": "b"},
+            store,
+        )
+
+
+def test_more_than_one_match(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    target = tmp_path / "notes.txt"
+    target.write_text("hello\nhello\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="appears multiple times"):
+        EditFileTool().run({"path": "notes.txt", "old_string": "hello", "new_string": "bye"}, store)
+
+    assert target.read_text(encoding="utf-8") == "hello\nhello\n"
+
+
+def test_edit_file_unique_replacement_successful(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    target = tmp_path / "notes.txt"
+    target.write_text("my code will work", encoding="utf-8")
+
+    EditFileTool().run({"path": "notes.txt", "old_string": "will", "new_string": "will not"}, store)
+
+    assert target.read_text(encoding="utf-8") == "my code will not work"
+
+
+def test_edit_file_rejects_missing_old_string(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    target = tmp_path / "notes.txt"
+    target.write_text("hello world", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cannot be found"):
+        EditFileTool().run(
+            {"path": "notes.txt", "old_string": "missing", "new_string": "bye"},
+            store,
+        )
+
+    assert target.read_text(encoding="utf-8") == "hello world"
+
+
+def test_edit_file_missing_file_hides_the_host_path(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        EditFileTool().run(
+            {"path": "missing.txt", "old_string": "will", "new_string": "will not"}, store
+        )
 
 
 def test_bash_reports_stdout_and_a_zero_exit(tmp_path: Path) -> None:
@@ -420,6 +492,47 @@ def test_read_file_missing_file_with_read_root_hides_host_paths(tmp_path: Path) 
     message = str(excinfo.value)
     assert "missing.txt" in message
     assert str(tmp_path) not in message
+
+
+def test_empty_old_string(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    target = tmp_path / "notes.txt"
+    target.write_text("hello world", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="empty"):
+        EditFileTool().run({"path": "notes.txt", "old_string": "", "new_string": "bye"}, store)
+
+    assert target.read_text(encoding="utf-8") == "hello world"
+
+
+def test_edit_file_rejects_oversized_file(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    target = tmp_path / "notes.txt"
+    original = b"HEAD" + b"x" * (EditFileTool.max_bytes - len(b"HEAD") + 1)
+    target.write_bytes(original)
+
+    with pytest.raises(ValueError, match="read limit"):
+        EditFileTool().run(
+            {"path": "notes.txt", "old_string": "HEAD", "new_string": "TAIL"},
+            store,
+        )
+
+    assert target.read_bytes() == original
+
+
+def test_edit_file_rejects_replacement_over_max_bytes(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    target = tmp_path / "notes.txt"
+    original = "keep" + ("x" * (EditFileTool.max_bytes - len("keep")))
+    target.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Edited content exceeds"):
+        EditFileTool().run(
+            {"path": "notes.txt", "old_string": "keep", "new_string": "keep!"},
+            store,
+        )
+
+    assert target.read_text(encoding="utf-8") == original
 
 
 def test_write_file_never_writes_to_the_read_root(tmp_path: Path) -> None:
