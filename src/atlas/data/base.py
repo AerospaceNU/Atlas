@@ -181,6 +181,9 @@ class Scene(BaseModel):
     cloud_cover: float | None = Field(default=None, ge=0, le=100)
     footprint_is_request: bool = False
     assets: dict[str, Asset] = Field(default_factory=dict)
+    # Common band name to a key in `assets`. Catalogs name the same band
+    # differently: S30 NIR is B8A, L30 NIR is B05.
+    band_aliases: dict[str, str] = Field(default_factory=dict)
     properties: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -193,6 +196,9 @@ class Scene(BaseModel):
             raise ValueError("end_datetime must be on or after start_datetime")
         if self.geometry_kind is GeometryKind.point and (self.lon is None or self.lat is None):
             raise ValueError("point geometry requires lon and lat")
+        unknown = set(self.band_aliases.values()) - set(self.assets)
+        if unknown:
+            raise ValueError(f"band_aliases point at missing assets: {sorted(unknown)}")
         return self
 
     @classmethod
