@@ -60,10 +60,12 @@ class HimawariClient(DataPullClient):
             slot
             for slot in _ten_minute_slots(request.start_date, request.end_date)
             if slot <= cutoff
-        ][-request.limit :]
+        ]
+        if request.limit is not None:
+            slots = slots[-request.limit :]
         scenes: list[Scene] = []
         for when in slots:
-            if len(scenes) >= request.limit:
+            if request.limit is not None and len(scenes) >= request.limit:
                 break
             prefix = (
                 f"{HIMAWARI_PRODUCT}/{when.year}/{when.month:02d}/{when.day:02d}/"

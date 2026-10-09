@@ -61,10 +61,12 @@ class GoesClient(DataPullClient):
     async def search(self, request: PullRequest) -> PullResult:
         bucket = _bucket_for_bbox(request.bbox)
         product = _product_for_bbox(request.bbox)
-        hours = _hours_in_range(request.start_date, request.end_date)[-request.limit :]
+        hours = _hours_in_range(request.start_date, request.end_date)
+        if request.limit is not None:
+            hours = hours[-request.limit :]
         scenes: list[Scene] = []
         for year, doy, hour in hours:
-            if len(scenes) >= request.limit:
+            if request.limit is not None and len(scenes) >= request.limit:
                 break
             prefix = f"{product}/{year}/{doy:03d}/{hour:02d}/"
             url = f"https://{bucket}.s3.amazonaws.com/?list-type=2&prefix={prefix}&max-keys=1"
@@ -74,7 +76,7 @@ class GoesClient(DataPullClient):
                 scene = _key_to_scene(bucket, key, product)
                 if scene is not None:
                     scenes.append(scene)
-                    if len(scenes) >= request.limit:
+                    if request.limit is not None and len(scenes) >= request.limit:
                         break
         return PullResult(request=request, scenes=scenes)
 
