@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
-from atlas.agent.artifacts import LocalArtifactStore
+from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
 from atlas.agent.contracts import Tool, ToolResult
 
 if TYPE_CHECKING:
@@ -29,6 +29,18 @@ _MIME_TYPES = {
 }
 
 
+def _load_genai() -> tuple[Any, Any]:
+    """Import the optional Gemini SDK."""
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise RuntimeError(
+            "google-genai is required for rsicc_tool. Install it with `uv sync --extra gemini`."
+        ) from exc
+    return genai, types
+
+
 # pydantic model for the inputs to the tool
 class RSICCInput(BaseModel):
     image1: str = Field(
@@ -40,34 +52,41 @@ class RSICCInput(BaseModel):
 
 
 class RSICCTool(Tool):
-    """Describe the differences between a before and an after image as one sentence of text."""
+    """Describe the differences between a before and an after image as one sentence of text.
+
+    Uploads both workspace images to the Gemini API, so the tool stays off unless the
+    caller opts in.
+    """
 
     name = "rsicc_tool"
     description = "Analyze differences between two images and convert them into text."
-    trust = "default"
+    trust: ClassVar[Literal["default", "opt_in"]] = "opt_in"
+    # Inline Gemini requests cap the payload. Refuse anything larger before reading it.
+    max_bytes: ClassVar[int] = 10_000_000
 
     @property
     def input_model(self) -> type[BaseModel]:
         return RSICCInput
 
     @staticmethod
-    def _image_part(path: Path) -> types.Part:
-        from google.genai import types
+    def _image_part(path: Path, relative: str) -> types.Part:
+        _, genai_types = _load_genai()
 
         mime_type = _MIME_TYPES.get(path.suffix.lower())
         if mime_type is None:  # non-supported image type
             raise ValueError(
                 f"Unsupported image type {path.suffix}. Supported types: {', '.join(_MIME_TYPES)}"
             )
+        if path.stat().st_size > RSICCTool.max_bytes:
+            raise SandboxDenied(
+                f"Image {relative} exceeds the {RSICCTool.max_bytes} byte read limit"
+            )
 
-        return types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type)
+        part: types.Part = genai_types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type)
+        return part
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         """Call Gemini to describe the differences between the two images."""
-        # imported here so tool discovery still works when google-genai is not installed.
-        from google import genai
-        from google.genai import types
-
         request = RSICCInput.model_validate(arguments)
         image_paths = [store.resolve(request.image1), store.resolve(request.image2)]
         for relative, path in zip((request.image1, request.image2), image_paths, strict=True):
@@ -78,19 +97,21 @@ class RSICCTool(Tool):
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
 
+        # Imported here so tool discovery still works when the gemini extra is absent.
+        genai, genai_types = _load_genai()
         contents: list[types.PartUnionDict] = [
             "Before image:",
-            self._image_part(image_paths[0]),
+            self._image_part(image_paths[0], request.image1),
             "After image:",
-            self._image_part(image_paths[1]),
+            self._image_part(image_paths[1], request.image2),
             _PROMPT,
         ]
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
             model=_MODEL,
             contents=contents,
-            config=types.GenerateContentConfig(
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
+            config=genai_types.GenerateContentConfig(
+                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True)
             ),
         )
         if not response.text:

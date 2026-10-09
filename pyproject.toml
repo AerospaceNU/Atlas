@@ -8,14 +8,13 @@ authors = [
     { name = "Liam Marcovitz", email = "marcovitz.l@northeastern.edu" },
     { name = "Luc Sciammetta", email = "sciammetta.l@northeastern.edu" },
     { name = "Sunny Shen", email = "shen.su@northeastern.edu" },
-    { name = "Mason King", email = "king.mas@northeastern.edu" },
-    { name = "Sabrina Valerjev", email = "sabrinaelena.v@gmail.com"},
+    { name = "Mason King", email = "king.mas@northeastern.edu" }, 
+    { name = "Sabrina Valerjev", email = "sabrinaelena.v@gmail.com"}, 
     { name = "Gabriel Ortiz", email = "ortiz.gabr@northeastern.edu"}
 ]
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.104.1",
-    "google-genai>=2.28.0",
     "httpx>=0.28.1",
     "numpy>=2.2.0",
     "pillow>=11.0.0",
@@ -23,6 +22,9 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "rich>=13.9.0",
 ]
+
+[project.optional-dependencies]
+gemini = ["google-genai>=2.28.0"]
 
 [project.scripts]
 atlas = "atlas:main"
@@ -81,7 +83,7 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["dotenv", "dotenv.*", "rich", "rich.*"]
+module = ["dotenv", "dotenv.*", "google", "google.*", "rich", "rich.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+import builtins
 import io
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import numpy as np
 import pytest
-from google.genai import types
 from PIL import Image
 from pydantic import ValidationError
 
-from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import default_registry
+from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.contracts import build_registry, default_registry
 from atlas.agent.tools.rsicc_tool import RSICCTool
 
 
@@ -44,10 +46,56 @@ class _FakeGemini:
         return self
 
 
+class _FakeInlineData:
+    def __init__(self, data: bytes, mime_type: str) -> None:
+        self.data = data
+        self.mime_type = mime_type
+
+
+class _FakePart:
+    def __init__(self, data: bytes, mime_type: str) -> None:
+        self.inline_data = _FakeInlineData(data, mime_type)
+
+    @classmethod
+    def from_bytes(cls, *, data: bytes, mime_type: str) -> _FakePart:
+        return cls(data, mime_type)
+
+
+class _FakeAutomaticFunctionCallingConfig:
+    def __init__(self, *, disable: bool) -> None:
+        self.disable = disable
+
+
+class _FakeGenerateContentConfig:
+    def __init__(self, *, automatic_function_calling: _FakeAutomaticFunctionCallingConfig) -> None:
+        self.automatic_function_calling = automatic_function_calling
+
+
+def _install_fake_genai(monkeypatch: pytest.MonkeyPatch, client: _FakeGemini) -> None:
+    """Expose a Gemini stand-in so tests run without the google-genai package."""
+    genai_types = ModuleType("google.genai.types")
+    genai_types.Part = _FakePart  # type: ignore[attr-defined]
+    genai_types.GenerateContentConfig = _FakeGenerateContentConfig  # type: ignore[attr-defined]
+    genai_types.AutomaticFunctionCallingConfig = _FakeAutomaticFunctionCallingConfig  # type: ignore[attr-defined]
+
+    genai = ModuleType("google.genai")
+    genai.Client = client  # type: ignore[attr-defined]
+    genai.types = genai_types  # type: ignore[attr-defined]
+
+    google = sys.modules.get("google")
+    if google is None:
+        google = ModuleType("google")
+        google.__path__ = []  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setattr(google, "genai", genai, raising=False)
+    monkeypatch.setitem(sys.modules, "google.genai", genai)
+    monkeypatch.setitem(sys.modules, "google.genai.types", genai_types)
+
+
 @pytest.fixture
 def gemini(monkeypatch: pytest.MonkeyPatch) -> _FakeGemini:
     fake = _FakeGemini(reply="  The lake in the before image is dry in the after image.\n")
-    monkeypatch.setattr("google.genai.Client", fake)
+    _install_fake_genai(monkeypatch, fake)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     return fake
 
@@ -63,21 +111,27 @@ def _rgb(width: int, height: int) -> Image.Image:
     return Image.fromarray(rng.integers(0, 256, (height, width, 3), dtype=np.uint8))
 
 
-def _sent_images(gemini: _FakeGemini) -> list[types.Part]:
+def _sent_images(gemini: _FakeGemini) -> list[Any]:
     contents = gemini.models.calls[-1]["contents"]
-    return [part for part in contents if isinstance(part, types.Part)]
+    return [part for part in contents if getattr(part, "inline_data", None) is not None]
 
 
-def _decode(part: types.Part) -> Image.Image:
+def _decode(part: Any) -> Image.Image:
     assert part.inline_data is not None
     assert part.inline_data.data is not None
     return Image.open(io.BytesIO(part.inline_data.data))
 
 
-def test_rsicc_tool_is_discovered() -> None:
+def test_rsicc_tool_is_opt_in() -> None:
     names = [definition.name for definition in default_registry().definitions]
+    opted_in = [
+        definition.name
+        for definition in build_registry(("atlas.agent.tools",), include_opt_in=True).definitions
+    ]
 
-    assert "rsicc_tool" in names
+    assert RSICCTool.trust == "opt_in"
+    assert "rsicc_tool" not in names
+    assert "rsicc_tool" in opted_in
 
 
 def test_returns_the_gemini_reply(tmp_path: Path, gemini: _FakeGemini) -> None:
@@ -85,7 +139,7 @@ def test_returns_the_gemini_reply(tmp_path: Path, gemini: _FakeGemini) -> None:
     before = _save(_rgb(40, 30), tmp_path / "before.png")
     after = _save(_rgb(40, 30), tmp_path / "after.png")
 
-    result = default_registry().execute("rsicc_tool", {"image1": before, "image2": after}, store)
+    result = RSICCTool().run({"image1": before, "image2": after}, store)
 
     assert result.text == "The lake in the before image is dry in the after image."
     assert result.artifacts == []
@@ -164,6 +218,64 @@ def test_missing_api_key_raises(
         RSICCTool().run({"image1": before, "image2": after}, store)
 
     assert gemini.models.calls == []
+
+
+def test_missing_sdk_raises_a_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = LocalArtifactStore(tmp_path)
+    before = _save(_rgb(8, 8), tmp_path / "before.png")
+    after = _save(_rgb(8, 8), tmp_path / "after.png")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    for name in ("google", "google.genai", "google.genai.types"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    real_import = builtins.__import__
+
+    def _blocked(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "google" or name.startswith("google."):
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked)
+
+    with pytest.raises(RuntimeError, match="uv sync --extra gemini"):
+        RSICCTool().run({"image1": before, "image2": after}, store)
+
+
+def test_oversized_image_is_rejected_without_reading(
+    tmp_path: Path, gemini: _FakeGemini, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    big = tmp_path / "big.png"
+    big.write_bytes(b"not-read")
+    os.truncate(big, RSICCTool.max_bytes + 1)
+    small = _save(_rgb(8, 8), tmp_path / "small.png")
+    original = Path.read_bytes
+
+    def _guarded(self: Path) -> bytes:
+        if self.name == "big.png":
+            raise AssertionError("oversized image was read")
+        return original(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _guarded)
+
+    with pytest.raises(SandboxDenied, match=f"big.png exceeds the {RSICCTool.max_bytes} byte"):
+        RSICCTool().run({"image1": "big.png", "image2": small}, store)
+
+    assert gemini.models.calls == []
+
+
+def test_image_at_the_byte_limit_is_sent(
+    tmp_path: Path, gemini: _FakeGemini, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"image bytes"
+    monkeypatch.setattr(RSICCTool, "max_bytes", len(payload))
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path / "limit.png").write_bytes(payload)
+
+    RSICCTool().run({"image1": "limit.png", "image2": "limit.png"}, store)
+
+    parts = _sent_images(gemini)
+    assert len(parts) == 2
+    assert parts[0].inline_data.data == payload
 
 
 @pytest.mark.parametrize("reply", [None, ""])
