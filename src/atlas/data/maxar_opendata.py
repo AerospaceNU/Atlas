@@ -47,7 +47,9 @@ class MaxarOpenDataClient(DataPullClient):
         scenes: list[Scene] = []
         matched = 0
         for event_url in _child_urls(root, MAXAR_ROOT):
-            if matched >= self._max_events or len(scenes) >= request.limit:
+            if matched >= self._max_events or (
+                request.limit is not None and len(scenes) >= request.limit
+            ):
                 break
             event = await self._get_json(event_url)
             if not _extent_overlaps(event.get("extent"), request):
@@ -55,7 +57,7 @@ class MaxarOpenDataClient(DataPullClient):
             matched += 1
             for scene in await self._scenes_from_event(event_url, event, request):
                 scenes.append(scene)
-                if len(scenes) >= request.limit:
+                if request.limit is not None and len(scenes) >= request.limit:
                     break
         return PullResult(request=request, scenes=scenes)
 
@@ -79,7 +81,7 @@ class MaxarOpenDataClient(DataPullClient):
                 )
                 if scene is not None and _scene_matches(scene, request):
                     scenes.append(scene)
-                if len(scenes) >= request.limit:
+                if request.limit is not None and len(scenes) >= request.limit:
                     return scenes
         return scenes
 

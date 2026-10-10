@@ -70,7 +70,7 @@ class HimawariClient(DataPullClient):
             for slot_prefix in reversed(
                 await list_prefixes(self._client, HIMAWARI_BUCKET, day_prefix)
             ):
-                if len(scenes) >= request.limit:
+                if request.limit is not None and len(scenes) >= request.limit:
                     break
                 when = _slot_time(day, slot_prefix)
                 if when is None or when > cutoff:
@@ -79,7 +79,7 @@ class HimawariClient(DataPullClient):
                 scene = _slot_to_scene(when, slot_prefix, keys)
                 if scene is not None:
                     scenes.append(scene)
-            if len(scenes) >= request.limit:
+            if request.limit is not None and len(scenes) >= request.limit:
                 break
         scenes.reverse()
         return PullResult(request=request, scenes=scenes)

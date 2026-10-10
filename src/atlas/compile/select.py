@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from atlas.data.base import BBox, GeometryKind, Scene, SceneKind
+from atlas.data.base import BBox, GeometryKind, LimitMode, Scene, SceneKind
 
 _CLOUD_KINDS = frozenset({SceneKind.optical, SceneKind.browse})
 _COVERAGE_SKIP_KINDS = frozenset({SceneKind.browse, SceneKind.lidar, SceneKind.altimetry})
@@ -54,6 +54,30 @@ def dedup(scenes: list[Scene]) -> list[Scene]:
     return out
 
 
+def pick_my_mode(
+    scene: list[Scene], limit: int | None, limit_mode: LimitMode | None
+) -> list[Scene]:
+    if limit is None:
+        return scene
+    if len(scene) <= limit:
+        return scene
+    if limit_mode is None:
+        limit_mode = LimitMode.first
+    if limit_mode is LimitMode.first:
+        return scene[:limit]
+    elif limit_mode is LimitMode.last:
+        return scene[-limit:]
+    elif limit_mode is LimitMode.even:
+        if limit == 1:
+            return [scene[0]]
+        scene_count = len(scene)
+        result = []
+        for i in range(limit):
+            pick_index = round(i * (scene_count - 1) / (limit - 1))
+            result.append(scene[pick_index])
+        return result
+
+
 def sort_clearest(scenes: list[Scene]) -> list[Scene]:
     """Order so the best pixels come first: lowest cloud, then most recent.
 
@@ -74,6 +98,7 @@ def select(
     min_cloud: float | None = None,
     max_cloud: float | None = None,
     limit: int | None = None,
+    limit_mode: LimitMode | None = None,
 ) -> list[Scene]:
     """Filter by cloud range, dedup, order clearest-first, and optionally cap count.
 
@@ -81,8 +106,10 @@ def select(
     cloud-seeking request returns the least cloudy scenes that still clear the
     floor. Pass a larger ``limit`` if you want the cloudiest end.
     """
-    chosen = sort_clearest(dedup(filter_cloud(scenes, max_cloud, min_cloud=min_cloud)))
-    return chosen[:limit] if limit is not None else chosen
+    chosen = dedup(filter_cloud(scenes, max_cloud, min_cloud=min_cloud))
+    if limit is None:
+        return sort_clearest(chosen)
+    return pick_my_mode(sorted(chosen, key=lambda s: s.datetime), limit, limit_mode)
 
 
 def representative_cloud(scenes: list[Scene]) -> float | None:

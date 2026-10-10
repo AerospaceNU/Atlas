@@ -33,6 +33,12 @@ class GeometryKind(StrEnum):
     polygon = "polygon"
 
 
+class LimitMode(StrEnum):
+    first = "first"
+    last = "last"
+    even = "even"
+
+
 class BBox(BaseModel):
     """West/south/east/north box in degrees.
 
@@ -122,7 +128,8 @@ class PullRequest(BaseModel):
     bbox: BBox
     min_cloud_cover: float | None = Field(default=None, ge=0, le=100)
     max_cloud_cover: float | None = Field(default=None, ge=0, le=100)
-    limit: int = Field(default=100, ge=1, le=1000)
+    limit: int | None = Field(default=None, ge=1)
+    limit_mode: LimitMode | None = Field(default=None)
 
     @model_validator(mode="after")
     def _validate_dates(self) -> Self:
