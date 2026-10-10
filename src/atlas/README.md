@@ -14,6 +14,7 @@ The tool loop over one local artifact directory.
 | `session` | A multi-turn conversation on top of that loop, plus the `python -m atlas.agent` entry. |
 | `model` | The OpenRouter chat backend. |
 | `tools/` | Concrete tools. `read_file` reads text in the workspace and does not run it. |
+| `skill_author` | Write an Agent Skill directory (`SKILL.md`) that matches the Agent Skills spec. |
 | `__main__` | Module entry that starts a session. |
 
 ## `cli`
