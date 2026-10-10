@@ -1,0 +1,16 @@
+name = "burn_scar"
+description = "Burned-area mask from dark red-brown scars on a true-color PNG tile (256 or 512). 0 is unburned, 1 is burn. Not NBR severity."
+runtime = "binary_mask"
+rule = "burn"
+weight = ""
+sha256 = ""
+
+[input]
+kind = "rgb_png"
+shape = [0, 0, 3]
+dtype = "uint8"
+sizes = [256, 512]
+
+[output]
+kind = "mask"
+classes = ["unburned", "burn"]

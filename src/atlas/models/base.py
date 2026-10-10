@@ -23,6 +23,10 @@ class PluginInput(BaseModel):
     kind: str
     shape: list[int]
     dtype: str
+    sizes: list[int] = Field(
+        default_factory=list,
+        description="Allowed square tile sizes. Empty means any spatial size.",
+    )
 
 
 class PluginOutput(BaseModel):
@@ -38,8 +42,9 @@ class PluginSpec(BaseModel):
     name: str
     description: str
     runtime: str
-    weight: str
+    weight: str = ""
     sha256: str = ""
+    rule: str = ""
     input: PluginInput
     output: PluginOutput
 
@@ -117,6 +122,26 @@ def load_centroids(spec: PluginSpec) -> dict[str, tuple[float, float, float]]:
             raise ValueError(f"Centroid {name} must be an RGB triple")
         centroids[name] = (float(rgb[0]), float(rgb[1]), float(rgb[2]))
     return centroids
+
+
+def load_rgb_array(path: Path) -> NDArray[np.uint8]:
+    """Read ``path`` as an ``HxWx3`` uint8 RGB array.
+
+    Args:
+        path: Image file to open. Any mode Pillow can convert is accepted.
+
+    Returns:
+        A copy of the image in RGB, at its native spatial size.
+
+    Raises:
+        ValueError: If the converted image is not three-channel.
+    """
+    with Image.open(path) as image:
+        rgb = image.convert("RGB")
+        array = np.array(rgb, dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("Expected an RGB image")
+    return array
 
 
 def mean_rgb(image: Image.Image) -> tuple[float, float, float]:

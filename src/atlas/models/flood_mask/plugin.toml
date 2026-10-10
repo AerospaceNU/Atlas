@@ -1,0 +1,16 @@
+name = "flood_mask"
+description = "Open-water mask on an optical PNG tile (256 or 512). 0 is dry, 1 is water. Not under-cloud SAR flood."
+runtime = "binary_mask"
+rule = "water"
+weight = ""
+sha256 = ""
+
+[input]
+kind = "rgb_png"
+shape = [0, 0, 3]
+dtype = "uint8"
+sizes = [256, 512]
+
+[output]
+kind = "mask"
+classes = ["dry", "water"]

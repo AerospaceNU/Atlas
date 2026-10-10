@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from importlib.resources import files
 
-from atlas.agent.contracts import ToolRegistry
+from atlas.agent.contracts import Tool, ToolRegistry
 from atlas.models.base import PluginSpec, parse_plugin_toml
+from atlas.models.binary_mask import BinaryMaskTool
+from atlas.models.rgb_change.infer import RgbChangeTool
 from atlas.models.segment_landcover.infer import SegmentLandcoverTool
 
 _MODELS_PACKAGE = "atlas.models"
@@ -23,10 +25,28 @@ def iter_plugin_specs() -> list[PluginSpec]:
     return specs
 
 
+def tool_for_spec(spec: PluginSpec) -> Tool:
+    """Build the agent tool for one plugin manifest.
+
+    Args:
+        spec: Parsed ``plugin.toml``.
+
+    Returns:
+        A tool whose name is ``spec.name``.
+
+    Raises:
+        ValueError: If ``spec.runtime`` has no local implementation.
+    """
+    if spec.runtime == "centroid_pixels":
+        return SegmentLandcoverTool(spec)
+    if spec.runtime == "binary_mask":
+        return BinaryMaskTool(spec)
+    if spec.runtime == "rgb_delta":
+        return RgbChangeTool(spec)
+    raise ValueError(f"Unsupported model runtime {spec.runtime!r} for {spec.name}")
+
+
 def register_model_tools(registry: ToolRegistry) -> None:
     """Register each discovered model plugin on ``registry``."""
     for spec in iter_plugin_specs():
-        if spec.runtime == "centroid_pixels":
-            registry.register(SegmentLandcoverTool(spec))
-            continue
-        raise ValueError(f"Unsupported model runtime {spec.runtime!r} for {spec.name}")
+        registry.register(tool_for_spec(spec))

@@ -1,0 +1,16 @@
+name = "mask_clouds"
+description = "Per-pixel cloud mask on a true-color PNG tile (256 or 512). 0 is clear, 1 is cloud."
+runtime = "binary_mask"
+rule = "cloud"
+weight = ""
+sha256 = ""
+
+[input]
+kind = "rgb_png"
+shape = [0, 0, 3]
+dtype = "uint8"
+sizes = [256, 512]
+
+[output]
+kind = "mask"
+classes = ["clear", "cloud"]
