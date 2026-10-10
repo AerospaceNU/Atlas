@@ -12,6 +12,7 @@ The tool loop over one local artifact directory.
 | `contracts` | Tool and model types, the tool registry, and discovery of tool classes. |
 | `runtime` | The bounded agent loop: call a tool, record the step, stop at the call budget. |
 | `session` | A multi-turn conversation on top of that loop, plus the `python -m atlas.agent` entry. |
+| `skills` | Load Agent Skills from the project and the user, and activate one with `use_skill`. |
 | `model` | The OpenRouter chat backend. |
 | `tools/` | Concrete tools. `read_file` reads text in the workspace and does not run it. |
 | `skill_author` | Write an Agent Skill directory (`SKILL.md`) that matches the Agent Skills spec. `normalize_skill_name` (`normalize_name`) and `is_within` are the shared name and path checks. |

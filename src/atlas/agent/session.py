@@ -32,7 +32,6 @@ from atlas.agent.model import (
     OpenRouterModel,
 )
 from atlas.agent.runtime import (
-    _SYSTEM_PROMPT,
     Agent,
     AgentRun,
     AgentStep,
@@ -40,6 +39,7 @@ from atlas.agent.runtime import (
     load_max_tool_calls,
     load_model,
 )
+from atlas.agent.skills import load_skills, register_skill_tool
 
 _REDACTED = "***"
 
@@ -49,7 +49,9 @@ class AgentSession:
 
     def __init__(self, agent: Agent) -> None:
         self.agent = agent
-        self.messages: list[ChatMessage] = [ChatMessage(role=Role.SYSTEM, content=_SYSTEM_PROMPT)]
+        self.messages: list[ChatMessage] = [
+            ChatMessage(role=Role.SYSTEM, content=self.agent.system_prompt())
+        ]
         self.stopped_for_limit = False
         self.session_key: str | None = None
         self.home: Path | None = None
@@ -112,7 +114,7 @@ class AgentSession:
         artifact directory inside the same workspace. Reads keep the previous
         read root, so this never widens write access to the workspace.
         """
-        self.messages = [ChatMessage(role=Role.SYSTEM, content=_SYSTEM_PROMPT)]
+        self.messages = [ChatMessage(role=Role.SYSTEM, content=self.agent.system_prompt())]
         self.stopped_for_limit = False
         self.totals = SessionTotals(
             model=self.model_id or self.totals.model,
@@ -639,15 +641,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     # session removes them and cannot touch the workspace root. Reads may
     # fall back to the project workspace via the store's read_root.
     artifact_root = project_atlas_root(workspace) / "artifacts" / session_id
+    skills = load_skills(workspace=workspace, home=home)
+    registry = default_registry()
+    register_skill_tool(registry, skills)
     model = OpenRouterModel(ModelConfig(model=model_id, api_key=api_key))
     try:
         agent = Agent(
             model,
-            default_registry(),
+            registry,
             LocalArtifactStore(artifact_root, read_root=workspace),
             # The store root is the session artifact directory, which has no
             # agent.toml. The budget lives in the workspace config.
             max_tool_calls=load_max_tool_calls(workspace),
+            skills=skills,
         )
         session = AgentSession(agent)
         session.requires_api_key = True

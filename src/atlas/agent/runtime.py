@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -20,6 +20,7 @@ from atlas.agent.contracts import (
     ToolResult,
 )
 from atlas.agent.metrics import observe_model_call, tokens_per_second
+from atlas.agent.skills import Skill, render_system_prompt
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -138,6 +139,7 @@ class Agent:
         artifacts: LocalArtifactStore,
         *,
         max_tool_calls: int | None = None,
+        skills: Sequence[Skill] | None = None,
     ) -> None:
         if max_tool_calls is None:
             max_tool_calls = load_max_tool_calls(artifacts.root)
@@ -147,11 +149,16 @@ class Agent:
         self.tools = tools
         self.artifacts = artifacts
         self.max_tool_calls = max_tool_calls
+        self.skills = list(skills or [])
+
+    def system_prompt(self) -> str:
+        """Return the system prompt, including the skill catalog when skills are loaded."""
+        return render_system_prompt(_SYSTEM_PROMPT, self.skills)
 
     def run(self, request: str) -> AgentRun:
         """Answer ``request``, making bounded, registry-approved tool calls."""
         messages = [
-            ChatMessage(role=Role.SYSTEM, content=_SYSTEM_PROMPT),
+            ChatMessage(role=Role.SYSTEM, content=self.system_prompt()),
             ChatMessage(role=Role.USER, content=request),
         ]
         return self.advance(messages)
