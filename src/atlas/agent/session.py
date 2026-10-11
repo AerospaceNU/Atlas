@@ -641,7 +641,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # session removes them and cannot touch the workspace root. Reads may
     # fall back to the project workspace via the store's read_root.
     artifact_root = project_atlas_root(workspace) / "artifacts" / session_id
-    skills = load_skills(workspace=workspace, home=home)
+    store = LocalArtifactStore(artifact_root, read_root=workspace)
+    skills = load_skills(store)
     registry = default_registry()
     register_skill_tool(registry, skills)
     model = OpenRouterModel(ModelConfig(model=model_id, api_key=api_key))
@@ -649,7 +650,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         agent = Agent(
             model,
             registry,
-            LocalArtifactStore(artifact_root, read_root=workspace),
+            store,
             # The store root is the session artifact directory, which has no
             # agent.toml. The budget lives in the workspace config.
             max_tool_calls=load_max_tool_calls(workspace),
