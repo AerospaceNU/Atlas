@@ -153,6 +153,23 @@ def skill_directory_name(draft: SkillDraft) -> str:
     return prepared.name
 
 
+def normalize_name(name: object) -> tuple[str | None, list[str]]:
+    """Return the NFKC skill name and any spec errors.
+
+    The skill loader and :func:`author_skill` share this check. The normalized
+    name is returned even when ``errors`` is non-empty. Callers reject the
+    name when ``errors`` is not empty.
+
+    Args:
+        name: Frontmatter or directory name to check.
+
+    Returns:
+        The NFKC name, or ``None`` when ``name`` is not a non-empty string,
+        and the list of problems.
+    """
+    return _normalize_name(name)
+
+
 def author_skill(
     skills_root: Path,
     draft: SkillDraft,
