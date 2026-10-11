@@ -5,8 +5,10 @@ from importlib.resources import files
 from atlas.agent.contracts import Tool, ToolRegistry
 from atlas.models.base import PluginSpec, parse_plugin_toml
 from atlas.models.binary_mask import BinaryMaskTool
+from atlas.models.lgbm_runtime import LightGBMTool
 from atlas.models.rgb_change.infer import RgbChangeTool
 from atlas.models.segment_landcover.infer import SegmentLandcoverTool
+from atlas.models.unet_cpu import UnetCpuTool
 
 _MODELS_PACKAGE = "atlas.models"
 
@@ -43,6 +45,10 @@ def tool_for_spec(spec: PluginSpec) -> Tool:
         return BinaryMaskTool(spec)
     if spec.runtime == "rgb_delta":
         return RgbChangeTool(spec)
+    if spec.runtime == "unet_cpu":
+        return UnetCpuTool(spec)
+    if spec.runtime == "lightgbm":
+        return LightGBMTool(spec)
     raise ValueError(f"Unsupported model runtime {spec.runtime!r} for {spec.name}")
 
 

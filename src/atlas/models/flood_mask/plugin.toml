@@ -1,5 +1,5 @@
 name = "flood_mask"
-description = "Open-water mask on an optical PNG tile (256 or 512). 0 is dry, 1 is water. Not under-cloud SAR flood."
+description = "Heuristic open-water mask on an optical PNG. Blue-dominant pixels are water (1); everything else is dry (0). Not under-cloud SAR flood and not a trained model. Large mosaics are tiled at 512 and stitched."
 runtime = "binary_mask"
 rule = "water"
 weight = ""

@@ -1,13 +1,20 @@
 # mask_clouds
 
-Per-pixel cloud mask on a true-color PNG tile so later tools can skip junk.
+Heuristic per-pixel cloud / valid mask on true-color PNG so later tools skip
+junk. Not a trained model. No GPU. Spectral / SAR / foundation models are out
+of scope.
 
-No weights. A pixel is cloud when it is bright and nearly neutral: the channel
-mean is at least 200 and `max(R, G, B) - min(R, G, B)` is at most 25.
+A pixel is cloud when the channel mean is at least 200 and
+`max(R, G, B) - min(R, G, B)` is at most 25.
 
-## Tool I/O
+## Spec
 
-- **Input:** workspace-relative RGB PNG, `256×256` or `512×512`. Other sizes are
-  rejected. The tile is not resized.
-- **Output:** same-size mask PNG (`0` clear, `1` cloud) and JSON with `width`,
-  `height`, and `positive_fraction`.
+Per-pixel cloud / valid mask on true-color PNG so later tools skip junk.
+
+- **Input:** RGB PNG tile, `256×256×3` or `512×512×3` uint8
+- **Output:** mask `H×W` uint8 (`0` clear, `1` cloud), same spatial size as input
+
+Tile large mosaics at 256–512; do not run the mask on a full mosaic in one
+pass. Windows use the larger declared edge (512). Each window is masked and
+stitched, so a mosaic that is not itself 256 or 512 still returns a mask at
+the original HxW. Smaller images run as one window.

@@ -124,6 +124,20 @@ def load_centroids(spec: PluginSpec) -> dict[str, tuple[float, float, float]]:
     return centroids
 
 
+def require_max_pixels(height: int, width: int) -> None:
+    """Reject rasters above ``_MAX_PIXELS``.
+
+    Args:
+        height: Raster height.
+        width: Raster width.
+
+    Raises:
+        ValueError: If ``height * width`` exceeds ``_MAX_PIXELS``.
+    """
+    if height * width > _MAX_PIXELS:
+        raise ValueError(f"Image exceeds {_MAX_PIXELS} pixels ({width}x{height})")
+
+
 def load_rgb_array(path: Path) -> NDArray[np.uint8]:
     """Read ``path`` as an ``HxWx3`` uint8 RGB array.
 
@@ -134,14 +148,65 @@ def load_rgb_array(path: Path) -> NDArray[np.uint8]:
         A copy of the image in RGB, at its native spatial size.
 
     Raises:
-        ValueError: If the converted image is not three-channel.
+        ValueError: If the converted image is not three-channel or exceeds
+            ``_MAX_PIXELS``.
     """
     with Image.open(path) as image:
+        width, height = image.size
+        require_max_pixels(height, width)
         rgb = image.convert("RGB")
         array = np.array(rgb, dtype=np.uint8)
     if array.ndim != 3 or array.shape[2] != 3:
         raise ValueError("Expected an RGB image")
     return array
+
+
+def load_weight_payload(spec: PluginSpec) -> dict[str, Any]:
+    """Load a JSON weight file and check its runtime and class names.
+
+    Args:
+        spec: Plugin whose relative ``weight`` key and ``output.classes`` form
+            the contract. ``sha256`` is enforced by :func:`read_weight_bytes`.
+
+    Returns:
+        The JSON object stored at that key.
+
+    Raises:
+        FileNotFoundError: If the weight file is missing. The message names the
+            relative key, not a host path.
+        ValueError: If the hash, runtime, or class list does not match.
+    """
+    payload: Any = json.loads(read_weight_bytes(spec).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Weight {spec.weight} must be a JSON object")
+    if payload.get("runtime") != spec.runtime:
+        raise ValueError(f"Weight runtime does not match plugin.toml for {spec.name}")
+    if payload.get("classes") != spec.output.classes:
+        raise ValueError("Weight classes do not match plugin.toml")
+    return payload
+
+
+def weight_tile(payload: dict[str, Any], spec: PluginSpec) -> int:
+    """Return the mosaic tile edge declared by a weight file.
+
+    Args:
+        payload: Object returned by :func:`load_weight_payload`.
+        spec: Plugin whose ``input.sizes`` lists allowed tile edges.
+
+    Returns:
+        The tile edge in pixels.
+
+    Raises:
+        ValueError: If ``tile`` is missing, not an int, or not allowed.
+    """
+    tile = payload.get("tile")
+    if isinstance(tile, bool) or not isinstance(tile, int):
+        raise ValueError(f"Weight {spec.weight} tile must be an int")
+    if spec.input.sizes and tile not in spec.input.sizes:
+        raise ValueError(f"Weight tile {tile} is not in plugin input.sizes")
+    if tile < 2:
+        raise ValueError(f"Weight tile {tile} must be >= 2")
+    return tile
 
 
 def mean_rgb(image: Image.Image) -> tuple[float, float, float]:

@@ -1,14 +1,19 @@
 # burn_scar
 
-Burned-area mask from dark red-brown scars in true color. Not NBR severity.
+Heuristic burned-area mask from dark scars in true color. Not NBR severity
+and not a trained model. No GPU.
 
-No weights. A pixel is burn when its luma is below 80, red is at least green
-and blue, and green is below 90. Dark blue water and green vegetation stay
+A pixel is burn only when red is strictly greater than green and blue, green
+is below 90, and luma is at least 25 and below 80. Black and dark grey stay
 unburned.
 
-## Tool I/O
+## Spec
 
-- **Input:** workspace-relative RGB PNG, `256×256` or `512×512`. Other sizes are
-  rejected. The tile is not resized.
-- **Output:** same-size mask PNG (`0` unburned, `1` burn) and JSON with
-  `width`, `height`, and `positive_fraction`.
+Burned-area mask from dark scars in true color. Not NBR severity.
+
+- **Input:** RGB PNG tile, `256×256×3` or `512×512×3` uint8
+- **Output:** mask `H×W` uint8 (`0` unburned, `1` burn), same spatial size as input
+
+Tile large mosaics at 256–512. Windows use the larger declared edge (512) and
+are stitched, so the mask stays the original HxW instead of rejecting a
+non-tile input.

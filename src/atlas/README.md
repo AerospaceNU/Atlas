@@ -77,9 +77,13 @@ Plugins the agent can call. Each plugin is a subpackage with a `plugin.toml`.
 |---|---|
 | `base` | Plugin manifest, weights loading, and shared image helpers. |
 | `registry` | Find every `plugin.toml` and register its tool. |
-| `binary_mask` | Shared 0/1 tile mask used by the cloud, burn, and flood plugins. |
+| `binary_mask` | Heuristic 0/1 masks. Large mosaics are tiled, then stitched. |
+| `unet_cpu` | CPU U-Net runtime: JSON weight contract and tiled mosaic inference. |
+| `lgbm_runtime` | LightGBM runtime: JSON weight contract and tiled mosaic inference. |
 | `segment_landcover/` | Per-pixel land-cover labels on an RGB scene. See that folder's README for train and export. |
 | `rgb_change/` | Before/after heatmap and blob polygons on an RGB pair. |
-| `mask_clouds/` | Cloud mask on a 256 or 512 true-color tile. |
-| `burn_scar/` | Burn-scar mask on a 256 or 512 true-color tile. |
-| `flood_mask/` | Open-water mask on a 256 or 512 true-color tile. |
+| `mask_clouds/` | Heuristic cloud mask. Mosaics are tiled at 512 and stitched. |
+| `burn_scar/` | Heuristic burn-scar mask. Mosaics are tiled at 512 and stitched. |
+| `flood_mask/` | Heuristic open-water mask. Mosaics are tiled at 512 and stitched. |
+| `unet_water/` | Open-water CPU U-Net plugin. |
+| `lgbm_clouds/` | Cloud LightGBM plugin. |

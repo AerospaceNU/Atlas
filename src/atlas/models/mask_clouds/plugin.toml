@@ -1,5 +1,5 @@
 name = "mask_clouds"
-description = "Per-pixel cloud mask on a true-color PNG tile (256 or 512). 0 is clear, 1 is cloud."
+description = "Heuristic cloud mask on a true-color PNG. Bright, low-chroma pixels are cloud (1); everything else is clear (0). Large mosaics are tiled at 512 and stitched. Not a trained model."
 runtime = "binary_mask"
 rule = "cloud"
 weight = ""

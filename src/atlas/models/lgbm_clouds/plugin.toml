@@ -1,0 +1,15 @@
+name = "lgbm_clouds"
+description = "LightGBM cloud mask on RGB pixels. Weights are a JSON contract (relative key, optional sha256) holding a LightGBM model string. Large mosaics are tiled and stitched to the original size."
+runtime = "lightgbm"
+weight = "lgbm_clouds/model.json"
+sha256 = ""
+
+[input]
+kind = "rgb_png"
+shape = [0, 0, 3]
+dtype = "uint8"
+sizes = [32, 256, 512]
+
+[output]
+kind = "mask"
+classes = ["clear", "cloud"]

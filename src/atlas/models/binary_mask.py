@@ -46,6 +46,9 @@ def cloud_mask(rgb: NDArray[np.uint8]) -> NDArray[np.uint8]:
 def burn_mask(rgb: NDArray[np.uint8]) -> NDArray[np.uint8]:
     """Label dark red-brown pixels as burn scar.
 
+    Red must be strictly greater than green and blue, and luma must be at least
+    25 and below 80. Black and dark grey fail that test.
+
     Args:
         rgb: ``HxWx3`` uint8 image.
 
@@ -56,7 +59,9 @@ def burn_mask(rgb: NDArray[np.uint8]) -> NDArray[np.uint8]:
     green = rgb[..., 1].astype(np.int32)
     blue = rgb[..., 2].astype(np.int32)
     luma = (299 * red + 587 * green + 114 * blue) // 1000
-    burned = (luma < 80) & (red >= green) & (red >= blue) & (green < 90)
+    # Red must strictly dominate, and luma has a floor, so black and dark grey
+    # (equal channels, or too dark to be a scar) stay unburned.
+    burned = (red > green) & (red > blue) & (luma >= 25) & (luma < 80) & (green < 90)
     return burned.astype(np.uint8)
 
 
@@ -83,15 +88,33 @@ _RULES: dict[str, Callable[[NDArray[np.uint8]], NDArray[np.uint8]]] = {
 }
 
 
-def _require_tile(width: int, height: int, sizes: list[int]) -> None:
-    if width == height and width in sizes:
-        return
-    allowed = ", ".join(f"{size}x{size}" for size in sizes)
-    raise ValueError(f"Expected a tile of {allowed}, got {width}x{height}")
+def apply_tiled_mask(
+    rgb: NDArray[np.uint8],
+    rule: Callable[[NDArray[np.uint8]], NDArray[np.uint8]],
+    tile: int,
+) -> NDArray[np.uint8]:
+    """Apply ``rule`` on ``tile`` windows and stitch a native-size mask.
+
+    Args:
+        rgb: ``HxWx3`` uint8 mosaic.
+        rule: Maps one tile to a 0/1 mask of the same spatial size.
+        tile: Window edge in pixels.
+
+    Returns:
+        ``HxW`` uint8 mask. The output is not resized to the tile.
+    """
+    height, width = int(rgb.shape[0]), int(rgb.shape[1])
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for y0 in range(0, height, tile):
+        for x0 in range(0, width, tile):
+            y1 = min(y0 + tile, height)
+            x1 = min(x0 + tile, width)
+            mask[y0:y1, x0:x1] = rule(rgb[y0:y1, x0:x1])
+    return mask
 
 
 class BinaryMaskTool(Tool):
-    """Per-pixel 0/1 mask on a 256 or 512 RGB tile. Does not resize the input."""
+    """Heuristic 0/1 mask. Large mosaics are tiled and stitched, not rejected."""
 
     def __init__(self, spec: PluginSpec) -> None:
         if spec.runtime != "binary_mask":
@@ -101,12 +124,11 @@ class BinaryMaskTool(Tool):
             raise ValueError(f"Unknown binary mask rule {spec.rule!r} for {spec.name}")
         if len(spec.output.classes) != 2:
             raise ValueError(f"{spec.name} must declare exactly two output classes")
-        if not spec.input.sizes:
-            raise ValueError(f"{spec.name} must declare input.sizes")
         self.spec = spec
         self.name = spec.name
         self.description = spec.description
         self._rule = rule
+        self._tile = max(spec.input.sizes) if spec.input.sizes else 512
 
     @property
     def input_model(self) -> type[BaseModel]:
@@ -126,8 +148,7 @@ class BinaryMaskTool(Tool):
 
         rgb = load_rgb_array(image_path)
         height, width = int(rgb.shape[0]), int(rgb.shape[1])
-        _require_tile(width, height, self.spec.input.sizes)
-        mask = self._rule(rgb)
+        mask = apply_tiled_mask(rgb, self._rule, self._tile)
         if mask.shape != (height, width):
             raise RuntimeError("Mask spatial size must match the input")
 

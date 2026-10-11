@@ -6,13 +6,21 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 from pydantic import BaseModel, Field
+from scipy import ndimage
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.models import base as model_base
 from atlas.models.base import PluginSpec, load_rgb_array
 
 CHANGE_THRESHOLD = 0.2
 MIN_BLOB_PIXELS = 16
+
+
+def _reject_oversized(height: int, width: int) -> None:
+    """Refuse a pair whose raster exceeds ``_MAX_PIXELS``."""
+    if height * width > model_base._MAX_PIXELS:
+        raise ValueError(f"Image exceeds {model_base._MAX_PIXELS} pixels ({width}x{height})")
 
 
 class RgbChangeInput(BaseModel):
@@ -48,14 +56,15 @@ def rgb_heatmap(before: NDArray[np.uint8], after: NDArray[np.uint8]) -> NDArray[
             "RGB pair must share HxW, got "
             f"{before.shape[1]}x{before.shape[0]} and {after.shape[1]}x{after.shape[0]}"
         )
+    _reject_oversized(int(before.shape[0]), int(before.shape[1]))
     delta = np.abs(after.astype(np.float32) - before.astype(np.float32))
     return (delta.mean(axis=2) / np.float32(255.0)).astype(np.float32)
 
 
 def _convex_hull(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
     unique = sorted(set(points))
-    if len(unique) <= 1:
-        return unique
+    if len(unique) < 3:
+        return []
 
     def cross(origin: tuple[int, int], left: tuple[int, int], right: tuple[int, int]) -> int:
         return (left[0] - origin[0]) * (right[1] - origin[1]) - (left[1] - origin[1]) * (
@@ -72,7 +81,10 @@ def _convex_hull(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
         while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
             upper.pop()
         upper.append(point)
-    return lower[:-1] + upper[:-1]
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return []
+    return hull
 
 
 def blob_polygons(
@@ -91,31 +103,19 @@ def blob_polygons(
     Returns:
         Polygons sorted by area, each with ``area`` and ``points`` as ``[x, y]``.
     """
+    _reject_oversized(int(heatmap.shape[0]), int(heatmap.shape[1]))
     mask = heatmap >= threshold
-    height, width = int(mask.shape[0]), int(mask.shape[1])
-    seen = np.zeros((height, width), dtype=bool)
+    structure = ndimage.generate_binary_structure(2, 1)
+    labeled, count = ndimage.label(np.asarray(mask, dtype=bool), structure=structure)
     polygons: list[dict[str, Any]] = []
-    rows, cols = np.nonzero(mask)
-    for y_raw, x_raw in zip(rows.tolist(), cols.tolist(), strict=True):
-        y, x = int(y_raw), int(x_raw)
-        if seen[y, x]:
+    for index in range(1, int(count) + 1):
+        rows, cols = np.nonzero(labeled == index)
+        if int(rows.size) < min_pixels:
             continue
-        seen[y, x] = True
-        stack = [(y, x)]
-        pixels: list[tuple[int, int]] = []
-        while stack:
-            cy, cx = stack.pop()
-            pixels.append((cx, cy))
-            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                if ny < 0 or nx < 0 or ny >= height or nx >= width:
-                    continue
-                if not bool(mask[ny, nx]) or bool(seen[ny, nx]):
-                    continue
-                seen[ny, nx] = True
-                stack.append((ny, nx))
-        if len(pixels) < min_pixels:
-            continue
+        pixels = list(zip(cols.tolist(), rows.tolist(), strict=True))
         hull = _convex_hull(pixels)
+        if len(hull) < 3:
+            continue
         polygons.append({"area": len(pixels), "points": [[px, py] for px, py in hull]})
     polygons.sort(
         key=lambda item: (
