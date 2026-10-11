@@ -62,7 +62,8 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help="Search and pull registered satellite sources",
         description=(
             "List discovered satellites, or search a satellite and download native assets. "
-            "fldas landsurface writes a CSV training table."
+            "A geographic, Web Mercator, or WGS84 UTM COG is read as the window "
+            "overlapping --coords. fldas landsurface writes a CSV training table."
         ),
         epilog=f"example:\n  {_EXAMPLE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -362,6 +363,7 @@ async def execute_pull(
                     clients=live_clients,
                     concurrency=concurrency,
                     asset_name=asset_name,
+                    bbox=request.bbox,
                     on_progress=lambda name, n_saved, total: reporter.source_pull(
                         name, saved=n_saved, total=total
                     ),
