@@ -20,6 +20,7 @@ from atlas.agent.skill_author import (
     _write_text,
     author_skill,
     is_within,
+    normalize_name,
     normalize_skill_name,
     project_skills_root,
     render_skill_md,
@@ -118,8 +119,10 @@ def test_normalize_skill_name_is_the_public_nfkc_check() -> None:
     composed = "caf\u00e9-scan"
     normalized, errors = normalize_skill_name("  cafe\u0301-scan  ")
 
+    assert normalize_name is normalize_skill_name
     assert normalized == composed
     assert errors == []
+    assert normalize_name("  cafe\u0301-scan  ") == (composed, [])
     upper, upper_errors = normalize_skill_name("NDVI")
     assert upper == "NDVI"
     assert any("lowercase" in error for error in upper_errors)

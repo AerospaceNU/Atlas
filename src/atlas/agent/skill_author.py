@@ -3,8 +3,8 @@
 A skill is a directory named after its frontmatter ``name`` with a
 ``SKILL.md`` of YAML frontmatter plus markdown instructions. This module
 checks those constraints and writes the directory. :func:`normalize_skill_name`
-and :func:`is_within` are the shared name and path checks. Discovering skills
-and activating them in a session are separate.
+(also :func:`normalize_name`) and :func:`is_within` are the shared name and
+path checks. Discovering skills and activating them in a session are separate.
 """
 
 from __future__ import annotations
@@ -104,10 +104,10 @@ def user_skills_root(home: Path | None = None) -> Path:
 def normalize_skill_name(name: object) -> tuple[str | None, list[str]]:
     """NFKC-normalize a skill name and report spec violations.
 
-    The returned string is the directory name :func:`author_skill` would use.
-    Loaders compare it to the skill directory. ``None`` means there is no
-    usable name. A non-empty invalid name is still returned so the caller can
-    show it.
+    The skill loader and :func:`author_skill` share this check. ``None`` means
+    there is no usable name. A non-empty invalid name is still returned so the
+    caller can show it; callers reject the name when ``errors`` is not empty.
+    :func:`normalize_name` is the same function.
 
     Args:
         name: Proposed skill name.
@@ -214,21 +214,7 @@ def skill_directory_name(draft: SkillDraft) -> str:
     return prepared.name
 
 
-def normalize_name(name: object) -> tuple[str | None, list[str]]:
-    """Return the NFKC skill name and any spec errors.
-
-    The skill loader and :func:`author_skill` share this check. The normalized
-    name is returned even when ``errors`` is non-empty. Callers reject the
-    name when ``errors`` is not empty.
-
-    Args:
-        name: Frontmatter or directory name to check.
-
-    Returns:
-        The NFKC name, or ``None`` when ``name`` is not a non-empty string,
-        and the list of problems.
-    """
-    return _normalize_name(name)
+normalize_name = normalize_skill_name
 
 
 def author_skill(
