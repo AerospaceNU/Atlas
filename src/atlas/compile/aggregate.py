@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import random
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -13,6 +14,8 @@ from atlas.data.base import DataPullClient, PullRequest, PullResult, Scene
 _MAX_SEARCH_ATTEMPTS = 3
 # Used when the response has no usable Retry-After. Attempt 1 waits 0.5s, then 1s.
 _BACKOFF_SECONDS = 0.5
+# Spread that wait by +/- 20% so sources do not retry in lockstep.
+_JITTER_FRACTION = 0.2
 # A huge or hostile Retry-After must not stall the catalog.
 _MAX_BACKOFF_SECONDS = 60.0
 
@@ -35,14 +38,27 @@ def _is_rate_limited(exc: BaseException) -> bool:
     return _status_code(exc) == 429
 
 
+def _apply_jitter(delay: float) -> float:
+    """Return ``delay`` shifted by a fraction of itself, still inside the cap."""
+    if delay <= 0.0 or not math.isfinite(delay):
+        return 0.0
+    span = delay * _JITTER_FRACTION
+    jittered = delay + random.uniform(-span, span)
+    if not math.isfinite(jittered):
+        return min(delay, _MAX_BACKOFF_SECONDS)
+    return min(_MAX_BACKOFF_SECONDS, max(0.0, jittered))
+
+
 def _retry_delay(exc: BaseException, attempt: int) -> float:
     """Return the seconds to wait before the next search attempt.
 
     ``attempt`` is the 1-based number of the attempt that just failed.
+    A parsed finite ``Retry-After`` is used as given, capped. The computed
+    backoff is jittered.
     """
     header = _retry_after_seconds(exc)
     if header is None:
-        header = _BACKOFF_SECONDS * attempt
+        return _apply_jitter(min(_BACKOFF_SECONDS * attempt, _MAX_BACKOFF_SECONDS))
     return min(header, _MAX_BACKOFF_SECONDS)
 
 
@@ -129,10 +145,11 @@ async def aggregate(
     aborting the whole fan-out. ``on_source`` is called as each source finishes.
 
     A source that fails with HTTP 429 is retried, up to three attempts in all.
-    The wait is the ``Retry-After`` header when that parses as seconds or an
-    HTTP date, otherwise half a second times the attempt number, and never more
-    than 60 seconds. Other sources keep running during that wait. Any other
-    error is recorded on the first failure.
+    The wait is the ``Retry-After`` header when that parses as a finite number
+    of seconds or an HTTP date, otherwise half a second times the attempt
+    number, jittered by 20 percent. The wait is never more than 60 seconds.
+    Other sources keep running during that wait. Any other error is recorded
+    on the first failure.
     """
 
     async def run(name: str, client: DataPullClient) -> SourceScenes:

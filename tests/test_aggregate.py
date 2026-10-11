@@ -86,6 +86,11 @@ class _StatusClient(DataPullClient):
         return PullResult(request=request, scenes=[_scene(self._then)])
 
 
+def _pin_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the computed backoff deterministic. ``Retry-After`` is not jittered."""
+    monkeypatch.setattr(aggregate_mod.random, "uniform", lambda _low, _high: 0.0)
+
+
 def _patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     """Record backoff delays and yield so sibling searches can finish."""
     delays: list[float] = []
@@ -95,6 +100,7 @@ def _patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
         delays.append(delay)
         await real_sleep(0)
 
+    _pin_jitter(monkeypatch)
     monkeypatch.setattr(aggregate_mod.asyncio, "sleep", fake_sleep)
     return delays
 
@@ -131,6 +137,7 @@ async def test_retry_does_not_abort_the_other_sources(
     def on_source(src: SourceScenes) -> None:
         finished.append(src.source)
 
+    _pin_jitter(monkeypatch)
     real_sleep = asyncio.sleep
 
     async def fake_sleep(delay: float) -> None:
@@ -179,6 +186,36 @@ async def test_past_retry_after_date_waits_zero(monkeypatch: pytest.MonkeyPatch)
     await aggregate(_request(), {"sentinel2": limited})
 
     assert delays == [0.0]
+
+
+@pytest.mark.asyncio
+async def test_computed_backoff_includes_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _patch_sleep(monkeypatch)
+
+    def uniform(low: float, high: float) -> float:
+        assert low < 0.0 < high
+        return high
+
+    monkeypatch.setattr(aggregate_mod.random, "uniform", uniform)
+    limited = _ScriptedClient([_rate_limit(), _rate_limit(), "S2A_after_retry"])
+
+    catalog = await aggregate(_request(), {"sentinel2": limited})
+
+    fraction = aggregate_mod._JITTER_FRACTION
+    assert delays == [0.5 + 0.5 * fraction, 1.0 + 1.0 * fraction]
+    assert [scene.id for scene in catalog.sources[0].scenes] == ["S2A_after_retry"]
+
+
+@pytest.mark.asyncio
+async def test_jitter_cannot_exceed_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _patch_sleep(monkeypatch)
+    monkeypatch.setattr(aggregate_mod, "_BACKOFF_SECONDS", 100.0)
+    monkeypatch.setattr(aggregate_mod.random, "uniform", lambda _low, high: high)
+    limited = _ScriptedClient([_rate_limit(), "S2A_after_retry"])
+
+    await aggregate(_request(), {"sentinel2": limited})
+
+    assert delays == [aggregate_mod._MAX_BACKOFF_SECONDS]
 
 
 @pytest.mark.asyncio
