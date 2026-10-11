@@ -34,7 +34,7 @@ Enter sends a line. `/` opens commands. `/new` starts a fresh conversation in th
 
 ## Data CLI
 
-`atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`. A polygon AOI is `--polygon` as `lon,lat` pairs separated by semicolons, or a GeoJSON Polygon. Without `--coords`, the search box is that ring's envelope.
+`atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`. A polygon AOI is `--polygon` as `lon,lat` pairs separated by semicolons, or a GeoJSON Polygon. Without `--coords`, the search box is that ring's envelope. A ring that winds around a pole is rejected: the boundary does not close inside one 360-degree window, so the interior is not a box or a STAC polygon. The written manifest stores the polygon and the box sent to catalogs that only accept a bounding box.
 
 ```bash
 atlas data                         # catalog

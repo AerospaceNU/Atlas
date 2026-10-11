@@ -554,18 +554,33 @@ async def _extract_table(
     )
 
 
+def _catalog_bbox_note(request: PullRequest) -> str:
+    if request.polygon is None:
+        return "Every catalog was searched with this bounding box."
+    return (
+        "Catalogs that only accept a bounding box were searched with this box. "
+        "The polygon is the area of interest, and scenes from every source are filtered to it."
+    )
+
+
 def _write_manifest(
     out_dir: Path,
     catalog: SceneCatalog,
     report: DownloadReport,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    request = catalog.request
+    bbox = request.bbox.as_list()
     payload = {
-        "request": catalog.request.model_dump(mode="json"),
+        "request": request.model_dump(mode="json"),
+        "polygon": None if request.polygon is None else request.polygon.as_geojson(),
+        "catalog_bbox": bbox,
+        "catalog_bbox_note": _catalog_bbox_note(request),
         "sources": [
             {
                 "source": src.source,
                 "collection": src.collection,
+                "bbox": bbox,
                 "error": src.error,
                 "n_scenes": len(src.scenes),
                 "scene_ids": [scene.id for scene in src.scenes],

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
-from datetime import date
+from datetime import UTC, date, datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
 
@@ -12,7 +14,16 @@ from pydantic import ValidationError
 
 from atlas.cli import _attach_negative_option_values, _inject_data_command
 from atlas.cli.data import add_data_parser, parse_polygon, run_data
-from atlas.data.base import BBox, DataPullClient, Polygon, PullRequest, PullResult
+from atlas.data.base import (
+    MAX_POLYGON_VERTICES,
+    BBox,
+    DataPullClient,
+    GeometryKind,
+    Polygon,
+    PullRequest,
+    PullResult,
+    Scene,
+)
 from atlas.data.sentinel2 import Sentinel2Client
 
 SQUARE = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]
@@ -67,9 +78,15 @@ def test_self_crossing_ring_is_rejected() -> None:
         Polygon(ring=[(0.0, 0.0), (4.0, 1.0), (0.0, 1.0), (1.0, 0.0), (0.0, 0.0)])
 
 
-def test_ring_that_wraps_the_globe_is_rejected() -> None:
-    with pytest.raises(ValidationError, match="wraps the globe"):
-        Polygon(ring=[(0.0, 0.0), (120.0, 0.0), (-120.0, 0.0), (0.0, 1.0), (0.0, 0.0)])
+def test_ring_that_wraps_a_pole_is_rejected() -> None:
+    # The boundary goes the long way around a pole, so it does not close inside
+    # one 360-degree window. A bbox catalog and a STAC antimeridian split both
+    # need that window.
+    assert Polygon.__doc__ is not None
+    assert "wraps a pole" in Polygon.__doc__
+    assert "360-degree window" in Polygon.__doc__
+    with pytest.raises(ValidationError, match="wraps a pole"):
+        Polygon(ring=[(0.0, 80.0), (120.0, 80.0), (-120.0, 80.0), (0.0, 80.0)])
 
 
 def test_antimeridian_ring_uses_the_narrow_envelope() -> None:
@@ -277,6 +294,156 @@ def test_cli_polygon_outside_coords_exits_2(
     )
     assert run_data(args, clients={"sentinel2": _Recording()}) == 2
     assert "outside bbox" in capsys.readouterr().err
+
+
+def _square_with_vertices(unique: int) -> list[tuple[float, float]]:
+    extra = unique - 4
+    bottom = [(index / (extra + 1), 0.0) for index in range(1, extra + 1)]
+    ring = [(0.0, 0.0), *bottom, (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    ring.append(ring[0])
+    return ring
+
+
+def test_vertex_cap_rejects_before_the_intersection_check() -> None:
+    assert Polygon(ring=_square_with_vertices(MAX_POLYGON_VERTICES)).ring[0] == (0.0, 0.0)
+    with pytest.raises(ValidationError, match=str(MAX_POLYGON_VERTICES)):
+        Polygon(ring=_square_with_vertices(MAX_POLYGON_VERTICES + 1))
+    huge = [(float(index), 0.0) for index in range(10_000)]
+    huge.append(huge[0])
+    with pytest.raises(ValidationError, match="more than"):
+        Polygon(ring=huge)
+
+
+def test_dateline_ring_splits_into_a_multipolygon() -> None:
+    polygon = Polygon(ring=FIJI)
+    geometry = polygon.as_stac_geometry()
+    assert geometry["type"] == "MultiPolygon"
+    rings = geometry["coordinates"]
+    assert len(rings) == 2
+    lon_sets = [{point[0] for point in ring[0]} for ring in rings]
+    assert any(178.0 in lons and 180.0 in lons for lons in lon_sets)
+    assert any(-178.0 in lons and -180.0 in lons for lons in lon_sets)
+    for ring in rings:
+        assert ring[0] == ring[-1]
+        for (x1, _y1), (x2, _y2) in pairwise(ring):
+            assert abs(x1 - x2) < 180
+    touching = [(170.0, -1.0), (180.0, -1.0), (180.0, 1.0), (170.0, 1.0), (170.0, -1.0)]
+    assert Polygon(ring=touching).as_stac_geometry()["type"] == "Polygon"
+
+
+@pytest.mark.asyncio
+async def test_stac_search_sends_a_dateline_multipolygon() -> None:
+    fake = _FakeStac()
+    request = PullRequest(
+        start_date=date(2024, 7, 1),
+        end_date=date(2024, 7, 3),
+        polygon=Polygon(ring=FIJI),
+        limit=2,
+    )
+    async with Sentinel2Client(client=cast(httpx.AsyncClient, fake)) as client:
+        await client.search(request)
+    intersects = fake.calls[0]["intersects"]
+    assert intersects["type"] == "MultiPolygon"
+    assert intersects == Polygon(ring=FIJI).as_stac_geometry()
+    assert fake.calls[0]["bbox"] == [178.0, -18.0, -178.0, -16.0]
+
+
+def _scene(scene_id: str, bbox: BBox, **kwargs: object) -> Scene:
+    body: dict[str, object] = {
+        "id": scene_id,
+        "datetime": datetime(2024, 7, 1, tzinfo=UTC),
+        "bbox": bbox,
+        "platform": "x",
+    }
+    body.update(kwargs)
+    return Scene.model_validate(body)
+
+
+TRIANGLE = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]
+
+
+def test_every_source_drops_scenes_outside_the_polygon() -> None:
+    polygon = Polygon(ring=TRIANGLE)
+    request = PullRequest(
+        start_date=date(2024, 7, 1),
+        end_date=date(2024, 7, 7),
+        bbox=BBox(west=0, south=0, east=1, north=1),
+        polygon=polygon,
+    )
+    inside = _scene("inside", BBox(west=0, south=0, east=0.3, north=0.3))
+    outside = _scene("outside", BBox(west=0.6, south=0.6, east=0.9, north=0.9))
+    point_in = _scene(
+        "point-in",
+        BBox.from_point(0.1, 0.1),
+        geometry_kind=GeometryKind.point,
+        lon=0.1,
+        lat=0.1,
+    )
+    point_out = _scene(
+        "point-out",
+        BBox.from_point(0.8, 0.8),
+        geometry_kind=GeometryKind.point,
+        lon=0.8,
+        lat=0.8,
+    )
+
+    class _BoxClient(DataPullClient):
+        async def search(self, request: PullRequest) -> PullResult:
+            return PullResult(request=request, scenes=[inside, outside, point_in, point_out])
+
+    result = asyncio.run(_BoxClient().search(request))
+    assert [scene.id for scene in result.scenes] == ["inside", "point-in"]
+
+
+def test_manifest_round_trips_polygon_and_source_bbox(tmp_path: Path) -> None:
+    polygon = Polygon(ring=TRIANGLE)
+    inside = _scene("inside", BBox(west=0, south=0, east=0.3, north=0.3))
+    outside = _scene("outside", BBox(west=0.6, south=0.6, east=0.9, north=0.9))
+
+    class _BoxClient(DataPullClient):
+        def __init__(self, scenes: list[Scene]) -> None:
+            self._scenes = scenes
+            self.requests: list[PullRequest] = []
+
+        async def search(self, request: PullRequest) -> PullResult:
+            self.requests.append(request)
+            return PullResult(request=request, scenes=self._scenes)
+
+    kept = _BoxClient([inside, outside])
+    missed = _BoxClient([outside])
+    args = _parse_pull(
+        [
+            "data",
+            "sentinel2",
+            "optical",
+            "--date",
+            "2024-07-01:2024-07-07",
+            "--coords",
+            "0,0,1,1",
+            "--polygon",
+            "0,0;1,0;0,1",
+            "--out",
+            str(tmp_path),
+            "--search-only",
+        ]
+    )
+    assert run_data(args, clients={"sentinel2": kept, "modis": missed}) == 0
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    restored = PullRequest.model_validate(manifest["request"])
+    assert restored.polygon is not None
+    assert restored.polygon.ring == polygon.ring
+    assert restored.bbox.as_list() == manifest["catalog_bbox"]
+    assert Polygon.from_geojson(manifest["polygon"]).ring == restored.polygon.ring
+    assert "only accept a bounding box" in manifest["catalog_bbox_note"]
+    assert {item["source"] for item in manifest["sources"]} == {"sentinel2", "modis"}
+    for item in manifest["sources"]:
+        assert item["bbox"] == manifest["catalog_bbox"]
+        assert item["bbox"] == restored.bbox.as_list()
+    by_source = {item["source"]: item for item in manifest["sources"]}
+    assert by_source["sentinel2"]["scene_ids"] == ["inside"]
+    assert by_source["modis"]["scene_ids"] == []
+    again = json.loads(json.dumps(manifest))
+    assert PullRequest.model_validate(again["request"]).polygon == restored.polygon
 
 
 def test_cli_requires_coords_or_polygon(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

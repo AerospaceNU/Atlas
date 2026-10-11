@@ -124,6 +124,13 @@ class BBox(BaseModel):
 
 
 _GEOM_EPS = 1e-9
+# The self-intersection test is quadratic. A fixed cap keeps that work bounded.
+MAX_POLYGON_VERTICES = 256
+_POLE_RING = (
+    "ring wraps a pole; the boundary winds around a pole and does not close "
+    "inside one 360-degree window, so the interior is not a single polygon a "
+    "bounding box or a STAC intersects query can describe"
+)
 
 
 def _as_position(value: object) -> tuple[float, float]:
@@ -218,7 +225,7 @@ def _unwrap_ring(ring: Sequence[tuple[float, float]]) -> list[tuple[float, float
     )
     span = max(point[0] for point in unwrapped) - min(point[0] for point in unwrapped)
     if not closed or span >= 360.0:
-        raise ValueError("ring wraps the globe")
+        raise ValueError(_POLE_RING)
     return unwrapped
 
 
@@ -234,13 +241,171 @@ def _reverse_closed(ring: list[tuple[float, float]]) -> list[tuple[float, float]
     return [*body, body[0]]
 
 
+def _planar_contains(planar: Sequence[tuple[float, float]], point: tuple[float, float]) -> bool:
+    x, y = point
+    edges = len(planar) - 1
+    for index in range(edges):
+        if _point_on_segment(point, planar[index], planar[index + 1]):
+            return True
+    inside = False
+    for index in range(edges):
+        x1, y1 = planar[index]
+        x2, y2 = planar[index + 1]
+        if (y1 > y) == (y2 > y):
+            continue
+        x_cross = (x2 - x1) * (y - y1) / (y2 - y1) + x1
+        if x < x_cross:
+            inside = not inside
+    return inside
+
+
+def _shift_near(lon: float, center: float) -> float:
+    shifted = lon
+    while shifted - center > 180.0:
+        shifted -= 360.0
+    while center - shifted > 180.0:
+        shifted += 360.0
+    return shifted
+
+
+def _crossed_meridian(planar: Sequence[tuple[float, float]]) -> float | None:
+    for (x1, _y1), (x2, _y2) in pairwise(planar):
+        lo, hi = (x1, x2) if x1 <= x2 else (x2, x1)
+        k = math.floor((lo - 180.0) / 360.0) + 1
+        meridian = 180.0 + 360.0 * k
+        if lo + 1e-9 < meridian < hi - 1e-9:
+            return meridian
+    return None
+
+
+def _clip_halfplane(
+    ring: Sequence[tuple[float, float]],
+    *,
+    keep_left: bool,
+    meridian: float,
+) -> list[tuple[float, float]]:
+    def inside(x: float) -> bool:
+        if keep_left:
+            return x <= meridian + _GEOM_EPS
+        return x >= meridian - _GEOM_EPS
+
+    def crossing(start: tuple[float, float], end: tuple[float, float]) -> tuple[float, float]:
+        x1, y1 = start
+        x2, y2 = end
+        denom = x2 - x1
+        if abs(denom) <= _GEOM_EPS:
+            return meridian, y1
+        t = min(1.0, max(0.0, (meridian - x1) / denom))
+        return meridian, y1 + t * (y2 - y1)
+
+    output: list[tuple[float, float]] = []
+    for start, end in pairwise(ring):
+        start_in = inside(start[0])
+        end_in = inside(end[0])
+        if end_in:
+            if not start_in:
+                output.append(crossing(start, end))
+            output.append(end)
+        elif start_in:
+            output.append(crossing(start, end))
+    if len(output) < 3:
+        return []
+    if not _same_position(output[0], output[-1]):
+        output.append(output[0])
+    return output
+
+
+def _dedupe_closed(ring: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not ring:
+        return []
+    body = [ring[0]]
+    for point in ring[1:]:
+        if not _same_position(body[-1], point):
+            body.append(point)
+    if len(body) == 1 or not _same_position(body[0], body[-1]):
+        body.append(body[0])
+    else:
+        body[-1] = body[0]
+    return body
+
+
+def _wrap_lon(lon: float) -> float:
+    while lon > 180.0:
+        lon -= 360.0
+    while lon < -180.0:
+        lon += 360.0
+    return lon
+
+
+def _piece_coordinates(
+    planar: Sequence[tuple[float, float]],
+    *,
+    eastern: bool,
+    meridian: float,
+) -> list[list[float]]:
+    coords: list[tuple[float, float]] = []
+    for x, y in planar:
+        on_cut = abs(x - meridian) <= 1e-8
+        lon = (meridian - 360.0 if eastern else meridian) if on_cut else x
+        lon = _wrap_lon(lon)
+        if not eastern and abs(lon + 180.0) <= 1e-8 and abs(x - meridian) <= 1e-8:
+            lon = 180.0
+        if eastern and abs(lon - 180.0) <= 1e-8 and abs(x - meridian) <= 1e-8:
+            lon = -180.0
+        coords.append((lon, y))
+    coords = _dedupe_closed(coords)
+    if len(coords) < 4 or abs(_ring_area(coords)) <= 1e-12:
+        return []
+    if _ring_area(coords) < 0:
+        coords = _reverse_closed(coords)
+    return [[lon, lat] for lon, lat in coords]
+
+
+def _polygon_hits_rect(
+    planar: Sequence[tuple[float, float]],
+    rect: tuple[float, float, float, float],
+) -> bool:
+    xmin, ymin, xmax, ymax = rect
+    if xmax < xmin or ymax < ymin:
+        return False
+    if any(
+        xmin - _GEOM_EPS <= x <= xmax + _GEOM_EPS and ymin - _GEOM_EPS <= y <= ymax + _GEOM_EPS
+        for x, y in planar[:-1]
+    ):
+        return True
+    corners = ((xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax))
+    if any(_planar_contains(planar, corner) for corner in corners):
+        return True
+    edges = (
+        (corners[0], corners[1]),
+        (corners[1], corners[2]),
+        (corners[2], corners[3]),
+        (corners[3], corners[0]),
+    )
+    for start, end in pairwise(planar):
+        for edge_start, edge_end in edges:
+            if _segments_cross(start, end, edge_start, edge_end):
+                return True
+    return False
+
+
 class Polygon(BaseModel):
     """One exterior ring in degrees, longitude then latitude.
 
     The ring follows RFC 7946: at least four positions, and the first and last
-    positions are the same. Holes are not an AOI. A ring may cross the
+    positions are the same. Holes are not an AOI. At most
+    ``MAX_POLYGON_VERTICES`` vertices are accepted, which keeps the
+    self-intersection test from growing without a bound. A ring may cross the
     antimeridian. The envelope is the narrow box from ``BBox.enclosing``.
     Clockwise rings are stored counter-clockwise.
+
+    A ring that wraps a pole is rejected. Walking each edge the short way
+    accumulates a full turn of longitude, so the ring does not close inside one
+    360-degree window. Its interior contains the pole. A bounding box cannot
+    describe that interior, and splitting the ring at plus or minus 180 (RFC
+    7946 section 3.1.9) cannot either: that split assumes the ring lives in a
+    single 360-degree window. Catalogs that only accept a bbox would be searched
+    with a box that is not the area of interest.
     """
 
     ring: list[tuple[float, float]]
@@ -248,7 +413,13 @@ class Polygon(BaseModel):
     @field_validator("ring", mode="before")
     @classmethod
     def _positions(cls, value: object) -> list[tuple[float, float]]:
-        if isinstance(value, str) or not isinstance(value, Sequence) or len(value) < 4:
+        if isinstance(value, str) or not isinstance(value, Sequence):
+            raise ValueError("polygon ring needs at least four positions")
+        # Reject before reading coordinates so a huge ring never reaches the
+        # quadratic self-intersection test.
+        if len(value) > MAX_POLYGON_VERTICES + 1:
+            raise ValueError(f"polygon ring has more than {MAX_POLYGON_VERTICES} vertices")
+        if len(value) < 4:
             raise ValueError("polygon ring needs at least four positions")
         return [_as_position(item) for item in value]
 
@@ -267,6 +438,7 @@ class Polygon(BaseModel):
         if abs(_ring_area(planar)) <= 1e-12:
             raise ValueError("polygon has no area")
         edges = len(planar) - 1
+        # ``MAX_POLYGON_VERTICES`` bounds this pairwise check.
         for i in range(edges):
             for j in range(i + 1, edges):
                 adjacent = j == i + 1 or (i == 0 and j == edges - 1)
@@ -326,31 +498,46 @@ class Polygon(BaseModel):
         planar = _unwrap_ring(self.ring)
         xs = [point[0] for point in planar]
         ys = [point[1] for point in planar]
-        placed = lon
-        origin = planar[0][0]
-        while placed - origin > 180.0:
-            placed -= 360.0
-        while origin - placed > 180.0:
-            placed += 360.0
+        placed = _shift_near(lon, planar[0][0])
         if placed < min(xs) - _GEOM_EPS or placed > max(xs) + _GEOM_EPS:
             return False
         if lat < min(ys) - _GEOM_EPS or lat > max(ys) + _GEOM_EPS:
             return False
-        point = (placed, lat)
-        edges = len(planar) - 1
-        for index in range(edges):
-            if _point_on_segment(point, planar[index], planar[index + 1]):
-                return True
-        inside = False
-        for index in range(edges):
-            x1, y1 = planar[index]
-            x2, y2 = planar[index + 1]
-            if (y1 > lat) == (y2 > lat):
-                continue
-            x_cross = (x2 - x1) * (lat - y1) / (y2 - y1) + x1
-            if placed < x_cross:
-                inside = not inside
-        return inside
+        return _planar_contains(planar, (placed, lat))
+
+    def intersects_bbox(self, bbox: BBox) -> bool:
+        """Whether this ring meets a box, including a box that crosses 180°.
+
+        Args:
+            bbox: Box to test. A point on the shared boundary counts.
+
+        Returns:
+            True when the ring and the box have any point in common.
+        """
+        planar = _unwrap_ring(self.ring)
+        center = (min(point[0] for point in planar) + max(point[0] for point in planar)) / 2.0
+        west = _shift_near(bbox.west, center)
+        rect = (west, bbox.south, west + bbox.lon_span, bbox.north)
+        return _polygon_hits_rect(planar, rect)
+
+    def overlaps(self, scene: Scene) -> bool:
+        """Whether a scene meets this area of interest.
+
+        Point scenes must fall inside the ring. Every other scene is kept when
+        its footprint box meets the ring, including a footprint that only clips
+        the polygon.
+
+        Args:
+            scene: Scene returned by any catalog.
+
+        Returns:
+            True when the scene should survive a polygon post-filter.
+        """
+        if scene.geometry_kind is GeometryKind.point:
+            if scene.lon is None or scene.lat is None:
+                return False
+            return self.contains(scene.lon, scene.lat)
+        return self.intersects_bbox(scene.bbox)
 
     def as_geojson(self) -> dict[str, Any]:
         """GeoJSON Polygon geometry for the ring.
@@ -362,6 +549,42 @@ class Polygon(BaseModel):
             "type": "Polygon",
             "coordinates": [[[lon, lat] for lon, lat in self.ring]],
         }
+
+    def as_stac_geometry(self) -> dict[str, Any]:
+        """GeoJSON geometry safe to send as a STAC ``intersects`` value.
+
+        A ring that crosses the antimeridian is cut at plus or minus 180 into a
+        MultiPolygon, as RFC 7946 section 3.1.9 requires. A ring that does not
+        cross stays one Polygon.
+
+        Returns:
+            A Polygon or MultiPolygon geometry in longitude, latitude order.
+        """
+        planar = _unwrap_ring(self.ring)
+        meridian = _crossed_meridian(planar)
+        if meridian is None:
+            return self.as_geojson()
+        pieces = [
+            piece
+            for piece in (
+                _piece_coordinates(
+                    _clip_halfplane(planar, keep_left=True, meridian=meridian),
+                    eastern=False,
+                    meridian=meridian,
+                ),
+                _piece_coordinates(
+                    _clip_halfplane(planar, keep_left=False, meridian=meridian),
+                    eastern=True,
+                    meridian=meridian,
+                ),
+            )
+            if piece
+        ]
+        if len(pieces) <= 1:
+            if len(pieces) == 1:
+                return {"type": "Polygon", "coordinates": [pieces[0]]}
+            return self.as_geojson()
+        return {"type": "MultiPolygon", "coordinates": [[piece] for piece in pieces]}
 
 
 class PullRequest(BaseModel):
@@ -484,6 +707,16 @@ class Scene(BaseModel):
 class PullResult(BaseModel):
     request: PullRequest
     scenes: list[Scene]
+
+    @model_validator(mode="after")
+    def _clip_to_polygon(self) -> Self:
+        polygon = self.request.polygon
+        if polygon is None:
+            return self
+        # Every catalog, STAC or not, is clipped here. Bbox-only catalogs can
+        # only search the envelope, so scenes outside the ring still come back.
+        self.scenes = [scene for scene in self.scenes if polygon.overlaps(scene)]
+        return self
 
 
 class DataPullClient(ABC):

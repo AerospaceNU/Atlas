@@ -62,7 +62,7 @@ class StacApiClient(DataPullClient):
             "limit": request.limit,
         }
         if request.polygon is not None:
-            body["intersects"] = request.polygon.as_geojson()
+            body["intersects"] = request.polygon.as_stac_geometry()
         if self.include_datetime:
             body["datetime"] = (
                 f"{request.start_date.isoformat()}T00:00:00Z/"
