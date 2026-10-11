@@ -183,15 +183,18 @@ def write_user_key(key: str, home: Path | None = None) -> Path:
     ``home`` is the directory that contains ``.atlas``, not the project
     workspace. The keys directory is mode ``0700``. The file is replaced
     atomically: a temporary file is created with ``O_EXCL`` and mode
-    ``0600``, fsynced, then renamed into place. An existing file is chmodded
-    to ``0600`` before that rename and is never opened with ``O_TRUNC``.
+    ``0600``, fsynced, then renamed into place. The keys directory is fsynced
+    after that rename so the new directory entry itself is durable. An
+    existing file is chmodded to ``0600`` before that rename and is never
+    opened with ``O_TRUNC``.
 
     A symlink at the key path or the keys directory is refused, and so is a
     keys directory that resolves outside the user root.
 
     On Windows the Unix modes are not enforced. ``chmod`` is still called,
     but the file ACL decides who can read the key, and symlinks are rejected
-    with ``is_symlink`` because ``O_NOFOLLOW`` is not available.
+    with ``is_symlink`` because ``O_NOFOLLOW`` is not available. Windows also
+    has no directory ``fsync``, so that durability step is skipped.
     """
     cleaned, _warning = prepare_openrouter_key(key)
     root = ensure_user_layout(home)
@@ -291,7 +294,8 @@ def _atomic_write_private(directory: Path, path: Path, text: str) -> None:
 
     An existing regular file is chmodded to ``0600`` before the rename so a
     loose file is never truncated in place. The temporary file is opened
-    with ``O_EXCL`` and fsynced before ``os.replace``.
+    with ``O_EXCL`` and fsynced before ``os.replace``. The directory is
+    fsynced after the rename on POSIX so the new name survives a crash.
     """
     if path.is_symlink():
         raise AtlasPathError("refusing to follow a key symlink")
@@ -320,7 +324,28 @@ def _atomic_write_private(directory: Path, path: Path, text: str) -> None:
     except Exception:
         temp.unlink(missing_ok=True)
         raise
+    _fsync_directory(directory)
     _chmod(path, 0o600)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Fsync ``directory`` so a rename is durable across a crash.
+
+    Opening a directory and calling ``fsync`` is POSIX. Windows does not
+    support it, so the call is skipped there. The key file is still fsynced
+    before ``os.replace``.
+    """
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if isinstance(directory_flag, int):
+        flags |= directory_flag
+    fd = os.open(directory, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _is_inside(root: Path, candidate: Path) -> bool:

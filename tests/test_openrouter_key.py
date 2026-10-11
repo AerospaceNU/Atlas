@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -402,14 +403,64 @@ def test_replacing_a_loose_key_file_tightens_it_before_the_atomic_replace(
     write_user_key("sk-or-new-key", home)
 
     assert seen[0] == ("old-loose-key\n", 0o644, 0o600)
-    assert opened
-    assert all(flags & os.O_EXCL and mode == 0o600 for _name, flags, mode in opened)
+    created = [item for item in opened if item[0] != "keys"]
+    assert created
+    assert all(flags & os.O_EXCL and mode == 0o600 for _name, flags, mode in created)
     assert synced
     assert replaced[0][1] == "openrouter_api_key"
     assert replaced[0][0] != "openrouter_api_key"
     assert path.read_text(encoding="utf-8") == "sk-or-new-key\n"
     assert path.stat().st_mode & 0o777 == 0o600
     assert [item.name for item in keys.iterdir()] == ["openrouter_api_key"]
+
+
+def test_the_keys_directory_is_fsynced_after_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("Windows has no directory fsync")
+    home = tmp_path / "home"
+    events: list[str] = []
+    real_replace = os.replace
+    real_fsync = os.fsync
+
+    def spy_replace(src: os.PathLike[str] | str, dst: os.PathLike[str] | str) -> None:
+        events.append("replace")
+        real_replace(src, dst)
+
+    def spy_fsync(fd: int) -> None:
+        kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        events.append(f"fsync-{kind}")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+
+    path = write_user_key("sk-or-dir-sync", home)
+
+    assert events == ["fsync-file", "replace", "fsync-dir"]
+    assert path.read_text(encoding="utf-8") == "sk-or-dir-sync\n"
+
+
+def test_a_failed_directory_fsync_raises_after_the_new_key_is_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("Windows has no directory fsync")
+    home = tmp_path / "home"
+    real_fsync = os.fsync
+
+    def spy_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("directory fsync failed")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    with pytest.raises(OSError, match="directory fsync failed"):
+        write_user_key("sk-or-dir-sync", home)
+    path = home / _USER_FILE
+    assert path.read_text(encoding="utf-8") == "sk-or-dir-sync\n"
+    assert [item.name for item in path.parent.iterdir()] == ["openrouter_api_key"]
 
 
 def test_a_failed_atomic_write_leaves_the_old_key_in_place(
