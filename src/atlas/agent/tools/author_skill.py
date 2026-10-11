@@ -88,11 +88,24 @@ def _drafts_root(store: LocalArtifactStore) -> Path:
 
 
 def _contained_drafts_root(base: Path, drafts_root: Path) -> Path:
-    """Return ``drafts_root`` unless a symlink would leave ``base``.
+    """Return ``drafts_root`` only when it is ``<workspace>/.atlas/skills-drafts``.
 
-    :func:`author_skill` resolves its root and would follow the symlink.
+    A symlink at ``skills-drafts`` is refused even when it stays inside the
+    workspace, including a link to ``.atlas/skills``. :func:`author_skill`
+    would otherwise follow it and write a live skill. The resolved path must
+    also be that exact directory.
     """
-    for candidate in (base / ".atlas", drafts_root):
-        if candidate.is_symlink() and not is_within(base, candidate):
-            raise ValueError("Skills root escapes the sandbox")
+    root = base.expanduser().resolve()
+    atlas = base / ".atlas"
+    if atlas.is_symlink() and not is_within(root, atlas):
+        raise ValueError("Skills root escapes the sandbox")
+    if drafts_root.is_symlink():
+        raise ValueError("Skills root escapes the sandbox")
+    expected = root / ".atlas" / "skills-drafts"
+    try:
+        resolved = drafts_root.resolve()
+    except OSError as exc:
+        raise ValueError("Skills root escapes the sandbox") from exc
+    if resolved != expected:
+        raise ValueError("Skills root escapes the sandbox")
     return drafts_root

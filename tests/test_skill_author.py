@@ -451,9 +451,10 @@ def test_refusing_a_write_leaves_a_replacing_backup_untouched(tmp_path: Path) ->
     backup = tmp_path / ".ndvi-change.replacing"
     os.rename(path, backup)
 
-    with pytest.raises(SkillAuthorError, match="already exists"):
+    with pytest.raises(SkillAuthorError, match=r"stored as \.ndvi-change\.replacing") as caught:
         author_skill(tmp_path, _draft(body="changed"), overwrite=False)
 
+    assert "already exists" not in str(caught.value)
     assert not path.exists()
     assert (backup / "SKILL.md").read_text(encoding="utf-8") == original
 
@@ -635,6 +636,21 @@ def test_author_skill_tool_has_no_overwrite_or_user_scope(tmp_path: Path) -> Non
 
     assert draft.read_text(encoding="utf-8") == original
     assert not (workspace / ".atlas" / "skills" / "ndvi-change").exists()
+
+
+def test_author_skill_tool_refuses_a_drafts_symlink_to_live_skills(tmp_path: Path) -> None:
+    store, workspace = _project_store(tmp_path)
+    skills = workspace / ".atlas" / "skills"
+    vetted = skills / "ndvi-change"
+    vetted.mkdir(parents=True)
+    (vetted / "SKILL.md").write_text("vetted\n", encoding="utf-8")
+    (workspace / ".atlas" / "skills-drafts").symlink_to(skills, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="escapes"):
+        AuthorSkillTool().run(_tool_arguments(), store)
+
+    assert (vetted / "SKILL.md").read_text(encoding="utf-8") == "vetted\n"
+    assert (workspace / ".atlas" / "skills-drafts").is_symlink()
 
 
 def test_author_skill_tool_refuses_a_drafts_symlink_outside_the_workspace(tmp_path: Path) -> None:

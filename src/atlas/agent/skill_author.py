@@ -631,9 +631,9 @@ def _stranded_backup_errors(destination: Path, *, overwrite: bool) -> list[str]:
     if overwrite or destination.exists() or destination.is_symlink():
         return []
     backup = _replacing_path(destination)
-    if backup.exists() or backup.is_symlink():
-        return ["Skill already exists: SKILL.md"]
-    return []
+    if not backup.exists() and not backup.is_symlink():
+        return []
+    return [f"Skill publish was interrupted; {destination.name} is stored as {backup.name}"]
 
 
 def _recover_replacing(destination: Path) -> None:
