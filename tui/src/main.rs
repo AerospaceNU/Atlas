@@ -625,11 +625,6 @@ impl App {
                 }
                 self.transcript.push(tool_note(note));
             }
-            ServerMessage::Removed { scope, kind, name } => {
-                self.mode = Mode::Compose;
-                self.transcript
-                    .push(tool_note(format!("removed {scope} {kind} {name}")));
-            }
             ServerMessage::Unknown => {}
         }
     }
@@ -1487,16 +1482,6 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
                 }))
             }
         }
-        "/sessions" => Some(serde_json::json!({
-            "type": "list",
-            "scope": app.scope_root,
-            "kind": "sessions"
-        })),
-        "/artifacts" => Some(serde_json::json!({
-            "type": "list",
-            "scope": app.scope_root,
-            "kind": "artifacts"
-        })),
         _ => {
             app.transcript
                 .push(tool_note(format!("unknown command {command}")));
