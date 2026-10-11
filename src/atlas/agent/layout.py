@@ -8,7 +8,8 @@ Project root (the workspace):
 
 User root (the home directory):
 
-- ``keys/`` — API keys, never written into the project tree
+- ``keys/`` — API keys, never written into the project tree. The OpenRouter
+  key file is mode ``0600`` and is not written or read through a symlink.
 - ``weights/`` — user-level weights (existing ``~/.atlas/weights``)
 - ``defaults/`` — user defaults
 
@@ -107,9 +108,16 @@ def remove_entry(atlas_root: Path, kind: str, name: str, *, confirm: bool) -> No
 
 
 def read_user_key(home: Path | None = None) -> str | None:
-    """Return the user OpenRouter key, or None when the file is absent."""
+    """Return the user OpenRouter key, or None when the file is absent.
+
+    A symlink for the key file or the keys directory is ignored, as is a
+    keys directory that resolves outside the user ``.atlas`` root.
+    """
     path = user_key_path(home)
-    if not path.is_file():
+    keys = path.parent
+    if keys.is_symlink() or path.is_symlink() or not path.is_file():
+        return None
+    if not _is_inside(keys.parent, keys):
         return None
     text = path.read_text(encoding="utf-8").strip()
     return text or None
@@ -118,16 +126,24 @@ def read_user_key(home: Path | None = None) -> str | None:
 def write_user_key(key: str, home: Path | None = None) -> Path:
     """Persist a user OpenRouter key under ``~/.atlas/keys`` and return the path.
 
-    The file mode is user-read/write only. ``home`` is the directory that
-    contains ``.atlas``, not the project workspace.
+    The file is created mode ``0o600``. ``home`` is the directory that
+    contains ``.atlas``, not the project workspace. A symlink at the key
+    path or the keys directory is refused, and so is a keys directory that
+    resolves outside the user root.
     """
     cleaned = key.strip()
     if not cleaned:
         raise ValueError("key is empty")
     root = ensure_user_layout(home)
-    path = root / "keys" / _KEY_FILE
-    path.write_text(cleaned + "\n", encoding="utf-8")
-    os.chmod(path, 0o600)
+    keys = root / "keys"
+    if keys.is_symlink():
+        raise AtlasPathError("refusing to follow a key symlink")
+    if not _is_inside(root, keys):
+        raise AtlasPathError("key path escapes the user atlas root")
+    path = keys / _KEY_FILE
+    if path.is_symlink():
+        raise AtlasPathError("refusing to follow a key symlink")
+    _write_private_text(path, cleaned + "\n")
     return path
 
 
@@ -152,6 +168,35 @@ def resolve_openrouter_key(
     if env_key is not None and env_key.strip():
         return env_key.strip()
     return read_user_key(home)
+
+
+def _is_inside(root: Path, candidate: Path) -> bool:
+    """Return whether ``candidate`` resolves inside ``root``."""
+    try:
+        root_resolved = root.resolve()
+        candidate_resolved = candidate.resolve()
+    except OSError:
+        return False
+    return candidate_resolved == root_resolved or root_resolved in candidate_resolved.parents
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    """Create or replace ``path`` as user-read/write text, without following a symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if isinstance(no_follow, int):
+        flags |= no_follow
+    fd = os.open(path, flags, 0o600)
+    try:
+        payload = memoryview(text.encode("utf-8"))
+        while payload:
+            written = os.write(fd, payload)
+            if written <= 0:
+                raise OSError("could not write the key file")
+            payload = payload[written:]
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
 
 
 def _delete_matching_artifact(atlas_root: Path, name: str) -> None:
