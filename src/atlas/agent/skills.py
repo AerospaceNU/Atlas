@@ -216,6 +216,54 @@ def render_system_prompt(base: str, skills: Sequence[Skill]) -> str:
     return base + "\n\n" + _SKILL_INSTRUCTIONS + "\n\n" + "\n".join(blocks)
 
 
+# ATLAS-90. Wrappers only: load_skills and content_sha256 above are unchanged.
+def parse_skill_document(text: str) -> tuple[dict[str, Any], str]:
+    """Return frontmatter fields and the markdown body.
+
+    This is the parser :func:`load_skills` uses. A document that is not a
+    closed frontmatter mapping raises ``ValueError``.
+
+    Args:
+        text: A ``SKILL.md`` document.
+
+    Returns:
+        The frontmatter mapping and the body with surrounding blank lines removed.
+    """
+    frontmatter, body = _split_frontmatter(text)
+    return _parse_frontmatter(frontmatter), body
+
+
+def load_skill_directory(
+    base: Path,
+    relative_dir: str,
+    *,
+    label_prefix: str = "",
+    artifact_root: Path | None = None,
+) -> Skill | None:
+    """Load one skill directory, or return ``None`` when the loader would skip it.
+
+    ``relative_dir`` is a path under ``base`` such as ``.atlas/skills/name``.
+    Existing catalog entries are left untouched; this does not rescan them or
+    replace their ``content_sha256`` values.
+
+    Args:
+        base: Workspace read root or user home that owns the skill.
+        relative_dir: Skill directory relative to ``base``.
+        label_prefix: ``""`` for a workspace skill, or ``"~/"`` for a home skill.
+        artifact_root: Project artifact directory the skill must not resolve into.
+
+    Returns:
+        The skill, or ``None`` when the loader would ignore that directory.
+    """
+    return _load_skill_dir(
+        base,
+        relative_dir,
+        Path(relative_dir).name,
+        label_prefix,
+        artifact_root,
+    )
+
+
 def register_skill_tool(registry: ToolRegistry, skills: Sequence[Skill]) -> None:
     """Register ``use_skill`` when ``skills`` is non-empty.
 
