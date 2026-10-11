@@ -57,13 +57,7 @@ from atlas.agent.runtime import (
     load_model,
 )
 from atlas.agent.skill_author import normalize_skill_name
-from atlas.agent.skills import (
-    Skill,
-    UseSkillTool,
-    load_skill_directory,
-    load_skills,
-    register_skill_tool,
-)
+from atlas.agent.skills import Skill, load_skills, register_skill_tool
 
 _REDACTED = "***"
 
@@ -154,11 +148,11 @@ class AgentSession:
         self.messages = [ChatMessage(role=Role.SYSTEM, content=self.agent.system_prompt())]
         self.active_skills = []
         self.stopped_for_limit = False
-        self._clear_analysis()
         self.totals = SessionTotals(
             model=self.model_id or self.totals.model,
             context_limit=self.totals.context_limit,
         )
+        self._clear_analysis()
         if self.workspace is None:
             return
         session_id = _remember_session(self.workspace, self.model_id)
@@ -799,6 +793,8 @@ def _skill_scope(scope: object) -> str:
 
 def _add_enabled_skill(session: AgentSession, name: str, scope: str) -> str:
     """Add ``name`` to the live catalog without rehashing skills already loaded."""
+    from atlas.agent.skills import UseSkillTool, load_skill_directory
+
     restart = "Restart Atlas to load this skill."
     workspace = session.workspace
     if workspace is None:

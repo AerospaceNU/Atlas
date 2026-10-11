@@ -625,6 +625,11 @@ impl App {
                 }
                 self.transcript.push(tool_note(note));
             }
+            ServerMessage::Removed { scope, kind, name } => {
+                self.mode = Mode::Compose;
+                self.transcript
+                    .push(tool_note(format!("removed {scope} {kind} {name}")));
+            }
             ServerMessage::Unknown => {}
         }
     }
@@ -1482,6 +1487,16 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
                 }))
             }
         }
+        "/sessions" => Some(serde_json::json!({
+            "type": "list",
+            "scope": app.scope_root,
+            "kind": "sessions"
+        })),
+        "/artifacts" => Some(serde_json::json!({
+            "type": "list",
+            "scope": app.scope_root,
+            "kind": "artifacts"
+        })),
         _ => {
             app.transcript
                 .push(tool_note(format!("unknown command {command}")));
@@ -1516,7 +1531,7 @@ struct MenuItem {
 /// Command or fixed-argument options that match `text`, or an empty list when
 /// the menu should stay hidden (free text after a finished command).
 fn menu_options(text: &str) -> Vec<MenuItem> {
-    const COMMANDS: [MenuItem; 10] = [
+    const COMMANDS: [MenuItem; 11] = [
         MenuItem {
             token: "/new",
             description: "Start a fresh conversation",
@@ -1532,6 +1547,10 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
         MenuItem {
             token: "/key",
             description: "Set an OpenRouter key",
+        },
+        MenuItem {
+            token: "/skill",
+            description: "Use a skill in this session",
         },
         MenuItem {
             token: "/sessions",
@@ -1718,8 +1737,6 @@ fn is_finished_command(text: &str) -> bool {
     let mut words = trimmed.split_whitespace();
     let command = words.next().unwrap_or("");
     match command {
-        "/model" => text.starts_with("/model"),
-        "/key" => matches!(words.next(), Some("session") | Some("user")),
         "/skill" => words.next().is_some(),
         "/save-skill" => words.next().is_some() && words.next().is_none(),
         "/enable-skill" => match words.next() {
@@ -1730,6 +1747,8 @@ fn is_finished_command(text: &str) -> bool {
             },
             None => false,
         },
+        "/model" => text.starts_with("/model"),
+        "/key" => matches!(words.next(), Some("session") | Some("user")),
         _ => false,
     }
 }
@@ -2950,11 +2969,13 @@ mod tests {
     fn slash_commands_leave_skill_to_the_other_branch() {
         let options = menu_options("/");
         let tokens: Vec<&str> = options.iter().map(|item| item.token).collect();
-        assert!(!tokens.contains(&"/skill"));
-        let key = tokens.iter().position(|token| *token == "/key").unwrap();
-        let sessions = tokens.iter().position(|token| *token == "/sessions").unwrap();
-        assert_eq!(sessions, key + 1);
+        // /save-skill and /enable-skill stay at the end. /skill, when present,
+        // belongs with the earlier commands so it can sit after /key.
         assert!(tokens.ends_with(&["/save-skill", "/enable-skill"]));
+        if let Some(skill) = tokens.iter().position(|token| *token == "/skill") {
+            let save = tokens.iter().position(|token| *token == "/save-skill").unwrap();
+            assert!(skill < save);
+        }
     }
 
     #[test]
@@ -3017,6 +3038,7 @@ mod tests {
             "/model",
             "/copy",
             "/key",
+            "/skill",
             "/sessions",
             "/artifacts",
             "/quit",

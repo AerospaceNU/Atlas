@@ -68,6 +68,12 @@ pub enum ServerMessage {
         location: String,
         active: Vec<String>,
     },
+    Phase {
+        phase: String,
+        name: Option<String>,
+    },
+    /// A line we do not understand yet.
+    Unknown,
     SaveSkill {
         name: String,
         description: String,
@@ -94,12 +100,6 @@ pub enum ServerMessage {
         enabled: bool,
         catalog: String,
     },
-    Phase {
-        phase: String,
-        name: Option<String>,
-    },
-    /// A line we do not understand yet.
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -266,15 +266,6 @@ enum RawMessage {
         #[serde(default)]
         tokens_per_second: Option<f64>,
     },
-    #[serde(rename = "removed")]
-    Removed {
-        #[serde(default)]
-        scope: String,
-        #[serde(default)]
-        kind: String,
-        #[serde(default)]
-        name: String,
-    },
     #[serde(rename = "skill")]
     Skill {
         #[serde(default)]
@@ -334,6 +325,15 @@ enum RawMessage {
         enabled: bool,
         #[serde(default)]
         catalog: String,
+    },
+    #[serde(rename = "removed")]
+    Removed {
+        #[serde(default)]
+        scope: String,
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        name: String,
     },
 }
 
@@ -444,6 +444,14 @@ impl From<RawMessage> for ServerMessage {
                 location,
                 active,
             },
+            RawMessage::Phase { phase, name } => ServerMessage::Phase { phase, name },
+            RawMessage::Thought {
+                text,
+                tokens_per_second,
+            } => ServerMessage::Thought {
+                text,
+                tokens_per_second,
+            },
             RawMessage::SaveSkill {
                 name,
                 description,
@@ -492,14 +500,6 @@ impl From<RawMessage> for ServerMessage {
                 path,
                 enabled,
                 catalog,
-            },
-            RawMessage::Phase { phase, name } => ServerMessage::Phase { phase, name },
-            RawMessage::Thought {
-                text,
-                tokens_per_second,
-            } => ServerMessage::Thought {
-                text,
-                tokens_per_second,
             },
         }
     }
