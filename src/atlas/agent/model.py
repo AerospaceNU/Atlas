@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Self
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -23,6 +24,8 @@ from atlas.agent.contracts import (
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 _ERROR_BODY_LIMIT = 180
+_CATALOG_PAGE_LIMIT = 20
+_OPENROUTER_HOST = "openrouter.ai"
 
 MISSING_KEY_MESSAGE = (
     "OPENROUTER_API_KEY is not set. Set it in the environment, the repo .env, "
@@ -412,16 +415,50 @@ def _merge_tool_call(acc: _StreamAcc, call: dict[str, Any], fallback: int) -> No
 
 
 def fetch_model_catalog(client: Any, api_key: str) -> list[CatalogModel]:
-    """GET the OpenRouter models endpoint and parse id, context length, and price."""
+    """GET the OpenRouter models endpoint and parse id, context length, and price.
+
+    The first request omits ``offset`` and ``limit`` so OpenRouter returns the
+    full list. When a page includes ``links.next``, later pages are followed
+    only while the URL stays on ``https://openrouter.ai``. A repeated URL or
+    the page cap ends the walk. The selected model is not changed here.
+    """
     if not api_key.strip():
         raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
     started = time.perf_counter()
-    resp = client.get(
-        OPENROUTER_MODELS_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    payload, _timing = _interpret_response(resp, started)
-    return parse_model_catalog(payload)
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url: str | None = OPENROUTER_MODELS_URL
+    seen: set[str] = set()
+    models: list[CatalogModel] = []
+    pages = 0
+    while url is not None and url not in seen and pages < _CATALOG_PAGE_LIMIT:
+        seen.add(url)
+        pages += 1
+        resp = client.get(url, headers=headers)
+        payload, _timing = _interpret_response(resp, started)
+        models.extend(parse_model_catalog(payload))
+        url = _next_catalog_page(payload, url)
+    return models
+
+
+def _next_catalog_page(payload: dict[str, Any], current: str) -> str | None:
+    """Return the next OpenRouter catalog URL, or None when the walk should stop."""
+    links = payload.get("links")
+    if not isinstance(links, dict):
+        return None
+    raw = links.get("next")
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    joined = urljoin(current, text)
+    parsed = urlparse(joined)
+    host = parsed.hostname
+    if parsed.scheme != "https" or host is None or host.casefold() != _OPENROUTER_HOST:
+        return None
+    if parsed.port not in (None, 443):
+        return None
+    return joined
 
 
 def parse_usage(raw: object) -> TokenUsage:

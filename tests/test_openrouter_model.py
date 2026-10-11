@@ -9,6 +9,7 @@ import pytest
 from atlas.agent.contracts import ChatMessage, Role, ToolDefinition
 from atlas.agent.model import (
     MISSING_KEY_MESSAGE,
+    OPENROUTER_MODELS_URL,
     MissingOpenRouterKey,
     ModelConfig,
     OpenRouterHTTPError,
@@ -306,8 +307,10 @@ def test_fetch_model_catalog_reads_id_context_and_price() -> None:
     class CatalogClient:
         def __init__(self) -> None:
             self.headers: dict[str, str] = {}
+            self.url = ""
 
-        def get(self, _url: str, **kwargs: Any) -> FakeResponse:
+        def get(self, url: str, **kwargs: Any) -> FakeResponse:
+            self.url = url
             self.headers = kwargs["headers"]
             return FakeResponse(
                 {
@@ -327,6 +330,7 @@ def test_fetch_model_catalog_reads_id_context_and_price() -> None:
     client = CatalogClient()
     models = fetch_model_catalog(client, "catalog-key")
 
+    assert client.url == OPENROUTER_MODELS_URL
     assert client.headers["Authorization"] == "Bearer catalog-key"
     assert models[0].id == "google/gemini-3.8-flash"
     assert models[0].context_length == 128000
@@ -337,4 +341,154 @@ def test_fetch_model_catalog_reads_id_context_and_price() -> None:
     assert models[1].prompt_price is None
     filtered = filter_model_catalog(models, "GEMINI")
     assert [model.id for model in filtered] == ["google/gemini-3.8-flash"]
+    assert [model.id for model in filter_model_catalog(models, "  ")] == [
+        model.id for model in models
+    ]
     assert parse_model_catalog({"data": []}) == []
+
+
+class _CatalogPages:
+    def __init__(self, pages: dict[str, tuple[dict[str, Any], int]]) -> None:
+        self.pages = pages
+        self.urls: list[str] = []
+        self.headers: list[dict[str, str]] = []
+
+    def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.urls.append(url)
+        self.headers.append(kwargs["headers"])
+        payload, status = self.pages[url]
+        return FakeResponse(payload, status_code=status, elapsed_seconds=0.2)
+
+
+def test_list_models_follows_a_same_host_next_page() -> None:
+    first = OPENROUTER_MODELS_URL
+    second = "https://openrouter.ai/api/v1/models?offset=1"
+    client = _CatalogPages(
+        {
+            first: (
+                {
+                    "data": [
+                        {"id": "alpha/one", "context_length": 1024, "pricing": {"prompt": "0.1"}}
+                    ],
+                    "links": {"next": "/api/v1/models?offset=1"},
+                },
+                200,
+            ),
+            second: (
+                {
+                    "data": [{"id": "beta/two", "pricing": {"completion": 0.4}}],
+                    "links": {"next": None},
+                },
+                200,
+            ),
+        }
+    )
+    model = OpenRouterModel(ModelConfig(model="keep-me", api_key="catalog-key"), client)
+
+    listed = model.list_models()
+
+    assert client.urls == [first, second]
+    assert client.headers == [{"Authorization": "Bearer catalog-key"}] * 2
+    assert [item.id for item in listed] == ["alpha/one", "beta/two"]
+    assert listed[0].context_length == 1024
+    assert listed[0].prompt_price == "0.1"
+    assert listed[1].completion_price == "0.4"
+    assert model.config.model == "keep-me"
+
+
+def test_fetch_model_catalog_stops_on_a_cycle_and_ignores_an_off_host_next() -> None:
+    first = OPENROUTER_MODELS_URL
+    second = "https://openrouter.ai/api/v1/models?offset=1"
+    cycling = _CatalogPages(
+        {
+            first: ({"data": [{"id": "alpha/one"}], "links": {"next": second}}, 200),
+            second: ({"data": [{"id": "beta/two"}], "links": {"next": first}}, 200),
+        }
+    )
+    cycled = fetch_model_catalog(cycling, "catalog-key")
+    assert cycling.urls == [first, second]
+    assert [item.id for item in cycled] == ["alpha/one", "beta/two"]
+
+    off_host = _CatalogPages(
+        {
+            first: (
+                {"data": [{"id": "alpha/one"}], "links": {"next": "https://evil.example/models"}},
+                200,
+            )
+        }
+    )
+    kept = fetch_model_catalog(off_host, "catalog-key")
+    assert off_host.urls == [first]
+    assert [item.id for item in kept] == ["alpha/one"]
+
+
+def test_fetch_model_catalog_stops_at_the_page_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("atlas.agent.model._CATALOG_PAGE_LIMIT", 1)
+    first = OPENROUTER_MODELS_URL
+    client = _CatalogPages(
+        {
+            first: (
+                {"data": [{"id": "alpha/one"}], "links": {"next": "/api/v1/models?offset=1"}},
+                200,
+            )
+        }
+    )
+
+    listed = fetch_model_catalog(client, "catalog-key")
+
+    assert client.urls == [first]
+    assert [item.id for item in listed] == ["alpha/one"]
+
+
+def test_fetch_model_catalog_without_a_key_does_not_call_http() -> None:
+    class Boom:
+        def get(self, *_args: object, **_kwargs: object) -> FakeResponse:
+            raise AssertionError("http")
+
+    with pytest.raises(MissingOpenRouterKey) as caught:
+        fetch_model_catalog(Boom(), "  ")
+
+    assert str(caught.value) == MISSING_KEY_MESSAGE
+
+
+def test_fetch_model_catalog_keeps_non_2xx_status_and_a_short_body() -> None:
+    body = "y" * 400
+    client = _CatalogPages({OPENROUTER_MODELS_URL: ({"error": {"message": body}}, 401)})
+
+    with pytest.raises(OpenRouterHTTPError) as caught:
+        fetch_model_catalog(client, "catalog-key")
+
+    err = caught.value
+    assert err.status_code == 401
+    assert err.elapsed_seconds == 0.2
+    assert err.body == body[:180]
+    assert "catalog-key" not in str(err)
+    assert client.urls == [OPENROUTER_MODELS_URL]
+
+
+def test_parse_model_catalog_skips_bad_rows_and_rejects_a_bad_payload() -> None:
+    models = parse_model_catalog(
+        {
+            "data": [
+                "nope",
+                {"id": "  "},
+                {"id": "  vendor/model  ", "context_length": True, "pricing": {"prompt": -1}},
+                {
+                    "id": "kept/zero",
+                    "context_length": -5,
+                    "pricing": {"prompt": 0, "completion": ""},
+                },
+            ]
+        }
+    )
+
+    assert [model.id for model in models] == ["vendor/model", "kept/zero"]
+    assert models[0].context_length is None
+    assert models[0].prompt_price == "-1"
+    assert models[1].context_length is None
+    assert models[1].prompt_price == "0"
+    assert models[1].completion_price is None
+    with pytest.raises(ValueError, match="model catalog must be an object"):
+        parse_model_catalog([])
+    with pytest.raises(ValueError, match="model catalog is missing data"):
+        parse_model_catalog({"models": []})

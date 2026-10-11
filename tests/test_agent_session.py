@@ -34,6 +34,7 @@ from atlas.agent.layout import (
 )
 from atlas.agent.model import (
     MISSING_KEY_MESSAGE,
+    OPENROUTER_MODELS_URL,
     ModelConfig,
     OpenRouterHTTPError,
     OpenRouterModel,
@@ -946,8 +947,54 @@ def test_catalog_fetch_failure_uses_openrouter_and_keeps_the_model(tmp_path: Pat
     assert events[1]["ok"] is False
     assert "500" in events[1]["message"]
     assert "down" in events[1]["message"]
+    assert client.gets[0]["url"] == OPENROUTER_MODELS_URL
     assert client.gets[0]["headers"]["Authorization"] == "Bearer catalog-key"
     assert client.posts == []
+    assert "catalog-key" not in json.dumps(events)
+
+
+def test_models_command_returns_the_live_catalog_without_changing_the_model(
+    tmp_path: Path,
+) -> None:
+    client = _HeaderClient(
+        {
+            "data": [
+                {
+                    "id": "google/gemini-3.8-flash",
+                    "context_length": 128000,
+                    "pricing": {"prompt": "0.1", "completion": "0.4"},
+                },
+                {"id": "  "},
+                {"name": "skipped"},
+            ]
+        }
+    )
+    model = OpenRouterModel(ModelConfig(model="keep-me", api_key="catalog-key"), client)
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
+    session.model_id = "keep-me"
+    session.totals.model = "keep-me"
+    session.totals.context_limit = 111
+    session.fetch_models = model.list_models
+
+    events = _run_protocol(['{"type":"models"}'], session)
+
+    assert session.model_id == "keep-me"
+    assert model.config.model == "keep-me"
+    assert client.gets[0]["url"] == OPENROUTER_MODELS_URL
+    assert client.gets[0]["headers"]["Authorization"] == "Bearer catalog-key"
+    assert client.posts == []
+    catalog = events[1]
+    assert catalog["type"] == "models"
+    assert catalog["ok"] is True
+    assert catalog["models"] == [
+        {
+            "id": "google/gemini-3.8-flash",
+            "context_length": 128000,
+            "prompt_price": "0.1",
+            "completion_price": "0.4",
+        }
+    ]
+    assert session.totals.context_limit == 111
     assert "catalog-key" not in json.dumps(events)
 
 
