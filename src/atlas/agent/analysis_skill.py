@@ -584,37 +584,54 @@ def _published_body(body: str) -> str:
     return _published_text(body).strip()
 
 
+def _is_publish_temp(relative: str) -> bool:
+    """Return whether ``relative`` is a leftover enable temp, not a resource."""
+    return any(
+        part == ".SKILL.md.enabling" or (part.startswith(".") and part.endswith(".enabling"))
+        for part in relative.split("/")
+    )
+
+
 def _bundled_resources(directory: Path) -> list[str]:
-    """Return every file under ``directory`` except ``SKILL.md``."""
+    """Return every file under ``directory`` except ``SKILL.md`` and temp files."""
     resources: list[str] = []
     for path in sorted(directory.rglob("*")):
         if path.is_symlink() or not path.is_file():
             continue
         relative = path.relative_to(directory).as_posix()
-        if relative == "SKILL.md":
+        if relative == "SKILL.md" or _is_publish_temp(relative):
             continue
         resources.append(relative)
     return resources
 
 
-def _manifest_sha256(directory: Path, *, skill_md: bytes | None = None) -> str:
-    """Hash a manifest of every file that enable would publish.
+def _manifest_payload(records: list[dict[str, str]]) -> str:
+    """Encode path/hash records so spaces and newlines in names stay distinct.
 
-    Each line is ``<relative path> <sha256>``. ``SKILL.md`` uses ``skill_md``
-    when that is given, so the preview can hash the notice-stripped bytes
-    before they are written. The returned digest is the SHA-256 of that text.
+    The text is a JSON list of ``{"path", "sha256"}`` objects. ``json.dumps``
+    escapes those characters, so two different names cannot form the same line.
+    """
+    return json.dumps(records, ensure_ascii=False, separators=(",", ":"))
+
+
+def _manifest_sha256(directory: Path, *, skill_md: bytes | None = None) -> str:
+    """Hash a JSON manifest of every file that enable would publish.
+
+    ``SKILL.md`` uses ``skill_md`` when that is given, so the preview can hash
+    the notice-stripped bytes before they are written. Temp files such as
+    ``.SKILL.md.enabling`` are left out.
     """
     skill_bytes = skill_md if skill_md is not None else (directory / "SKILL.md").read_bytes()
-    entries = [("SKILL.md", skill_bytes)]
-    entries.extend(
+    files = [("SKILL.md", skill_bytes)]
+    files.extend(
         (relative, (directory / relative).read_bytes())
         for relative in _bundled_resources(directory)
     )
-    lines = [
-        f"{path} {hashlib.sha256(data).hexdigest()}"
-        for path, data in sorted(entries, key=lambda item: item[0])
+    records = [
+        {"path": path, "sha256": hashlib.sha256(data).hexdigest()}
+        for path, data in sorted(files, key=lambda item: item[0])
     ]
-    return hashlib.sha256(("\n".join(lines) + "\n").encode("utf-8")).hexdigest()
+    return hashlib.sha256(_manifest_payload(records).encode("utf-8")).hexdigest()
 
 
 def _resource_previews(directory: Path) -> list[ResourcePreview]:
@@ -662,12 +679,17 @@ def _resource_previews(directory: Path) -> list[ResourcePreview]:
 
 
 def _write_published(skill_file: Path, published: str) -> None:
+    """Replace ``SKILL.md`` without leaving a temp file inside the draft."""
     data = published.encode("utf-8")
     if skill_file.read_bytes() == data:
         return
-    temporary = skill_file.with_name(".SKILL.md.enabling")
+    temporary = skill_file.parent.parent / f".{skill_file.parent.name}.SKILL.md.enabling"
     temporary.write_bytes(data)
-    os.replace(temporary, skill_file)
+    try:
+        os.replace(temporary, skill_file)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _refuse_symlinks(directory: Path) -> None:
@@ -692,14 +714,29 @@ def _validated_description(text: str, folder: str) -> tuple[str, str]:
     return description.strip(), body
 
 
-def atomic_rename(source: Path, target: Path) -> None:
-    """Rename ``source`` to ``target``.
+def rename_without_replace(source: Path, target: Path) -> None:
+    """Move the whole ``source`` directory onto ``target`` in one rename.
 
-    This is the public form of the ``os.rename`` move used when ``renameat2``
-    cannot claim a directory. It does not replace an existing skill directory:
-    callers claim ``target`` with ``mkdir`` first, then rename children into it.
+    ``renameat2(RENAME_NOREPLACE)`` refuses an existing destination. When that
+    call is unavailable or returns ``EXDEV``, one ``os.rename`` runs after an
+    existence check. Children are not moved one at a time, so a loader cannot
+    observe ``SKILL.md`` without the rest of the tree.
     """
-    os.rename(source, target)
+    result = _renameat2(source, target, _RENAME_NOREPLACE)
+    if result == 0:
+        return
+    if result == errno.EEXIST:
+        raise SkillSaveError(f"Skill already exists: {target.name}")
+    if result not in {None, errno.EXDEV}:
+        raise SkillSaveError("could not enable skill")
+    if target.exists() or target.is_symlink():
+        raise SkillSaveError(f"Skill already exists: {target.name}")
+    try:
+        os.rename(source, target)
+    except OSError as exc:
+        if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise SkillSaveError(f"Skill already exists: {target.name}") from exc
+        raise
 
 
 def _enabling_path(target: Path) -> Path:
@@ -707,26 +744,16 @@ def _enabling_path(target: Path) -> Path:
 
 
 def _recover_enabling(target: Path) -> None:
-    """Drop a leftover ``.<name>.enabling`` so a crashed enable can be retried.
+    """Delete a leftover ``.<name>.enabling`` directory and nothing else.
 
-    A symlink is reported and left in place. An empty destination left by a
-    crash is removed with the leftover. A destination that already has files
-    is kept, and the leftover is removed so it does not block a later retry.
+    A symlink is reported and left in place. The destination directory is
+    never removed, so recovery cannot drop a folder another enable claimed.
     """
     temporary = _enabling_path(target)
     if not temporary.exists() and not temporary.is_symlink():
         return
     if temporary.is_symlink():
         raise SkillSaveError(f"enable was interrupted; {temporary.name} must not be a symlink")
-    if target.is_symlink():
-        raise SkillSaveError(f"Skill already exists: {target.name}")
-    if target.is_dir() and any(target.iterdir()):
-        _discard_tree(temporary)
-        if temporary.exists() or temporary.is_symlink():
-            raise SkillSaveError(f"enable was interrupted; {temporary.name} is still present")
-        raise SkillSaveError(f"Skill already exists: {target.name}")
-    if target.is_dir():
-        target.rmdir()
     _discard_tree(temporary)
     if temporary.exists() or temporary.is_symlink():
         raise SkillSaveError(f"enable was interrupted; {temporary.name} is still present")
@@ -735,10 +762,9 @@ def _recover_enabling(target: Path) -> None:
 def _rename_exclusive(source: Path, target: Path) -> None:
     """Move ``source`` to ``target`` without replacing an existing path.
 
-    ``renameat2(RENAME_NOREPLACE)`` claims the destination in one call. When
-    that call is unavailable or returns ``EXDEV``, the tree is copied beside
-    ``target`` and ``mkdir`` claims the destination name. Children then move
-    with :func:`atomic_rename`. ``exists`` followed by ``rename`` is not used.
+    ``renameat2(RENAME_NOREPLACE)`` moves the draft in one call. When that
+    call is unavailable or returns ``EXDEV``, the tree is copied to
+    ``.<name>.enabling`` and that directory is renamed onto ``target`` once.
     """
     _recover_enabling(target)
     result = _renameat2(source, target, _RENAME_NOREPLACE)
@@ -748,31 +774,17 @@ def _rename_exclusive(source: Path, target: Path) -> None:
         raise SkillSaveError(f"Skill already exists: {target.name}")
     if result not in {None, errno.EXDEV}:
         raise SkillSaveError("could not enable skill")
-    _copy_claim_and_move(source, target)
+    _stage_and_rename(source, target)
 
 
-def _copy_claim_and_move(source: Path, target: Path) -> None:
-    """Copy ``source`` beside ``target``, claim ``target`` with ``mkdir``, then fill it."""
+def _stage_and_rename(source: Path, target: Path) -> None:
+    """Copy ``source`` to ``.<name>.enabling``, then rename that directory once."""
     temporary = _enabling_path(target)
-    claimed = False
     try:
         shutil.copytree(source, temporary, symlinks=False)
-        os.mkdir(target)
-        claimed = True
-        for child in sorted(temporary.iterdir(), key=lambda path: path.name):
-            atomic_rename(child, target / child.name)
-        os.rmdir(temporary)
-    except FileExistsError as exc:
+        rename_without_replace(temporary, target)
+    except (OSError, SkillSaveError):
         _discard_tree(temporary)
-        if claimed and target.is_dir() and not any(target.iterdir()):
-            target.rmdir()
-        raise SkillSaveError(f"Skill already exists: {target.name}") from exc
-    except OSError as exc:
-        _discard_tree(temporary)
-        if claimed and target.is_dir() and not any(target.iterdir()):
-            target.rmdir()
-        if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
-            raise SkillSaveError(f"Skill already exists: {target.name}") from exc
         raise
     _discard_tree(source)
 

@@ -1010,32 +1010,39 @@ def test_enable_rechecks_the_bytes_immediately_before_the_move(
     assert (tmp_path / ".atlas" / "skills-drafts" / "coast-check").is_dir()
 
 
-def test_enable_claims_the_destination_with_mkdir_when_renameat2_is_missing(
+def test_enable_renames_the_staged_directory_when_renameat2_is_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    draft = tmp_path / ".atlas" / "skills-drafts" / "coast-check"
+    (draft / "scripts").mkdir()
+    (draft / "scripts" / "run.py").write_text("print(1)\n", encoding="utf-8")
     preview = preview_skill(tmp_path, "coast-check")
     calls: list[tuple[str, str]] = []
     from atlas.agent import analysis_skill
 
-    original = analysis_skill.atomic_rename
+    original = analysis_skill.rename_without_replace
 
     def spy(source: Path, target: Path) -> None:
-        calls.append((source.parent.name, source.name))
+        calls.append((source.name, target.name))
+        staged = source / "scripts" / "run.py"
+        assert staged.is_file()
+        assert not target.exists()
         original(source, target)
 
     monkeypatch.setattr(analysis_skill, "_renameat2", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(analysis_skill, "atomic_rename", spy)
+    monkeypatch.setattr(analysis_skill, "rename_without_replace", spy)
     enabled = enable_skill(tmp_path, "coast-check", preview.content_sha256)
     assert enabled.path == ".atlas/skills/coast-check/SKILL.md"
-    assert calls == [(".coast-check.enabling", "SKILL.md")]
-    published = tmp_path / ".atlas" / "skills" / "coast-check" / "SKILL.md"
-    assert "This skill is a draft" not in published.read_text(encoding="utf-8")
-    assert not (tmp_path / ".atlas" / "skills-drafts" / "coast-check").exists()
+    assert calls == [(".coast-check.enabling", "coast-check")]
+    published = tmp_path / ".atlas" / "skills" / "coast-check"
+    assert (published / "scripts" / "run.py").read_text(encoding="utf-8") == "print(1)\n"
+    assert "This skill is a draft" not in (published / "SKILL.md").read_text(encoding="utf-8")
+    assert not draft.exists()
     assert not (tmp_path / ".atlas" / "skills" / ".coast-check.enabling").exists()
 
 
-def test_renameat2_exdev_copies_then_claims_the_name(
+def test_renameat2_exdev_renames_the_staged_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     save_skill(tmp_path, _finished("compare the coast"), "coast-check")
@@ -1043,14 +1050,14 @@ def test_renameat2_exdev_copies_then_claims_the_name(
     calls: list[str] = []
     from atlas.agent import analysis_skill
 
-    original = analysis_skill.atomic_rename
+    original = analysis_skill.rename_without_replace
 
     def spy(source: Path, target: Path) -> None:
-        calls.append(source.parent.name)
+        calls.append(source.name)
         original(source, target)
 
     monkeypatch.setattr(analysis_skill, "_renameat2", lambda *_args, **_kwargs: errno.EXDEV)
-    monkeypatch.setattr(analysis_skill, "atomic_rename", spy)
+    monkeypatch.setattr(analysis_skill, "rename_without_replace", spy)
     enable_skill(tmp_path, "coast-check", preview.content_sha256)
     assert calls == [".coast-check.enabling"]
     published = tmp_path / ".atlas" / "skills" / "coast-check" / "SKILL.md"
@@ -1166,6 +1173,80 @@ def test_large_resources_are_counted_without_hiding_the_omission(tmp_path: Path)
     assert raw.text == ""
     assert "body not shown" in raw.omitted
     assert "bytes" in raw.omitted
+
+
+def test_failure_mid_move_does_not_publish_a_partial_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    draft = tmp_path / ".atlas" / "skills-drafts" / "coast-check"
+    (draft / "scripts").mkdir()
+    (draft / "scripts" / "run.py").write_text("print(1)\n", encoding="utf-8")
+    preview = preview_skill(tmp_path, "coast-check")
+    from atlas.agent import analysis_skill
+
+    real_rename = analysis_skill.os.rename
+
+    def fail_the_only_rename(src: Path, dst: Path, *args: object, **kwargs: object) -> None:
+        source = Path(src)
+        if source.name == ".coast-check.enabling":
+            assert (source / "SKILL.md").is_file()
+            assert (source / "scripts" / "run.py").is_file()
+            assert not Path(dst).exists()
+            raise OSError(errno.EIO, "Input/output error")
+        real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(analysis_skill, "_renameat2", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(analysis_skill.os, "rename", fail_the_only_rename)
+    with pytest.raises(SkillSaveError, match="could not enable skill"):
+        enable_skill(tmp_path, "coast-check", preview.content_sha256)
+    live = tmp_path / ".atlas" / "skills" / "coast-check"
+    assert not live.exists()
+    assert (draft / "scripts" / "run.py").is_file()
+    assert not (tmp_path / ".atlas" / "skills" / ".coast-check.enabling").exists()
+
+
+def test_manifest_encodes_spaces_newlines_and_skips_temp_files(tmp_path: Path) -> None:
+    from atlas.agent.analysis_skill import _manifest_payload
+
+    spaced = _manifest_payload([{"path": "a b.txt", "sha256": "aa"}, {"path": "c", "sha256": "bb"}])
+    split = _manifest_payload([{"path": "a", "sha256": "b aa"}, {"path": "c", "sha256": "bb"}])
+    newline = _manifest_payload([{"path": "a\nb.txt", "sha256": "cc"}])
+    assert json.loads(spaced)[0]["path"] == "a b.txt"
+    assert json.loads(newline)[0]["path"] == "a\nb.txt"
+    assert hashlib.sha256(spaced.encode()).hexdigest() != hashlib.sha256(split.encode()).hexdigest()
+
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    draft = tmp_path / ".atlas" / "skills-drafts" / "coast-check"
+    (draft / "my file.txt").write_text("space\n", encoding="utf-8")
+    (draft / "a\nb.txt").write_text("newline\n", encoding="utf-8")
+    (draft / ".SKILL.md.enabling").write_text("temp\n", encoding="utf-8")
+    preview = preview_skill(tmp_path, "coast-check")
+    paths = [item.path for item in preview.resources]
+    assert paths == ["a\nb.txt", "my file.txt"]
+    changed = (draft / "my file.txt").read_text(encoding="utf-8")
+    (draft / "my file.txt").write_text("other\n", encoding="utf-8")
+    assert preview_skill(tmp_path, "coast-check").content_sha256 != preview.content_sha256
+    (draft / "my file.txt").write_text(changed, encoding="utf-8")
+    assert preview_skill(tmp_path, "coast-check").content_sha256 == preview.content_sha256
+
+
+def test_recovery_deletes_only_the_hidden_enabling_directory(tmp_path: Path) -> None:
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    preview = preview_skill(tmp_path, "coast-check")
+    skills = tmp_path / ".atlas" / "skills"
+    destination = skills / "coast-check"
+    destination.mkdir(parents=True)
+    marker = destination / "SKILL.md"
+    marker.write_text("keep me\n", encoding="utf-8")
+    leftover = skills / ".coast-check.enabling"
+    leftover.mkdir()
+    (leftover / "SKILL.md").write_text("partial\n", encoding="utf-8")
+    with pytest.raises(SkillSaveError, match="already exists"):
+        enable_skill(tmp_path, "coast-check", preview.content_sha256)
+    assert marker.read_text(encoding="utf-8") == "keep me\n"
+    assert not leftover.exists()
+    assert (tmp_path / ".atlas" / "skills-drafts" / "coast-check").is_dir()
 
 
 def test_mixed_case_name_matches_the_preview(tmp_path: Path) -> None:

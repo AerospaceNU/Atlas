@@ -254,8 +254,9 @@ class AgentSession:
         self._require_user_skills(scope)
         if self.workspace is None:
             raise SkillSaveError("project scope needs a workspace")
-        preview = preview_skill(self.workspace, name, scope=scope, home=self.home)
-        self._skill_previews[(preview.name, scope)] = preview.content_sha256
+        slug = skill_slug(name)
+        preview = preview_skill(self.workspace, slug, scope=scope, home=self.home)
+        self._skill_previews[(slug, scope)] = preview.content_sha256
         return preview
 
     def enable_saved_skill(
