@@ -22,6 +22,7 @@ from atlas.agent.skill_author import (
     SkillAuthorError,
     SkillDraft,
     author_skill,
+    is_within,
     project_skills_root,
     user_skills_root,
 )
@@ -100,12 +101,8 @@ def _contained_skills_root(base: Path, skills_root: Path) -> Path:
 
     :func:`author_skill` resolves its root and would follow the symlink.
     """
-    root = base.expanduser().resolve()
     for candidate in (base / ".atlas", skills_root):
-        if not candidate.is_symlink():
-            continue
-        target = candidate.resolve()
-        if target != root and root not in target.parents:
+        if candidate.is_symlink() and not is_within(base, candidate):
             raise ValueError("Skills root escapes the sandbox")
     return skills_root
 

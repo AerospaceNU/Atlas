@@ -19,6 +19,8 @@ from atlas.agent.skill_author import (
     SkillDraft,
     _write_text,
     author_skill,
+    is_within,
+    normalize_skill_name,
     project_skills_root,
     render_skill_md,
     user_skills_root,
@@ -110,6 +112,43 @@ def test_blank_optional_fields_are_omitted() -> None:
     assert "compatibility:" not in text
     assert "allowed-tools:" not in text
     assert "metadata:" not in text
+
+
+def test_normalize_skill_name_is_the_public_nfkc_check() -> None:
+    composed = "caf\u00e9-scan"
+    normalized, errors = normalize_skill_name("  cafe\u0301-scan  ")
+
+    assert normalized == composed
+    assert errors == []
+    upper, upper_errors = normalize_skill_name("NDVI")
+    assert upper == "NDVI"
+    assert any("lowercase" in error for error in upper_errors)
+    missing, missing_errors = normalize_skill_name("  ")
+    assert missing is None
+    assert missing_errors
+
+
+def test_is_within_follows_symlinks_and_keeps_paths_inside_the_root(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    inside = root / "notes.txt"
+    inside.write_text("ok", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped = root / "escape"
+    escaped.symlink_to(outside, target_is_directory=True)
+    nested = root / "real"
+    nested.mkdir()
+    alias = root / "alias"
+    alias.symlink_to(nested, target_is_directory=True)
+
+    assert is_within(root, inside)
+    assert is_within(root, root)
+    assert is_within(root, Path("notes.txt"))
+    assert is_within(root, alias)
+    assert not is_within(root, outside)
+    assert not is_within(root, escaped)
+    assert not is_within(root, Path("../outside"))
 
 
 def test_name_is_nfkc_normalized_into_the_directory(tmp_path: Path) -> None:

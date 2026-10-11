@@ -2,8 +2,9 @@
 
 A skill is a directory named after its frontmatter ``name`` with a
 ``SKILL.md`` of YAML frontmatter plus markdown instructions. This module
-checks those constraints and writes the directory. Discovering skills and
-activating them in a session are separate.
+checks those constraints and writes the directory. :func:`normalize_skill_name`
+and :func:`is_within` are the shared name and path checks. Discovering skills
+and activating them in a session are separate.
 """
 
 from __future__ import annotations
@@ -98,6 +99,66 @@ def user_skills_root(home: Path | None = None) -> Path:
         The user skills directory.
     """
     return user_atlas_root(home) / "skills"
+
+
+def normalize_skill_name(name: object) -> tuple[str | None, list[str]]:
+    """NFKC-normalize a skill name and report spec violations.
+
+    The returned string is the directory name :func:`author_skill` would use.
+    Loaders compare it to the skill directory. ``None`` means there is no
+    usable name. A non-empty invalid name is still returned so the caller can
+    show it.
+
+    Args:
+        name: Proposed skill name.
+
+    Returns:
+        The normalized name and any problems. An empty problem list means the
+        name is writable.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return None, ["Field 'name' must be a non-empty string"]
+    normalized = unicodedata.normalize("NFKC", name.strip())
+    errors: list[str] = []
+    if len(normalized) > MAX_SKILL_NAME_LENGTH:
+        errors.append(
+            f"Skill name '{normalized}' exceeds {MAX_SKILL_NAME_LENGTH} character limit "
+            f"({len(normalized)} chars)"
+        )
+    if normalized != normalized.lower():
+        errors.append(f"Skill name '{normalized}' must be lowercase")
+    if normalized.startswith("-") or normalized.endswith("-"):
+        errors.append("Skill name cannot start or end with a hyphen")
+    if "--" in normalized:
+        errors.append("Skill name cannot contain consecutive hyphens")
+    if not all(character.isalnum() or character == "-" for character in normalized):
+        errors.append(
+            f"Skill name '{normalized}' contains invalid characters. "
+            "Only letters, digits, and hyphens are allowed."
+        )
+    if _contains_delimiter(normalized):
+        errors.append("Frontmatter field 'name' cannot contain '---'")
+    return normalized, errors
+
+
+def is_within(root: Path, path: Path) -> bool:
+    """Return whether ``path`` resolves to ``root`` or a file inside it.
+
+    A relative ``path`` is joined to ``root`` first. Both paths are expanded
+    and resolved, so a symlink that points outside ``root`` is not inside.
+
+    Args:
+        root: Directory that bounds ``path``.
+        path: Path to test. It does not have to exist.
+
+    Returns:
+        True when the resolved path is ``root`` or a descendant of ``root``.
+    """
+    resolved_root = Path(root).expanduser().resolve()
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = resolved_root / candidate
+    return candidate.resolve().is_relative_to(resolved_root)
 
 
 def validate_skill(draft: SkillDraft) -> list[str]:
@@ -261,30 +322,7 @@ def _prepare(draft: SkillDraft) -> tuple[_PreparedSkill | None, list[str]]:
     )
 
 
-def _normalize_name(name: object) -> tuple[str | None, list[str]]:
-    if not isinstance(name, str) or not name.strip():
-        return None, ["Field 'name' must be a non-empty string"]
-    normalized = unicodedata.normalize("NFKC", name.strip())
-    errors: list[str] = []
-    if len(normalized) > MAX_SKILL_NAME_LENGTH:
-        errors.append(
-            f"Skill name '{normalized}' exceeds {MAX_SKILL_NAME_LENGTH} character limit "
-            f"({len(normalized)} chars)"
-        )
-    if normalized != normalized.lower():
-        errors.append(f"Skill name '{normalized}' must be lowercase")
-    if normalized.startswith("-") or normalized.endswith("-"):
-        errors.append("Skill name cannot start or end with a hyphen")
-    if "--" in normalized:
-        errors.append("Skill name cannot contain consecutive hyphens")
-    if not all(character.isalnum() or character == "-" for character in normalized):
-        errors.append(
-            f"Skill name '{normalized}' contains invalid characters. "
-            "Only letters, digits, and hyphens are allowed."
-        )
-    if _contains_delimiter(normalized):
-        errors.append("Frontmatter field 'name' cannot contain '---'")
-    return normalized, errors
+_normalize_name = normalize_skill_name
 
 
 def _required_text(value: object, field_name: str, limit: int) -> tuple[str | None, list[str]]:
@@ -502,7 +540,7 @@ def _locate_file(skill_dir: Path, relative: str) -> tuple[Path | None, str | Non
         return None, "SKILL.md is written from the skill draft"
     root = skill_dir.resolve()
     candidate = (root / path).resolve()
-    if root not in candidate.parents:
+    if candidate == root or not is_within(root, candidate):
         return None, "Skill file path escapes the skill directory"
     return candidate, None
 
