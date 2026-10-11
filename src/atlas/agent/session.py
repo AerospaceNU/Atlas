@@ -21,6 +21,7 @@ from atlas.agent.analysis_skill import (
     enable_skill,
     preview_skill,
     save_skill,
+    skill_slug,
     successful_steps,
 )
 from atlas.agent.artifacts import LocalArtifactStore
@@ -210,7 +211,7 @@ class AgentSession:
         self._require_user_skills(scope)
         if self.workspace is None:
             raise SkillSaveError("project scope needs a workspace")
-        slug = name.strip()
+        slug = skill_slug(name)
         full_hash = self._expected_preview_hash(slug, scope, expected_sha256)
         saved = enable_skill(
             self.workspace,
@@ -647,7 +648,7 @@ def _handle_enable_skill(session: AgentSession, stdout: IO[str], message: dict[s
                     "body": preview.body,
                     "body_characters": preview.body_characters,
                     "body_lines": preview.body_lines,
-                    "resources": preview.resources,
+                    "resources": [item.model_dump() for item in preview.resources],
                     "confirm": preview.confirm,
                 },
                 session.secrets,

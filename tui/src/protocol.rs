@@ -79,7 +79,7 @@ pub enum ServerMessage {
         body: String,
         body_characters: i64,
         body_lines: i64,
-        resources: Vec<String>,
+        resources: Vec<ResourcePreview>,
         confirm: String,
     },
     EnabledSkill {
@@ -94,6 +94,22 @@ pub enum ServerMessage {
     },
     /// A line we do not understand yet.
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct ResourcePreview {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub characters: i64,
+    #[serde(default)]
+    pub lines: i64,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub omitted: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -287,7 +303,7 @@ enum RawMessage {
         #[serde(default)]
         body_lines: i64,
         #[serde(default)]
-        resources: Vec<String>,
+        resources: Vec<ResourcePreview>,
         #[serde(default)]
         confirm: String,
     },
@@ -687,7 +703,7 @@ mod tests {
 
     #[test]
     fn parses_enable_preview_before_promotion() {
-        let line = r#"{"type":"enable_preview","name":"coast-check","description":"compare the coast","path":".atlas/skills-drafts/coast-check/SKILL.md","content_sha256":"abcd1234","body":"Replay this procedure","body_characters":21,"body_lines":1,"resources":["scripts/run.py"],"confirm":"/enable-skill coast-check confirm abcd1234"}"#;
+        let line = r#"{"type":"enable_preview","name":"coast-check","description":"compare the coast","path":".atlas/skills-drafts/coast-check/SKILL.md","content_sha256":"abcd1234","body":"Replay this procedure","body_characters":21,"body_lines":1,"resources":[{"path":"scripts/run.py","sha256":"abc","characters":9,"lines":1,"text":"print(1)\n","omitted":""}],"confirm":"/enable-skill coast-check confirm abcd1234"}"#;
         match parse_line(line).unwrap() {
             Some(ServerMessage::EnablePreview {
                 name,
@@ -707,7 +723,17 @@ mod tests {
                 assert_eq!(body, "Replay this procedure");
                 assert_eq!(body_characters, 21);
                 assert_eq!(body_lines, 1);
-                assert_eq!(resources, vec!["scripts/run.py".to_string()]);
+                assert_eq!(
+                    resources,
+                    vec![ResourcePreview {
+                        path: "scripts/run.py".to_string(),
+                        sha256: "abc".to_string(),
+                        characters: 9,
+                        lines: 1,
+                        text: "print(1)\n".to_string(),
+                        omitted: String::new(),
+                    }]
+                );
                 assert_eq!(confirm, "/enable-skill coast-check confirm abcd1234");
             }
             other => panic!("unexpected: {other:?}"),

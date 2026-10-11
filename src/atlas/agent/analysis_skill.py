@@ -24,7 +24,7 @@ import shutil
 import unicodedata
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -41,14 +41,12 @@ from atlas.agent.skill_author import (
     skill_directory_name,
     user_skills_root,
 )
-from atlas.agent.skill_author import (
-    _rename as _atomic_rename,
-)
 from atlas.agent.skills import parse_skill_document
 
 _MAX_DESCRIPTION = 200
 _MAX_STEP_TEXT = 500
 _MAX_RESPONSE = 2000
+_SMALL_RESOURCE_CHARACTERS = 2000
 _DRAFTS_DIR = "skills-drafts"
 _SKILLS_DIR = "skills"
 _REDACTED = "***"
@@ -149,6 +147,17 @@ class SavedSkill(BaseModel):
     note: str = ""
 
 
+class ResourcePreview(BaseModel):
+    """One bundled file shown before a draft is enabled."""
+
+    path: str
+    sha256: str
+    characters: int
+    lines: int
+    text: str = ""
+    omitted: str = ""
+
+
 class SkillPreview(BaseModel):
     """What ``/enable-skill`` shows before it moves a draft."""
 
@@ -159,7 +168,7 @@ class SkillPreview(BaseModel):
     body: str
     body_characters: int
     body_lines: int
-    resources: list[str] = Field(default_factory=list)
+    resources: list[ResourcePreview] = Field(default_factory=list)
     confirm: str
 
 
@@ -279,10 +288,11 @@ def preview_skill(
     """Describe a draft without moving it.
 
     The description comes from :func:`parse_skill_document`. ``content_sha256``
-    is the SHA-256 of the ``SKILL.md`` bytes enable would publish, which is the
-    same hash the loader records. ``body`` is the full instruction text. The
-    character count, line count, path, and bundled resources are included so
-    nothing in the draft is omitted without being counted.
+    is the SHA-256 of a manifest listing every file that would be published,
+    each as its relative path plus the SHA-256 of its bytes. ``SKILL.md`` is
+    hashed after the draft notice is removed. ``body`` is the full instruction
+    text. Small text resources include their text; a larger or binary file
+    reports its size and says the body is not shown.
 
     Args:
         workspace: Project directory that contains ``.atlas``.
@@ -291,8 +301,9 @@ def preview_skill(
         home: User home for ``scope="user"``.
 
     Returns:
-        The description, full body, hash, and confirm command. The command
-        ends with the first eight hex characters of ``content_sha256``.
+        The description, full body, manifest hash, resource previews, and
+        confirm command. The command ends with the first eight hex characters
+        of ``content_sha256``.
 
     Raises:
         SkillSaveError: If the draft is missing or the loader would skip it.
@@ -303,7 +314,7 @@ def preview_skill(
     except OSError as exc:
         raise SkillSaveError("could not enable skill") from exc
     published = _published_text(loaded.text)
-    digest = hashlib.sha256(published.encode("utf-8")).hexdigest()
+    digest = _manifest_sha256(loaded.source, skill_md=published.encode("utf-8"))
     body = _published_body(loaded.body)
     return SkillPreview(
         name=loaded.slug,
@@ -313,7 +324,7 @@ def preview_skill(
         body=body,
         body_characters=len(body),
         body_lines=len(body.splitlines()),
-        resources=_bundled_resources(loaded.source),
+        resources=_resource_previews(loaded.source),
         confirm=f"{enable_command(loaded.slug)} confirm {digest[:8]}",
     )
 
@@ -329,13 +340,13 @@ def enable_skill(
     """Move ``skills-drafts/<name>`` into ``.atlas/skills``.
 
     The draft notice is removed before the directory moves. Immediately
-    before that move, the ``SKILL.md`` bytes are hashed again and refused
-    when they are not ``expected_sha256``.
+    before that move, the manifest of every file is hashed again and refused
+    when it is not ``expected_sha256``.
 
     Args:
         workspace: Project directory that contains ``.atlas``.
         name: Skill slug previously written by :func:`save_skill`.
-        expected_sha256: Hex digest shown by :func:`preview_skill`.
+        expected_sha256: Manifest digest shown by :func:`preview_skill`.
         scope: ``project`` or ``user``.
         home: User home for ``scope="user"``.
 
@@ -372,11 +383,12 @@ def _enable_skill(
     loaded = _load_draft(workspace, name, scope=scope, home=home)
     published = _published_text(loaded.text)
     expected = expected_sha256.strip().lower()
-    if hashlib.sha256(published.encode("utf-8")).hexdigest() != expected:
+    published_bytes = published.encode("utf-8")
+    if _manifest_sha256(loaded.source, skill_md=published_bytes) != expected:
         raise SkillSaveError("skill hash does not match the preview")
     skill_file = loaded.source / "SKILL.md"
     _write_published(skill_file, published)
-    if hashlib.sha256(skill_file.read_bytes()).hexdigest() != expected:
+    if _manifest_sha256(loaded.source) != expected:
         raise SkillSaveError("skill hash does not match the preview")
     skills = _skills_root(workspace, scope, home)
     if not skills.exists():
@@ -469,6 +481,25 @@ def _skill_slug(name: str) -> str:
         raise SkillSaveError("; ".join(exc.errors)) from exc
 
 
+def skill_slug(name: str) -> str:
+    """Return the drafts directory name for ``name``.
+
+    Case is folded first, so ``Coast-Check`` and ``coast-check`` name the
+    same skill. Saving a skill still requires the lowercase form.
+
+    Args:
+        name: A skill name, possibly with different case.
+
+    Returns:
+        The normalized directory name.
+
+    Raises:
+        SkillSaveError: If the folded name is not a skill slug.
+    """
+    folded = unicodedata.normalize("NFKC", name).strip().lower()
+    return _skill_slug(folded)
+
+
 def _scope_base(workspace: Path, scope: str, home: Path | None) -> Path:
     if scope == "user":
         if home is None:
@@ -525,7 +556,7 @@ class _LoadedDraft:
 
 
 def _load_draft(workspace: Path, name: str, *, scope: str, home: Path | None) -> _LoadedDraft:
-    slug = _skill_slug(name)
+    slug = skill_slug(name)
     base = _scope_base(workspace, scope, home)
     drafts = _drafts_root(workspace, scope, home)
     source = drafts / slug
@@ -566,6 +597,70 @@ def _bundled_resources(directory: Path) -> list[str]:
     return resources
 
 
+def _manifest_sha256(directory: Path, *, skill_md: bytes | None = None) -> str:
+    """Hash a manifest of every file that enable would publish.
+
+    Each line is ``<relative path> <sha256>``. ``SKILL.md`` uses ``skill_md``
+    when that is given, so the preview can hash the notice-stripped bytes
+    before they are written. The returned digest is the SHA-256 of that text.
+    """
+    skill_bytes = skill_md if skill_md is not None else (directory / "SKILL.md").read_bytes()
+    entries = [("SKILL.md", skill_bytes)]
+    entries.extend(
+        (relative, (directory / relative).read_bytes())
+        for relative in _bundled_resources(directory)
+    )
+    lines = [
+        f"{path} {hashlib.sha256(data).hexdigest()}"
+        for path, data in sorted(entries, key=lambda item: item[0])
+    ]
+    return hashlib.sha256(("\n".join(lines) + "\n").encode("utf-8")).hexdigest()
+
+
+def _resource_previews(directory: Path) -> list[ResourcePreview]:
+    """Describe bundled files, including the text of small UTF-8 resources."""
+    previews: list[ResourcePreview] = []
+    for relative in _bundled_resources(directory):
+        data = (directory / relative).read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            previews.append(
+                ResourcePreview(
+                    path=relative,
+                    sha256=digest,
+                    characters=len(data),
+                    lines=0,
+                    omitted=f"{len(data)} bytes, body not shown",
+                )
+            )
+            continue
+        characters = len(text)
+        lines = len(text.splitlines())
+        if characters <= _SMALL_RESOURCE_CHARACTERS:
+            previews.append(
+                ResourcePreview(
+                    path=relative,
+                    sha256=digest,
+                    characters=characters,
+                    lines=lines,
+                    text=text,
+                )
+            )
+            continue
+        previews.append(
+            ResourcePreview(
+                path=relative,
+                sha256=digest,
+                characters=characters,
+                lines=lines,
+                omitted=f"{characters} characters, {lines} lines, body not shown",
+            )
+        )
+    return previews
+
+
 def _write_published(skill_file: Path, published: str) -> None:
     data = published.encode("utf-8")
     if skill_file.read_bytes() == data:
@@ -597,15 +692,55 @@ def _validated_description(text: str, folder: str) -> tuple[str, str]:
     return description.strip(), body
 
 
+def atomic_rename(source: Path, target: Path) -> None:
+    """Rename ``source`` to ``target``.
+
+    This is the public form of the ``os.rename`` move used when ``renameat2``
+    cannot claim a directory. It does not replace an existing skill directory:
+    callers claim ``target`` with ``mkdir`` first, then rename children into it.
+    """
+    os.rename(source, target)
+
+
+def _enabling_path(target: Path) -> Path:
+    return target.with_name(f".{target.name}.enabling")
+
+
+def _recover_enabling(target: Path) -> None:
+    """Drop a leftover ``.<name>.enabling`` so a crashed enable can be retried.
+
+    A symlink is reported and left in place. An empty destination left by a
+    crash is removed with the leftover. A destination that already has files
+    is kept, and the leftover is removed so it does not block a later retry.
+    """
+    temporary = _enabling_path(target)
+    if not temporary.exists() and not temporary.is_symlink():
+        return
+    if temporary.is_symlink():
+        raise SkillSaveError(f"enable was interrupted; {temporary.name} must not be a symlink")
+    if target.is_symlink():
+        raise SkillSaveError(f"Skill already exists: {target.name}")
+    if target.is_dir() and any(target.iterdir()):
+        _discard_tree(temporary)
+        if temporary.exists() or temporary.is_symlink():
+            raise SkillSaveError(f"enable was interrupted; {temporary.name} is still present")
+        raise SkillSaveError(f"Skill already exists: {target.name}")
+    if target.is_dir():
+        target.rmdir()
+    _discard_tree(temporary)
+    if temporary.exists() or temporary.is_symlink():
+        raise SkillSaveError(f"enable was interrupted; {temporary.name} is still present")
+
+
 def _rename_exclusive(source: Path, target: Path) -> None:
     """Move ``source`` to ``target`` without replacing an existing path.
 
     ``renameat2(RENAME_NOREPLACE)`` claims the destination in one call. When
-    that call is unavailable, the move uses skill authoring's atomic rename.
-    ``EXDEV`` from either call copies onto a sibling of ``target`` and that
-    sibling is renamed into place with the same helper. The destination name
-    appears only after the copy is complete.
+    that call is unavailable or returns ``EXDEV``, the tree is copied beside
+    ``target`` and ``mkdir`` claims the destination name. Children then move
+    with :func:`atomic_rename`. ``exists`` followed by ``rename`` is not used.
     """
+    _recover_enabling(target)
     result = _renameat2(source, target, _RENAME_NOREPLACE)
     if result == 0:
         return
@@ -613,56 +748,33 @@ def _rename_exclusive(source: Path, target: Path) -> None:
         raise SkillSaveError(f"Skill already exists: {target.name}")
     if result not in {None, errno.EXDEV}:
         raise SkillSaveError("could not enable skill")
-    if result == errno.EXDEV:
-        _copy_then_rename(source, target)
-        return
-    if target.exists() or target.is_symlink():
-        raise SkillSaveError(f"Skill already exists: {target.name}")
-    try:
-        _atomic_rename(source, target)
-    except SkillAuthorError as exc:
-        if _errno_of(exc) == errno.EXDEV:
-            _copy_then_rename(source, target)
-            return
-        _raise_move_error(target, exc)
+    _copy_claim_and_move(source, target)
 
 
-def _copy_then_rename(source: Path, target: Path) -> None:
-    """Copy ``source`` beside ``target``, then rename that copy into place."""
-    if target.exists() or target.is_symlink():
-        raise SkillSaveError(f"Skill already exists: {target.name}")
-    temporary = target.with_name(f".{target.name}.enabling")
-    if temporary.exists() or temporary.is_symlink():
-        raise SkillSaveError("could not enable skill")
+def _copy_claim_and_move(source: Path, target: Path) -> None:
+    """Copy ``source`` beside ``target``, claim ``target`` with ``mkdir``, then fill it."""
+    temporary = _enabling_path(target)
+    claimed = False
     try:
         shutil.copytree(source, temporary, symlinks=False)
-        _atomic_rename(temporary, target)
-    except SkillAuthorError as exc:
-        _discard_tree(temporary)
-        _raise_move_error(target, exc)
+        os.mkdir(target)
+        claimed = True
+        for child in sorted(temporary.iterdir(), key=lambda path: path.name):
+            atomic_rename(child, target / child.name)
+        os.rmdir(temporary)
     except FileExistsError as exc:
         _discard_tree(temporary)
+        if claimed and target.is_dir() and not any(target.iterdir()):
+            target.rmdir()
         raise SkillSaveError(f"Skill already exists: {target.name}") from exc
     except OSError as exc:
         _discard_tree(temporary)
+        if claimed and target.is_dir() and not any(target.iterdir()):
+            target.rmdir()
         if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
             raise SkillSaveError(f"Skill already exists: {target.name}") from exc
         raise
     _discard_tree(source)
-
-
-def _errno_of(exc: SkillAuthorError) -> int | None:
-    cause = exc.__cause__
-    if isinstance(cause, OSError):
-        return cause.errno
-    return None
-
-
-def _raise_move_error(target: Path, exc: SkillAuthorError) -> NoReturn:
-    """Turn a failed atomic rename into a path-free :class:`SkillSaveError`."""
-    if _errno_of(exc) in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise SkillSaveError(f"Skill already exists: {target.name}") from exc
-    raise SkillSaveError("could not enable skill") from exc
 
 
 def _discard_tree(path: Path) -> None:
@@ -754,6 +866,7 @@ def _redact_text(text: str, secrets: Sequence[str]) -> str:
         held.append(match.group(0))
         return f"\ue000url{len(held) - 1}\ue001"
 
+    text = _scrub_secret_fragments(text)
     text = _HTTP_URL.sub(_hold, text)
     text = _KEY_SHAPED.sub(_REDACTED, text)
     text = _FILE_URL.sub(_REDACTED, text)
@@ -768,7 +881,15 @@ def _sanitize_url(url: str) -> str:
     """Drop userinfo and secret query params, then scrub credentials in the rest."""
     url = _USERINFO.sub(r"\1", url)
     url = _strip_secret_query(url)
+    url = _scrub_secret_fragments(url)
     return _KEY_SHAPED.sub(_REDACTED, url)
+
+
+def _scrub_secret_fragments(text: str) -> str:
+    """Replace values in fragments such as ``#access_token=``."""
+    names = "|".join(re.escape(name) for name in sorted(_SECRET_QUERY_NAMES, key=len, reverse=True))
+    pattern = re.compile(rf"(?i)#({names})=([^\s\"'\\&#]*)")
+    return pattern.sub(r"#\1=***", text)
 
 
 def _strip_secret_query(url: str) -> str:

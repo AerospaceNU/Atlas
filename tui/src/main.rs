@@ -584,13 +584,24 @@ impl App {
                 self.transcript.push(tool_note(format!(
                     "{body_characters} characters, {body_lines} lines"
                 )));
-                let listed = if resources.is_empty() {
-                    "(none)".to_string()
+                if resources.is_empty() {
+                    self.transcript.push(tool_note("resources: (none)"));
                 } else {
-                    resources.join(", ")
-                };
-                self.transcript
-                    .push(tool_note(format!("resources: {listed}")));
+                    self.transcript.push(tool_note("resources:"));
+                    for resource in resources {
+                        let mut line = format!(
+                            "{} sha256 {} ({} characters, {} lines)",
+                            resource.path, resource.sha256, resource.characters, resource.lines
+                        );
+                        if !resource.omitted.is_empty() {
+                            line.push_str(&format!(", {}", resource.omitted));
+                        }
+                        self.transcript.push(tool_note(line));
+                        if !resource.text.is_empty() {
+                            self.transcript.push(tool_note(resource.text));
+                        }
+                    }
+                }
                 if !body.is_empty() {
                     self.transcript.push(tool_note(body));
                 }
@@ -2596,7 +2607,7 @@ mod tests {
         TranscriptLine,
     };
     use crate::logo::logo_size;
-    use crate::protocol::{CatalogEntry, ServerMessage, StatusSnapshot};
+    use crate::protocol::{CatalogEntry, ResourcePreview, ServerMessage, StatusSnapshot};
 
     fn tool_text(app: &App) -> String {
         app.transcript
@@ -2916,7 +2927,14 @@ mod tests {
             body: "Replay this procedure".to_string(),
             body_characters: 21,
             body_lines: 1,
-            resources: vec!["scripts/run.py".to_string()],
+            resources: vec![ResourcePreview {
+                path: "scripts/run.py".to_string(),
+                sha256: "abc".to_string(),
+                characters: 9,
+                lines: 1,
+                text: "print(1)\n".to_string(),
+                omitted: String::new(),
+            }],
             confirm: "/enable-skill coast-check confirm abcd1234".to_string(),
         });
         let preview = tool_text(&app);
@@ -2924,7 +2942,9 @@ mod tests {
         assert!(preview.contains(".atlas/skills-drafts/coast-check/SKILL.md"));
         assert!(preview.contains("sha256 abcd1234"));
         assert!(preview.contains("21 characters, 1 lines"));
-        assert!(preview.contains("resources: scripts/run.py"));
+        assert!(preview.contains("resources:"));
+        assert!(preview.contains("scripts/run.py sha256 abc"));
+        assert!(preview.contains("print(1)"));
         assert!(preview.contains("Replay this procedure"));
         assert!(preview.contains("/enable-skill coast-check confirm abcd1234"));
         let sent = slash_outcome(&mut app, "/enable-skill coast-check confirm abcd1234")

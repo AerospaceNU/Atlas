@@ -216,6 +216,7 @@ def render_system_prompt(base: str, skills: Sequence[Skill]) -> str:
     return base + "\n\n" + _SKILL_INSTRUCTIONS + "\n\n" + "\n".join(blocks)
 
 
+# ATLAS-90. Wrappers only: load_skills and content_sha256 above are unchanged.
 def parse_skill_document(text: str) -> tuple[dict[str, Any], str]:
     """Return frontmatter fields and the markdown body.
 
