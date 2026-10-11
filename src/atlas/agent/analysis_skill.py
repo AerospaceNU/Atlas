@@ -21,7 +21,9 @@ import json
 import os
 import re
 import shutil
+import time
 import unicodedata
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -52,6 +54,8 @@ _SKILLS_DIR = "skills"
 _REDACTED = "***"
 _RENAME_NOREPLACE = 1
 _AT_FDCWD = -100
+# A staging directory younger than this, with a live pid or no pid, is in use.
+_STALE_ENABLING_SECONDS = 3600
 _DRAFT_NOTICE = re.compile(
     r"^This skill is a draft\. Enable it with `/enable-skill [^`]+`\.\n?",
     re.MULTILINE,
@@ -584,22 +588,19 @@ def _published_body(body: str) -> str:
     return _published_text(body).strip()
 
 
-def _is_publish_temp(relative: str) -> bool:
-    """Return whether ``relative`` is a leftover enable temp, not a resource."""
-    return any(
-        part == ".SKILL.md.enabling" or (part.startswith(".") and part.endswith(".enabling"))
-        for part in relative.split("/")
-    )
-
-
 def _bundled_resources(directory: Path) -> list[str]:
-    """Return every file under ``directory`` except ``SKILL.md`` and temp files."""
+    """Return every file under ``directory`` except ``SKILL.md``.
+
+    Names such as ``scripts/.run.enabling`` are real skill files. The enable
+    temp lives beside the draft, not inside it, so nothing here is skipped by
+    name.
+    """
     resources: list[str] = []
     for path in sorted(directory.rglob("*")):
         if path.is_symlink() or not path.is_file():
             continue
         relative = path.relative_to(directory).as_posix()
-        if relative == "SKILL.md" or _is_publish_temp(relative):
+        if relative == "SKILL.md":
             continue
         resources.append(relative)
     return resources
@@ -618,8 +619,8 @@ def _manifest_sha256(directory: Path, *, skill_md: bytes | None = None) -> str:
     """Hash a JSON manifest of every file that enable would publish.
 
     ``SKILL.md`` uses ``skill_md`` when that is given, so the preview can hash
-    the notice-stripped bytes before they are written. Temp files such as
-    ``.SKILL.md.enabling`` are left out.
+    the notice-stripped bytes before they are written. Every other file in
+    the directory is included.
     """
     skill_bytes = skill_md if skill_md is not None else (directory / "SKILL.md").read_bytes()
     files = [("SKILL.md", skill_bytes)]
@@ -718,9 +719,10 @@ def rename_without_replace(source: Path, target: Path) -> None:
     """Move the whole ``source`` directory onto ``target`` in one rename.
 
     ``renameat2(RENAME_NOREPLACE)`` refuses an existing destination. When that
-    call is unavailable or returns ``EXDEV``, one ``os.rename`` runs after an
-    existence check. Children are not moved one at a time, so a loader cannot
-    observe ``SKILL.md`` without the rest of the tree.
+    call is unavailable or returns ``EXDEV``, ``os.mkdir`` claims ``target``
+    and one ``os.rename`` moves ``source`` onto that empty directory. Children
+    are not moved one at a time, so a loader cannot observe ``SKILL.md``
+    without the rest of the tree.
     """
     result = _renameat2(source, target, _RENAME_NOREPLACE)
     if result == 0:
@@ -729,44 +731,153 @@ def rename_without_replace(source: Path, target: Path) -> None:
         raise SkillSaveError(f"Skill already exists: {target.name}")
     if result not in {None, errno.EXDEV}:
         raise SkillSaveError("could not enable skill")
-    if target.exists() or target.is_symlink():
-        raise SkillSaveError(f"Skill already exists: {target.name}")
+    try:
+        os.mkdir(target)
+    except FileExistsError as exc:
+        raise SkillSaveError(f"Skill already exists: {target.name}") from exc
+    except OSError as exc:
+        raise SkillSaveError("could not enable skill") from exc
     try:
         os.rename(source, target)
     except OSError as exc:
+        _release_empty_claim(target)
         if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
             raise SkillSaveError(f"Skill already exists: {target.name}") from exc
         raise
 
 
-def _enabling_path(target: Path) -> Path:
-    return target.with_name(f".{target.name}.enabling")
-
-
-def _recover_enabling(target: Path) -> None:
-    """Delete a leftover ``.<name>.enabling`` directory and nothing else.
-
-    A symlink is reported and left in place. The destination directory is
-    never removed, so recovery cannot drop a folder another enable claimed.
-    """
-    temporary = _enabling_path(target)
-    if not temporary.exists() and not temporary.is_symlink():
+def _release_empty_claim(target: Path) -> None:
+    """Remove the empty directory claimed for a rename that did not finish."""
+    try:
+        os.rmdir(target)
+    except OSError:
         return
-    if temporary.is_symlink():
-        raise SkillSaveError(f"enable was interrupted; {temporary.name} must not be a symlink")
-    _discard_tree(temporary)
-    if temporary.exists() or temporary.is_symlink():
-        raise SkillSaveError(f"enable was interrupted; {temporary.name} is still present")
+
+
+def _new_staging_path(target: Path) -> Path:
+    """Return a staging directory no other enable will reuse.
+
+    The pid and a random id are in the directory name. A marker file inside
+    the tree would be copied into the published skill.
+    """
+    return target.with_name(f".{target.name}.enabling.{os.getpid()}.{uuid.uuid4().hex}")
+
+
+def _skill_md_temp(source: Path) -> Path:
+    """Return the ``SKILL.md`` temp written beside the drafts root."""
+    return source.parent / f".{source.name}.SKILL.md.enabling"
+
+
+def _is_enabling_name(name: str, skill: str) -> bool:
+    prefix = f".{skill}.enabling"
+    return name == prefix or name.startswith(f"{prefix}.")
+
+
+def _enabling_pid(name: str, skill: str) -> int | None:
+    """Return the pid encoded in ``.<skill>.enabling.<pid>.<id>``."""
+    prefix = f".{skill}.enabling."
+    if not name.startswith(prefix):
+        return None
+    token = name[len(prefix) :].split(".", 1)[0]
+    if not token.isdigit():
+        return None
+    pid = int(token)
+    if pid <= 0 or str(pid) != token:
+        return None
+    return pid
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return whether ``pid`` is a running process.
+
+    ``PermissionError`` means the process exists and belongs to someone else.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def _should_reap_enabling(path: Path, skill: str) -> bool:
+    """Return whether ``path`` is a stale or dead-pid staging directory."""
+    pid = _enabling_pid(path.name, skill)
+    if pid is not None and not _pid_alive(pid):
+        return True
+    try:
+        modified = path.lstat().st_mtime
+    except OSError:
+        return False
+    return time.time() - modified > _STALE_ENABLING_SECONDS
+
+
+def _unlink_file_or_symlink(path: Path) -> None:
+    """Unlink a file or symlink without following it."""
+    if not path.is_symlink() and not path.is_file():
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SkillSaveError("could not enable skill") from exc
+
+
+def _reap_enabling(path: Path) -> None:
+    """Remove one staging entry. A symlink is unlinked, not followed."""
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        else:
+            return
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SkillSaveError("could not enable skill") from exc
+    if path.exists() or path.is_symlink():
+        raise SkillSaveError(f"enable was interrupted; {path.name} is still present")
+
+
+def _recover_enabling(source: Path, target: Path) -> None:
+    """Remove stale staging directories and a leftover ``SKILL.md`` temp.
+
+    A staging directory is ``.<name>.enabling`` or
+    ``.<name>.enabling.<pid>.<id>``. It is removed only when its mtime is
+    older than ``_STALE_ENABLING_SECONDS`` or the pid in its name is not
+    running. A young directory with a live pid, or with no pid, is left
+    alone. The destination directory is never removed.
+    """
+    _unlink_file_or_symlink(_skill_md_temp(source))
+    parent = target.parent
+    if not parent.is_dir():
+        return
+    try:
+        children = list(parent.iterdir())
+    except OSError as exc:
+        raise SkillSaveError("could not enable skill") from exc
+    for child in children:
+        if child.name == target.name or not _is_enabling_name(child.name, target.name):
+            continue
+        if not _should_reap_enabling(child, target.name):
+            continue
+        _reap_enabling(child)
 
 
 def _rename_exclusive(source: Path, target: Path) -> None:
     """Move ``source`` to ``target`` without replacing an existing path.
 
     ``renameat2(RENAME_NOREPLACE)`` moves the draft in one call. When that
-    call is unavailable or returns ``EXDEV``, the tree is copied to
-    ``.<name>.enabling`` and that directory is renamed onto ``target`` once.
+    call is unavailable or returns ``EXDEV``, the tree is copied to a unique
+    ``.<name>.enabling.<pid>.<id>`` directory and that directory is renamed
+    onto ``target`` once.
     """
-    _recover_enabling(target)
+    _recover_enabling(source, target)
     result = _renameat2(source, target, _RENAME_NOREPLACE)
     if result == 0:
         return
@@ -778,12 +889,14 @@ def _rename_exclusive(source: Path, target: Path) -> None:
 
 
 def _stage_and_rename(source: Path, target: Path) -> None:
-    """Copy ``source`` to ``.<name>.enabling``, then rename that directory once."""
-    temporary = _enabling_path(target)
+    """Copy ``source`` to a unique hidden sibling, then rename that directory once."""
+    temporary = _new_staging_path(target)
     try:
         shutil.copytree(source, temporary, symlinks=False)
         rename_without_replace(temporary, target)
-    except (OSError, SkillSaveError):
+    except FileExistsError as exc:
+        raise SkillSaveError("could not enable skill") from exc
+    except (OSError, shutil.Error, SkillSaveError):
         _discard_tree(temporary)
         raise
     _discard_tree(source)
