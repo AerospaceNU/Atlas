@@ -27,6 +27,7 @@ from atlas.agent.images import (
     MAX_IMAGE_BYTES,
     MAX_REQUEST_IMAGE_BYTES,
     MAX_SOURCE_BYTES,
+    apply_image_budget,
     ingest_image,
     ingest_images,
 )
@@ -219,11 +220,13 @@ def test_image_at_the_byte_limit_is_ingested(
     store = LocalArtifactStore(tmp_path)
     path = tmp_path / "limit.png"
     _save(path, fmt="PNG")
-    monkeypatch.setattr("atlas.agent.images.MAX_IMAGE_BYTES", path.stat().st_size)
+    raw = path.read_bytes()
+    monkeypatch.setattr("atlas.agent.images.MAX_IMAGE_BYTES", len(base64.b64encode(raw)))
 
     image = ingest_image(store, "limit.png")
 
-    assert base64.b64decode(image.data) == path.read_bytes()
+    assert image.data == base64.b64encode(raw).decode("ascii")
+    assert len(image.data) <= len(base64.b64encode(raw))
 
 
 def test_image_over_the_per_image_cap_is_downscaled(
@@ -241,14 +244,35 @@ def test_image_over_the_per_image_cap_is_downscaled(
     monkeypatch.setattr("atlas.agent.images.MAX_IMAGE_BYTES", cap)
 
     image = ingest_image(store, "wide.png")
-    encoded = base64.b64decode(image.data)
 
-    assert len(encoded) <= cap
-    with Image.open(io.BytesIO(encoded)) as reduced:
+    assert len(image.data) <= cap
+    with Image.open(io.BytesIO(base64.b64decode(image.data))) as reduced:
         assert reduced.size[0] < 128
     assert MAX_IMAGE_BYTES == 5 * 1024 * 1024
-    assert MAX_REQUEST_IMAGE_BYTES > MAX_IMAGE_BYTES
+    assert MAX_REQUEST_IMAGE_BYTES == 15 * 1024 * 1024
     assert MAX_SOURCE_BYTES > MAX_IMAGE_BYTES
+
+
+def test_base64_over_the_cap_is_downscaled_when_raw_bytes_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    path = tmp_path / "wide.png"
+    Image.frombytes(
+        "RGB",
+        (128, 128),
+        bytes((index * 17) % 256 for index in range(128 * 128 * 3)),
+    ).save(path)
+    raw = path.read_bytes()
+    cap = len(raw)
+    assert len(base64.b64encode(raw)) > cap
+    monkeypatch.setattr("atlas.agent.images.MAX_IMAGE_BYTES", cap)
+
+    image = ingest_image(store, "wide.png")
+
+    assert len(image.data) <= cap
+    with Image.open(io.BytesIO(base64.b64decode(image.data))) as reduced:
+        assert reduced.size[0] < 128
 
 
 def test_model_sends_image_artifacts_as_data_urls(tmp_path: Path) -> None:
@@ -422,10 +446,9 @@ def test_newer_images_replace_older_ones_in_the_request_budget(
         _save(tmp_path / name, fmt="PNG", color=color)
         paths.append(name)
     images = ingest_images(store, paths)
-    newest_size = len(base64.b64decode(images[2].data))
     monkeypatch.setattr(
         "atlas.agent.images.MAX_REQUEST_IMAGE_BYTES",
-        newest_size + len(base64.b64decode(images[1].data)),
+        len(images[2].data) + len(images[1].data),
     )
     messages = [
         ChatMessage(role=Role.USER, content="old", images=[images[0]]),
@@ -438,16 +461,34 @@ def test_newer_images_replace_older_ones_in_the_request_budget(
     model.complete(messages, [])
 
     assert messages[0].images == []
+    assert messages[0].content == "old\n[image old.png omitted]"
     assert [image.path for image in messages[1].images] == ["mid.png"]
     assert [image.path for image in messages[2].images] == ["new.png"]
     sent = client.calls[0]["json"]["messages"]
-    assert sent[0]["content"] == "old"
+    assert sent[0]["content"] == "old\n[image old.png omitted]"
+    assert "image_url" not in str(sent[0])
     assert "image_url" in str(sent[1]["content"])
     assert "image_url" in str(sent[2]["content"])
     model.complete(messages, [])
     resent = client.calls[1]["json"]["messages"]
-    assert resent[0]["content"] == "old"
-    assert "old.png" not in str(resent)
+    assert resent[0]["content"] == "old\n[image old.png omitted]"
+    assert "image_url" not in str(resent[0])
+
+
+def test_evicted_image_without_text_leaves_only_the_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    _save(tmp_path / "old.png", fmt="PNG", color="red")
+    _save(tmp_path / "new.png", fmt="PNG", color="blue")
+    images = ingest_images(store, ["old.png", "new.png"])
+    monkeypatch.setattr("atlas.agent.images.MAX_REQUEST_IMAGE_BYTES", len(images[1].data))
+    messages = [ChatMessage(role=Role.USER, content=None, images=images)]
+
+    apply_image_budget(messages)
+
+    assert [image.path for image in messages[0].images] == ["new.png"]
+    assert messages[0].content == "[image old.png omitted]"
 
 
 def test_two_tool_images_follow_the_tool_messages(tmp_path: Path) -> None:

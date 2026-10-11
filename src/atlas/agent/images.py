@@ -23,11 +23,12 @@ _FORMAT_MEDIA_TYPES = {
 # comes from Pillow, so a mislabeled file is not sent as the wrong type.
 _IMAGE_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
 
-# Each encoded image stays at or under this size. Larger images are downscaled.
+# Caps are the base64 payload length, not the raw file size. Each image stays
+# at or under this size. Larger images are downscaled.
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
-# Newest images are sent until this request budget is full. Older images are
-# dropped instead of being attached again on the next request.
+# Newest images are sent until this base64 budget is full. Older images are
+# replaced with a placeholder and are not attached again on the next request.
 MAX_REQUEST_IMAGE_BYTES = 15 * 1024 * 1024
 
 # Files above this are refused before they are read. Images between
@@ -52,13 +53,14 @@ def ingest_image(store: LocalArtifactStore, relative_path: str) -> ModelImage:
         relative_path: Image path relative to the write sandbox or the workspace.
 
     Returns:
-        Base64 image bytes, at most ``MAX_IMAGE_BYTES``, with a portable path.
+        Base64 image bytes whose encoded length is at most ``MAX_IMAGE_BYTES``,
+        with a portable path.
 
     Raises:
         ValueError: Pillow cannot read the file, or its format is unsupported.
         FileNotFoundError: The path is not a file in either root.
         SandboxDenied: The path escapes a root, is a hardlink, exceeds
-            ``MAX_SOURCE_BYTES``, or cannot be downscaled to ``MAX_IMAGE_BYTES``.
+            ``MAX_SOURCE_BYTES``, or cannot be downscaled under ``MAX_IMAGE_BYTES``.
     """
     path = store.resolve_read(relative_path)
     if not path.is_file():
@@ -92,10 +94,11 @@ def ingest_images(
 def apply_image_budget(messages: list[ChatMessage]) -> None:
     """Drop older images until the newest ones fit in one request.
 
-    Images are considered from the newest message backward. An image that
-    does not fit replaces nothing newer: it and every older image are removed.
-    Tool messages never carry image parts. The messages are updated in place
-    so a later request does not send the evicted bytes again.
+    Sizes are the base64 payload length. Images are considered from the newest
+    message backward. An image that does not fit, and every older image, is
+    removed. Each removed image leaves ``[image <path> omitted]`` on that
+    message. Tool messages never carry image parts. The messages are updated
+    in place so a later request does not send the evicted bytes again.
     """
     remaining = MAX_REQUEST_IMAGE_BYTES
     chosen: dict[int, list[ModelImage]] = {}
@@ -106,7 +109,7 @@ def apply_image_budget(messages: list[ChatMessage]) -> None:
             continue
         picked: list[ModelImage] = []
         for image in reversed(message.images):
-            size = _encoded_size(image.data)
+            size = len(image.data)
             if size > remaining:
                 stop = True
                 break
@@ -116,10 +119,20 @@ def apply_image_budget(messages: list[ChatMessage]) -> None:
         if stop:
             break
     for index, message in enumerate(messages):
-        if index in chosen:
-            message.images = chosen[index]
-        elif message.images:
-            message.images = []
+        if message.role is Role.TOOL:
+            if message.images:
+                message.images = []
+            continue
+        kept = chosen.get(index)
+        if kept is None:
+            omitted = list(message.images)
+            kept = []
+        else:
+            kept_ids = {id(image) for image in kept}
+            omitted = [image for image in message.images if id(image) not in kept_ids]
+        if omitted:
+            _mark_omitted(message, omitted)
+        message.images = kept
 
 
 def _media_type(fmt: str | None, relative_path: str) -> str:
@@ -133,11 +146,16 @@ def _media_type(fmt: str | None, relative_path: str) -> str:
     )
 
 
+def _base64_len(raw: bytes) -> int:
+    """Return the base64 payload length of ``raw``, without newlines."""
+    return len(base64.b64encode(raw))
+
+
 def _within_cap(path: Path, image: Image.Image, fmt: str, relative_path: str) -> bytes:
-    """Return the original bytes when they already fit, otherwise a smaller encoding."""
+    """Return the original bytes when their base64 form fits, else a smaller encoding."""
     if path.stat().st_size <= MAX_IMAGE_BYTES:
         data = path.read_bytes()
-        if len(data) <= MAX_IMAGE_BYTES:
+        if _base64_len(data) <= MAX_IMAGE_BYTES:
             return data
     return _shrink(image, fmt, relative_path)
 
@@ -146,7 +164,7 @@ def _shrink(image: Image.Image, fmt: str, relative_path: str) -> bytes:
     current = image
     while True:
         encoded = _save_bytes(current, fmt)
-        if len(encoded) <= MAX_IMAGE_BYTES:
+        if _base64_len(encoded) <= MAX_IMAGE_BYTES:
             return encoded
         width, height = current.size
         if width <= 1 or height <= 1:
@@ -166,8 +184,12 @@ def _save_bytes(image: Image.Image, fmt: str) -> bytes:
     return buffer.getvalue()
 
 
-def _encoded_size(data: str) -> int:
-    return len(base64.b64decode(data))
+def _mark_omitted(message: ChatMessage, omitted: list[ModelImage]) -> None:
+    note = "\n".join(f"[image {image.path} omitted]" for image in omitted)
+    if message.content:
+        message.content = f"{message.content}\n{note}"
+    else:
+        message.content = note
 
 
 def _portable_path(store: LocalArtifactStore, resolved: Path) -> str:
