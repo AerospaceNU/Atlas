@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 import atlas.agent.skill_author as skill_author
 from atlas.agent.artifacts import LocalArtifactStore
@@ -623,19 +624,15 @@ def test_author_skill_tool_writes_a_draft_not_a_live_skill(
     assert body == "Subtract the later scene from the earlier one."
 
 
-def test_author_skill_tool_has_no_overwrite_or_user_scope(tmp_path: Path) -> None:
+def test_author_skill_tool_rejects_extra_fields(tmp_path: Path) -> None:
     assert set(AuthorSkillInput.model_fields) == {"name", "description", "body"}
     store, workspace = _project_store(tmp_path)
-    tool = AuthorSkillTool()
-    tool.run(_tool_arguments(), store)
-    draft = workspace / ".atlas" / "skills-drafts" / "ndvi-change" / "SKILL.md"
-    original = draft.read_text(encoding="utf-8")
 
-    with pytest.raises(ValueError, match="already exists"):
-        tool.run(_tool_arguments(body="changed", overwrite=True, scope="user"), store)
+    with pytest.raises(ValidationError, match="overwrite"):
+        AuthorSkillTool().run(_tool_arguments(overwrite=True, scope="user"), store)
 
-    assert draft.read_text(encoding="utf-8") == original
-    assert not (workspace / ".atlas" / "skills" / "ndvi-change").exists()
+    assert not (workspace / ".atlas" / "skills-drafts").exists()
+    assert not (workspace / ".atlas" / "skills").exists()
 
 
 def test_author_skill_tool_refuses_a_drafts_symlink_to_live_skills(tmp_path: Path) -> None:

@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
@@ -33,8 +33,10 @@ class AuthorSkillInput(BaseModel):
 
     ``name``, ``description``, and ``body`` are the Agent Skill fields. The
     tool writes ``<workspace>/.atlas/skills-drafts/<name>`` and does not
-    enable or overwrite a skill.
+    enable or overwrite a skill. Unknown fields are rejected.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str = Field(description="Skill name. Lowercase letters, digits, and hyphens.")
     description: str = Field(description="What the skill does and when to use it.")
