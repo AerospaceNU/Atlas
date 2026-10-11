@@ -10,8 +10,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
+from pydantic import ValidationError
+
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import CatalogModel, ChatMessage, Role, default_registry
+from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
 from atlas.agent.layout import (
     AtlasPathError,
     ensure_project_layout,
@@ -40,7 +42,8 @@ from atlas.agent.runtime import (
     load_max_tool_calls,
     load_model,
 )
-from atlas.agent.skills import load_skills, register_skill_tool
+from atlas.agent.skill_author import normalize_skill_name
+from atlas.agent.skills import Skill, load_skills, register_skill_tool
 
 _REDACTED = "***"
 
@@ -62,6 +65,7 @@ class AgentSession:
         self.secrets: list[str] = []
         self.model_id = ""
         self.catalog: list[CatalogModel] = []
+        self.active_skills: list[str] = []
         self.totals = SessionTotals()
         self.fetch_models: Callable[[], list[CatalogModel]] | None = None
         config = getattr(agent.model, "config", None)
@@ -110,12 +114,15 @@ class AgentSession:
     def start_fresh(self) -> None:
         """Start a new conversation without reopening the process.
 
-        History and running totals return to their initial state. The current
-        model id and context window are kept, and writes move to a new session
-        artifact directory inside the same workspace. Reads keep the previous
-        read root, so this never widens write access to the workspace.
+        History and running totals return to their initial state. A skill
+        applied during this conversation leaves with that history. The skill
+        catalog on the system prompt stays. The current model id and context
+        window are kept, and writes move to a new session artifact directory
+        inside the same workspace. Reads keep the previous read root, so this
+        never widens write access to the workspace.
         """
         self.messages = [ChatMessage(role=Role.SYSTEM, content=self.agent.system_prompt())]
+        self.active_skills = []
         self.stopped_for_limit = False
         self.totals = SessionTotals(
             model=self.model_id or self.totals.model,
@@ -127,6 +134,55 @@ class AgentSession:
         artifact_root = project_atlas_root(self.workspace) / "artifacts" / session_id
         read_root = self.agent.artifacts.read_root
         self.agent.artifacts = LocalArtifactStore(artifact_root, read_root=read_root)
+
+    def use_skill(self, name: str, argument: str | None = None) -> Skill:
+        """Apply a named skill for later turns in this conversation.
+
+        The name is looked up in the catalog loaded at session start
+        (``self.agent.skills``). A skill written after that catalog was built
+        is not available. The first activation re-reads the file and refuses
+        it when the bytes changed, then appends the tool text as a user
+        message. A later activation of the same skill appends only a new
+        ``Argument:`` line. The system prompt stays the catalog.
+
+        Args:
+            name: Skill name from the catalog, matched with
+                :func:`atlas.agent.skill_author.normalize_skill_name`.
+            argument: Optional text from the user, kept outside the skill body.
+
+        Returns:
+            The skill that was activated.
+
+        Raises:
+            ValueError: ``name`` is empty, fails
+                :func:`atlas.agent.skill_author.normalize_skill_name`, the
+                file changed, or it cannot be parsed.
+            FileNotFoundError: No skill with that name is in the catalog.
+        """
+        cleaned = name.strip()
+        if not cleaned:
+            raise ValueError("skill name must be a non-empty string")
+        requested, errors = normalize_skill_name(cleaned)
+        if requested is None or errors:
+            raise ValueError("; ".join(errors))
+        skills = list(self.agent.skills)
+        skill = next((item for item in skills if item.name == requested), None)
+        if skill is None:
+            raise FileNotFoundError(f"Skill {requested} is missing")
+        extra = argument.strip() if isinstance(argument, str) else ""
+        if skill.name in self.active_skills:
+            if extra:
+                self.messages.append(ChatMessage(role=Role.USER, content=f"Argument: {extra}"))
+            return skill
+        registry = ToolRegistry()
+        register_skill_tool(registry, skills)
+        result = registry.execute("use_skill", {"name": requested}, self.agent.artifacts)
+        content = result.text
+        if extra:
+            content = f"{content}\n\nArgument: {extra}"
+        self.messages.append(ChatMessage(role=Role.USER, content=content))
+        self.active_skills.append(skill.name)
+        return skill
 
     def _require_key(self) -> None:
         if self.requires_api_key and not (self.active_key and self.active_key.strip()):
@@ -213,6 +269,9 @@ def serve(
         if kind == "new":
             _handle_new(session, stdout)
             continue
+        if kind == "skill":
+            _handle_skill(session, stdout, message)
+            continue
         if kind == "models":
             _handle_models(session, stdout)
             continue
@@ -292,6 +351,49 @@ def _handle_new(session: AgentSession, stdout: IO[str]) -> None:
     """Start a fresh conversation and report the reset status."""
     session.start_fresh()
     _write_line(stdout, _ready_event(session), session.secrets)
+
+
+def _handle_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
+    """Apply a named skill without calling the model."""
+    name = message.get("name")
+    argument = message.get("argument")
+    if not isinstance(name, str) or not name.strip():
+        _write_line(
+            stdout,
+            {"type": "error", "message": "skill name must be a non-empty string"},
+            session.secrets,
+        )
+        return
+    if argument is not None and not isinstance(argument, str):
+        _write_line(
+            stdout,
+            {"type": "error", "message": "skill argument must be a string"},
+            session.secrets,
+        )
+        return
+    try:
+        skill = session.use_skill(name, argument if isinstance(argument, str) else None)
+    except OSError:
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"Skill {name.strip()} could not be read"},
+            session.secrets,
+        )
+        return
+    except (ValueError, ValidationError, KeyError) as exc:
+        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
+        return
+    _write_line(
+        stdout,
+        {
+            "type": "skill",
+            "name": skill.name,
+            "description": skill.description,
+            "location": skill.directory,
+            "active": list(session.active_skills),
+        },
+        session.secrets,
+    )
 
 
 def _handle_models(session: AgentSession, stdout: IO[str]) -> None:

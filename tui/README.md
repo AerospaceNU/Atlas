@@ -38,7 +38,9 @@ when that file is missing, with `model` set to `deepseek/deepseek-v4.1-flash`.
 
 Keys: `enter` sends the input line, `ctrl-r` resumes a turn that stopped at the
 tool-call limit, `ctrl-c` / `esc` quits. `PageUp` / `PageDown` scroll. `/new`
-starts a fresh conversation and clears the transcript.
+starts a fresh conversation and clears the transcript. `/skill <name>` applies
+a workspace skill for the rest of this conversation. The `.atlas` copy wins
+over `.agents` when both exist.
 
 ## Adding a tool
 
