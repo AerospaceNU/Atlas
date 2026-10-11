@@ -166,6 +166,11 @@ class ToolRegistry:
             raise ValueError(f"Tool already registered: {tool.name}")
         self._tools[tool.name] = tool
 
+    # ATLAS-90. register() still refuses a duplicate. This only swaps one name.
+    def replace(self, tool: Tool) -> None:
+        """Register ``tool``, replacing any tool already stored under its name."""
+        self._tools[tool.name] = tool
+
     @property
     def definitions(self) -> list[ToolDefinition]:
         return [tool.definition() for tool in self._tools.values()]

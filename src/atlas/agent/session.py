@@ -10,6 +10,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
+from atlas.agent.analysis_skill import (
+    AnalysisStep,
+    AnalysisTurn,
+    FinishedAnalysis,
+    SavedSkill,
+    SkillPreview,
+    SkillSaveError,
+    enable_command,
+    enable_skill,
+    preview_skill,
+    save_skill,
+    skill_slug,
+    successful_steps,
+)
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import CatalogModel, ChatMessage, Role, default_registry
 from atlas.agent.layout import (
@@ -40,7 +54,7 @@ from atlas.agent.runtime import (
     load_max_tool_calls,
     load_model,
 )
-from atlas.agent.skills import load_skills, register_skill_tool
+from atlas.agent.skills import UseSkillTool, load_skill_directory, load_skills, register_skill_tool
 
 _REDACTED = "***"
 
@@ -70,6 +84,13 @@ class AgentSession:
             self.totals.model = self.model_id
             key = str(getattr(config, "api_key", "") or "").strip()
             self.active_key = key or None
+        self.skill_catalog_note = ""
+        self._skill_previews: dict[tuple[str, str], str] = {}
+        self._analysis_turns: list[AnalysisTurn] = []
+        self._analysis_open = False
+        self._analysis_request = ""
+        self._analysis_steps: list[AnalysisStep] = []
+        self._analysis_response = ""
 
     def turn(
         self,
@@ -81,12 +102,14 @@ class AgentSession:
     ) -> AgentRun:
         """Append the user message and advance the shared history one turn."""
         self._require_key()
+        self._begin_analysis(request)
         self.messages.append(ChatMessage(role=Role.USER, content=request))
         run = self.agent.advance(
             self.messages, on_step=on_step, on_phase=on_phase, on_thought=on_thought
         )
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
+        self._capture_analysis(run)
         return run
 
     def resume(
@@ -105,6 +128,7 @@ class AgentSession:
         )
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
+        self._capture_analysis(run)
         return run
 
     def start_fresh(self) -> None:
@@ -117,6 +141,7 @@ class AgentSession:
         """
         self.messages = [ChatMessage(role=Role.SYSTEM, content=self.agent.system_prompt())]
         self.stopped_for_limit = False
+        self._clear_analysis()
         self.totals = SessionTotals(
             model=self.model_id or self.totals.model,
             context_limit=self.totals.context_limit,
@@ -135,6 +160,121 @@ class AgentSession:
     def _note(self, run: AgentRun) -> None:
         for call in run.calls:
             apply_call(self.totals, call)
+
+    def save_finished_skill(
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        replace: bool = False,
+        scope: str = "project",
+    ) -> SavedSkill:
+        """Save the finished analysis as a draft in the shared drafts directory."""
+        if self._analysis_open:
+            raise SkillSaveError("analysis is not finished")
+        if not self._analysis_turns:
+            raise SkillSaveError("no finished analysis to save")
+        if self.workspace is None:
+            raise SkillSaveError("project scope needs a workspace")
+        return save_skill(
+            self.workspace,
+            FinishedAnalysis(turns=list(self._analysis_turns)),
+            name,
+            description=description,
+            replace=replace,
+            secrets=self.secrets,
+            scope=scope,
+            home=self.home,
+        )
+
+    def preview_saved_skill(self, name: str, *, scope: str = "project") -> SkillPreview:
+        """Show a draft's description and body hash without promoting it."""
+        self._require_user_skills(scope)
+        if self.workspace is None:
+            raise SkillSaveError("project scope needs a workspace")
+        preview = preview_skill(self.workspace, name, scope=scope, home=self.home)
+        self._skill_previews[(preview.name, scope)] = preview.content_sha256
+        return preview
+
+    def enable_saved_skill(
+        self,
+        name: str,
+        expected_sha256: str,
+        *,
+        scope: str = "project",
+    ) -> SavedSkill:
+        """Move a previewed draft into the live skills directory.
+
+        ``expected_sha256`` is the digest from :meth:`preview_saved_skill`, or
+        its first eight hex characters. Enabling without that preview is refused.
+        """
+        self._require_user_skills(scope)
+        if self.workspace is None:
+            raise SkillSaveError("project scope needs a workspace")
+        slug = skill_slug(name)
+        full_hash = self._expected_preview_hash(slug, scope, expected_sha256)
+        saved = enable_skill(
+            self.workspace,
+            slug,
+            full_hash,
+            scope=scope,
+            home=self.home,
+        )
+        self._skill_previews.pop((saved.name, scope), None)
+        self.skill_catalog_note = _add_enabled_skill(self, saved.name, scope)
+        return saved
+
+    def _expected_preview_hash(self, name: str, scope: str, presented: str) -> str:
+        stored = self._skill_previews.get((name, scope))
+        if stored is None:
+            raise SkillSaveError("enable needs a preview")
+        token = presented.strip().lower()
+        if token != stored and not (len(token) == 8 and stored.startswith(token)):
+            raise SkillSaveError("skill hash does not match the preview")
+        return stored
+
+    def _require_user_skills(self, scope: str) -> None:
+        if scope != "user":
+            return
+        if self.workspace is None or not load_home_skills_enabled(self.workspace):
+            raise SkillSaveError(
+                "home skills are off; set ATLAS_HOME_SKILLS or home_skills = true "
+                "in ~/.atlas/config.toml"
+            )
+
+    def _begin_analysis(self, request: str) -> None:
+        # A turn that stopped for the tool-call limit is not finished.
+        # Starting another turn drops it instead of recording it.
+        self._analysis_open = True
+        self._analysis_request = request
+        self._analysis_steps = []
+        self._analysis_response = ""
+
+    def _capture_analysis(self, run: AgentRun) -> None:
+        if not self._analysis_open:
+            return
+        self._analysis_steps.extend(successful_steps(run))
+        self._analysis_response = run.response
+        if run.stopped_for_limit:
+            return
+        self._analysis_turns.append(
+            AnalysisTurn(
+                request=self._analysis_request,
+                response=self._analysis_response,
+                steps=list(self._analysis_steps),
+            )
+        )
+        self._analysis_open = False
+        self._analysis_request = ""
+        self._analysis_steps = []
+        self._analysis_response = ""
+
+    def _clear_analysis(self) -> None:
+        self._analysis_turns = []
+        self._analysis_open = False
+        self._analysis_request = ""
+        self._analysis_steps = []
+        self._analysis_response = ""
 
 
 def _write_line(stdout: IO[str], payload: dict[str, Any], secrets: list[str]) -> None:
@@ -227,6 +367,12 @@ def serve(
             continue
         if kind == "remove":
             _handle_remove(session, stdout, message)
+            continue
+        if kind == "save_skill":
+            _handle_save_skill(session, stdout, message)
+            continue
+        if kind == "enable_skill":
+            _handle_enable_skill(session, stdout, message)
             continue
         _write_line(
             stdout,
@@ -435,6 +581,149 @@ def _handle_remove(session: AgentSession, stdout: IO[str], message: dict[str, An
         {"type": "removed", "scope": message.get("scope"), "kind": kind, "name": name},
         session.secrets,
     )
+
+
+def _handle_save_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
+    name = message.get("name")
+    if not isinstance(name, str) or not name.strip():
+        _write_line(
+            stdout, {"type": "error", "message": "save_skill needs a name"}, session.secrets
+        )
+        return
+    description = message.get("description")
+    if description is not None and not isinstance(description, str):
+        _write_line(
+            stdout,
+            {"type": "error", "message": "description must be a string"},
+            session.secrets,
+        )
+        return
+    try:
+        scope = _skill_scope(message.get("scope"))
+        saved = session.save_finished_skill(
+            name,
+            description=description,
+            replace=message.get("replace") is True,
+            scope=scope,
+        )
+    except (SkillSaveError, AtlasPathError) as exc:
+        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
+        return
+    _write_line(
+        stdout,
+        {
+            "type": "saved_skill",
+            "name": saved.name,
+            "description": saved.description,
+            "scope": scope,
+            "path": saved.path,
+            "enabled": saved.enabled,
+            "enable": enable_command(saved.name),
+            "note": saved.note,
+        },
+        session.secrets,
+    )
+
+
+def _handle_enable_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
+    name = message.get("name")
+    if not isinstance(name, str) or not name.strip():
+        _write_line(
+            stdout, {"type": "error", "message": "enable_skill needs a name"}, session.secrets
+        )
+        return
+    try:
+        scope = _skill_scope(message.get("scope"))
+        if message.get("confirm") is not True:
+            preview = session.preview_saved_skill(name, scope=scope)
+            _write_line(
+                stdout,
+                {
+                    "type": "enable_preview",
+                    "name": preview.name,
+                    "description": preview.description,
+                    "scope": scope,
+                    "path": preview.path,
+                    "content_sha256": preview.content_sha256,
+                    "body": preview.body,
+                    "body_characters": preview.body_characters,
+                    "body_lines": preview.body_lines,
+                    "resources": [item.model_dump() for item in preview.resources],
+                    "confirm": preview.confirm,
+                },
+                session.secrets,
+            )
+            return
+        expected = message.get("expected_sha256")
+        if not isinstance(expected, str) or not expected.strip():
+            raise SkillSaveError("enable needs a preview")
+        saved = session.enable_saved_skill(name, expected, scope=scope)
+        catalog = session.skill_catalog_note
+    except OSError:
+        _write_line(stdout, {"type": "error", "message": "could not enable skill"}, session.secrets)
+        return
+    except (SkillSaveError, AtlasPathError) as exc:
+        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
+        return
+    _write_line(
+        stdout,
+        {
+            "type": "enabled_skill",
+            "name": saved.name,
+            "description": saved.description,
+            "scope": scope,
+            "path": saved.path,
+            "enabled": saved.enabled,
+            "catalog": catalog,
+        },
+        session.secrets,
+    )
+
+
+def _skill_scope(scope: object) -> str:
+    if scope is None:
+        return "project"
+    if scope in {"project", "user"}:
+        return str(scope)
+    raise SkillSaveError("scope must be project or user")
+
+
+def _add_enabled_skill(session: AgentSession, name: str, scope: str) -> str:
+    """Add ``name`` to the live catalog without rehashing skills already loaded."""
+    restart = "Restart Atlas to load this skill."
+    workspace = session.workspace
+    if workspace is None:
+        return restart
+    if scope == "user":
+        if session.home is None or not load_home_skills_enabled(workspace):
+            return restart
+        base = session.home
+        label = "~/"
+    else:
+        base = workspace
+        label = ""
+    try:
+        skill = load_skill_directory(
+            base,
+            f".atlas/skills/{name}",
+            label_prefix=label,
+            artifact_root=project_atlas_root(workspace) / "artifacts",
+        )
+    except OSError:
+        return restart
+    if skill is None:
+        return restart
+    skills = [item for item in session.agent.skills if item.name != skill.name]
+    skills.append(skill)
+    skills.sort(key=lambda item: item.name)
+    session.agent.skills = skills
+    session.agent.tools.replace(UseSkillTool(skills))
+    if session.messages and session.messages[0].role == Role.SYSTEM:
+        session.messages[0] = ChatMessage(
+            role=Role.SYSTEM,
+            content=session.agent.system_prompt(),
+        )
+    return "The skill catalog was reloaded."
 
 
 def _install_key(session: AgentSession, key: str) -> None:

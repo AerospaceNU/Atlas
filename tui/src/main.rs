@@ -199,6 +199,8 @@ struct App {
     tool_hits: Vec<ToolHit>,
     /// Last positive output rate from the session, in tokens per second.
     tokens_per_second: f64,
+    /// Name and full SHA-256 of the draft preview currently on screen.
+    preview_sha: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -387,6 +389,7 @@ impl App {
             reveal_selected: false,
             tool_hits: Vec::new(),
             tokens_per_second: 0.0,
+            preview_sha: None,
         }
     }
 
@@ -540,6 +543,83 @@ impl App {
                 self.mode = Mode::Compose;
                 self.transcript
                     .push(tool_note(format!("removed {scope} {kind} {name}")));
+            }
+            ServerMessage::SaveSkill {
+                name,
+                path,
+                enable,
+                note,
+                ..
+            } => {
+                self.transcript
+                    .push(tool_note(format!("saved skill {name} ({path})")));
+                if !enable.is_empty() {
+                    self.transcript.push(tool_note(enable));
+                }
+                if !note.is_empty() {
+                    self.transcript.push(tool_note(note));
+                }
+            }
+            ServerMessage::EnablePreview {
+                name,
+                description,
+                path,
+                content_sha256,
+                body,
+                body_characters,
+                body_lines,
+                resources,
+                confirm,
+            } => {
+                self.preview_sha = Some((name.clone(), content_sha256.clone()));
+                self.transcript
+                    .push(tool_note(format!("draft {name}: {description}")));
+                if !path.is_empty() {
+                    self.transcript.push(tool_note(path));
+                }
+                if !content_sha256.is_empty() {
+                    self.transcript
+                        .push(tool_note(format!("sha256 {content_sha256}")));
+                }
+                self.transcript.push(tool_note(format!(
+                    "{body_characters} characters, {body_lines} lines"
+                )));
+                if resources.is_empty() {
+                    self.transcript.push(tool_note("resources: (none)"));
+                } else {
+                    self.transcript.push(tool_note("resources:"));
+                    for resource in resources {
+                        let mut line = format!(
+                            "{} sha256 {} ({} characters, {} lines)",
+                            resource.path, resource.sha256, resource.characters, resource.lines
+                        );
+                        if !resource.omitted.is_empty() {
+                            line.push_str(&format!(", {}", resource.omitted));
+                        }
+                        self.transcript.push(tool_note(line));
+                        if !resource.text.is_empty() {
+                            self.transcript.push(tool_note(resource.text));
+                        }
+                    }
+                }
+                if !body.is_empty() {
+                    self.transcript.push(tool_note(body));
+                }
+                if !confirm.is_empty() {
+                    self.transcript.push(tool_note(confirm));
+                }
+            }
+            ServerMessage::EnabledSkill {
+                name,
+                path,
+                catalog,
+                ..
+            } => {
+                let mut note = format!("enabled skill {name} ({path})");
+                if !catalog.is_empty() {
+                    note.push_str(&format!(". {catalog}"));
+                }
+                self.transcript.push(tool_note(note));
             }
             ServerMessage::Unknown => {}
         }
@@ -1335,6 +1415,51 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
             "scope": app.scope_root,
             "kind": "artifacts"
         })),
+        "/save-skill" => {
+            let name = parts.next().unwrap_or("");
+            if name.is_empty() || parts.next().is_some() {
+                app.transcript
+                    .push(tool_note("usage: /save-skill <name>"));
+                None
+            } else {
+                Some(serde_json::json!({
+                    "type": "save_skill",
+                    "name": name,
+                    "scope": app.scope_root
+                }))
+            }
+        }
+        "/enable-skill" => {
+            let name = parts.next().unwrap_or("");
+            let extra = parts.next();
+            let sha = parts.next();
+            if name.is_empty()
+                || extra.is_some_and(|word| word != "confirm")
+                || (extra == Some("confirm") && !sha.is_some_and(is_sha8))
+                || parts.next().is_some()
+            {
+                app.transcript.push(tool_note(
+                    "usage: /enable-skill <name> | /enable-skill <name> confirm <sha8>",
+                ));
+                None
+            } else if extra == Some("confirm") {
+                let typed = sha.unwrap_or("");
+                Some(serde_json::json!({
+                    "type": "enable_skill",
+                    "name": name,
+                    "scope": app.scope_root,
+                    "confirm": true,
+                    "expected_sha256": confirmed_sha256(app, name, typed)
+                }))
+            } else {
+                Some(serde_json::json!({
+                    "type": "enable_skill",
+                    "name": name,
+                    "scope": app.scope_root,
+                    "confirm": false
+                }))
+            }
+        }
         _ => {
             app.transcript
                 .push(tool_note(format!("unknown command {command}")));
@@ -1344,6 +1469,8 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
 }
 
 const PICKER_PAGE: usize = 8;
+/// Slash commands stay on one page so a new command is not clipped off `/`.
+const MENU_PAGE: usize = 12;
 
 /// Slice of the filtered catalog that stays on screen around `index`.
 fn picker_window(len: usize, index: usize, page: usize) -> std::ops::Range<usize> {
@@ -1367,7 +1494,7 @@ struct MenuItem {
 /// Command or fixed-argument options that match `text`, or an empty list when
 /// the menu should stay hidden (free text after a finished command).
 fn menu_options(text: &str) -> Vec<MenuItem> {
-    const COMMANDS: [MenuItem; 8] = [
+    const COMMANDS: [MenuItem; 10] = [
         MenuItem {
             token: "/new",
             description: "Start a fresh conversation",
@@ -1399,6 +1526,14 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
         MenuItem {
             token: "/exit",
             description: "Quit Atlas",
+        },
+        MenuItem {
+            token: "/save-skill",
+            description: "Save the finished analysis as a skill",
+        },
+        MenuItem {
+            token: "/enable-skill",
+            description: "Enable a saved skill draft",
         },
     ];
     const KEY_ARGS: [MenuItem; 2] = [
@@ -1434,7 +1569,7 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
 
     match command {
         "/model" => Vec::new(),
-        "/sessions" | "/artifacts" => Vec::new(),
+        "/sessions" | "/artifacts" | "/save-skill" | "/enable-skill" => Vec::new(),
         "/key" => {
             if rest.len() > 1 {
                 Vec::new()
@@ -1537,6 +1672,19 @@ fn menu_action(text: &str, index: usize, run: bool) -> MenuAction {
 }
 
 /// Commands `slash_outcome` accepts without showing a usage error.
+fn is_sha8(token: &str) -> bool {
+    token.len() == 8 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn confirmed_sha256(app: &App, name: &str, sha8: &str) -> String {
+    if let Some((shown_name, full)) = &app.preview_sha {
+        if shown_name == name && full.starts_with(sha8) {
+            return full.clone();
+        }
+    }
+    sha8.to_string()
+}
+
 fn is_finished_command(text: &str) -> bool {
     let trimmed = text.trim_end();
     if matches!(
@@ -1550,6 +1698,15 @@ fn is_finished_command(text: &str) -> bool {
     match command {
         "/model" => text.starts_with("/model"),
         "/key" => matches!(words.next(), Some("session") | Some("user")),
+        "/save-skill" => words.next().is_some() && words.next().is_none(),
+        "/enable-skill" => match words.next() {
+            Some(_) => match words.next() {
+                None => true,
+                Some("confirm") => words.next().is_some_and(is_sha8) && words.next().is_none(),
+                Some(_) => false,
+            },
+            None => false,
+        },
         _ => false,
     }
 }
@@ -1562,7 +1719,7 @@ fn menu_rows(app: &App) -> u16 {
     if options.is_empty() {
         return 0;
     }
-    let count = options.len().clamp(1, PICKER_PAGE) as u16;
+    let count = options.len().clamp(1, MENU_PAGE) as u16;
     count.saturating_add(1)
 }
 
@@ -1572,7 +1729,7 @@ fn render_menu(frame: &mut Frame, app: &App, area: Rect) {
         MENU_HEADER,
         Style::default().fg(GRAY).bg(BG_BASE),
     ))];
-    let window = picker_window(options.len(), app.menu_index, PICKER_PAGE);
+    let window = picker_window(options.len(), app.menu_index, MENU_PAGE);
     for (index, option) in options
         .iter()
         .enumerate()
@@ -2450,7 +2607,7 @@ mod tests {
         TranscriptLine,
     };
     use crate::logo::logo_size;
-    use crate::protocol::{CatalogEntry, ServerMessage, StatusSnapshot};
+    use crate::protocol::{CatalogEntry, ResourcePreview, ServerMessage, StatusSnapshot};
 
     fn tool_text(app: &App) -> String {
         app.transcript
@@ -2687,6 +2844,115 @@ mod tests {
     }
 
     #[test]
+    fn save_skill_command_saves_the_finished_analysis() {
+        let mut app = App::new();
+        assert!(slash_outcome(&mut app, "/save-skill").is_none());
+        assert!(tool_text(&app).contains("usage: /save-skill <name>"));
+
+        let payload = slash_outcome(&mut app, "/save-skill coast-check").expect("save request");
+        assert_eq!(payload["type"], "save_skill");
+        assert_eq!(payload["name"], "coast-check");
+        assert_eq!(payload["scope"], "project");
+        assert!(is_finished_command("/save-skill coast-check"));
+        assert!(!is_finished_command("/save-skill"));
+        assert!(!is_finished_command("/save-skill coast extra"));
+
+        assert!(slash_outcome(&mut app, "/enable-skill").is_none());
+        assert!(tool_text(&app).contains("usage: /enable-skill <name>"));
+        let enable = slash_outcome(&mut app, "/enable-skill coast-check").expect("enable");
+        assert_eq!(enable["type"], "enable_skill");
+        assert_eq!(enable["name"], "coast-check");
+        assert!(is_finished_command("/enable-skill coast-check"));
+        assert!(!is_finished_command("/enable-skill"));
+        assert!(!enable["confirm"].as_bool().unwrap());
+        assert!(slash_outcome(&mut app, "/enable-skill coast-check confirm").is_none());
+        assert!(!is_finished_command("/enable-skill coast-check confirm"));
+        app.preview_sha = Some((
+            "coast-check".to_string(),
+            "abcd1234ffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
+        ));
+        let confirmed =
+            slash_outcome(&mut app, "/enable-skill coast-check confirm abcd1234").expect("confirm");
+        assert_eq!(confirmed["type"], "enable_skill");
+        assert_eq!(confirmed["name"], "coast-check");
+        assert!(confirmed["confirm"].as_bool().unwrap());
+        assert_eq!(
+            confirmed["expected_sha256"],
+            "abcd1234ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert!(is_finished_command("/enable-skill coast-check confirm abcd1234"));
+        let mismatched =
+            slash_outcome(&mut app, "/enable-skill coast-check confirm 00000000").expect("mismatch");
+        assert_eq!(mismatched["expected_sha256"], "00000000");
+        assert!(!is_finished_command("/enable-skill coast-check confirm"));
+        assert!(!is_finished_command("/enable-skill coast-check confirm abcd"));
+        assert!(!is_finished_command(
+            "/enable-skill coast-check confirm abcd1234 extra"
+        ));
+    }
+
+    #[test]
+    fn slash_commands_leave_skill_to_the_other_branch() {
+        let options = menu_options("/");
+        let tokens: Vec<&str> = options.iter().map(|item| item.token).collect();
+        assert!(!tokens.contains(&"/skill"));
+        let key = tokens.iter().position(|token| *token == "/key").unwrap();
+        let sessions = tokens.iter().position(|token| *token == "/sessions").unwrap();
+        assert_eq!(sessions, key + 1);
+        assert!(tokens.ends_with(&["/save-skill", "/enable-skill"]));
+    }
+
+    #[test]
+    fn saving_a_skill_prints_the_enable_command() {
+        let mut app = App::new();
+        app.apply(ServerMessage::SaveSkill {
+            name: "coast-check".to_string(),
+            description: "compare the coast".to_string(),
+            scope: "project".to_string(),
+            path: ".atlas/skills-drafts/coast-check/SKILL.md".to_string(),
+            enabled: false,
+            enable: "/enable-skill coast-check".to_string(),
+            note: "replace=True overwrites a draft of the same name, including one written by the author_skill tool.".to_string(),
+        });
+        let notes = tool_text(&app);
+        assert!(notes.contains("saved skill coast-check"));
+        assert!(notes.contains("/enable-skill coast-check"));
+        assert!(notes.contains("replace=True"));
+        assert!(notes.contains("author_skill"));
+        app.apply(ServerMessage::EnablePreview {
+            name: "coast-check".to_string(),
+            description: "compare the coast".to_string(),
+            path: ".atlas/skills-drafts/coast-check/SKILL.md".to_string(),
+            content_sha256: "abcd1234".to_string(),
+            body: "Replay this procedure".to_string(),
+            body_characters: 21,
+            body_lines: 1,
+            resources: vec![ResourcePreview {
+                path: "scripts/run.py".to_string(),
+                sha256: "abc".to_string(),
+                characters: 9,
+                lines: 1,
+                text: "print(1)\n".to_string(),
+                omitted: String::new(),
+            }],
+            confirm: "/enable-skill coast-check confirm abcd1234".to_string(),
+        });
+        let preview = tool_text(&app);
+        assert!(preview.contains("draft coast-check: compare the coast"));
+        assert!(preview.contains(".atlas/skills-drafts/coast-check/SKILL.md"));
+        assert!(preview.contains("sha256 abcd1234"));
+        assert!(preview.contains("21 characters, 1 lines"));
+        assert!(preview.contains("resources:"));
+        assert!(preview.contains("scripts/run.py sha256 abc"));
+        assert!(preview.contains("print(1)"));
+        assert!(preview.contains("Replay this procedure"));
+        assert!(preview.contains("/enable-skill coast-check confirm abcd1234"));
+        let sent = slash_outcome(&mut app, "/enable-skill coast-check confirm abcd1234")
+            .expect("sends the shown hash");
+        assert_eq!(sent["expected_sha256"], "abcd1234");
+    }
+
+    #[test]
     fn slash_menu_lists_every_command() {
         let mut app = App::new();
         app.input = "/".to_string();
@@ -2700,6 +2966,8 @@ mod tests {
             "/artifacts",
             "/quit",
             "/exit",
+            "/save-skill",
+            "/enable-skill",
         ] {
             assert!(painted.contains(name), "missing {name} in:\n{painted}");
         }
