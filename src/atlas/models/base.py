@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,10 @@ class PluginInput(BaseModel):
     kind: str
     shape: list[int]
     dtype: str
+    sizes: list[int] = Field(
+        default_factory=list,
+        description="Allowed square tile sizes. Empty means any spatial size.",
+    )
 
 
 class PluginOutput(BaseModel):
@@ -38,8 +43,9 @@ class PluginSpec(BaseModel):
     name: str
     description: str
     runtime: str
-    weight: str
+    weight: str = ""
     sha256: str = ""
+    rule: str = ""
     input: PluginInput
     output: PluginOutput
 
@@ -101,6 +107,38 @@ def read_weight_bytes(spec: PluginSpec) -> bytes:
     return data
 
 
+def replace_weight_bytes(destination: Path, data: bytes) -> None:
+    """Atomically replace ``destination`` with ``data``.
+
+    The bytes land in a temporary file in the same directory, then
+    ``os.replace`` moves that file onto ``destination``. A symlink at
+    ``destination`` is refused so the write cannot follow it.
+
+    Args:
+        destination: Weight file to publish.
+        data: Exact bytes that should be stored there.
+
+    Raises:
+        ValueError: If ``destination`` is a symlink.
+    """
+    if destination.is_symlink():
+        raise ValueError("Refusing to replace a symlink weight file")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp, destination)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def load_centroids(spec: PluginSpec) -> dict[str, tuple[float, float, float]]:
     """Load per-class RGB centroids from the exported weight JSON."""
     payload: dict[str, Any] = json.loads(read_weight_bytes(spec).decode("utf-8"))
@@ -117,6 +155,108 @@ def load_centroids(spec: PluginSpec) -> dict[str, tuple[float, float, float]]:
             raise ValueError(f"Centroid {name} must be an RGB triple")
         centroids[name] = (float(rgb[0]), float(rgb[1]), float(rgb[2]))
     return centroids
+
+
+def require_max_pixels(height: int, width: int) -> None:
+    """Reject rasters above ``_MAX_PIXELS``.
+
+    Args:
+        height: Raster height.
+        width: Raster width.
+
+    Raises:
+        ValueError: If ``height * width`` exceeds ``_MAX_PIXELS``.
+    """
+    if height * width > _MAX_PIXELS:
+        raise ValueError(f"Image exceeds {_MAX_PIXELS} pixels ({width}x{height})")
+
+
+def load_rgb_array(path: Path) -> NDArray[np.uint8]:
+    """Read ``path`` as an ``HxWx3`` uint8 RGB array.
+
+    Args:
+        path: Image file to open. Any mode Pillow can convert is accepted.
+
+    Returns:
+        A copy of the image in RGB, at its native spatial size.
+
+    Raises:
+        ValueError: If the converted image is not three-channel or exceeds
+            ``_MAX_PIXELS``.
+    """
+    with Image.open(path) as image:
+        width, height = image.size
+        require_max_pixels(height, width)
+        rgb = image.convert("RGB")
+        array = np.array(rgb, dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("Expected an RGB image")
+    return array
+
+
+def parse_weight_payload(spec: PluginSpec, data: bytes) -> dict[str, Any]:
+    """Check a weight document's runtime and class names.
+
+    Args:
+        spec: Plugin whose ``runtime`` and ``output.classes`` form the contract.
+        data: Raw JSON bytes, already hash-checked.
+
+    Returns:
+        The JSON object.
+
+    Raises:
+        ValueError: If the document is not an object, or the runtime or class
+            list does not match ``spec``.
+    """
+    payload: Any = json.loads(data.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Weight {spec.weight} must be a JSON object")
+    if payload.get("runtime") != spec.runtime:
+        raise ValueError(f"Weight runtime does not match plugin.toml for {spec.name}")
+    if payload.get("classes") != spec.output.classes:
+        raise ValueError("Weight classes do not match plugin.toml")
+    return payload
+
+
+def load_weight_payload(spec: PluginSpec) -> dict[str, Any]:
+    """Load a JSON weight file and check its runtime and class names.
+
+    Args:
+        spec: Plugin whose relative ``weight`` key and ``output.classes`` form
+            the contract. ``sha256`` is enforced by :func:`read_weight_bytes`.
+
+    Returns:
+        The JSON object stored at that key.
+
+    Raises:
+        FileNotFoundError: If the weight file is missing. The message names the
+            relative key, not a host path.
+        ValueError: If the hash, runtime, or class list does not match.
+    """
+    return parse_weight_payload(spec, read_weight_bytes(spec))
+
+
+def weight_tile(payload: dict[str, Any], spec: PluginSpec) -> int:
+    """Return the mosaic tile edge declared by a weight file.
+
+    Args:
+        payload: Object returned by :func:`load_weight_payload`.
+        spec: Plugin whose ``input.sizes`` lists allowed tile edges.
+
+    Returns:
+        The tile edge in pixels.
+
+    Raises:
+        ValueError: If ``tile`` is missing, not an int, or not allowed.
+    """
+    tile = payload.get("tile")
+    if isinstance(tile, bool) or not isinstance(tile, int):
+        raise ValueError(f"Weight {spec.weight} tile must be an int")
+    if spec.input.sizes and tile not in spec.input.sizes:
+        raise ValueError(f"Weight tile {tile} is not in plugin input.sizes")
+    if tile < 2:
+        raise ValueError(f"Weight tile {tile} must be >= 2")
+    return tile
 
 
 def mean_rgb(image: Image.Image) -> tuple[float, float, float]:
