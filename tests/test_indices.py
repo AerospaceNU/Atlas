@@ -233,6 +233,14 @@ def test_scene_aliases_open_ndvi_only_once_red_and_nir_resolve() -> None:
     assert available_indices(nir_only.band_aliases) == ()
 
 
+def test_nodata_nan_is_rejected() -> None:
+    bands = {"red": np.array([1.0, np.nan]), "nir": np.array([2.0, 3.0])}
+    with pytest.raises(ValueError, match="nodata cannot be NaN"):
+        compute_indices(bands, nodata=float("nan"))
+    with pytest.raises(ValueError, match="nodata cannot be NaN"):
+        compute_indices(bands, nodata={"nir": np.nan})
+
+
 @pytest.mark.parametrize("fill", [0, 65535, -9999])
 def test_nodata_fill_on_an_input_band_is_nan(fill: int) -> None:
     red = np.array([fill, 0.2], dtype=np.float64)

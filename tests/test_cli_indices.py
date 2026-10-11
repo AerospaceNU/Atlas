@@ -158,6 +158,28 @@ def test_cli_nodata_fills(tmp_path: Path) -> None:
         np.testing.assert_allclose(written, expected["ndvi"], equal_nan=True)
 
 
+def test_cli_rejects_nan_nodata(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    red = tmp_path / "red.npy"
+    nir = tmp_path / "nir.npy"
+    _save(red, [0.1])
+    _save(nir, [0.4])
+    code = main(
+        [
+            "indices",
+            "--red",
+            str(red),
+            "--nir",
+            str(nir),
+            "--out",
+            str(tmp_path / "out"),
+            "--nodata",
+            "nan",
+        ]
+    )
+    assert code == 2
+    assert "NaN" in capsys.readouterr().err
+
+
 def test_cli_missing_band_is_usage(tmp_path: Path) -> None:
     assert (
         main(

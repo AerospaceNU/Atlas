@@ -266,6 +266,9 @@ def _finite_number(label: str, raw: object) -> float:
     if isinstance(raw, bool) or not isinstance(raw, int | float):
         raise TypeError(f"{label} must be a real number")
     value = float(raw)
+    # NaN never compares equal, so it would mask nothing and look like success.
+    if math.isnan(value):
+        raise ValueError(f"{label} cannot be NaN")
     if not math.isfinite(value):
         raise ValueError(f"{label} must be finite")
     return value
