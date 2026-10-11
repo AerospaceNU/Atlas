@@ -642,7 +642,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # fall back to the project workspace via the store's read_root.
     artifact_root = project_atlas_root(workspace) / "artifacts" / session_id
     store = LocalArtifactStore(artifact_root, read_root=workspace)
-    skills = load_skills(store)
+    skills = load_skills(store, home=home)
     registry = default_registry()
     register_skill_tool(registry, skills)
     model = OpenRouterModel(ModelConfig(model=model_id, api_key=api_key))
