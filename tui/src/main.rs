@@ -499,13 +499,24 @@ impl App {
                     self.adopt_status(&status);
                 }
                 let user_asked = matches!(self.mode, Mode::ModelWait | Mode::ModelPicker);
-                if !ok {
+                if !ok && !message.is_empty() && user_asked {
+                    self.transcript
+                        .push(tool_note(format!("model list failed: {message}")));
+                }
+                // A later page can fail after earlier rows arrived. Keep those
+                // rows and still show the error.
+                if !models.is_empty() {
+                    self.picker_models = models;
                     if user_asked {
+                        self.picker_index = 0;
+                        self.mode = Mode::ModelPicker;
+                        let count = self.filtered_models().len();
                         self.transcript
-                            .push(tool_note(format!("model list failed: {message}")));
-                        if self.mode == Mode::ModelWait {
-                            self.mode = Mode::Compose;
-                        }
+                            .push(tool_note(format!("models: {count}")));
+                    }
+                } else if !ok {
+                    if user_asked && self.mode == Mode::ModelWait {
+                        self.mode = Mode::Compose;
                     }
                 } else if user_asked {
                     self.picker_models = models;
@@ -2669,6 +2680,33 @@ mod tests {
         let text = tool_text(&app);
         assert!(text.contains("model list failed"));
         assert!(text.contains("500"));
+    }
+
+    #[test]
+    fn partial_model_list_keeps_rows_and_shows_the_error() {
+        let mut app = App::new();
+        app.model_id = "keep-me".to_string();
+        app.mode = Mode::ModelWait;
+        app.apply(ServerMessage::Models {
+            ok: false,
+            message: "OpenRouter HTTP 500: down".to_string(),
+            models: vec![CatalogEntry {
+                id: "vendor/model".to_string(),
+                context_length: Some(1024),
+                prompt_price: None,
+                completion_price: None,
+            }],
+            status: crate::protocol::StatusSnapshot::default(),
+        });
+
+        assert_eq!(app.model_id, "keep-me");
+        assert_eq!(app.mode, Mode::ModelPicker);
+        assert_eq!(app.picker_models.len(), 1);
+        assert_eq!(app.picker_models[0].id, "vendor/model");
+        let text = tool_text(&app);
+        assert!(text.contains("model list failed"));
+        assert!(text.contains("500"));
+        assert!(text.contains("models: 1"));
     }
 
     #[test]

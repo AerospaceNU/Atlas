@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
@@ -41,11 +42,14 @@ from atlas.agent.layout import (
 )
 from atlas.agent.metrics import SessionTotals, apply_call, apply_http_error, format_tui_status
 from atlas.agent.model import (
+    _CATALOG_TIME_LIMIT,
     MISSING_KEY_MESSAGE,
+    CatalogFetch,
     MissingOpenRouterKey,
     ModelConfig,
     OpenRouterHTTPError,
     OpenRouterModel,
+    peek_model_catalog,
 )
 from atlas.agent.runtime import (
     Agent,
@@ -60,6 +64,7 @@ from atlas.agent.skill_author import normalize_skill_name
 from atlas.agent.skills import Skill, load_skills, register_skill_tool
 
 _REDACTED = "***"
+_STDOUT_LOCK = threading.Lock()
 
 
 class AgentSession:
@@ -81,7 +86,9 @@ class AgentSession:
         self.catalog: list[CatalogModel] = []
         self.active_skills: list[str] = []
         self.totals = SessionTotals()
-        self.fetch_models: Callable[[], list[CatalogModel]] | None = None
+        self.fetch_models: Callable[[], CatalogFetch | list[CatalogModel]] | None = None
+        self._catalog_thread: threading.Thread | None = None
+        self._catalog_inflight = False
         config = getattr(agent.model, "config", None)
         if config is not None:
             self.model_id = str(getattr(config, "model", "") or "")
@@ -336,8 +343,9 @@ class AgentSession:
 
 def _write_line(stdout: IO[str], payload: dict[str, Any], secrets: list[str]) -> None:
     text = json.dumps(_redact_value(payload, secrets), ensure_ascii=False)
-    stdout.write(text + "\n")
-    stdout.flush()
+    with _STDOUT_LOCK:
+        stdout.write(text + "\n")
+        stdout.flush()
 
 
 def _redact_value(value: Any, secrets: list[str]) -> Any:
@@ -400,6 +408,7 @@ def serve(
             continue
         kind = message.get("type")
         if kind == "quit":
+            _join_catalog_fetch(session)
             return 0
         if kind == "user":
             _handle_user(session, stdout, message)
@@ -439,6 +448,7 @@ def serve(
             {"type": "error", "message": f"Unknown message type: {kind!r}"},
             session.secrets,
         )
+    _join_catalog_fetch(session)
     return 0
 
 
@@ -544,8 +554,12 @@ def _handle_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any
 
 
 def _handle_models(session: AgentSession, stdout: IO[str]) -> None:
-    """Fetch the catalog. A failure leaves the selected model id unchanged."""
-    previous = session.model_id
+    """Start a catalog fetch. A failure leaves the selected model id unchanged.
+
+    A fresh cache hit is written immediately. Otherwise paging runs on a
+    background thread so the session loop can keep reading. The thread is
+    joined when the loop ends.
+    """
     fetcher = session.fetch_models
     if fetcher is None:
         _write_line(
@@ -559,26 +573,74 @@ def _handle_models(session: AgentSession, stdout: IO[str]) -> None:
             session.secrets,
         )
         return
+    key = _catalog_api_key(session)
+    cached = peek_model_catalog(key) if key else None
+    if cached is not None:
+        _publish_catalog(session, stdout, CatalogFetch(models=cached))
+        return
+    if session._catalog_inflight:
+        return
+    session._catalog_inflight = True
+    thread = threading.Thread(
+        target=_catalog_worker,
+        args=(session, stdout),
+        daemon=True,
+        name="atlas-model-catalog",
+    )
+    session._catalog_thread = thread
+    thread.start()
+
+
+def _catalog_worker(session: AgentSession, stdout: IO[str]) -> None:
     try:
-        catalog = fetcher()
+        fetcher = session.fetch_models
+        if fetcher is None:
+            fetched = CatalogFetch(models=[], error="model catalog is unavailable")
+        else:
+            fetched = _coerce_catalog(fetcher())
+        _publish_catalog(session, stdout, fetched)
     except Exception as exc:
-        session.model_id = previous
         _write_line(
             stdout,
             {"type": "models", "ok": False, "message": _public_error(exc), "models": []},
             session.secrets,
         )
-        return
-    session.catalog = catalog
+    finally:
+        session._catalog_inflight = False
+
+
+def _join_catalog_fetch(session: AgentSession) -> None:
+    thread = session._catalog_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=_CATALOG_TIME_LIMIT + 5)
+
+
+def _coerce_catalog(value: CatalogFetch | list[CatalogModel]) -> CatalogFetch:
+    if isinstance(value, CatalogFetch):
+        return value
+    return CatalogFetch(models=list(value))
+
+
+def _publish_catalog(session: AgentSession, stdout: IO[str], fetched: CatalogFetch) -> None:
+    session.catalog = fetched.models
     _apply_known_context_limit(session)
     payload: dict[str, Any] = {
         "type": "models",
-        "ok": True,
-        "message": "",
-        "models": [model.model_dump() for model in catalog],
+        "ok": fetched.error is None,
+        "message": fetched.error or "",
+        "models": [model.model_dump() for model in fetched.models],
     }
     payload.update(_status_fields(session))
     _write_line(stdout, payload, session.secrets)
+
+
+def _catalog_api_key(session: AgentSession) -> str:
+    config = getattr(session.agent.model, "config", None)
+    if config is not None:
+        key = str(getattr(config, "api_key", "") or "").strip()
+        if key:
+            return key
+    return (session.active_key or "").strip()
 
 
 def _handle_select_model(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:

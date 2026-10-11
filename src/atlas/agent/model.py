@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -25,7 +28,13 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 _ERROR_BODY_LIMIT = 180
 _CATALOG_PAGE_LIMIT = 20
+_CATALOG_TIME_LIMIT = 15.0
+_CATALOG_CACHE_SECONDS = 30.0
 _OPENROUTER_HOST = "openrouter.ai"
+_ANSI_ESCAPE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]"
+)
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 MISSING_KEY_MESSAGE = (
     "OPENROUTER_API_KEY is not set. Set it in the environment, the repo .env, "
@@ -67,7 +76,7 @@ class OpenRouterModel:
     def __init__(self, config: ModelConfig, client: httpx.Client | None = None) -> None:
         self.config = config
         self.history: list[ChatMessage] = []
-        self._client = client or httpx.Client(timeout=config.timeout)
+        self._client = client or httpx.Client(timeout=config.timeout, follow_redirects=False)
         self._owns_client = client is None
 
     def __call__(self, prompt: str) -> str:
@@ -120,7 +129,7 @@ class OpenRouterModel:
         parsed.timing = timing
         return parsed
 
-    def list_models(self) -> list[CatalogModel]:
+    def list_models(self) -> CatalogFetch:
         """Fetch the live OpenRouter model catalog with this client's key."""
         return fetch_model_catalog(self._client, self.config.api_key)
 
@@ -414,30 +423,141 @@ def _merge_tool_call(acc: _StreamAcc, call: dict[str, Any], fallback: int) -> No
         slot.arguments = json.dumps(arguments)
 
 
-def fetch_model_catalog(client: Any, api_key: str) -> list[CatalogModel]:
+@dataclass
+class CatalogFetch:
+    """Models read from the OpenRouter catalog, plus a later-page error if any.
+
+    ``models`` keeps every page that succeeded. ``error`` is set when a later
+    page fails or the total time cap is reached, and stays empty when the walk
+    finishes cleanly. The selected model is not changed here.
+    """
+
+    models: list[CatalogModel]
+    error: str | None = None
+
+
+@dataclass
+class _CatalogCacheEntry:
+    key_id: str
+    stored_at: float
+    models: list[CatalogModel]
+
+
+_catalog_cache: _CatalogCacheEntry | None = None
+_catalog_cache_lock = threading.Lock()
+
+
+def clear_model_catalog_cache() -> None:
+    """Drop the short-lived catalog cache. Tests use this between cases."""
+    global _catalog_cache
+    with _catalog_cache_lock:
+        _catalog_cache = None
+
+
+def peek_model_catalog(api_key: str) -> list[CatalogModel] | None:
+    """Return a cached catalog for ``api_key`` when it is still fresh."""
+    if not api_key.strip():
+        return None
+    return _read_catalog_cache(api_key)
+
+
+def fetch_model_catalog(client: Any, api_key: str) -> CatalogFetch:
     """GET the OpenRouter models endpoint and parse id, context length, and price.
 
     The first request omits ``offset`` and ``limit`` so OpenRouter returns the
     full list. When a page includes ``links.next``, later pages are followed
-    only while the URL stays on ``https://openrouter.ai``. A repeated URL or
-    the page cap ends the walk. The selected model is not changed here.
+    only while the URL stays on ``https://openrouter.ai``. Redirects are not
+    followed. A repeated URL, the page cap, or the total time cap ends the
+    walk. A failure after the first page keeps the rows already parsed and
+    reports the error. Rows that do not list ``tools`` are omitted, and
+    duplicate ids keep the first row. A fresh result is cached briefly.
     """
     if not api_key.strip():
         raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
-    started = time.perf_counter()
+    cached = _read_catalog_cache(api_key)
+    if cached is not None:
+        return CatalogFetch(models=cached)
+    started = _catalog_now()
+    deadline = started + _CATALOG_TIME_LIMIT
     headers = {"Authorization": f"Bearer {api_key}"}
     url: str | None = OPENROUTER_MODELS_URL
     seen: set[str] = set()
     models: list[CatalogModel] = []
     pages = 0
+    error: str | None = None
     while url is not None and url not in seen and pages < _CATALOG_PAGE_LIMIT:
+        remaining = deadline - _catalog_now()
+        if remaining <= 0:
+            error = "model catalog timed out"
+            break
         seen.add(url)
         pages += 1
-        resp = client.get(url, headers=headers)
-        payload, _timing = _interpret_response(resp, started)
-        models.extend(parse_model_catalog(payload))
+        try:
+            resp = client.get(
+                url,
+                headers=headers,
+                follow_redirects=False,
+                timeout=remaining,
+            )
+            payload, _timing = _interpret_response(resp, started)
+            page = parse_model_catalog(payload)
+        except Exception as exc:
+            if models:
+                error = _catalog_error_text(exc)
+                break
+            raise
+        models.extend(page)
         url = _next_catalog_page(payload, url)
-    return models
+    fetched = CatalogFetch(models=_dedupe_tool_models(models), error=error)
+    if error is None:
+        _write_catalog_cache(api_key, fetched.models)
+    return fetched
+
+
+def _catalog_now() -> float:
+    return time.perf_counter()
+
+
+def _catalog_error_text(exc: Exception) -> str:
+    if isinstance(exc, OpenRouterHTTPError | MissingOpenRouterKey):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"[:300]
+
+
+def _key_id(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode()).hexdigest()
+
+
+def _read_catalog_cache(api_key: str) -> list[CatalogModel] | None:
+    with _catalog_cache_lock:
+        entry = _catalog_cache
+        if entry is None or entry.key_id != _key_id(api_key):
+            return None
+        if _catalog_now() - entry.stored_at >= _CATALOG_CACHE_SECONDS:
+            return None
+        return list(entry.models)
+
+
+def _write_catalog_cache(api_key: str, models: list[CatalogModel]) -> None:
+    global _catalog_cache
+    with _catalog_cache_lock:
+        _catalog_cache = _CatalogCacheEntry(
+            key_id=_key_id(api_key),
+            stored_at=_catalog_now(),
+            models=list(models),
+        )
+
+
+def _dedupe_tool_models(models: list[CatalogModel]) -> list[CatalogModel]:
+    """Keep the first tool-capable row for each id."""
+    seen: set[str] = set()
+    kept: list[CatalogModel] = []
+    for model in models:
+        if not model.supports_tools or model.id in seen:
+            continue
+        seen.add(model.id)
+        kept.append(model)
+    return kept
 
 
 def _next_catalog_page(payload: dict[str, Any], current: str) -> str | None:
@@ -481,6 +601,8 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
     """Parse an OpenRouter ``/models`` payload.
 
     Rows without an id are skipped. Missing context length or pricing stays unset.
+    Names and descriptions lose control characters and ANSI sequences.
+    ``supports_tools`` records whether ``supported_parameters`` lists ``tools``.
     """
     if not isinstance(payload, dict):
         raise ValueError("model catalog must be an object")
@@ -491,8 +613,8 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
     for item in data:
         if not isinstance(item, dict):
             continue
-        model_id = item.get("id")
-        if not isinstance(model_id, str) or not model_id.strip():
+        model_id = _sanitize_display(item.get("id"))
+        if model_id is None:
             continue
         pricing = item.get("pricing")
         prompt_price = None
@@ -502,13 +624,31 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
             completion_price = _as_price(pricing.get("completion"))
         models.append(
             CatalogModel(
-                id=model_id.strip(),
+                id=model_id,
+                name=_sanitize_display(item.get("name")),
+                description=_sanitize_display(item.get("description")),
                 context_length=_as_optional_int(item.get("context_length")),
                 prompt_price=prompt_price,
                 completion_price=completion_price,
+                supports_tools=_lists_tools(item.get("supported_parameters")),
             )
         )
     return models
+
+
+def _lists_tools(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    return any(isinstance(item, str) and item == "tools" for item in value)
+
+
+def _sanitize_display(value: object) -> str | None:
+    """Remove ANSI sequences and control characters from provider text."""
+    if not isinstance(value, str):
+        return None
+    text = _ANSI_ESCAPE.sub("", value)
+    text = _CONTROL_CHARS.sub("", text).strip()
+    return text or None
 
 
 def filter_model_catalog(models: Sequence[CatalogModel], query: str) -> list[CatalogModel]:

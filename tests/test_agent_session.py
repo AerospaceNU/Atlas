@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field
 
+from atlas.agent import session as session_module
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import (
     CallTiming,
@@ -963,6 +964,7 @@ def test_models_command_returns_the_live_catalog_without_changing_the_model(
                     "id": "google/gemini-3.8-flash",
                     "context_length": 128000,
                     "pricing": {"prompt": "0.1", "completion": "0.4"},
+                    "supported_parameters": ["tools"],
                 },
                 {"id": "  "},
                 {"name": "skipped"},
@@ -982,6 +984,7 @@ def test_models_command_returns_the_live_catalog_without_changing_the_model(
     assert model.config.model == "keep-me"
     assert client.gets[0]["url"] == OPENROUTER_MODELS_URL
     assert client.gets[0]["headers"]["Authorization"] == "Bearer catalog-key"
+    assert client.gets[0]["follow_redirects"] is False
     assert client.posts == []
     catalog = events[1]
     assert catalog["type"] == "models"
@@ -989,13 +992,124 @@ def test_models_command_returns_the_live_catalog_without_changing_the_model(
     assert catalog["models"] == [
         {
             "id": "google/gemini-3.8-flash",
+            "name": None,
+            "description": None,
             "context_length": 128000,
             "prompt_price": "0.1",
             "completion_price": "0.4",
+            "supports_tools": True,
         }
     ]
     assert session.totals.context_limit == 111
     assert "catalog-key" not in json.dumps(events)
+
+
+def test_later_page_failure_keeps_rows_in_the_session(tmp_path: Path) -> None:
+    first = OPENROUTER_MODELS_URL
+    second = "https://openrouter.ai/api/v1/models?offset=1"
+
+    class Pages:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def get(self, url: str, **kwargs: Any) -> _HeaderResponse:
+            self.urls.append(url)
+            assert kwargs["follow_redirects"] is False
+            if url == first:
+                return _HeaderResponse(
+                    {
+                        "data": [
+                            {
+                                "id": "alpha/one",
+                                "name": "Alpha\x1b[31m!\x1b[0m",
+                                "description": "coast\x00",
+                                "supported_parameters": ["tools"],
+                            }
+                        ],
+                        "links": {"next": "/api/v1/models?offset=1"},
+                    },
+                    status_code=200,
+                    elapsed_seconds=0.1,
+                )
+            return _HeaderResponse(
+                {"error": {"message": "down"}},
+                status_code=500,
+                elapsed_seconds=0.2,
+            )
+
+        def close(self) -> None:
+            return None
+
+    client = Pages()
+    model = OpenRouterModel(ModelConfig(model="keep-me", api_key="catalog-key"), client)
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
+    session.model_id = "keep-me"
+    session.totals.model = "keep-me"
+    session.fetch_models = model.list_models
+
+    events = _run_protocol(['{"type":"models"}'], session)
+
+    assert client.urls == [first, second]
+    assert session.model_id == "keep-me"
+    assert [item.id for item in session.catalog] == ["alpha/one"]
+    assert session.catalog[0].name == "Alpha!"
+    catalog = events[1]
+    assert catalog["ok"] is False
+    assert "500" in catalog["message"]
+    assert catalog["models"][0]["id"] == "alpha/one"
+    assert catalog["models"][0]["name"] == "Alpha!"
+    assert "catalog-key" not in json.dumps(events)
+
+
+def test_catalog_paging_does_not_block_the_next_session_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    saw_new = threading.Event()
+
+    class PausingStdin:
+        def __init__(self) -> None:
+            self._lines = ['{"type":"models"}\n', '{"type":"new"}\n']
+            self._index = 0
+
+        def __iter__(self) -> PausingStdin:
+            return self
+
+        def __next__(self) -> str:
+            if self._index >= len(self._lines):
+                raise StopIteration
+            if self._index == 1:
+                assert started.wait(timeout=2)
+            line = self._lines[self._index]
+            self._index += 1
+            return line
+
+    def fetch() -> list[CatalogModel]:
+        started.set()
+        assert release.wait(timeout=2)
+        return [CatalogModel(id="vendor/model", supports_tools=True)]
+
+    original = session_module._handle_new
+
+    def wrapped(active: AgentSession, stdout: Any) -> None:
+        assert started.is_set()
+        saw_new.set()
+        release.set()
+        original(active, stdout)
+
+    monkeypatch.setattr(session_module, "_handle_new", wrapped)
+    session = _session(ScriptedModel([]), tmp_path=tmp_path)
+    session.fetch_models = fetch
+    stdout = io.StringIO()
+    code = serve(session, PausingStdin(), stdout)
+    assert code == 0
+    assert saw_new.is_set()
+    events = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert any(event["type"] == "ready" for event in events)
+    models = [event for event in events if event["type"] == "models"]
+    assert models[0]["ok"] is True
+    assert models[0]["models"][0]["id"] == "vendor/model"
 
 
 def test_session_key_is_what_the_next_completion_sends(tmp_path: Path) -> None:
