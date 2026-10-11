@@ -156,7 +156,7 @@ def test_installed_wheel_loads_a_hardlinked_prompt(tmp_path: Path) -> None:
         if candidate.is_file():
             uv = str(candidate)
     if uv is None:
-        pytest.skip("uv is not available")
+        pytest.fail("uv is required to build and install the wheel")
 
     wheel_dir = tmp_path / "dist"
     repo = Path(__file__).resolve().parents[1]
