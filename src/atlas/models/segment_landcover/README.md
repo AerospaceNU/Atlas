@@ -37,6 +37,16 @@ uv run python src/atlas/models/segment_landcover/preview.py
 `preview.py` runs the tool at **native** size and writes a sheet of
 RGB | overlay thumbnails (thumbnails are display-only).
 
+## Spec
+
+Per-pixel land cover on an RGB scene (bare, built-up, water, vegetation, cloud).
+Does not resize the input. Large rasters are labeled at native H×W (row strips
+only to bound memory).
+
+- **Input:** RGB PNG, `H×W×3` uint8, any size
+- **Output:** label map `H×W` uint8 (class index), RGB overlay `H×W×3`, JSON
+  pixel fractions
+
 ## Tool I/O
 
 - **Input:** workspace-relative RGB PNG, any H×W

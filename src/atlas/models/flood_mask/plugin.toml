@@ -1,0 +1,16 @@
+name = "flood_mask"
+description = "Heuristic open-water mask on an optical PNG. Blue-dominant pixels are water (1); everything else is dry (0). Not under-cloud SAR flood and not a trained model. Large mosaics are tiled at 512 and stitched."
+runtime = "binary_mask"
+rule = "water"
+weight = ""
+sha256 = ""
+
+[input]
+kind = "rgb_png"
+shape = [0, 0, 3]
+dtype = "uint8"
+sizes = [256, 512]
+
+[output]
+kind = "mask"
+classes = ["dry", "water"]
