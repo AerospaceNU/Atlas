@@ -8,11 +8,8 @@ be UTF-8 and must include every required rule.
 
 from __future__ import annotations
 
-import os
-import stat
 from functools import cache
 from importlib.resources import files
-from pathlib import Path
 
 _PACKAGE = "atlas.agent"
 _PROMPT_FILENAME = "system_prompt.md"
@@ -50,58 +47,6 @@ def load_system_prompt() -> str:
     except OSError as exc:
         raise SystemPromptError("system prompt file could not be read") from exc
     return _decode_prompt(data)
-
-
-def read_prompt_file(path: Path, *, root: Path) -> str:
-    """Read a prompt file that must stay inside ``root``.
-
-    ``path`` may be relative to ``root``. Symlinks are refused, including a
-    link whose target stays inside ``root``. The resolved path must stay
-    inside ``root``. A hard link is allowed.
-
-    Args:
-        path: Prompt file, absolute or relative to ``root``.
-        root: Directory the file is not allowed to leave.
-
-    Returns:
-        The prompt text with newlines normalized to line feeds and with trailing
-        newlines removed.
-
-    Raises:
-        SystemPromptError: The path is not a path, leaves ``root``, or the
-            file is not a safe UTF-8 prompt.
-    """
-    if not isinstance(path, Path) or not isinstance(root, Path):
-        raise SystemPromptError("system prompt path must be a path")
-    root_resolved = root.resolve()
-    candidate = path if path.is_absolute() else root_resolved / path
-    if candidate.is_symlink():
-        raise SystemPromptError("system prompt file must not be a symlink")
-    if not candidate.is_file():
-        raise SystemPromptError("system prompt file is missing")
-    resolved = candidate.resolve()
-    if not _is_within(root_resolved, resolved):
-        raise SystemPromptError("system prompt file leaves its directory")
-    try:
-        fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError as exc:
-        raise SystemPromptError("system prompt file could not be read") from exc
-    with os.fdopen(fd, "rb") as handle:
-        info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode):
-            raise SystemPromptError("system prompt file must be a regular file")
-        data = handle.read()
-    return _decode_prompt(data)
-
-
-def _is_within(root: Path, path: Path) -> bool:
-    if path == root:
-        return False
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
 
 
 def _decode_prompt(data: bytes) -> str:

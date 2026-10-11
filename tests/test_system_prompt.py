@@ -17,8 +17,8 @@ from atlas.agent.skills import Skill, render_system_prompt
 from atlas.agent.system_prompt import (
     _REQUIRED_RULES,
     SystemPromptError,
+    _decode_prompt,
     load_system_prompt,
-    read_prompt_file,
 )
 
 _OPENING = "You are Atlas, a local workspace assistant."
@@ -100,88 +100,37 @@ def test_skill_description_cannot_close_the_catalog(tmp_path: Path) -> None:
     assert "untrusted data" in prompt
 
 
-def test_crlf_prompt_matches_the_package_text(tmp_path: Path) -> None:
+def test_crlf_prompt_matches_the_package_text() -> None:
     text = load_system_prompt()
-    path = tmp_path / "system_prompt.md"
-    path.write_bytes(text.replace("\n", "\r\n").encode("utf-8") + b"\r\n")
 
-    assert read_prompt_file(path, root=tmp_path) == text
+    assert _decode_prompt(text.replace("\n", "\r\n").encode("utf-8") + b"\r\n") == text
 
 
-def test_empty_prompt_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "system_prompt.md"
-    path.write_text("\n\n", encoding="utf-8")
-
+def test_empty_prompt_is_rejected() -> None:
     with pytest.raises(SystemPromptError, match="system prompt is empty"):
-        read_prompt_file(path, root=tmp_path)
+        _decode_prompt(b"\n\n")
 
 
-def test_nul_prompt_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "system_prompt.md"
-    path.write_bytes(b"You are Atlas\x00")
-
+def test_nul_prompt_is_rejected() -> None:
     with pytest.raises(SystemPromptError, match="must not contain NUL"):
-        read_prompt_file(path, root=tmp_path)
+        _decode_prompt(b"You are Atlas\x00")
 
 
-def test_non_utf8_prompt_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "system_prompt.md"
-    path.write_bytes(b"\xff")
-
+def test_non_utf8_prompt_is_rejected() -> None:
     with pytest.raises(SystemPromptError, match="must be UTF-8"):
-        read_prompt_file(path, root=tmp_path)
+        _decode_prompt(b"\xff")
 
 
-def test_byte_order_mark_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "system_prompt.md"
-    path.write_text("\ufeff" + load_system_prompt(), encoding="utf-8")
-
+def test_byte_order_mark_is_rejected() -> None:
     with pytest.raises(SystemPromptError, match="byte order mark"):
-        read_prompt_file(path, root=tmp_path)
+        _decode_prompt(("\ufeff" + load_system_prompt()).encode("utf-8"))
 
 
-def test_missing_required_rule_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "system_prompt.md"
-    path.write_text(
-        load_system_prompt().replace("untrusted data", "trusted data"), encoding="utf-8"
-    )
+def test_missing_required_rule_is_rejected() -> None:
+    data = load_system_prompt().replace("untrusted data", "trusted data").encode("utf-8")
 
     with pytest.raises(SystemPromptError, match="missing a required rule"):
-        read_prompt_file(path, root=tmp_path)
-
-
-def test_missing_prompt_file_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(SystemPromptError, match="system prompt file is missing"):
-        read_prompt_file(tmp_path / "system_prompt.md", root=tmp_path)
-
-
-def test_prompt_path_must_be_a_path(tmp_path: Path) -> None:
-    with pytest.raises(SystemPromptError, match="must be a path"):
-        read_prompt_file("system_prompt.md", root=tmp_path)  # type: ignore[arg-type]
-
-
-def test_symlink_prompt_is_rejected(tmp_path: Path) -> None:
-    outside = tmp_path / "outside.md"
-    outside.write_text(load_system_prompt(), encoding="utf-8")
-    root = tmp_path / "package"
-    root.mkdir()
-    link = root / "system_prompt.md"
-    link.symlink_to(outside)
-
-    with pytest.raises(SystemPromptError, match="must not be a symlink"):
-        read_prompt_file(link, root=root)
-
-
-def test_hardlinked_prompt_file_is_readable(tmp_path: Path) -> None:
-    outside = tmp_path / "outside.md"
-    outside.write_text(load_system_prompt(), encoding="utf-8")
-    root = tmp_path / "package"
-    root.mkdir()
-    link = root / "system_prompt.md"
-    os.link(outside, link)
-
-    assert link.stat().st_nlink >= 2
-    assert read_prompt_file(link, root=root) == load_system_prompt()
+        _decode_prompt(data)
 
 
 def test_load_system_prompt_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -269,23 +218,3 @@ print("ok")
     assert ran.returncode == 0, ran.stderr
     assert "ok" in ran.stdout
     assert str(venv) in ran.stdout
-
-
-def test_prompt_file_outside_its_directory_is_rejected(tmp_path: Path) -> None:
-    outside = tmp_path / "outside.md"
-    outside.write_text(load_system_prompt(), encoding="utf-8")
-    root = tmp_path / "package"
-    root.mkdir()
-
-    with pytest.raises(SystemPromptError, match="leaves its directory"):
-        read_prompt_file(outside, root=root)
-
-
-def test_relative_escape_is_rejected(tmp_path: Path) -> None:
-    outside = tmp_path / "outside.md"
-    outside.write_text(load_system_prompt(), encoding="utf-8")
-    root = tmp_path / "package"
-    root.mkdir()
-
-    with pytest.raises(SystemPromptError, match="leaves its directory"):
-        read_prompt_file(Path("../outside.md"), root=root)
