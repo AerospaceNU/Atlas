@@ -1,9 +1,11 @@
 """Load the Atlas system prompt from package data.
 
 The text lives in ``system_prompt.md`` beside this module. The agent reads
-that package resource once and reuses it. A copy planted in the project
-workspace or the session artifact directory cannot replace it. The text must
-be UTF-8 and must include every required rule.
+that package resource once and reuses it for the life of the process.
+Editing the file during development does not take effect until Atlas is
+restarted. A copy planted in the project workspace or the session artifact
+directory cannot replace it. The text must be UTF-8 and must include every
+required rule.
 """
 
 from __future__ import annotations
@@ -32,9 +34,10 @@ class SystemPromptError(ValueError):
 def load_system_prompt() -> str:
     """Return the system prompt shipped with this package.
 
-    The file is read once through :mod:`importlib.resources` and cached.
-    Installed copies may be hard-linked, which is how ``uv`` lays a wheel
-    into ``site-packages``.
+    The file is read once through :mod:`importlib.resources` and cached for
+    the life of the process. Editing ``system_prompt.md`` during development
+    does not take effect until Atlas is restarted. Installed copies may be
+    hard-linked, which is how ``uv`` lays a wheel into ``site-packages``.
 
     Raises:
         SystemPromptError: The package file is missing or not a safe prompt.
