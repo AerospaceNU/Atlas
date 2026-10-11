@@ -138,9 +138,12 @@ class AgentSession:
     def use_skill(self, name: str, argument: str | None = None) -> Skill:
         """Apply a named skill for later turns in this conversation.
 
-        The skill comes from the catalog loaded at session start. ``use_skill``
-        re-reads that file and refuses it when the bytes changed. The tool
-        text is appended as a user message. The system prompt stays the catalog.
+        The name is looked up in the catalog loaded at session start
+        (``self.agent.skills``). A skill written after that catalog was built
+        is not available. The first activation re-reads the file and refuses
+        it when the bytes changed, then appends the tool text as a user
+        message. A later activation of the same skill appends only a new
+        ``Argument:`` line. The system prompt stays the catalog.
 
         Args:
             name: Skill name from the catalog, matched with
@@ -151,7 +154,9 @@ class AgentSession:
             The skill that was activated.
 
         Raises:
-            ValueError: ``name`` is empty, the file changed, or it cannot be parsed.
+            ValueError: ``name`` is empty, fails
+                :func:`atlas.agent.skill_author.normalize_skill_name`, the
+                file changed, or it cannot be parsed.
             FileNotFoundError: No skill with that name is in the catalog.
         """
         cleaned = name.strip()
@@ -159,21 +164,24 @@ class AgentSession:
             raise ValueError("skill name must be a non-empty string")
         requested, errors = normalize_skill_name(cleaned)
         if requested is None or errors:
-            raise FileNotFoundError(f"Skill {cleaned} is missing")
+            raise ValueError("; ".join(errors))
         skills = list(self.agent.skills)
         skill = next((item for item in skills if item.name == requested), None)
         if skill is None:
             raise FileNotFoundError(f"Skill {requested} is missing")
+        extra = argument.strip() if isinstance(argument, str) else ""
+        if skill.name in self.active_skills:
+            if extra:
+                self.messages.append(ChatMessage(role=Role.USER, content=f"Argument: {extra}"))
+            return skill
         registry = ToolRegistry()
         register_skill_tool(registry, skills)
         result = registry.execute("use_skill", {"name": requested}, self.agent.artifacts)
         content = result.text
-        extra = argument.strip() if isinstance(argument, str) else ""
         if extra:
             content = f"{content}\n\nArgument: {extra}"
         self.messages.append(ChatMessage(role=Role.USER, content=content))
-        if skill.name not in self.active_skills:
-            self.active_skills.append(skill.name)
+        self.active_skills.append(skill.name)
         return skill
 
     def _require_key(self) -> None:

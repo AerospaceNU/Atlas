@@ -183,6 +183,75 @@ def test_nfkc_compatible_name_selects_the_skill(tmp_path: Path) -> None:
     assert "Open the file." in (session.messages[-1].content or "")
 
 
+def test_a_skill_written_after_startup_is_not_usable(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    before = [message.model_dump() for message in session.messages]
+    _write_skill(
+        tmp_path / "workspace" / ".atlas" / "skills",
+        "flood-check",
+        "Check water.",
+        "Label water.",
+    )
+
+    with pytest.raises(FileNotFoundError, match="Skill flood-check is missing"):
+        session.use_skill("flood-check")
+
+    assert [message.model_dump() for message in session.messages] == before
+    assert session.active_skills == []
+    joined = "\n".join(message.content or "" for message in session.messages)
+    assert "Label water." not in joined
+    assert "<name>flood-check</name>" not in joined
+
+
+def test_repeating_an_active_skill_appends_only_the_argument(tmp_path: Path) -> None:
+    _write_skill(
+        tmp_path / "workspace" / ".atlas" / "skills",
+        "flood-check",
+        "Check water.",
+        "Label water.",
+    )
+    session = _session(tmp_path)
+    session.use_skill("flood-check", argument="scene.png")
+    first = session.messages[-1].content or ""
+    count_after_first = len(session.messages)
+
+    session.use_skill("flood-check", argument="  hello  world  ")
+
+    added = session.messages[-1].content or ""
+    assert len(session.messages) == count_after_first + 1
+    assert added == "Argument: hello  world"
+    assert "<untrusted_skill_body>" not in added
+    assert "Label water." not in added
+    assert first.count("<untrusted_skill_body>") == 1
+    bodies = [message.content or "" for message in session.messages]
+    assert sum("<untrusted_skill_body>" in item for item in bodies) == 1
+    assert session.active_skills == ["flood-check"]
+
+    session.use_skill("flood-check")
+
+    assert len(session.messages) == count_after_first + 1
+    assert session.messages[-1].content == added
+
+
+def test_a_malformed_skill_name_raises_the_normalization_errors(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    before = [message.model_dump() for message in session.messages]
+
+    with pytest.raises(ValueError) as path_error:
+        session.use_skill("../secrets")
+    with pytest.raises(ValueError) as case_error:
+        session.use_skill("Flood")
+
+    assert not isinstance(path_error.value, FileNotFoundError)
+    assert (
+        str(path_error.value) == "Skill name '../secrets' contains invalid characters. "
+        "Only letters, digits, and hyphens are allowed."
+    )
+    assert str(case_error.value) == "Skill name 'Flood' must be lowercase"
+    assert [message.model_dump() for message in session.messages] == before
+    assert session.active_skills == []
+
+
 def test_unknown_skill_leaves_the_session_unchanged(tmp_path: Path) -> None:
     session = _session(tmp_path)
     before = [message.model_dump() for message in session.messages]
@@ -322,7 +391,10 @@ def test_protocol_bad_skill_does_not_end_the_session(tmp_path: Path) -> None:
 
     assert [event["type"] for event in events[1:]] == ["error", "error", "error"]
     assert events[1]["message"] == "Skill flood-check could not be read"
-    assert events[2]["message"] == "Skill ../secrets could not be read"
+    assert events[2]["message"] == (
+        "Skill name '../secrets' contains invalid characters. "
+        "Only letters, digits, and hyphens are allowed."
+    )
     assert str(session.workspace) not in json.dumps(events)
     assert events[3]["message"] == "skill name must be a non-empty string"
 
