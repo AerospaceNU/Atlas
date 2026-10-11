@@ -76,7 +76,10 @@ pub enum ServerMessage {
         description: String,
         path: String,
         content_sha256: String,
-        preview: String,
+        body: String,
+        body_characters: i64,
+        body_lines: i64,
+        resources: Vec<String>,
         confirm: String,
     },
     EnabledSkill {
@@ -278,7 +281,13 @@ enum RawMessage {
         #[serde(default)]
         content_sha256: String,
         #[serde(default)]
-        preview: String,
+        body: String,
+        #[serde(default)]
+        body_characters: i64,
+        #[serde(default)]
+        body_lines: i64,
+        #[serde(default)]
+        resources: Vec<String>,
         #[serde(default)]
         confirm: String,
     },
@@ -413,14 +422,20 @@ impl From<RawMessage> for ServerMessage {
                 description,
                 path,
                 content_sha256,
-                preview,
+                body,
+                body_characters,
+                body_lines,
+                resources,
                 confirm,
             } => ServerMessage::EnablePreview {
                 name,
                 description,
                 path,
                 content_sha256,
-                preview,
+                body,
+                body_characters,
+                body_lines,
+                resources,
                 confirm,
             },
             RawMessage::EnabledSkill {
@@ -672,22 +687,28 @@ mod tests {
 
     #[test]
     fn parses_enable_preview_before_promotion() {
-        let line = r#"{"type":"enable_preview","name":"coast-check","description":"compare the coast","path":".atlas/skills-drafts/coast-check/SKILL.md","content_sha256":"abcd","preview":"Replay this procedure","confirm":"/enable-skill coast-check confirm"}"#;
+        let line = r#"{"type":"enable_preview","name":"coast-check","description":"compare the coast","path":".atlas/skills-drafts/coast-check/SKILL.md","content_sha256":"abcd1234","body":"Replay this procedure","body_characters":21,"body_lines":1,"resources":["scripts/run.py"],"confirm":"/enable-skill coast-check confirm abcd1234"}"#;
         match parse_line(line).unwrap() {
             Some(ServerMessage::EnablePreview {
                 name,
                 description,
                 path,
                 content_sha256,
-                preview,
+                body,
+                body_characters,
+                body_lines,
+                resources,
                 confirm,
             }) => {
                 assert_eq!(name, "coast-check");
                 assert_eq!(description, "compare the coast");
                 assert_eq!(path, ".atlas/skills-drafts/coast-check/SKILL.md");
-                assert_eq!(content_sha256, "abcd");
-                assert!(preview.contains("Replay"));
-                assert_eq!(confirm, "/enable-skill coast-check confirm");
+                assert_eq!(content_sha256, "abcd1234");
+                assert_eq!(body, "Replay this procedure");
+                assert_eq!(body_characters, 21);
+                assert_eq!(body_lines, 1);
+                assert_eq!(resources, vec!["scripts/run.py".to_string()]);
+                assert_eq!(confirm, "/enable-skill coast-check confirm abcd1234");
             }
             other => panic!("unexpected: {other:?}"),
         }

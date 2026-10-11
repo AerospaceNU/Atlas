@@ -53,7 +53,7 @@ from atlas.agent.runtime import (
     load_max_tool_calls,
     load_model,
 )
-from atlas.agent.skills import load_skills, register_skill_tool
+from atlas.agent.skills import UseSkillTool, load_skill_directory, load_skills, register_skill_tool
 
 _REDACTED = "***"
 
@@ -84,6 +84,7 @@ class AgentSession:
             key = str(getattr(config, "api_key", "") or "").strip()
             self.active_key = key or None
         self.skill_catalog_note = ""
+        self._skill_previews: dict[tuple[str, str], str] = {}
         self._analysis_turns: list[AnalysisTurn] = []
         self._analysis_open = False
         self._analysis_request = ""
@@ -190,35 +191,59 @@ class AgentSession:
         self._require_user_skills(scope)
         if self.workspace is None:
             raise SkillSaveError("project scope needs a workspace")
-        return preview_skill(self.workspace, name, scope=scope, home=self.home)
+        preview = preview_skill(self.workspace, name, scope=scope, home=self.home)
+        self._skill_previews[(preview.name, scope)] = preview.content_sha256
+        return preview
 
-    def enable_saved_skill(self, name: str, *, scope: str = "project") -> SavedSkill:
-        """Move a previewed draft into the live skills directory."""
+    def enable_saved_skill(
+        self,
+        name: str,
+        expected_sha256: str,
+        *,
+        scope: str = "project",
+    ) -> SavedSkill:
+        """Move a previewed draft into the live skills directory.
+
+        ``expected_sha256`` is the digest from :meth:`preview_saved_skill`, or
+        its first eight hex characters. Enabling without that preview is refused.
+        """
         self._require_user_skills(scope)
         if self.workspace is None:
             raise SkillSaveError("project scope needs a workspace")
-        saved = enable_skill(self.workspace, name, scope=scope, home=self.home)
-        self.skill_catalog_note = _reload_skill_catalog(self, saved.name)
+        slug = name.strip()
+        full_hash = self._expected_preview_hash(slug, scope, expected_sha256)
+        saved = enable_skill(
+            self.workspace,
+            slug,
+            full_hash,
+            scope=scope,
+            home=self.home,
+        )
+        self._skill_previews.pop((saved.name, scope), None)
+        self.skill_catalog_note = _add_enabled_skill(self, saved.name, scope)
         return saved
+
+    def _expected_preview_hash(self, name: str, scope: str, presented: str) -> str:
+        stored = self._skill_previews.get((name, scope))
+        if stored is None:
+            raise SkillSaveError("enable needs a preview")
+        token = presented.strip().lower()
+        if token != stored and not (len(token) == 8 and stored.startswith(token)):
+            raise SkillSaveError("skill hash does not match the preview")
+        return stored
 
     def _require_user_skills(self, scope: str) -> None:
         if scope != "user":
             return
         if self.workspace is None or not load_home_skills_enabled(self.workspace):
             raise SkillSaveError(
-                "home skills are off; set ATLAS_HOME_SKILLS=1 or "
-                "home_skills = true in ~/.atlas/config.toml"
+                "home skills are off; set ATLAS_HOME_SKILLS or home_skills = true "
+                "in ~/.atlas/config.toml"
             )
 
     def _begin_analysis(self, request: str) -> None:
-        if self._analysis_open:
-            self._analysis_turns.append(
-                AnalysisTurn(
-                    request=self._analysis_request,
-                    response=self._analysis_response,
-                    steps=list(self._analysis_steps),
-                )
-            )
+        # A turn that stopped for the tool-call limit is not finished.
+        # Starting another turn drops it instead of recording it.
         self._analysis_open = True
         self._analysis_request = request
         self._analysis_steps = []
@@ -619,13 +644,19 @@ def _handle_enable_skill(session: AgentSession, stdout: IO[str], message: dict[s
                     "scope": scope,
                     "path": preview.path,
                     "content_sha256": preview.content_sha256,
-                    "preview": preview.preview,
+                    "body": preview.body,
+                    "body_characters": preview.body_characters,
+                    "body_lines": preview.body_lines,
+                    "resources": preview.resources,
                     "confirm": preview.confirm,
                 },
                 session.secrets,
             )
             return
-        saved = session.enable_saved_skill(name, scope=scope)
+        expected = message.get("expected_sha256")
+        if not isinstance(expected, str) or not expected.strip():
+            raise SkillSaveError("enable needs a preview")
+        saved = session.enable_saved_skill(name, expected, scope=scope)
         catalog = session.skill_catalog_note
     except OSError:
         _write_line(stdout, {"type": "error", "message": "could not enable skill"}, session.secrets)
@@ -656,32 +687,42 @@ def _skill_scope(scope: object) -> str:
     raise SkillSaveError("scope must be project or user")
 
 
-def _reload_skill_catalog(session: AgentSession, name: str) -> str:
-    """Re-read skills and register ``use_skill`` for the live session."""
+def _add_enabled_skill(session: AgentSession, name: str, scope: str) -> str:
+    """Add ``name`` to the live catalog without rehashing skills already loaded."""
     restart = "Restart Atlas to load this skill."
+    workspace = session.workspace
+    if workspace is None:
+        return restart
+    if scope == "user":
+        if session.home is None or not load_home_skills_enabled(workspace):
+            return restart
+        base = session.home
+        label = "~/"
+    else:
+        base = workspace
+        label = ""
     try:
-        workspace = session.workspace
-        home = None
-        if (
-            workspace is not None
-            and session.home is not None
-            and load_home_skills_enabled(workspace)
-        ):
-            home = session.home
-        skills = load_skills(session.agent.artifacts, home=home)
-        session.agent.skills = list(skills)
-        session.agent.tools._tools.pop("use_skill", None)
-        register_skill_tool(session.agent.tools, skills)
-        if session.messages and session.messages[0].role == Role.SYSTEM:
-            session.messages[0] = ChatMessage(
-                role=Role.SYSTEM,
-                content=session.agent.system_prompt(),
-            )
+        skill = load_skill_directory(
+            base,
+            f".atlas/skills/{name}",
+            label_prefix=label,
+            artifact_root=project_atlas_root(workspace) / "artifacts",
+        )
     except OSError:
         return restart
-    if any(skill.name == name for skill in session.agent.skills):
-        return "The skill catalog was reloaded."
-    return restart
+    if skill is None:
+        return restart
+    skills = [item for item in session.agent.skills if item.name != skill.name]
+    skills.append(skill)
+    skills.sort(key=lambda item: item.name)
+    session.agent.skills = skills
+    session.agent.tools.replace(UseSkillTool(skills))
+    if session.messages and session.messages[0].role == Role.SYSTEM:
+        session.messages[0] = ChatMessage(
+            role=Role.SYSTEM,
+            content=session.agent.system_prompt(),
+        )
+    return "The skill catalog was reloaded."
 
 
 def _install_key(session: AgentSession, key: str) -> None:
