@@ -40,7 +40,7 @@ Agent-agnostic consolidation. Same path for interactive use and batch jobs.
 | Module | What it holds |
 |---|---|
 | `pipeline` | `consolidate`: search, select, optionally render mosaics. |
-| `aggregate` | Fan a request out across sources. One source's error does not abort the rest. A rate-limited source (HTTP 429) is retried while the others continue. |
+| `aggregate` | Fan a request out across sources. One source's error does not abort the rest. A rate-limited source (HTTP 429) is retried while the others continue. Each source has a time budget. Recorded HTTP errors are the status and reason only. |
 | `select` | Metadata filters: cloud, id dedup, clearest-then-newest, a cheap coverage estimate. |
 | `mosaic` | Planetary Computer mosaic render, written as `<source>.png`. |
 | `product` | Result types: per-source scenes, the catalog, and a rendered mosaic. |

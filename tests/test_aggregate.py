@@ -35,15 +35,19 @@ def _scene(scene_id: str) -> Scene:
     )
 
 
-def _rate_limit(retry_after: str | None = None) -> httpx.HTTPStatusError:
-    request = httpx.Request("POST", "https://example.com/search")
+def _status_error(status: int, url: str, retry_after: str | None = None) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", url)
     headers = {} if retry_after is None else {"Retry-After": retry_after}
-    response = httpx.Response(429, headers=headers, request=request)
+    response = httpx.Response(status, headers=headers, request=request)
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         return exc
-    raise AssertionError("expected HTTP 429")
+    raise AssertionError(f"expected HTTP {status}")
+
+
+def _rate_limit(retry_after: str | None = None) -> httpx.HTTPStatusError:
+    return _status_error(429, "https://example.com/search", retry_after)
 
 
 class _ScriptedClient(DataPullClient):
@@ -162,9 +166,8 @@ async def test_retry_does_not_abort_the_other_sources(
     assert [scene.id for scene in by_name["healthy"].scenes] == ["S2B_ok"]
     assert by_name["healthy"].error is None
     assert by_name["limited"].scenes == []
-    assert by_name["limited"].error is not None
-    assert "HTTPStatusError" in by_name["limited"].error
-    assert "429" in by_name["limited"].error
+    assert by_name["limited"].error == "429 Too Many Requests"
+    assert "example.com" not in by_name["limited"].error
 
 
 @pytest.mark.asyncio
@@ -326,6 +329,52 @@ async def test_other_errors_are_not_retried(monkeypatch: pytest.MonkeyPatch) -> 
     assert broken.calls == 1
     assert server.calls == 1
     assert by_name["broken"].error == "RuntimeError: boom"
-    assert by_name["server"].error is not None
-    assert "503" in by_name["server"].error
+    assert by_name["server"].error == "503"
     assert [scene.id for scene in by_name["healthy"].scenes] == ["S2B_ok"]
+
+
+@pytest.mark.asyncio
+async def test_http_error_records_status_and_reason_without_the_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_sleep(monkeypatch)
+    secret = "sekret-key"
+    url = f"https://cmr.example/search?api_key={secret}&bbox=1,2,3,4"
+    limited_error = _status_error(429, url)
+    server_error = _status_error(500, url)
+    assert secret in str(limited_error)
+    assert secret in str(server_error)
+    limited = _ScriptedClient([limited_error, limited_error, limited_error])
+    server = _ScriptedClient([server_error])
+    healthy = _ScriptedClient(["S2B_ok"])
+
+    catalog = await aggregate(
+        _request(),
+        {"limited": limited, "server": server, "healthy": healthy},
+    )
+
+    by_name = {src.source: src for src in catalog.sources}
+    assert by_name["limited"].error == "429 Too Many Requests"
+    assert by_name["server"].error == "500 Internal Server Error"
+    assert by_name["healthy"].error is None
+    for error in (by_name["limited"].error, by_name["server"].error):
+        assert error is not None
+        assert secret not in error
+        assert "cmr.example" not in error
+        assert "api_key" not in error
+        assert "?" not in error
+        assert "://" not in error
+
+
+@pytest.mark.asyncio
+async def test_non_http_error_drops_a_message_that_contains_a_url() -> None:
+    secret = "sekret-key"
+    broken = _ScriptedClient(
+        [RuntimeError(f"GET https://cmr.example/search?api_key={secret} failed")]
+    )
+
+    catalog = await aggregate(_request(), {"broken": broken})
+
+    assert catalog.sources[0].error == "RuntimeError"
+    assert catalog.sources[0].error is not None
+    assert secret not in catalog.sources[0].error

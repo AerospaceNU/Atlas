@@ -99,6 +99,40 @@ def _parse_retry_after(value: str) -> float | None:
     return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
+def _contains_url(text: str) -> bool:
+    return "://" in text
+
+
+def _reason_phrase(response: object) -> str | None:
+    reason = getattr(response, "reason_phrase", None)
+    if not isinstance(reason, str):
+        return None
+    text = reason.strip()
+    if not text or _contains_url(text):
+        return None
+    return text
+
+
+def _error_text(exc: Exception) -> str:
+    """Return a status and reason, never the request URL or query string.
+
+    ``str`` of an HTTP error includes the full URL, which can carry a key.
+    """
+    status = _status_code(exc)
+    response = getattr(exc, "response", None)
+    reason = _reason_phrase(response) if response is not None else None
+    if status is not None and reason is not None:
+        return f"{status} {reason}"
+    if status is not None:
+        return str(status)
+    if response is not None or getattr(exc, "request", None) is not None:
+        return type(exc).__name__
+    message = str(exc)
+    if _contains_url(message):
+        return type(exc).__name__
+    return f"{type(exc).__name__}: {message}"
+
+
 def _stamp_source(name: str, collection: str, result: PullResult) -> SourceScenes:
     stamped: list[Scene] = []
     for scene in result.scenes:
@@ -132,7 +166,7 @@ async def _search_attempts(
         source=name,
         collection=collection,
         scenes=[],
-        error=f"{type(failure).__name__}: {failure}",
+        error=_error_text(failure),
     )
 
 
@@ -146,7 +180,7 @@ async def _search_one(name: str, client: DataPullClient, request: PullRequest) -
         if budget is not None and budget.expired():
             error = "TimeoutError: source search exceeded the time budget"
         else:
-            error = f"{type(exc).__name__}: {exc}"
+            error = _error_text(exc)
         return SourceScenes(source=name, collection=collection, scenes=[], error=error)
 
 
@@ -168,6 +202,8 @@ async def aggregate(
     Each source, including those waits, is limited to 60 seconds with
     ``asyncio.timeout``. Other sources keep running during that wait and if
     the budget runs out. Any other error is recorded on the first failure.
+    An HTTP failure is stored as its status and reason phrase, with no
+    request URL or query string.
     """
 
     async def run(name: str, client: DataPullClient) -> SourceScenes:
