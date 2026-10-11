@@ -34,7 +34,7 @@ Enter sends a line. `/` opens commands. `/new` starts a fresh conversation in th
 
 ## Data CLI
 
-`atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`.
+`atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`. A polygon AOI is `--polygon` as `lon,lat` pairs separated by semicolons, or a GeoJSON Polygon. Without `--coords`, the search box is that ring's envelope.
 
 ```bash
 atlas data                         # catalog
@@ -43,6 +43,10 @@ atlas data sentinel2               # kinds for one satellite
 atlas data sentinel2 optical \
   --date 2024-07-01:2024-07-07 \
   --coords -71.12,42.32,-71.02,42.40
+
+atlas data sentinel2 optical \
+  --date 2024-07-01:2024-07-07 \
+  --polygon -71.12,42.32;-71.02,42.32;-71.02,42.40;-71.12,42.40
 
 atlas data fldas landsurface \
   --date 2023-01-01:2024-12-31 \

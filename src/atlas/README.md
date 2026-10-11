@@ -51,7 +51,7 @@ STAC and related search clients. `search` is the only required method, and it is
 
 | Module | What it holds |
 |---|---|
-| `base` | Shared models: bbox, scene, pull request/result, and the client interface. |
+| `base` | Shared models: bbox, polygon AOI, scene, pull request/result, and the client interface. |
 | `registry` | Stable source names and `sources()` / `all_sources()`. |
 | `stac` | Generic STAC API client. |
 | `planetary_computer` | Microsoft Planetary Computer search and asset signing. |

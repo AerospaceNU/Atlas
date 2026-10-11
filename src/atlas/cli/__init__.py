@@ -61,6 +61,7 @@ def _is_tui_invocation(tokens: list[str]) -> bool:
 _VALUE_FLAGS = frozenset(
     {
         "--coords",
+        "--polygon",
         "--date",
         "--out",
         "--limit",
