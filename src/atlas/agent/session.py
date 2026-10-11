@@ -10,6 +10,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
+from atlas.agent.analysis_skill import (
+    AnalysisStep,
+    AnalysisTurn,
+    FinishedAnalysis,
+    SavedSkill,
+    SkillPreview,
+    SkillSaveError,
+    enable_command,
+    enable_skill,
+    preview_skill,
+    save_skill,
+    successful_steps,
+)
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import CatalogModel, ChatMessage, Role, default_registry
 from atlas.agent.layout import (
@@ -70,6 +83,12 @@ class AgentSession:
             self.totals.model = self.model_id
             key = str(getattr(config, "api_key", "") or "").strip()
             self.active_key = key or None
+        self.skill_catalog_note = ""
+        self._analysis_turns: list[AnalysisTurn] = []
+        self._analysis_open = False
+        self._analysis_request = ""
+        self._analysis_steps: list[AnalysisStep] = []
+        self._analysis_response = ""
 
     def turn(
         self,
@@ -81,12 +100,14 @@ class AgentSession:
     ) -> AgentRun:
         """Append the user message and advance the shared history one turn."""
         self._require_key()
+        self._begin_analysis(request)
         self.messages.append(ChatMessage(role=Role.USER, content=request))
         run = self.agent.advance(
             self.messages, on_step=on_step, on_phase=on_phase, on_thought=on_thought
         )
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
+        self._capture_analysis(run)
         return run
 
     def resume(
@@ -105,6 +126,7 @@ class AgentSession:
         )
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
+        self._capture_analysis(run)
         return run
 
     def start_fresh(self) -> None:
@@ -117,6 +139,7 @@ class AgentSession:
         """
         self.messages = [ChatMessage(role=Role.SYSTEM, content=self.agent.system_prompt())]
         self.stopped_for_limit = False
+        self._clear_analysis()
         self.totals = SessionTotals(
             model=self.model_id or self.totals.model,
             context_limit=self.totals.context_limit,
@@ -135,6 +158,97 @@ class AgentSession:
     def _note(self, run: AgentRun) -> None:
         for call in run.calls:
             apply_call(self.totals, call)
+
+    def save_finished_skill(
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        replace: bool = False,
+        scope: str = "project",
+    ) -> SavedSkill:
+        """Save the finished analysis as a draft in the shared drafts directory."""
+        if self._analysis_open:
+            raise SkillSaveError("analysis is not finished")
+        if not self._analysis_turns:
+            raise SkillSaveError("no finished analysis to save")
+        if self.workspace is None:
+            raise SkillSaveError("project scope needs a workspace")
+        return save_skill(
+            self.workspace,
+            FinishedAnalysis(turns=list(self._analysis_turns)),
+            name,
+            description=description,
+            replace=replace,
+            secrets=self.secrets,
+            scope=scope,
+            home=self.home,
+        )
+
+    def preview_saved_skill(self, name: str, *, scope: str = "project") -> SkillPreview:
+        """Show a draft's description and body hash without promoting it."""
+        self._require_user_skills(scope)
+        if self.workspace is None:
+            raise SkillSaveError("project scope needs a workspace")
+        return preview_skill(self.workspace, name, scope=scope, home=self.home)
+
+    def enable_saved_skill(self, name: str, *, scope: str = "project") -> SavedSkill:
+        """Move a previewed draft into the live skills directory."""
+        self._require_user_skills(scope)
+        if self.workspace is None:
+            raise SkillSaveError("project scope needs a workspace")
+        saved = enable_skill(self.workspace, name, scope=scope, home=self.home)
+        self.skill_catalog_note = _reload_skill_catalog(self, saved.name)
+        return saved
+
+    def _require_user_skills(self, scope: str) -> None:
+        if scope != "user":
+            return
+        if self.workspace is None or not load_home_skills_enabled(self.workspace):
+            raise SkillSaveError(
+                "home skills are off; set ATLAS_HOME_SKILLS=1 or "
+                "home_skills = true in ~/.atlas/config.toml"
+            )
+
+    def _begin_analysis(self, request: str) -> None:
+        if self._analysis_open:
+            self._analysis_turns.append(
+                AnalysisTurn(
+                    request=self._analysis_request,
+                    response=self._analysis_response,
+                    steps=list(self._analysis_steps),
+                )
+            )
+        self._analysis_open = True
+        self._analysis_request = request
+        self._analysis_steps = []
+        self._analysis_response = ""
+
+    def _capture_analysis(self, run: AgentRun) -> None:
+        if not self._analysis_open:
+            return
+        self._analysis_steps.extend(successful_steps(run))
+        self._analysis_response = run.response
+        if run.stopped_for_limit:
+            return
+        self._analysis_turns.append(
+            AnalysisTurn(
+                request=self._analysis_request,
+                response=self._analysis_response,
+                steps=list(self._analysis_steps),
+            )
+        )
+        self._analysis_open = False
+        self._analysis_request = ""
+        self._analysis_steps = []
+        self._analysis_response = ""
+
+    def _clear_analysis(self) -> None:
+        self._analysis_turns = []
+        self._analysis_open = False
+        self._analysis_request = ""
+        self._analysis_steps = []
+        self._analysis_response = ""
 
 
 def _write_line(stdout: IO[str], payload: dict[str, Any], secrets: list[str]) -> None:
@@ -227,6 +341,12 @@ def serve(
             continue
         if kind == "remove":
             _handle_remove(session, stdout, message)
+            continue
+        if kind == "save_skill":
+            _handle_save_skill(session, stdout, message)
+            continue
+        if kind == "enable_skill":
+            _handle_enable_skill(session, stdout, message)
             continue
         _write_line(
             stdout,
@@ -435,6 +555,133 @@ def _handle_remove(session: AgentSession, stdout: IO[str], message: dict[str, An
         {"type": "removed", "scope": message.get("scope"), "kind": kind, "name": name},
         session.secrets,
     )
+
+
+def _handle_save_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
+    name = message.get("name")
+    if not isinstance(name, str) or not name.strip():
+        _write_line(
+            stdout, {"type": "error", "message": "save_skill needs a name"}, session.secrets
+        )
+        return
+    description = message.get("description")
+    if description is not None and not isinstance(description, str):
+        _write_line(
+            stdout,
+            {"type": "error", "message": "description must be a string"},
+            session.secrets,
+        )
+        return
+    try:
+        scope = _skill_scope(message.get("scope"))
+        saved = session.save_finished_skill(
+            name,
+            description=description,
+            replace=message.get("replace") is True,
+            scope=scope,
+        )
+    except (SkillSaveError, AtlasPathError) as exc:
+        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
+        return
+    _write_line(
+        stdout,
+        {
+            "type": "saved_skill",
+            "name": saved.name,
+            "description": saved.description,
+            "scope": scope,
+            "path": saved.path,
+            "enabled": saved.enabled,
+            "enable": enable_command(saved.name),
+            "note": saved.note,
+        },
+        session.secrets,
+    )
+
+
+def _handle_enable_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
+    name = message.get("name")
+    if not isinstance(name, str) or not name.strip():
+        _write_line(
+            stdout, {"type": "error", "message": "enable_skill needs a name"}, session.secrets
+        )
+        return
+    try:
+        scope = _skill_scope(message.get("scope"))
+        if message.get("confirm") is not True:
+            preview = session.preview_saved_skill(name, scope=scope)
+            _write_line(
+                stdout,
+                {
+                    "type": "enable_preview",
+                    "name": preview.name,
+                    "description": preview.description,
+                    "scope": scope,
+                    "path": preview.path,
+                    "content_sha256": preview.content_sha256,
+                    "preview": preview.preview,
+                    "confirm": preview.confirm,
+                },
+                session.secrets,
+            )
+            return
+        saved = session.enable_saved_skill(name, scope=scope)
+        catalog = session.skill_catalog_note
+    except OSError:
+        _write_line(stdout, {"type": "error", "message": "could not enable skill"}, session.secrets)
+        return
+    except (SkillSaveError, AtlasPathError) as exc:
+        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
+        return
+    _write_line(
+        stdout,
+        {
+            "type": "enabled_skill",
+            "name": saved.name,
+            "description": saved.description,
+            "scope": scope,
+            "path": saved.path,
+            "enabled": saved.enabled,
+            "catalog": catalog,
+        },
+        session.secrets,
+    )
+
+
+def _skill_scope(scope: object) -> str:
+    if scope is None:
+        return "project"
+    if scope in {"project", "user"}:
+        return str(scope)
+    raise SkillSaveError("scope must be project or user")
+
+
+def _reload_skill_catalog(session: AgentSession, name: str) -> str:
+    """Re-read skills and register ``use_skill`` for the live session."""
+    restart = "Restart Atlas to load this skill."
+    try:
+        workspace = session.workspace
+        home = None
+        if (
+            workspace is not None
+            and session.home is not None
+            and load_home_skills_enabled(workspace)
+        ):
+            home = session.home
+        skills = load_skills(session.agent.artifacts, home=home)
+        session.agent.skills = list(skills)
+        session.agent.tools._tools.pop("use_skill", None)
+        register_skill_tool(session.agent.tools, skills)
+        if session.messages and session.messages[0].role == Role.SYSTEM:
+            session.messages[0] = ChatMessage(
+                role=Role.SYSTEM,
+                content=session.agent.system_prompt(),
+            )
+    except OSError:
+        return restart
+    if any(skill.name == name for skill in session.agent.skills):
+        return "The skill catalog was reloaded."
+    return restart
 
 
 def _install_key(session: AgentSession, key: str) -> None:

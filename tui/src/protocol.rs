@@ -62,6 +62,29 @@ pub enum ServerMessage {
         kind: String,
         name: String,
     },
+    SaveSkill {
+        name: String,
+        description: String,
+        scope: String,
+        path: String,
+        enabled: bool,
+        enable: String,
+        note: String,
+    },
+    EnablePreview {
+        name: String,
+        description: String,
+        path: String,
+        content_sha256: String,
+        preview: String,
+        confirm: String,
+    },
+    EnabledSkill {
+        name: String,
+        path: String,
+        enabled: bool,
+        catalog: String,
+    },
     Phase {
         phase: String,
         name: Option<String>,
@@ -227,6 +250,49 @@ enum RawMessage {
         #[serde(default)]
         name: String,
     },
+    #[serde(rename = "saved_skill")]
+    SaveSkill {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        scope: String,
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default)]
+        enable: String,
+        #[serde(default)]
+        note: String,
+    },
+    #[serde(rename = "enable_preview")]
+    EnablePreview {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        content_sha256: String,
+        #[serde(default)]
+        preview: String,
+        #[serde(default)]
+        confirm: String,
+    },
+    #[serde(rename = "enabled_skill")]
+    EnabledSkill {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default)]
+        catalog: String,
+    },
 }
 
 /// Parse one protocol line. Blank lines yield `Ok(None)`.
@@ -325,6 +391,49 @@ impl From<RawMessage> for ServerMessage {
             RawMessage::Removed { scope, kind, name } => {
                 ServerMessage::Removed { scope, kind, name }
             }
+            RawMessage::SaveSkill {
+                name,
+                description,
+                scope,
+                path,
+                enabled,
+                enable,
+                note,
+            } => ServerMessage::SaveSkill {
+                name,
+                description,
+                scope,
+                path,
+                enabled,
+                enable,
+                note,
+            },
+            RawMessage::EnablePreview {
+                name,
+                description,
+                path,
+                content_sha256,
+                preview,
+                confirm,
+            } => ServerMessage::EnablePreview {
+                name,
+                description,
+                path,
+                content_sha256,
+                preview,
+                confirm,
+            },
+            RawMessage::EnabledSkill {
+                name,
+                path,
+                enabled,
+                catalog,
+            } => ServerMessage::EnabledSkill {
+                name,
+                path,
+                enabled,
+                catalog,
+            },
             RawMessage::Phase { phase, name } => ServerMessage::Phase { phase, name },
             RawMessage::Thought {
                 text,
@@ -511,6 +620,74 @@ mod tests {
                 assert!(!ok);
                 assert!(message.contains("500"));
                 assert!(models.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_saved_skill() {
+        let line = r#"{"type":"saved_skill","name":"coast-check","description":"compare the coast","scope":"project","path":".atlas/skills-drafts/coast-check/SKILL.md","enabled":false,"enable":"/enable-skill coast-check","note":"replace=True overwrites a draft of the same name, including one written by the author_skill tool."}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::SaveSkill {
+                name,
+                description,
+                scope,
+                path,
+                enabled,
+                enable,
+                note,
+            }) => {
+                assert_eq!(name, "coast-check");
+                assert_eq!(description, "compare the coast");
+                assert_eq!(scope, "project");
+                assert_eq!(path, ".atlas/skills-drafts/coast-check/SKILL.md");
+                assert!(!enabled);
+                assert_eq!(enable, "/enable-skill coast-check");
+                assert!(note.contains("replace=True"));
+                assert!(note.contains("author_skill"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_enabled_skill() {
+        let line = r#"{"type":"enabled_skill","name":"coast-check","path":".atlas/skills/coast-check/SKILL.md","enabled":true,"catalog":"The skill catalog was reloaded."}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::EnabledSkill {
+                name,
+                path,
+                enabled,
+                catalog,
+            }) => {
+                assert_eq!(name, "coast-check");
+                assert_eq!(path, ".atlas/skills/coast-check/SKILL.md");
+                assert!(enabled);
+                assert!(catalog.contains("reloaded"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_enable_preview_before_promotion() {
+        let line = r#"{"type":"enable_preview","name":"coast-check","description":"compare the coast","path":".atlas/skills-drafts/coast-check/SKILL.md","content_sha256":"abcd","preview":"Replay this procedure","confirm":"/enable-skill coast-check confirm"}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::EnablePreview {
+                name,
+                description,
+                path,
+                content_sha256,
+                preview,
+                confirm,
+            }) => {
+                assert_eq!(name, "coast-check");
+                assert_eq!(description, "compare the coast");
+                assert_eq!(path, ".atlas/skills-drafts/coast-check/SKILL.md");
+                assert_eq!(content_sha256, "abcd");
+                assert!(preview.contains("Replay"));
+                assert_eq!(confirm, "/enable-skill coast-check confirm");
             }
             other => panic!("unexpected: {other:?}"),
         }
