@@ -90,6 +90,7 @@ def test_default_registry_has_discovered_tools_only() -> None:
     assert "create_contact_sheet" not in names
     assert "stage_script_proposal" not in names
     assert "review_script_proposals" not in names
+    assert "author_skill" not in names
 
 
 def test_discovery_sorts_by_module_then_qualname() -> None:
