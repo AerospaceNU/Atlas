@@ -69,9 +69,9 @@ _SKILL_ROOTS = (".agents/skills", ".atlas/skills")
 _CONTENT_TAG = "skill_content"
 _UNTRUSTED_BODY_TAG = "untrusted_skill_body"
 _RESOURCE_TAG = "skill_resources"
-# The closing ">" is optional so an unclosed tag still matches.
+# The closing ">" is optional. The match stops at a newline.
 _WRAPPER_TAG_RE = re.compile(
-    rf"<\s*/?\s*(?:{_UNTRUSTED_BODY_TAG}|{_CONTENT_TAG}|{_RESOURCE_TAG})\b[^>]*>?",
+    rf"<\s*/?\s*(?:{_UNTRUSTED_BODY_TAG}|{_CONTENT_TAG}|{_RESOURCE_TAG})\b[^>\n]*>?",
     re.IGNORECASE,
 )
 _DIRECTORY_LABEL = "Skill directory:"
@@ -239,8 +239,9 @@ class UseSkillTool(Tool):
     Those files are not read here. The body is labeled untrusted. Wrapper and
     resource tags in the body are escaped even when their case or whitespace
     differs from the tags this tool emits, the closing angle bracket is
-    missing, or zero-width characters split the tag. A fake skill-directory
-    label is escaped too. Comparisons in the instructions stay intact. Reads
+    missing, or zero-width characters split the tag. The rest of the body is
+    left unchanged. A fake skill-directory label is escaped too. Comparisons
+    in the instructions stay intact. Reads
     use the skill's captured read-only base, never the store write root. A
     ``SKILL.md`` whose bytes changed since discovery is refused.
     """
@@ -634,42 +635,74 @@ def _decode_double_quoted(inner: str) -> str:
     return "".join(pieces)
 
 
-def _escape_markup(match: re.Match[str]) -> str:
-    return html.escape(match.group(0))
+def _ignored_in_match(character: str) -> bool:
+    """Return whether ``character`` is invisible to the wrapper-tag match."""
+    return character == "\u180e" or unicodedata.category(character) == "Cf"
 
 
-def _escape_directory_label(match: re.Match[str]) -> str:
-    return match.group(0).replace(":", "&#58;")
+def _fold_for_match(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """Return an NFKC copy of ``text`` and the original span of each character.
+
+    Format characters are omitted from the copy. Each entry in the span list
+    is the ``[start, end)`` index in ``text`` that produced that folded
+    character. The copy is only for matching.
+    """
+    folded: list[str] = []
+    spans: list[tuple[int, int]] = []
+    for index, character in enumerate(text):
+        if _ignored_in_match(character):
+            continue
+        piece = "".join(
+            item for item in unicodedata.normalize("NFKC", character) if not _ignored_in_match(item)
+        )
+        origin = (index, index + 1)
+        for item in piece:
+            folded.append(item)
+            spans.append(origin)
+    return "".join(folded), spans
 
 
-def _strip_zero_width(text: str) -> str:
-    """Drop Unicode format characters and the Mongolian vowel separator."""
-    return "".join(
-        character
-        for character in text
-        if character != "\u180e" and unicodedata.category(character) != "Cf"
-    )
-
-
-def _prepare_untrusted_text(text: str) -> str:
-    """NFKC-normalize ``text`` and strip zero-width characters."""
-    stripped = _strip_zero_width(text)
-    return _strip_zero_width(unicodedata.normalize("NFKC", stripped))
+def _original_span(spans: list[tuple[int, int]], start: int, end: int) -> tuple[int, int] | None:
+    if end <= start:
+        return None
+    return (spans[start][0], spans[end - 1][1])
 
 
 def _neutralize_untrusted_body(body: str) -> str:
-    """Escape wrapper markup in ``body`` and leave comparisons raw.
+    """Escape wrapper markup in ``body`` and leave every other character as written.
 
-    The text is NFKC-normalized and zero-width characters are removed before
-    matching. Opening and closing ``skill_content``, ``untrusted_skill_body``,
-    and ``skill_resources`` tags match case-insensitively, including tags with
-    whitespace or newlines before the name. The closing angle bracket may be
-    absent. A ``Skill directory:`` label is escaped so the body cannot forge
-    the trailer this renderer adds after the untrusted region.
+    Matching uses an NFKC copy with format characters removed, so a compatibility
+    character or a zero-width joiner cannot hide a tag. Only the matched spans
+    are escaped in ``body``. Superscripts, fractions, and joiners outside those
+    spans stay byte for byte. A tag does not continue past a newline. The
+    closing angle bracket may be absent. A ``Skill directory:`` label is
+    escaped so the body cannot forge the trailer this renderer adds after the
+    untrusted region.
     """
-    prepared = _prepare_untrusted_text(body)
-    neutralized = _WRAPPER_TAG_RE.sub(_escape_markup, prepared)
-    return _DIRECTORY_LABEL_RE.sub(_escape_directory_label, neutralized)
+    folded, spans = _fold_for_match(body)
+    replacements: list[tuple[int, int, str]] = []
+    for match in _WRAPPER_TAG_RE.finditer(folded):
+        origin = _original_span(spans, match.start(), match.end())
+        if origin is None:
+            continue
+        replacements.append((origin[0], origin[1], html.escape(body[origin[0] : origin[1]])))
+    for match in _DIRECTORY_LABEL_RE.finditer(folded):
+        origin = _original_span(spans, match.start(), match.end())
+        if origin is None:
+            continue
+        label = body[origin[0] : origin[1]].replace(":", "&#58;")
+        replacements.append((origin[0], origin[1], label))
+    replacements.sort(key=lambda item: item[0])
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, replacement in replacements:
+        if start < cursor:
+            continue
+        pieces.append(body[cursor:start])
+        pieces.append(replacement)
+        cursor = end
+    pieces.append(body[cursor:])
+    return "".join(pieces)
 
 
 def _render_skill_content(skill: Skill) -> str:
@@ -706,7 +739,8 @@ def _read_skill_markdown(skill: Skill) -> str:
     """Re-read ``SKILL.md`` from the skill's read-only base.
 
     Raises:
-        ValueError: If the file bytes differ from the catalog hash.
+        ValueError: If the file bytes differ from the catalog hash. The message
+            tells the caller to restart the session.
         FileNotFoundError: If the file is missing, symlinked, or inside the
             project artifact directory.
     """
@@ -727,7 +761,9 @@ def _read_skill_markdown(skill: Skill) -> str:
     if data is None:
         raise FileNotFoundError(f"Skill {skill.name} is missing")
     if hashlib.sha256(data).hexdigest() != skill.content_sha256:
-        raise ValueError(f"Skill {skill.name} changed since it was loaded")
+        raise ValueError(
+            f"Skill {skill.name} changed since it was loaded. Restart the session to reload it."
+        )
     text = _decode_utf8(data, skill.directory)
     if text is None:
         raise FileNotFoundError(f"Skill {skill.name} is missing")
