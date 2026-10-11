@@ -1,0 +1,14 @@
+name = "rgb_change"
+description = "Visual before/after hotspots on an RGB PNG pair. Writes a float32 heatmap in [0, 1] and polygons for blobs at or above 0.2 covering at least 16 pixels. Not NDVI or NBR."
+runtime = "rgb_delta"
+weight = ""
+sha256 = ""
+
+[input]
+kind = "rgb_png_pair"
+shape = [0, 0, 3]
+dtype = "uint8"
+
+[output]
+kind = "heatmap"
+classes = []

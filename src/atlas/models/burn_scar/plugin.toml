@@ -1,0 +1,16 @@
+name = "burn_scar"
+description = "Heuristic burn-scar mask. A pixel is burn only when red strictly dominates green and blue and luma is at least 25 and below 80, so black and dark grey stay unburned. Not NBR and not a trained model. Large mosaics are tiled at 512 and stitched."
+runtime = "binary_mask"
+rule = "burn"
+weight = ""
+sha256 = ""
+
+[input]
+kind = "rgb_png"
+shape = [0, 0, 3]
+dtype = "uint8"
+sizes = [256, 512]
+
+[output]
+kind = "mask"
+classes = ["unburned", "burn"]

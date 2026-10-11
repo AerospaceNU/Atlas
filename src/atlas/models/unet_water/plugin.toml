@@ -1,0 +1,16 @@
+name = "unet_water"
+description = "CPU U-Net open-water mask. Weights are a JSON contract (relative key and sha256) with scale, mean, and std. Large mosaics are tiled at 256 or 512 with an 8 pixel overlap and stitched to the original size."
+runtime = "unet_cpu"
+weight = "unet_water/model.json"
+# Empty in git: weights are not shipped. export.py prints the digest to paste here.
+sha256 = ""
+
+[input]
+kind = "rgb_png"
+shape = [0, 0, 3]
+dtype = "uint8"
+sizes = [256, 512]
+
+[output]
+kind = "labels"
+classes = ["land", "water"]
