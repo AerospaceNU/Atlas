@@ -108,8 +108,8 @@ class AgentSession:
     ) -> AgentRun:
         """Append the user message and advance the shared history one turn.
 
-        ``images`` are artifact-root paths read in the sandbox and sent with
-        this user message. A path the sandbox rejects is not appended.
+        ``images`` are paths in the write sandbox or the project workspace.
+        A path the sandbox rejects is not appended.
         """
         self._require_key()
         message = ChatMessage(role=Role.USER, content=request)

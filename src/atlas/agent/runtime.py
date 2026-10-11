@@ -166,8 +166,8 @@ class Agent:
     def run(self, request: str, *, images: Sequence[str] = ()) -> AgentRun:
         """Answer ``request``, making bounded, registry-approved tool calls.
 
-        ``images`` are artifact-root paths. Each one is read in the sandbox
-        and sent with the user message as vision input.
+        ``images`` are paths in the write sandbox or the project workspace.
+        Each one is read through the store and sent with the user message.
         """
         user = ChatMessage(role=Role.USER, content=request)
         if images:
@@ -234,6 +234,8 @@ class Agent:
             if not response.tool_calls:
                 return AgentRun(response=response.content or "", steps=steps, calls=calls)
             hit_limit = False
+            attached: list[ModelImage] = []
+            image_errors: list[str] = []
             for call in response.tool_calls:
                 emit("tool_calling", call.name)
                 if executed < self.max_tool_calls:
@@ -243,10 +245,30 @@ class Agent:
                 else:
                     hit_limit = True
                     step = AgentStep(call=call, error="tool call limit reached", error_kind="limit")
+                images, errors = _ingest_tool_images(step, self.artifacts)
+                if errors and step.error is None:
+                    step.error = "\n".join(errors)
+                    step.error_kind = "tool_failure"
                 steps.append(step)
-                messages.append(_tool_chat_message(step, self.artifacts))
+                messages.append(
+                    ChatMessage(
+                        role=Role.TOOL,
+                        tool_call_id=call.id,
+                        content=_tool_message(step),
+                    )
+                )
+                attached.extend(images)
+                image_errors.extend(errors)
                 if on_step is not None:
                     on_step(step)
+            if attached or image_errors:
+                messages.append(
+                    ChatMessage(
+                        role=Role.USER,
+                        content="\n".join(image_errors) if image_errors else None,
+                        images=attached,
+                    )
+                )
             if executed >= self.max_tool_calls or hit_limit:
                 return AgentRun(
                     response=_STOPPED_RESPONSE,
@@ -289,26 +311,23 @@ def _tool_message(step: AgentStep) -> str:
     return json.dumps({"error": step.error, "error_kind": step.error_kind})
 
 
-def _tool_chat_message(step: AgentStep, store: LocalArtifactStore) -> ChatMessage:
-    """Build the tool message, attaching any image artifacts the tool wrote."""
-    return ChatMessage(
-        role=Role.TOOL,
-        tool_call_id=step.call.id,
-        content=_tool_message(step),
-        images=_images_for_step(step, store),
-    )
+def _ingest_tool_images(
+    step: AgentStep, store: LocalArtifactStore
+) -> tuple[list[ModelImage], list[str]]:
+    """Read image artifacts for a following user message.
 
-
-def _images_for_step(step: AgentStep, store: LocalArtifactStore) -> list[ModelImage]:
-    """Ingest image artifacts. A file the model cannot see is left as text."""
+    An over-cap or unreadable image is an error string. Other artifacts are
+    left as the tool's text result.
+    """
     if step.result is None:
-        return []
+        return [], []
     images: list[ModelImage] = []
+    errors: list[str] = []
     for path in step.result.artifacts:
         if not is_model_image(path):
             continue
         try:
             images.append(ingest_image(store, path))
-        except (OSError, ValueError):
-            continue
-    return images
+        except (OSError, ValueError) as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+    return images, errors
