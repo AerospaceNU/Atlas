@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 from pathlib import Path
 
 import pytest
@@ -28,7 +30,7 @@ def test_fake_plugin_registers_without_packaged_manifests() -> None:
 
 
 def test_fake_unet_is_hidden_until_weights_exist(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("ATLAS_WEIGHTS_DIR", str(tmp_path))
     spec = PluginSpec(
@@ -45,9 +47,26 @@ def test_fake_unet_is_hidden_until_weights_exist(
 
     weight = tmp_path / "fake_unet" / "model.json"
     weight.parent.mkdir(parents=True)
-    weight.write_text("{}", encoding="utf-8")
+    body = b"{}\n"
+    weight.write_bytes(body)
+    monkeypatch.delenv("ATLAS_ALLOW_UNPINNED", raising=False)
     register_model_tools(registry, [spec])
-    assert [item.name for item in registry.definitions] == ["fake_unet"]
+    assert registry.definitions == []
+
+    monkeypatch.setenv("ATLAS_ALLOW_UNPINNED", "1")
+    allowed = ToolRegistry()
+    with caplog.at_level(logging.WARNING, logger="atlas.models.registry"):
+        register_model_tools(allowed, [spec])
+    assert [item.name for item in allowed.definitions] == ["fake_unet"]
+    assert "unpinned" in allowed.definitions[0].description
+    assert any("unpinned" in record.message for record in caplog.records)
+
+    pinned = spec.model_copy(update={"sha256": hashlib.sha256(body).hexdigest()})
+    monkeypatch.delenv("ATLAS_ALLOW_UNPINNED", raising=False)
+    pinned_registry = ToolRegistry()
+    register_model_tools(pinned_registry, [pinned])
+    assert [item.name for item in pinned_registry.definitions] == ["fake_unet"]
+    assert "unpinned" not in pinned_registry.definitions[0].description
 
 
 def test_fake_lightgbm_is_skipped_when_the_extra_is_missing(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import lightgbm as lgb
@@ -19,11 +20,15 @@ from atlas.models.base import (
     parse_plugin_toml,
 )
 from atlas.models.lgbm_clouds.export import export_weight as export_lgbm
+from atlas.models.lgbm_clouds.export import main as export_lgbm_main
 from atlas.models.lgbm_clouds.train import main as train_lgbm
+from atlas.models.lgbm_runtime import _WEIGHT_CACHE as _LGBM_CACHE
 from atlas.models.lgbm_runtime import LightGBMWeights, load_lightgbm_weights
 from atlas.models.registry import tool_for_spec
+from atlas.models.unet_cpu import _WEIGHT_CACHE as _UNET_CACHE
 from atlas.models.unet_cpu import UnetWeights, load_unet_weights, predict_unet, unet_forward
 from atlas.models.unet_water.export import export_weight as export_unet
+from atlas.models.unet_water.export import main as export_unet_main
 from atlas.models.unet_water.train import main as train_unet
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -104,6 +109,7 @@ def learned_weights(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     _write_weight(root, "unet_water/model.json", _unet_payload())
     _write_weight(root, "lgbm_clouds/model.json", _lgbm_payload())
     monkeypatch.setenv("ATLAS_WEIGHTS_DIR", str(root))
+    monkeypatch.setenv("ATLAS_ALLOW_UNPINNED", "1")
     return root
 
 
@@ -199,21 +205,41 @@ def test_production_tiles_are_256_or_512() -> None:
 
 
 def test_learned_tools_register_when_weights_exist(learned_weights: Path) -> None:
-    names = {item.name for item in default_registry().definitions}
-    assert {"unet_water", "lgbm_clouds"} <= names
+    definitions = {item.name: item for item in default_registry().definitions}
+    assert {"unet_water", "lgbm_clouds"} <= definitions.keys()
+    assert "unpinned" in definitions["unet_water"].description
+    assert "unpinned" in definitions["lgbm_clouds"].description
     assert learned_weights.is_dir()
 
 
-def test_unet_weight_cache_reuses_the_same_object(learned_weights: Path) -> None:
+def test_unet_weight_cache_keeps_the_latest_entry(learned_weights: Path) -> None:
     spec = parse_plugin_toml(_plugin("unet_water").read_text(encoding="utf-8"))
-    assert load_unet_weights(spec) is load_unet_weights(spec)
-    assert learned_weights.is_dir()
+    _UNET_CACHE.pop(spec.name, None)
+    first = load_unet_weights(spec)
+    assert first is load_unet_weights(spec)
+    path = learned_weights / "unet_water" / "model.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["scale"] = 2.0
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    second = load_unet_weights(spec)
+    assert first is not second
+    assert second is load_unet_weights(spec)
+    assert list(_UNET_CACHE).count(spec.name) == 1
+    assert _UNET_CACHE[spec.name][0] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_lightgbm_weight_cache_reuses_the_same_object(learned_weights: Path) -> None:
+def test_lightgbm_weight_cache_keeps_the_latest_entry(learned_weights: Path) -> None:
     spec = parse_plugin_toml(_plugin("lgbm_clouds").read_text(encoding="utf-8"))
-    assert load_lightgbm_weights(spec) is load_lightgbm_weights(spec)
-    assert learned_weights.is_dir()
+    _LGBM_CACHE.pop(spec.name, None)
+    first = load_lightgbm_weights(spec)
+    path = learned_weights / "lgbm_clouds" / "model.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["tile"] = 512
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    second = load_lightgbm_weights(spec)
+    assert first is not second
+    assert second is load_lightgbm_weights(spec)
+    assert list(_LGBM_CACHE).count(spec.name) == 1
 
 
 def test_unet_applies_scale_mean_and_std() -> None:
@@ -325,6 +351,7 @@ def test_unet_train_and_export_roundtrip(tmp_path: Path, monkeypatch: pytest.Mon
     assert len(digest) == 64
     assert digest == hashlib.sha256(destination.read_bytes()).hexdigest()
     monkeypatch.setenv("ATLAS_WEIGHTS_DIR", str(tmp_path / "weights"))
+    monkeypatch.setenv("ATLAS_ALLOW_UNPINNED", "1")
     store = LocalArtifactStore(tmp_path / "workspace")
     for name, color in colors.items():
         _save(store, f"{name}.png", np.full((16, 16, 3), color, dtype=np.uint8))
@@ -352,8 +379,55 @@ def test_lightgbm_train_and_export_roundtrip(
     digest = export_lgbm(trained, destination)
     assert len(digest) == 64
     monkeypatch.setenv("ATLAS_WEIGHTS_DIR", str(tmp_path / "weights"))
+    monkeypatch.setenv("ATLAS_ALLOW_UNPINNED", "1")
     store = LocalArtifactStore(tmp_path / "workspace")
     _save(store, "cloud.png", np.full((12, 12, 3), colors["cloud"], dtype=np.uint8))
     default_registry().execute("lgbm_clouds", {"path": "cloud.png"}, store)
     mask = np.asarray(Image.open(store.root / "artifacts/lgbm_clouds_mask.png"))
     assert int(mask.min()) == 1
+
+
+def test_unet_rejects_bad_scale_and_non_finite_weights() -> None:
+    spec = parse_plugin_toml(_plugin("unet_water").read_text(encoding="utf-8"))
+    payload = _unet_payload()
+    for scale in (0.0, float("nan"), float("inf")):
+        payload["scale"] = scale
+        with pytest.raises(ValueError, match="scale"):
+            UnetWeights(spec, payload)
+    payload["scale"] = 1.0
+    payload["mean"] = [0.0, float("nan"), 0.0]
+    with pytest.raises(ValueError, match="mean"):
+        UnetWeights(spec, payload)
+    payload["mean"] = [0.0, 0.0, 0.0]
+    payload["enc_b"] = [0.0, float("inf"), 0.0]
+    with pytest.raises(ValueError, match="enc_b"):
+        UnetWeights(spec, payload)
+
+
+@pytest.mark.parametrize("export", [export_unet, export_lgbm])
+def test_export_refuses_a_symlink_target(
+    tmp_path: Path, export: Callable[[Path, Path], str]
+) -> None:
+    model = tmp_path / "trained.json"
+    model.write_text("{}\n", encoding="utf-8")
+    target = tmp_path / "elsewhere.json"
+    target.write_text("keep", encoding="utf-8")
+    link = tmp_path / "out" / "model.json"
+    link.parent.mkdir()
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        export(model, link)
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_export_prints_restart_to_load(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    model = tmp_path / "trained.json"
+    model.write_text("{}\n", encoding="utf-8")
+    for main, name in ((export_unet_main, "unet.json"), (export_lgbm_main, "lgbm.json")):
+        destination = tmp_path / name
+        main(["--model", str(model), "--out", str(destination)])
+        printed = capsys.readouterr().out
+        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        assert "restart to load" in printed
+        assert digest in printed
+        assert list(destination.parent.glob(f".{destination.name}.*")) == []

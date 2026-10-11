@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,38 @@ def read_weight_bytes(spec: PluginSpec) -> bytes:
         if digest != expected:
             raise ValueError(f"Weight {spec.weight} sha256 mismatch")
     return data
+
+
+def replace_weight_bytes(destination: Path, data: bytes) -> None:
+    """Atomically replace ``destination`` with ``data``.
+
+    The bytes land in a temporary file in the same directory, then
+    ``os.replace`` moves that file onto ``destination``. A symlink at
+    ``destination`` is refused so the write cannot follow it.
+
+    Args:
+        destination: Weight file to publish.
+        data: Exact bytes that should be stored there.
+
+    Raises:
+        ValueError: If ``destination`` is a symlink.
+    """
+    if destination.is_symlink():
+        raise ValueError("Refusing to replace a symlink weight file")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp, destination)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def load_centroids(spec: PluginSpec) -> dict[str, tuple[float, float, float]]:

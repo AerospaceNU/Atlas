@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Sequence
 from importlib.resources import files
 
@@ -12,6 +14,8 @@ from atlas.models.unet_cpu import UnetCpuTool
 
 _MODELS_PACKAGE = "atlas.models"
 _WEIGHTED_RUNTIMES = frozenset({"unet_cpu", "lightgbm"})
+_ALLOW_UNPINNED = "ATLAS_ALLOW_UNPINNED"
+logger = logging.getLogger(__name__)
 
 
 def iter_plugin_specs() -> list[PluginSpec]:
@@ -73,15 +77,33 @@ def tool_for_spec(spec: PluginSpec) -> Tool:
     raise ValueError(f"Unsupported model runtime {spec.runtime!r} for {spec.name}")
 
 
+def allow_unpinned() -> bool:
+    """Return whether an empty ``sha256`` may still register a weighted tool."""
+    return os.environ.get(_ALLOW_UNPINNED) == "1"
+
+
 def should_register(spec: PluginSpec) -> bool:
     """Return whether ``spec`` should be advertised on a session registry.
 
     ``unet_cpu`` and ``lightgbm`` stay hidden until their weight file exists.
-    LightGBM also stays hidden when the extra failed to import.
+    An empty ``sha256`` also hides them, unless ``ATLAS_ALLOW_UNPINNED=1``.
+    LightGBM stays hidden when the extra failed to import.
     """
     if spec.runtime == "lightgbm" and not lightgbm_available():
         return False
-    return spec.runtime not in _WEIGHTED_RUNTIMES or weight_path(spec).is_file()
+    if spec.runtime not in _WEIGHTED_RUNTIMES:
+        return True
+    if not weight_path(spec).is_file():
+        return False
+    return bool(spec.sha256.strip()) or allow_unpinned()
+
+
+def _label_unpinned(spec: PluginSpec, tool: Tool) -> None:
+    if spec.runtime not in _WEIGHTED_RUNTIMES or spec.sha256.strip():
+        return
+    logger.warning("%s weight is unpinned; set sha256 in plugin.toml", spec.name)
+    if "unpinned" not in tool.description:
+        tool.description = f"{tool.description} (unpinned)"
 
 
 def register_model_tools(
@@ -100,4 +122,6 @@ def register_model_tools(
     for spec in chosen:
         if not should_register(spec):
             continue
-        registry.register(tool_for_spec(spec))
+        tool = tool_for_spec(spec)
+        _label_unpinned(spec, tool)
+        registry.register(tool)

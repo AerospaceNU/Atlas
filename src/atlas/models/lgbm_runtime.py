@@ -21,7 +21,7 @@ from atlas.models.base import (
 from atlas.models.inputs import SegmentInput
 
 _FEATURES = ["r", "g", "b"]
-_WEIGHT_CACHE: dict[tuple[str, str, tuple[str, ...]], LightGBMWeights] = {}
+_WEIGHT_CACHE: dict[str, tuple[str, tuple[str, ...], LightGBMWeights]] = {}
 
 
 class LightGBMWeights:
@@ -48,17 +48,17 @@ def load_lightgbm_weights(spec: PluginSpec) -> LightGBMWeights:
         spec: Plugin whose relative weight key points at the JSON contract.
 
     Returns:
-        Parsed booster. A second call with the same name, class list, and
-        sha256 returns the same object.
+        Parsed booster. Only the latest file for ``spec.name`` is kept. A
+        second call with the same bytes and class list returns that object.
     """
     data = read_weight_bytes(spec)
     digest = hashlib.sha256(data).hexdigest()
-    key = (spec.name, digest, tuple(spec.output.classes))
-    cached = _WEIGHT_CACHE.get(key)
-    if cached is not None:
-        return cached
+    classes = tuple(spec.output.classes)
+    cached = _WEIGHT_CACHE.get(spec.name)
+    if cached is not None and cached[0] == digest and cached[1] == classes:
+        return cached[2]
     weights = LightGBMWeights(spec, parse_weight_payload(spec, data))
-    _WEIGHT_CACHE[key] = weights
+    _WEIGHT_CACHE[spec.name] = (digest, classes, weights)
     return weights
 
 

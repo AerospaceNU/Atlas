@@ -22,7 +22,7 @@ from atlas.models.inputs import SegmentInput
 
 _MAX_HIDDEN = 32
 _TILE_MARGIN = 8
-_WEIGHT_CACHE: dict[tuple[str, str, tuple[str, ...]], UnetWeights] = {}
+_WEIGHT_CACHE: dict[str, tuple[str, tuple[str, ...], UnetWeights]] = {}
 
 
 class UnetWeights:
@@ -58,32 +58,41 @@ def load_unet_weights(spec: PluginSpec) -> UnetWeights:
         spec: Plugin whose relative weight key points at the JSON contract.
 
     Returns:
-        Parsed kernels. A second call with the same name, class list, and
-        sha256 returns the same object.
+        Parsed kernels. Only the latest file for ``spec.name`` is kept. A
+        second call with the same bytes and class list returns that object.
     """
     data = read_weight_bytes(spec)
     digest = hashlib.sha256(data).hexdigest()
-    key = (spec.name, digest, tuple(spec.output.classes))
-    cached = _WEIGHT_CACHE.get(key)
-    if cached is not None:
-        return cached
+    classes = tuple(spec.output.classes)
+    cached = _WEIGHT_CACHE.get(spec.name)
+    if cached is not None and cached[0] == digest and cached[1] == classes:
+        return cached[2]
     weights = UnetWeights(spec, parse_weight_payload(spec, data))
-    _WEIGHT_CACHE[key] = weights
+    _WEIGHT_CACHE[spec.name] = (digest, classes, weights)
     return weights
 
 
 def _scalar(payload: dict[str, Any], key: str) -> float:
     value = payload.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"Weight {key} must be a number")
-    return float(value)
+        raise ValueError(f"Weight {key} must be a finite non-zero number")
+    number = float(value)
+    if not np.isfinite(number) or number == 0.0:
+        raise ValueError(f"Weight {key} must be a finite non-zero number")
+    return number
+
+
+def _require_finite(array: NDArray[np.float32], key: str) -> NDArray[np.float32]:
+    if not bool(np.isfinite(array).all()):
+        raise ValueError(f"Weight {key} must be finite")
+    return array
 
 
 def _rgb_triple(payload: dict[str, Any], key: str) -> NDArray[np.float32]:
     array = np.asarray(payload.get(key), dtype=np.float32)
     if array.shape != (3,):
         raise ValueError(f"Weight {key} must be an RGB triple")
-    return array
+    return _require_finite(array, key)
 
 
 def _kernel(
@@ -98,14 +107,14 @@ def _kernel(
         raise ValueError(f"Weight {key} must have shape (Cout, {cin}, 3, 3)")
     if cout is not None and array.shape[0] != cout:
         raise ValueError(f"Weight {key} must have {cout} output channels")
-    return array
+    return _require_finite(array, key)
 
 
 def _bias(payload: dict[str, Any], key: str, width: int) -> NDArray[np.float32]:
     array = np.asarray(payload.get(key), dtype=np.float32)
     if array.shape != (width,):
         raise ValueError(f"Weight {key} must have shape ({width},)")
-    return array
+    return _require_finite(array, key)
 
 
 def _conv2d(
