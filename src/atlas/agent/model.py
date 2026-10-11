@@ -13,6 +13,7 @@ from atlas.agent.contracts import (
     CallTiming,
     CatalogModel,
     ChatMessage,
+    ModelImage,
     ModelResponse,
     Role,
     TokenUsage,
@@ -539,7 +540,9 @@ def _short_error_body(resp: Any) -> str:
 
 def _serialize_message(message: ChatMessage) -> dict[str, Any]:
     data: dict[str, Any] = {"role": message.role.value}
-    if message.content is not None:
+    if message.images:
+        data["content"] = _content_with_images(message)
+    elif message.content is not None:
         data["content"] = message.content
     if message.tool_call_id is not None:
         data["tool_call_id"] = message.tool_call_id
@@ -557,6 +560,28 @@ def _serialize_message(message: ChatMessage) -> dict[str, Any]:
     if message.reasoning_details:
         data["reasoning_details"] = message.reasoning_details
     return data
+
+
+def _content_with_images(message: ChatMessage) -> list[dict[str, Any]]:
+    """Turn text plus local image artifacts into OpenRouter vision parts.
+
+    Each image is a data URL. A short text part names the artifact path so
+    the model can refer to the file the bytes came from.
+    """
+    parts: list[dict[str, Any]] = []
+    if message.content is not None:
+        parts.append({"type": "text", "text": message.content})
+    for image in message.images:
+        parts.append({"type": "text", "text": f"Image artifact: {image.path}"})
+        parts.append(_image_part(image))
+    return parts
+
+
+def _image_part(image: ModelImage) -> dict[str, Any]:
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{image.media_type};base64,{image.data}"},
+    }
 
 
 def _optional_text(value: object) -> str | None:

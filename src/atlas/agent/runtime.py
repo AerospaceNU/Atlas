@@ -13,12 +13,14 @@ from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied, record_deni
 from atlas.agent.contracts import (
     ChatMessage,
     ModelCall,
+    ModelImage,
     Role,
     ToolCall,
     ToolCapableModel,
     ToolRegistry,
     ToolResult,
 )
+from atlas.agent.images import ingest_image, ingest_images, is_model_image
 from atlas.agent.metrics import observe_model_call, tokens_per_second
 from atlas.agent.skills import (
     Skill,
@@ -161,11 +163,18 @@ class Agent:
         """Return the system prompt, including the skill catalog when skills are loaded."""
         return render_system_prompt(_SYSTEM_PROMPT, self.skills)
 
-    def run(self, request: str) -> AgentRun:
-        """Answer ``request``, making bounded, registry-approved tool calls."""
+    def run(self, request: str, *, images: Sequence[str] = ()) -> AgentRun:
+        """Answer ``request``, making bounded, registry-approved tool calls.
+
+        ``images`` are artifact-root paths. Each one is read in the sandbox
+        and sent with the user message as vision input.
+        """
+        user = ChatMessage(role=Role.USER, content=request)
+        if images:
+            user.images = ingest_images(self.artifacts, list(images))
         messages = [
             ChatMessage(role=Role.SYSTEM, content=self.system_prompt()),
-            ChatMessage(role=Role.USER, content=request),
+            user,
         ]
         return self.advance(messages)
 
@@ -235,13 +244,7 @@ class Agent:
                     hit_limit = True
                     step = AgentStep(call=call, error="tool call limit reached", error_kind="limit")
                 steps.append(step)
-                messages.append(
-                    ChatMessage(
-                        role=Role.TOOL,
-                        tool_call_id=call.id,
-                        content=_tool_message(step),
-                    )
-                )
+                messages.append(_tool_chat_message(step, self.artifacts))
                 if on_step is not None:
                     on_step(step)
             if executed >= self.max_tool_calls or hit_limit:
@@ -284,3 +287,28 @@ def _tool_message(step: AgentStep) -> str:
     if step.result is not None:
         return step.result.model_dump_json()
     return json.dumps({"error": step.error, "error_kind": step.error_kind})
+
+
+def _tool_chat_message(step: AgentStep, store: LocalArtifactStore) -> ChatMessage:
+    """Build the tool message, attaching any image artifacts the tool wrote."""
+    return ChatMessage(
+        role=Role.TOOL,
+        tool_call_id=step.call.id,
+        content=_tool_message(step),
+        images=_images_for_step(step, store),
+    )
+
+
+def _images_for_step(step: AgentStep, store: LocalArtifactStore) -> list[ModelImage]:
+    """Ingest image artifacts. A file the model cannot see is left as text."""
+    if step.result is None:
+        return []
+    images: list[ModelImage] = []
+    for path in step.result.artifacts:
+        if not is_model_image(path):
+            continue
+        try:
+            images.append(ingest_image(store, path))
+        except (OSError, ValueError):
+            continue
+    return images

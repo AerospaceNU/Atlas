@@ -28,6 +28,7 @@ from atlas.agent.analysis_skill import (
 )
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
+from atlas.agent.images import ingest_images
 from atlas.agent.layout import (
     AtlasPathError,
     ensure_project_layout,
@@ -100,14 +101,22 @@ class AgentSession:
         self,
         request: str,
         *,
+        images: Sequence[str] = (),
         on_step: Callable[[AgentStep], None] | None = None,
         on_phase: Callable[[str, str | None], None] | None = None,
         on_thought: Callable[[str, float | None], None] | None = None,
     ) -> AgentRun:
-        """Append the user message and advance the shared history one turn."""
+        """Append the user message and advance the shared history one turn.
+
+        ``images`` are artifact-root paths read in the sandbox and sent with
+        this user message. A path the sandbox rejects is not appended.
+        """
         self._require_key()
+        message = ChatMessage(role=Role.USER, content=request)
+        if images:
+            message.images = ingest_images(self.agent.artifacts, list(images))
         self._begin_analysis(request)
-        self.messages.append(ChatMessage(role=Role.USER, content=request))
+        self.messages.append(message)
         run = self.agent.advance(
             self.messages, on_step=on_step, on_phase=on_phase, on_thought=on_thought
         )

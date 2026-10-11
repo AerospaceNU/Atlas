@@ -40,11 +40,24 @@ class ToolCall(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
+class ModelImage(BaseModel):
+    """One local image artifact encoded for a vision model.
+
+    ``data`` is standard base64 of the file bytes. ``path`` is the
+    workspace-relative artifact path those bytes were read from.
+    """
+
+    path: str
+    media_type: str
+    data: str
+
+
 class ChatMessage(BaseModel):
     """A portable chat-completions message.
 
     ``reasoning`` and ``reasoning_details`` are echoed on the next request when
-    the provider returned them. They are not part of ``content``.
+    the provider returned them. They are not part of ``content``. ``images``
+    are local artifact bytes sent alongside ``content`` as vision input.
     """
 
     role: Role
@@ -53,6 +66,7 @@ class ChatMessage(BaseModel):
     tool_call_id: str | None = None
     reasoning: str | None = None
     reasoning_details: list[dict[str, Any]] = Field(default_factory=list)
+    images: list[ModelImage] = Field(default_factory=list)
 
 
 class TokenUsage(BaseModel):
