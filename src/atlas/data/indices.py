@@ -29,6 +29,21 @@ class _Formula(NamedTuple):
     right: str
 
 
+class Calibration(NamedTuple):
+    """Scale and offset for ``reflectance = stored * scale + offset``."""
+
+    scale: float
+    offset: float
+
+
+# s2-l2a: published digital-number offset -1000 and scale 1e-4.
+# landsat-c2: Collection 2 surface reflectance scale and offset.
+CALIBRATION_PRESETS: Final[Mapping[str, Calibration]] = {
+    "s2-l2a": Calibration(1e-4, -1000 * 1e-4),
+    "landsat-c2": Calibration(2.75e-5, -0.2),
+}
+
+
 # Insertion order is the order both public functions return.
 _FORMULAS: Final[tuple[_Formula, ...]] = (
     _Formula("ndvi", "nir", "red"),
@@ -69,6 +84,7 @@ def compute_indices(
     mask: NDArray[Any] | Mapping[str, NDArray[Any]] | None = None,
     scale: float | Mapping[str, float] | None = None,
     offset: float | Mapping[str, float] | None = None,
+    preset: str | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute NDVI, McFeeters NDWI, and NBR once red and NIR are available.
 
@@ -89,6 +105,8 @@ def compute_indices(
             Sentinel-2 L2A's published offset of -1000 with scale 1e-4 is
             ``offset=-1000 * 1e-4``. Landsat Collection 2 uses scale
             ``2.75e-5`` and offset ``-0.2``.
+        preset: ``s2-l2a`` or ``landsat-c2``. Supplies scale and offset.
+            Cannot be combined with ``scale`` or ``offset``.
 
     Returns:
         Index name to a float64 array with the same shape as NIR. Empty when
@@ -99,8 +117,10 @@ def compute_indices(
         TypeError: if a name is not a string, a used band is not a numeric
             array, or a mask is not boolean.
         ValueError: if two names collapse to one band, used bands do not share
-            a shape, or scale, offset, nodata, or mask names an unused band.
+            a shape, scale, offset, nodata, or mask names an unused band, or
+            ``preset`` is combined with ``scale`` or ``offset``.
     """
+    scale, offset = _apply_preset(preset, scale, offset)
     collected = _collect(bands)
     chosen = available_indices(collected)
     if not chosen:
@@ -201,6 +221,24 @@ def _normalize(raw: object) -> str:
     if not isinstance(raw, str):
         raise TypeError(f"band name must be a string, got {type(raw).__name__}")
     return raw.strip().lower()
+
+
+def _apply_preset(
+    preset: str | None,
+    scale: float | Mapping[str, float] | None,
+    offset: float | Mapping[str, float] | None,
+) -> tuple[float | Mapping[str, float] | None, float | Mapping[str, float] | None]:
+    """Return scale and offset, expanding a named preset."""
+    if preset is None:
+        return scale, offset
+    if scale is not None or offset is not None:
+        raise ValueError("pass a calibration preset or scale and offset, not both")
+    try:
+        chosen = CALIBRATION_PRESETS[preset]
+    except KeyError as exc:
+        known = ", ".join(sorted(CALIBRATION_PRESETS))
+        raise ValueError(f"unknown calibration preset {preset!r}; known presets: {known}") from exc
+    return chosen.scale, chosen.offset
 
 
 def _used_bands(chosen: tuple[str, ...]) -> set[str]:

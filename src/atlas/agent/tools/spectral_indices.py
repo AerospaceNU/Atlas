@@ -59,6 +59,14 @@ class SpectralIndicesInput(BaseModel):
             "scale 2.75e-5 and offset -0.2."
         ),
     )
+    preset: Literal["s2-l2a", "landsat-c2"] | None = Field(
+        default=None,
+        description=(
+            "Calibration preset. s2-l2a is scale 1e-4 and offset -0.1 "
+            "(published DN offset -1000). landsat-c2 is scale 2.75e-5 and "
+            "offset -0.2. Cannot be combined with scale or offset."
+        ),
+    )
 
 
 class SpectralIndicesTool(Tool):
@@ -70,7 +78,8 @@ class SpectralIndicesTool(Tool):
         "reflectance .npy arrays once red and NIR are available. Optional scale "
         "and offset convert digital numbers (reflectance = stored * scale + offset). "
         "Sentinel-2 L2A: scale 1e-4 and offset -0.1 (published DN offset -1000). "
-        "Landsat Collection 2: scale 2.75e-5 and offset -0.2. A nodata fill value "
+        "Landsat Collection 2: scale 2.75e-5 and offset -0.2. Presets s2-l2a and "
+        "landsat-c2 set both. A nodata fill value "
         "or a boolean mask (True = nodata) becomes NaN."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
@@ -96,6 +105,7 @@ class SpectralIndicesTool(Tool):
             mask=mask,
             scale=request.scale,
             offset=request.offset,
+            preset=request.preset,
         )
         if not result:
             raise ValueError("red and NIR are required before an index can be computed")

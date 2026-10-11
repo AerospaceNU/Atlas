@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from atlas.data.indices import available_indices, compute_indices, normalized_difference
+from atlas.data.indices import (
+    CALIBRATION_PRESETS,
+    available_indices,
+    compute_indices,
+    normalized_difference,
+)
 from atlas.data.stac import item_to_scene
 
 
@@ -340,6 +345,34 @@ def test_landsat_c2_scale_and_offset() -> None:
     assert nir_sr == pytest.approx(0.35)
     assert result["ndvi"][0] == pytest.approx((nir_sr - red_sr) / (nir_sr + red_sr))
     assert np.isnan(result["ndvi"][1])
+
+
+def test_s2_l2a_and_landsat_c2_presets() -> None:
+    assert CALIBRATION_PRESETS["s2-l2a"].scale == pytest.approx(1e-4)
+    assert CALIBRATION_PRESETS["s2-l2a"].offset == pytest.approx(-1000 * 1e-4)
+    assert CALIBRATION_PRESETS["landsat-c2"].scale == pytest.approx(2.75e-5)
+    assert CALIBRATION_PRESETS["landsat-c2"].offset == pytest.approx(-0.2)
+
+    red = np.array([2000.0, 0.0])
+    nir = np.array([6000.0, 4000.0])
+    preset = compute_indices({"red": red, "nir": nir}, preset="s2-l2a", nodata=0)
+    manual = compute_indices(
+        {"red": red, "nir": nir},
+        scale=1e-4,
+        offset=-1000 * 1e-4,
+        nodata=0,
+    )
+    np.testing.assert_allclose(preset["ndvi"], manual["ndvi"], equal_nan=True)
+
+    landsat_dn = {"red": np.array([10000.0]), "nir": np.array([20000.0])}
+    landsat = compute_indices(landsat_dn, preset="landsat-c2")
+    landsat_manual = compute_indices(landsat_dn, scale=2.75e-5, offset=-0.2)
+    np.testing.assert_allclose(landsat["ndvi"], landsat_manual["ndvi"])
+
+    with pytest.raises(ValueError, match="not both"):
+        compute_indices(landsat_dn, preset="s2-l2a", scale=1.0)
+    with pytest.raises(ValueError, match="unknown calibration preset"):
+        compute_indices(landsat_dn, preset="modis")
 
 
 def test_scale_and_offset_can_differ_per_band() -> None:

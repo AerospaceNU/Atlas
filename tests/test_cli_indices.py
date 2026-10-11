@@ -158,6 +158,81 @@ def test_cli_nodata_fills(tmp_path: Path) -> None:
         np.testing.assert_allclose(written, expected["ndvi"], equal_nan=True)
 
 
+def test_cli_presets_match_compute_indices(tmp_path: Path) -> None:
+    red = tmp_path / "red.npy"
+    nir = tmp_path / "nir.npy"
+    _save(red, [2000.0, 0.0])
+    _save(nir, [6000.0, 4000.0])
+    out = tmp_path / "s2"
+    assert (
+        main(
+            [
+                "indices",
+                "--red",
+                str(red),
+                "--nir",
+                str(nir),
+                "--out",
+                str(out),
+                "--preset",
+                "s2-l2a",
+                "--nodata",
+                "0",
+            ]
+        )
+        == 0
+    )
+    expected = compute_indices(
+        {"red": np.load(red), "nir": np.load(nir)},
+        preset="s2-l2a",
+        nodata=0,
+    )
+    np.testing.assert_allclose(np.load(out / "ndvi.npy"), expected["ndvi"], equal_nan=True)
+
+    landsat_red = tmp_path / "l8_red.npy"
+    landsat_nir = tmp_path / "l8_nir.npy"
+    _save(landsat_red, [10000.0])
+    _save(landsat_nir, [20000.0])
+    landsat_out = tmp_path / "l8"
+    assert (
+        main(
+            [
+                "indices",
+                "--red",
+                str(landsat_red),
+                "--nir",
+                str(landsat_nir),
+                "--out",
+                str(landsat_out),
+                "--preset",
+                "landsat-c2",
+            ]
+        )
+        == 0
+    )
+    landsat = compute_indices(
+        {"red": np.load(landsat_red), "nir": np.load(landsat_nir)},
+        preset="landsat-c2",
+    )
+    np.testing.assert_allclose(np.load(landsat_out / "ndvi.npy"), landsat["ndvi"])
+    mixed = main(
+        [
+            "indices",
+            "--red",
+            str(red),
+            "--nir",
+            str(nir),
+            "--out",
+            str(tmp_path / "mixed"),
+            "--preset",
+            "s2-l2a",
+            "--scale",
+            "1",
+        ]
+    )
+    assert mixed == 2
+
+
 def test_cli_rejects_nan_nodata(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     red = tmp_path / "red.npy"
     nir = tmp_path / "nir.npy"

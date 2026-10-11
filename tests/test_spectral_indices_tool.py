@@ -117,6 +117,32 @@ def test_tool_sentinel2_and_landsat_calibration_match_compute_indices(tmp_path: 
     )
 
 
+def test_tool_preset_matches_compute_indices(tmp_path: Path) -> None:
+    _save(tmp_path, "red.npy", [10000.0, 0.0])
+    _save(tmp_path, "nir.npy", [20000.0, 8000.0])
+    result = SpectralIndicesTool().run(
+        {
+            "red": "red.npy",
+            "nir": "nir.npy",
+            "preset": "landsat-c2",
+            "nodata": 0,
+            "out": "landsat",
+        },
+        LocalArtifactStore(tmp_path),
+    )
+    assert result.artifacts == ["landsat/ndvi.npy"]
+    expected = compute_indices(
+        {"red": np.load(tmp_path / "red.npy"), "nir": np.load(tmp_path / "nir.npy")},
+        preset="landsat-c2",
+        nodata=0,
+    )
+    np.testing.assert_allclose(
+        np.load(tmp_path / "landsat" / "ndvi.npy"),
+        expected["ndvi"],
+        equal_nan=True,
+    )
+
+
 def test_tool_rejects_a_path_outside_the_workspace(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     with pytest.raises(SandboxDenied):

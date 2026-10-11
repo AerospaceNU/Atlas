@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-from atlas.data.indices import compute_indices
+from atlas.data.indices import CALIBRATION_PRESETS, compute_indices
 
 _DESCRIPTION = (
     "Inputs must be surface reflectance arrays stored as .npy files. "
@@ -18,6 +18,7 @@ _DESCRIPTION = (
     "Sentinel-2 L2A publishes an additive offset of -1000 and a scale of 1e-4, "
     "passed as --scale 1e-4 --offset -0.1. "
     "Landsat Collection 2 uses --scale 2.75e-5 --offset -0.2. "
+    "Presets --preset s2-l2a and --preset landsat-c2 set both. "
     "NDWI is the McFeeters index and is written as ndwi_mcfeeters.npy. "
     "A --nodata fill value, or a boolean --mask where True means nodata, "
     "makes that pixel NaN."
@@ -48,6 +49,12 @@ def add_indices_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser])
         type=Path,
         default=None,
         help="Boolean .npy mask; True marks nodata for every band",
+    )
+    parser.add_argument(
+        "--preset",
+        choices=sorted(CALIBRATION_PRESETS),
+        default=None,
+        help="Scale and offset preset: s2-l2a or landsat-c2",
     )
     parser.add_argument(
         "--scale",
@@ -86,6 +93,7 @@ def run_indices(args: argparse.Namespace) -> int:
             mask=mask,
             scale=_parse_band_floats(args.scale, "scale"),
             offset=_parse_band_floats(args.offset, "offset"),
+            preset=args.preset,
         )
     except (OSError, ValueError, TypeError) as exc:
         print(str(exc), file=sys.stderr)
