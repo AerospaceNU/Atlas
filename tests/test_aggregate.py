@@ -255,6 +255,60 @@ async def test_status_code_attribute_is_retried(monkeypatch: pytest.MonkeyPatch)
     assert [scene.id for scene in catalog.sources[0].scenes] == ["S2A_wrapped"]
 
 
+class _HangingClient(DataPullClient):
+    """Search that waits until the source budget cancels it."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def search(self, request: PullRequest) -> PullResult:
+        self.calls += 1
+        await asyncio.sleep(30)
+        return PullResult(request=request, scenes=[_scene("should-not-return")])
+
+
+@pytest.mark.asyncio
+async def test_source_budget_does_not_abort_others(monkeypatch: pytest.MonkeyPatch) -> None:
+    budgets: list[float] = []
+    real_timeout = asyncio.timeout
+
+    def spy(delay: float | None) -> asyncio.Timeout:
+        if delay is not None:
+            budgets.append(delay)
+        return real_timeout(delay)
+
+    monkeypatch.setattr(aggregate_mod, "_SOURCE_BUDGET_SECONDS", 0.1)
+    monkeypatch.setattr(aggregate_mod.asyncio, "timeout", spy)
+    slow = _HangingClient()
+    healthy = _ScriptedClient(["S2B_ok"])
+
+    catalog = await aggregate(_request(), {"slow": slow, "healthy": healthy})
+
+    by_name = {src.source: src for src in catalog.sources}
+    assert budgets == [0.1, 0.1]
+    assert slow.calls == 1
+    assert by_name["slow"].scenes == []
+    assert by_name["slow"].error == "TimeoutError: source search exceeded the time budget"
+    assert by_name["healthy"].error is None
+    assert [scene.id for scene in by_name["healthy"].scenes] == ["S2B_ok"]
+
+
+@pytest.mark.asyncio
+async def test_budget_stops_a_long_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(aggregate_mod, "_SOURCE_BUDGET_SECONDS", 0.1)
+    limited = _ScriptedClient([_rate_limit("30"), "should-not-run"])
+    healthy = _ScriptedClient(["S2B_ok"])
+
+    catalog = await aggregate(_request(), {"limited": limited, "healthy": healthy})
+
+    by_name = {src.source: src for src in catalog.sources}
+    assert limited.calls == 1
+    assert by_name["limited"].error == "TimeoutError: source search exceeded the time budget"
+    assert by_name["limited"].scenes == []
+    assert by_name["healthy"].error is None
+    assert [scene.id for scene in by_name["healthy"].scenes] == ["S2B_ok"]
+
+
 @pytest.mark.asyncio
 async def test_other_errors_are_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     delays = _patch_sleep(monkeypatch)

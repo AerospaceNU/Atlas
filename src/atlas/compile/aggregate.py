@@ -18,6 +18,8 @@ _BACKOFF_SECONDS = 0.5
 _JITTER_FRACTION = 0.2
 # A huge or hostile Retry-After must not stall the catalog.
 _MAX_BACKOFF_SECONDS = 60.0
+# Wall-clock cap for one source, including retries. Others are not cancelled.
+_SOURCE_BUDGET_SECONDS = 60.0
 
 
 def _status_code(exc: BaseException) -> int | None:
@@ -109,8 +111,9 @@ def _stamp_source(name: str, collection: str, result: PullResult) -> SourceScene
     return SourceScenes(source=name, collection=collection, scenes=stamped)
 
 
-async def _search_one(name: str, client: DataPullClient, request: PullRequest) -> SourceScenes:
-    collection = getattr(client, "collection", "")
+async def _search_attempts(
+    name: str, collection: str, client: DataPullClient, request: PullRequest
+) -> SourceScenes:
     failure: Exception | None = None
     for attempt in range(1, _MAX_SEARCH_ATTEMPTS + 1):
         try:
@@ -133,6 +136,20 @@ async def _search_one(name: str, client: DataPullClient, request: PullRequest) -
     )
 
 
+async def _search_one(name: str, client: DataPullClient, request: PullRequest) -> SourceScenes:
+    collection = getattr(client, "collection", "")
+    budget: asyncio.Timeout | None = None
+    try:
+        async with asyncio.timeout(_SOURCE_BUDGET_SECONDS) as budget:
+            return await _search_attempts(name, collection, client, request)
+    except TimeoutError as exc:
+        if budget is not None and budget.expired():
+            error = "TimeoutError: source search exceeded the time budget"
+        else:
+            error = f"{type(exc).__name__}: {exc}"
+        return SourceScenes(source=name, collection=collection, scenes=[], error=error)
+
+
 async def aggregate(
     request: PullRequest,
     clients: Mapping[str, DataPullClient],
@@ -148,8 +165,9 @@ async def aggregate(
     The wait is the ``Retry-After`` header when that parses as a finite number
     of seconds or an HTTP date, otherwise half a second times the attempt
     number, jittered by 20 percent. The wait is never more than 60 seconds.
-    Other sources keep running during that wait. Any other error is recorded
-    on the first failure.
+    Each source, including those waits, is limited to 60 seconds with
+    ``asyncio.timeout``. Other sources keep running during that wait and if
+    the budget runs out. Any other error is recorded on the first failure.
     """
 
     async def run(name: str, client: DataPullClient) -> SourceScenes:
