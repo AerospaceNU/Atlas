@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -63,9 +64,14 @@ def _parse_retry_after(value: str) -> float | None:
     if not value:
         return None
     try:
-        return max(0.0, float(value))
+        parsed = float(value)
     except ValueError:
-        pass
+        parsed = None
+    if parsed is not None:
+        # inf and nan would sleep forever or raise inside asyncio.sleep.
+        if not math.isfinite(parsed):
+            return None
+        return max(0.0, parsed)
     try:
         when = parsedate_to_datetime(value)
     except (TypeError, ValueError, IndexError, OverflowError):

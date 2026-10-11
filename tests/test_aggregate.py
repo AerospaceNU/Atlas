@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import math
 from datetime import UTC, date, datetime
 
 import httpx
@@ -178,6 +179,21 @@ async def test_past_retry_after_date_waits_zero(monkeypatch: pytest.MonkeyPatch)
     await aggregate(_request(), {"sentinel2": limited})
 
     assert delays == [0.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", ["inf", "+inf", "-inf", "nan", "NaN"])
+async def test_non_finite_retry_after_falls_back_to_backoff(
+    monkeypatch: pytest.MonkeyPatch, header: str
+) -> None:
+    delays = _patch_sleep(monkeypatch)
+    limited = _ScriptedClient([_rate_limit(header), "S2A_after_retry"])
+
+    catalog = await aggregate(_request(), {"sentinel2": limited})
+
+    assert delays == [0.5]
+    assert all(math.isfinite(delay) for delay in delays)
+    assert [scene.id for scene in catalog.sources[0].scenes] == ["S2A_after_retry"]
 
 
 @pytest.mark.asyncio
