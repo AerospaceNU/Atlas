@@ -30,9 +30,11 @@ from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
 from atlas.agent.layout import (
     AtlasPathError,
+    delete_user_key,
     ensure_project_layout,
     ensure_user_layout,
     list_entries,
+    prepare_openrouter_key,
     project_atlas_root,
     remove_entry,
     resolve_openrouter_key,
@@ -88,6 +90,8 @@ class AgentSession:
             self.totals.model = self.model_id
             key = str(getattr(config, "api_key", "") or "").strip()
             self.active_key = key or None
+            if key:
+                self.secrets.append(key)
         self.skill_catalog_note = ""
         self._skill_previews: dict[tuple[str, str], str] = {}
         self._analysis_turns: list[AnalysisTurn] = []
@@ -422,6 +426,9 @@ def serve(
         if kind == "set_key":
             _handle_set_key(session, stdout, message)
             continue
+        if kind == "delete_key":
+            _handle_delete_key(session, stdout)
+            continue
         if kind == "list":
             _handle_list(session, stdout, message)
             continue
@@ -623,9 +630,17 @@ def _handle_set_key(session: AgentSession, stdout: IO[str], message: dict[str, A
             session.secrets,
         )
         return
-    cleaned = key.strip()
-    if cleaned not in session.secrets:
-        session.secrets.append(cleaned)
+    try:
+        # User scope warns inside write_user_key. Session scope warns here.
+        cleaned, warning = prepare_openrouter_key(key, warn=scope != "user")
+    except ValueError:
+        _write_line(
+            stdout,
+            {"type": "error", "message": "set_key rejected a key that contains a newline"},
+            session.secrets,
+        )
+        return
+    _remember_secret(session, cleaned)
     try:
         if scope == "user":
             write_user_key(cleaned, session.home)
@@ -641,7 +656,26 @@ def _handle_set_key(session: AgentSession, stdout: IO[str], message: dict[str, A
             session.secrets,
         )
         return
-    _write_line(stdout, {"type": "key", "scope": scope, "saved": True}, session.secrets)
+    payload: dict[str, Any] = {"type": "key", "scope": scope, "saved": True}
+    if warning:
+        payload["warning"] = warning
+    _write_line(stdout, payload, session.secrets)
+
+
+def _handle_delete_key(session: AgentSession, stdout: IO[str]) -> None:
+    """Remove the saved user key and stop using any key in this process."""
+    try:
+        delete_user_key(session.home)
+    except Exception as exc:
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"Could not delete the key: {type(exc).__name__}"},
+            session.secrets,
+        )
+        return
+    session.session_key = None
+    _clear_installed_key(session)
+    _write_line(stdout, {"type": "key", "scope": "deleted", "saved": False}, session.secrets)
 
 
 def _handle_list(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
@@ -831,11 +865,24 @@ def _add_enabled_skill(session: AgentSession, name: str, scope: str) -> str:
     return "The skill catalog was reloaded."
 
 
+def _remember_secret(session: AgentSession, key: str) -> None:
+    if key and key not in session.secrets:
+        session.secrets.append(key)
+
+
 def _install_key(session: AgentSession, key: str) -> None:
+    _remember_secret(session, key)
     session.active_key = key
     config = getattr(session.agent.model, "config", None)
     if config is not None:
         config.api_key = key
+
+
+def _clear_installed_key(session: AgentSession) -> None:
+    session.active_key = None
+    config = getattr(session.agent.model, "config", None)
+    if config is not None:
+        config.api_key = ""
 
 
 def _atlas_root(session: AgentSession, scope: object) -> Path:

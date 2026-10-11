@@ -12,9 +12,11 @@ from typing import Any
 import pytest
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import ToolRegistry
+from atlas.agent.contracts import ModelResponse, ToolRegistry
 from atlas.agent.layout import (
     AtlasPathError,
+    OpenRouterKeyWarning,
+    ensure_user_layout,
     read_user_key,
     resolve_openrouter_key,
     write_user_key,
@@ -93,19 +95,21 @@ def _project_text(project: Path) -> str:
 
 def test_resolution_prefers_session_then_environment_then_the_user_file(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    write_user_key("  user-key  ", home)
+    write_user_key("  sk-or-user-key  ", home)
 
-    assert read_user_key(home) == "user-key"
-    assert resolve_openrouter_key(session_key=" session-key ", env_key="env-key", home=home) == (
-        "session-key"
+    assert read_user_key(home) == "sk-or-user-key"
+    assert (
+        resolve_openrouter_key(session_key=" sk-or-session-key ", env_key="env-key", home=home)
+        == "sk-or-session-key"
     )
     assert resolve_openrouter_key(session_key="  ", env_key=" env-key ", home=home) == "env-key"
-    assert resolve_openrouter_key(session_key=None, env_key=None, home=home) == "user-key"
-    assert resolve_openrouter_key(session_key=None, env_key=" ", home=home) == "user-key"
+    assert resolve_openrouter_key(session_key=None, env_key=None, home=home) == "sk-or-user-key"
+    assert resolve_openrouter_key(session_key=None, env_key=" ", home=home) == "sk-or-user-key"
     path = home / _USER_FILE
     assert path.is_file()
     assert path.stat().st_mode & 0o777 == 0o600
-    assert path.read_text(encoding="utf-8") == "user-key\n"
+    assert (home / ".atlas" / "keys").stat().st_mode & 0o777 == 0o700
+    assert path.read_text(encoding="utf-8") == "sk-or-user-key\n"
 
 
 def test_session_key_is_sent_on_the_next_completion_and_is_not_stored(tmp_path: Path) -> None:
@@ -114,21 +118,22 @@ def test_session_key_is_sent_on_the_next_completion_and_is_not_stored(tmp_path: 
     events = _run(
         session,
         [
-            _set_key("session", "  session-key  "),
+            _set_key("session", "  sk-or-session-key  "),
             '{"type":"user","text":"hi"}',
             '{"type":"new"}',
             '{"type":"user","text":"again"}',
         ],
     )
 
-    assert _bearer(client) == ["Bearer session-key", "Bearer session-key"]
-    assert session.session_key == "session-key"
+    assert _bearer(client) == ["Bearer sk-or-session-key", "Bearer sk-or-session-key"]
+    assert session.session_key == "sk-or-session-key"
+    assert "sk-or-session-key" in session.secrets
     assert events[1] == {"type": "key", "scope": "session", "saved": True}
     ready = next(event for event in events if event["type"] == "ready" and event is not events[0])
     assert ready["key_set"] is True
-    assert "session-key" not in json.dumps(events)
+    assert "sk-or-session-key" not in json.dumps(events)
     assert not (home / _USER_FILE).exists()
-    assert "session-key" not in _project_text(project)
+    assert "sk-or-session-key" not in _project_text(project)
 
 
 def test_user_key_is_saved_for_later_and_used_when_no_session_key_is_set(tmp_path: Path) -> None:
@@ -137,18 +142,19 @@ def test_user_key_is_saved_for_later_and_used_when_no_session_key_is_set(tmp_pat
     events = _run(
         session,
         [
-            _set_key("user", "  user-key  "),
+            _set_key("user", "  sk-or-user-key  "),
             '{"type":"user","text":"hi"}',
         ],
     )
 
-    assert _bearer(client) == ["Bearer user-key"]
+    assert _bearer(client) == ["Bearer sk-or-user-key"]
     assert events[1] == {"type": "key", "scope": "user", "saved": True}
     path = home / _USER_FILE
-    assert path.read_text(encoding="utf-8") == "user-key\n"
+    assert path.read_text(encoding="utf-8") == "sk-or-user-key\n"
     assert path.stat().st_mode & 0o777 == 0o600
-    assert "user-key" not in json.dumps(events)
-    assert "user-key" not in _project_text(project)
+    assert (home / ".atlas" / "keys").stat().st_mode & 0o777 == 0o700
+    assert "sk-or-user-key" not in json.dumps(events)
+    assert "sk-or-user-key" not in _project_text(project)
 
 
 def test_a_later_user_key_does_not_replace_the_session_key(tmp_path: Path) -> None:
@@ -157,22 +163,22 @@ def test_a_later_user_key_does_not_replace_the_session_key(tmp_path: Path) -> No
     events = _run(
         session,
         [
-            _set_key("user", "user-key"),
-            _set_key("session", "session-key"),
-            _set_key("user", "later-user-key"),
+            _set_key("user", "sk-or-user-key"),
+            _set_key("session", "sk-or-session-key"),
+            _set_key("user", "sk-or-later-user-key"),
             '{"type":"user","text":"hi"}',
         ],
     )
 
-    assert _bearer(client) == ["Bearer session-key"]
-    assert session.session_key == "session-key"
-    assert (home / _USER_FILE).read_text(encoding="utf-8").strip() == "later-user-key"
+    assert _bearer(client) == ["Bearer sk-or-session-key"]
+    assert session.session_key == "sk-or-session-key"
+    assert (home / _USER_FILE).read_text(encoding="utf-8").strip() == "sk-or-later-user-key"
     dumped = json.dumps(events)
-    assert "user-key" not in dumped
-    assert "session-key" not in dumped
-    assert "later-user-key" not in dumped
-    assert "session-key" not in _project_text(project)
-    assert "later-user-key" not in _project_text(project)
+    assert "sk-or-user-key" not in dumped
+    assert "sk-or-session-key" not in dumped
+    assert "sk-or-later-user-key" not in dumped
+    assert "sk-or-session-key" not in _project_text(project)
+    assert "sk-or-later-user-key" not in _project_text(project)
 
 
 def test_a_blank_or_unknown_scope_is_rejected_without_echoing_the_key(tmp_path: Path) -> None:
@@ -253,7 +259,7 @@ def test_main_loads_the_user_key_and_prefers_the_environment(
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    write_user_key("saved-user-key", home)
+    write_user_key("sk-or-saved-user-key", home)
     seen: list[str] = []
     real = OpenRouterModel
 
@@ -271,9 +277,9 @@ def test_main_loads_the_user_key_and_prefers_the_environment(
     ready = json.loads(captured.out.splitlines()[0])
     assert ready["type"] == "ready"
     assert ready["key_set"] is True
-    assert seen == ["saved-user-key"]
-    assert "saved-user-key" not in captured.out
-    assert "saved-user-key" not in captured.err
+    assert seen == ["sk-or-saved-user-key"]
+    assert "sk-or-saved-user-key" not in captured.out
+    assert "sk-or-saved-user-key" not in captured.err
 
     seen.clear()
     monkeypatch.setenv("OPENROUTER_API_KEY", "env-wins-key")
@@ -282,15 +288,15 @@ def test_main_loads_the_user_key_and_prefers_the_environment(
     captured = capsys.readouterr()
     assert seen == ["env-wins-key"]
     assert "env-wins-key" not in captured.out
-    assert "saved-user-key" not in captured.out
-    assert (home / _USER_FILE).read_text(encoding="utf-8").strip() == "saved-user-key"
+    assert "sk-or-saved-user-key" not in captured.out
+    assert (home / _USER_FILE).read_text(encoding="utf-8").strip() == "sk-or-saved-user-key"
 
 
 def test_a_session_key_does_not_survive_into_the_next_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     session, _client, home, _project = _session(tmp_path)
-    _run(session, [_set_key("session", "session-only")])
+    _run(session, [_set_key("session", "sk-or-session-only")])
     assert not (home / _USER_FILE).exists()
 
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -304,15 +310,217 @@ def test_a_session_key_does_not_survive_into_the_next_process(
     captured = capsys.readouterr()
     ready = json.loads(captured.out.splitlines()[0])
     assert ready["key_set"] is False
-    assert "session-only" not in captured.out
-    assert "session-only" not in captured.err
+    assert "sk-or-session-only" not in captured.out
+    assert "sk-or-session-only" not in captured.err
 
 
 def test_private_key_file_stays_mode_600_when_the_umask_is_permissive(tmp_path: Path) -> None:
     home = tmp_path / "home"
     previous = os.umask(0)
     try:
-        path = write_user_key("user-key", home)
+        path = write_user_key("sk-or-user-key", home)
     finally:
         os.umask(previous)
     assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_keys_directory_is_created_mode_700_and_an_existing_one_is_tightened(
+    tmp_path: Path,
+) -> None:
+    if os.name != "posix":
+        pytest.skip("Windows does not enforce Unix directory modes")
+    home = tmp_path / "home"
+    keys = home / ".atlas" / "keys"
+    keys.mkdir(parents=True)
+    os.chmod(keys, 0o755)
+
+    ensure_user_layout(home)
+
+    assert keys.stat().st_mode & 0o777 == 0o700
+    previous = os.umask(0)
+    try:
+        fresh = tmp_path / "fresh"
+        write_user_key("sk-or-fresh-key", fresh)
+    finally:
+        os.umask(previous)
+    assert (fresh / ".atlas" / "keys").stat().st_mode & 0o777 == 0o700
+
+
+def test_replacing_a_loose_key_file_tightens_it_before_the_atomic_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("Windows does not enforce Unix file modes")
+    home = tmp_path / "home"
+    keys = home / ".atlas" / "keys"
+    keys.mkdir(parents=True)
+    path = keys / "openrouter_api_key"
+    path.write_text("old-loose-key\n", encoding="utf-8")
+    os.chmod(path, 0o644)
+    real_chmod = os.chmod
+    real_open = os.open
+    real_replace = os.replace
+    real_fsync = os.fsync
+    seen: list[tuple[str, str, int]] = []
+    opened: list[tuple[str, int, int]] = []
+    replaced: list[tuple[str, str]] = []
+    synced: list[int] = []
+
+    def spy_chmod(target: os.PathLike[str] | str, mode: int) -> None:
+        candidate = Path(target)
+        if candidate.name == "openrouter_api_key" and candidate.exists():
+            seen.append(
+                (
+                    candidate.read_text(encoding="utf-8"),
+                    candidate.stat().st_mode & 0o777,
+                    mode,
+                )
+            )
+        real_chmod(target, mode)
+
+    def spy_open(target: os.PathLike[str] | str, flags: int, mode: int = 0o777) -> int:
+        name = Path(target).name
+        opened.append((name, flags, mode))
+        if name == "openrouter_api_key":
+            raise AssertionError("the existing key file was opened in place")
+        return real_open(target, flags, mode)
+
+    def spy_replace(src: os.PathLike[str] | str, dst: os.PathLike[str] | str) -> None:
+        replaced.append((Path(src).name, Path(dst).name))
+        real_replace(src, dst)
+
+    def spy_fsync(fd: int) -> None:
+        synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "chmod", spy_chmod)
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "replace", spy_replace)
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+
+    write_user_key("sk-or-new-key", home)
+
+    assert seen[0] == ("old-loose-key\n", 0o644, 0o600)
+    assert opened
+    assert all(flags & os.O_EXCL and mode == 0o600 for _name, flags, mode in opened)
+    assert synced
+    assert replaced[0][1] == "openrouter_api_key"
+    assert replaced[0][0] != "openrouter_api_key"
+    assert path.read_text(encoding="utf-8") == "sk-or-new-key\n"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert [item.name for item in keys.iterdir()] == ["openrouter_api_key"]
+
+
+def test_a_failed_atomic_write_leaves_the_old_key_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    keys = home / ".atlas" / "keys"
+    keys.mkdir(parents=True)
+    path = keys / "openrouter_api_key"
+    path.write_text("old-loose-key\n", encoding="utf-8")
+    os.chmod(path, 0o644)
+
+    def boom(_fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(os, "fsync", boom)
+    with pytest.raises(OSError, match="fsync failed"):
+        write_user_key("sk-or-new-key", home)
+    assert path.read_text(encoding="utf-8") == "old-loose-key\n"
+    if os.name == "posix":
+        assert path.stat().st_mode & 0o777 == 0o600
+    assert [item.name for item in keys.iterdir()] == ["openrouter_api_key"]
+
+
+def test_read_warns_when_the_key_file_is_too_loose(tmp_path: Path) -> None:
+    if os.name != "posix":
+        pytest.skip("Windows does not report Unix permission bits")
+    home = tmp_path / "home"
+    path = write_user_key("sk-or-user-key", home)
+    os.chmod(path, 0o644)
+
+    with pytest.warns(OpenRouterKeyWarning, match="too loose"):
+        assert read_user_key(home) == "sk-or-user-key"
+
+
+def test_a_newline_is_rejected_and_a_missing_prefix_is_warned(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    with pytest.raises(ValueError, match="newline"):
+        write_user_key("sk-or-abc\nmore", home)
+    assert not (home / _USER_FILE).exists()
+
+    with pytest.warns(OpenRouterKeyWarning, match="sk-or-"):
+        path = write_user_key("plain-user-key", home)
+    assert path.read_text(encoding="utf-8") == "plain-user-key\n"
+
+    session, client, session_home, _project = _session(tmp_path)
+    secret = "sk-or-line\nsecret"
+    events = _run(session, [_set_key("user", secret), _set_key("session", "plain-session-key")])
+    assert secret not in json.dumps(events)
+    assert events[1]["type"] == "error"
+    assert events[1]["message"] == "set_key rejected a key that contains a newline"
+    assert events[2]["warning"] == "OpenRouter key does not start with sk-or-"
+    assert "plain-session-key" in session.secrets
+    assert "plain-session-key" not in json.dumps(events)
+    assert (session_home / _USER_FILE).read_text(encoding="utf-8") == "plain-user-key\n"
+    assert client.posts == []
+
+
+def test_delete_key_removes_the_file_and_keeps_redacting_it(tmp_path: Path) -> None:
+    session, client, home, project = _session(tmp_path)
+
+    class Echo:
+        def __init__(self) -> None:
+            self.config = ModelConfig(model="example/model", api_key="")
+            self.reply = "leak sk-or-delete-me"
+
+        def complete(self, messages: list[Any], tools: list[Any]) -> ModelResponse:
+            del messages, tools
+            return ModelResponse(content=self.reply)
+
+    echo = Echo()
+    session.agent.model = echo
+    events = _run(
+        session,
+        [
+            _set_key("user", "sk-or-delete-me"),
+            '{"type":"user","text":"hi"}',
+            '{"type":"delete_key"}',
+            '{"type":"user","text":"again"}',
+        ],
+    )
+    assert not (home / _USER_FILE).exists()
+    assert session.session_key is None
+    assert session.active_key is None
+    assert echo.config.api_key == ""
+    deleted = next(event for event in events if event.get("scope") == "deleted")
+    assert deleted == {"type": "key", "scope": "deleted", "saved": False}
+    assert "sk-or-delete-me" not in json.dumps(events)
+    assert "***" in json.dumps(events)
+    assert client.posts == []
+    missing = [event for event in events if event["type"] == "error"]
+    assert missing[0]["message"] == MISSING_KEY_MESSAGE
+    assert "sk-or-delete-me" not in _project_text(project)
+
+
+def test_a_key_present_at_startup_is_redacted_without_a_separate_redact_argument(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+
+    class Echo:
+        def __init__(self) -> None:
+            self.config = ModelConfig(model="example/model", api_key="sk-or-startup-key")
+
+        def complete(self, messages: list[Any], tools: list[Any]) -> ModelResponse:
+            del messages, tools
+            return ModelResponse(content="see sk-or-startup-key")
+
+    session = AgentSession(Agent(Echo(), ToolRegistry(), LocalArtifactStore(project)))
+    assert "sk-or-startup-key" in session.secrets
+    events = _run(session, ['{"type":"user","text":"hi"}'])
+    assert "sk-or-startup-key" not in json.dumps(events)
+    assert "***" in json.dumps(events)

@@ -523,12 +523,23 @@ impl App {
                 self.mode = Mode::Compose;
                 self.transcript.push(tool_note(format!("model {id}")));
             }
-            ServerMessage::KeySet { scope, saved } => {
+            ServerMessage::KeySet {
+                scope,
+                saved,
+                warning,
+            } => {
                 self.mode = Mode::Compose;
                 self.input.clear();
-                let label = if saved { "saved" } else { "not saved" };
-                self.transcript
-                    .push(tool_note(format!("{scope} key {label}")));
+                let note = if scope == "deleted" {
+                    "OpenRouter key deleted".to_string()
+                } else {
+                    let label = if saved { "saved" } else { "not saved" };
+                    format!("{scope} key {label}")
+                };
+                self.transcript.push(tool_note(note));
+                if !warning.is_empty() {
+                    self.transcript.push(tool_note(warning));
+                }
             }
             ServerMessage::Listing { scope, kind, names } => {
                 let body = if names.is_empty() {
@@ -1396,18 +1407,22 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
         }
         "/key" => {
             let scope = parts.next().unwrap_or("");
-            if scope == "session" || scope == "user" {
+            if scope == "delete" && parts.next().is_none() {
+                Some(serde_json::json!({"type": "delete_key"}))
+            } else if scope == "session" || scope == "user" {
                 app.mode = Mode::Key {
                     scope: scope.to_string(),
                 };
                 app.transcript.push(tool_note(format!(
                     "Enter the OpenRouter key for this {scope}. It stays hidden."
                 )));
+                None
             } else {
-                app.transcript
-                    .push(tool_note("usage: /key session | /key user"));
+                app.transcript.push(tool_note(
+                    "usage: /key session | /key user | /key delete",
+                ));
+                None
             }
-            None
         }
         "/sessions" => Some(serde_json::json!({
             "type": "list",
@@ -1562,7 +1577,7 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
             description: "Enable a saved skill draft",
         },
     ];
-    const KEY_ARGS: [MenuItem; 2] = [
+    const KEY_ARGS: [MenuItem; 3] = [
         MenuItem {
             token: "session",
             description: "Key for this session",
@@ -1570,6 +1585,10 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
         MenuItem {
             token: "user",
             description: "Saved for this user",
+        },
+        MenuItem {
+            token: "delete",
+            description: "Delete the saved key",
         },
     ];
 
@@ -1733,7 +1752,7 @@ fn is_finished_command(text: &str) -> bool {
             None => false,
         },
         "/model" => text.starts_with("/model"),
-        "/key" => matches!(words.next(), Some("session") | Some("user")),
+        "/key" => matches!(words.next(), Some("session") | Some("user") | Some("delete")),
         _ => false,
     }
 }
@@ -3344,6 +3363,15 @@ mod tests {
         let painted = screen(&mut app, 80, 24);
         assert!(painted.contains("session"), "{painted}");
         assert!(painted.contains("user"), "{painted}");
+        assert!(painted.contains("delete"), "{painted}");
+    }
+
+    #[test]
+    fn key_delete_sends_delete_key() {
+        let mut app = App::new();
+        let payload = slash_outcome(&mut app, "/key delete").expect("delete request");
+        assert_eq!(payload["type"], "delete_key");
+        assert!(slash_outcome(&mut app, "/key delete extra").is_none());
     }
 
     #[test]
