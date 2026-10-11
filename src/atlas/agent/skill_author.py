@@ -9,6 +9,8 @@ activating them in a session are separate.
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import stat
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -22,6 +24,8 @@ MAX_DESCRIPTION_LENGTH = 1024
 MAX_COMPATIBILITY_LENGTH = 500
 
 _FRONTMATTER_DELIMITER = "---"
+_METADATA_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+_FOLD_WIDTH = 72
 
 
 class SkillAuthorError(ValueError):
@@ -44,7 +48,7 @@ class SkillDraft:
 
     ``allowed_tools`` is the experimental ``allowed-tools`` frontmatter field.
     ``metadata`` values are strings. ``body`` is the markdown after the
-    frontmatter.
+    frontmatter and must be non-empty.
     """
 
     name: str
@@ -126,6 +130,24 @@ def render_skill_md(draft: SkillDraft) -> str:
     return _render(prepared)
 
 
+def skill_directory_name(draft: SkillDraft) -> str:
+    """Return the directory name :func:`author_skill` would write for ``draft``.
+
+    Args:
+        draft: Skill fields to check.
+
+    Returns:
+        The normalized skill name, which is also the directory name.
+
+    Raises:
+        SkillAuthorError: If ``draft`` violates the Agent Skills spec.
+    """
+    prepared, errors = _prepare(draft)
+    if prepared is None:
+        raise SkillAuthorError(errors)
+    return prepared.name
+
+
 def author_skill(
     skills_root: Path,
     draft: SkillDraft,
@@ -157,7 +179,7 @@ def author_skill(
     prepared, errors = _prepare(draft)
     if prepared is None:
         raise SkillAuthorError(errors)
-    bundled = {} if files is None else files
+    bundled: Mapping[str, str] = {} if files is None else files
     root = Path(skills_root).expanduser().resolve()
     destination = root / prepared.name
     errors = _destination_errors(root, destination, bundled, overwrite=overwrite)
@@ -165,15 +187,17 @@ def author_skill(
         raise SkillAuthorError(errors)
 
     rendered = _render(prepared)
+    payload = _skill_payload(destination, bundled, rendered)
     root.mkdir(parents=True, exist_ok=True)
-    destination.mkdir(exist_ok=True)
-    for relative, content in sorted(bundled.items()):
-        path, locate_error = _locate_file(destination, relative)
-        if path is None or locate_error is not None:
-            raise SkillAuthorError([locate_error or "Skill file path is invalid"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _write_text(path, content, overwrite=overwrite and path.exists())
-    _write_text(destination / "SKILL.md", rendered, overwrite=overwrite)
+    staging = root / f".{prepared.name}.authoring"
+    try:
+        _reset_staging(staging)
+        _write_tree(staging, payload)
+        _publish(staging, destination)
+    except Exception:
+        if staging.is_dir() and not staging.is_symlink():
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
     return destination
 
 
@@ -195,10 +219,9 @@ def _prepare(draft: SkillDraft) -> tuple[_PreparedSkill | None, list[str]]:
     errors.extend(allowed_errors)
     metadata, metadata_errors = _normalize_metadata(draft.metadata)
     errors.extend(metadata_errors)
-    body = draft.body.strip() if isinstance(draft.body, str) else ""
-    if not isinstance(draft.body, str):
-        errors.append("Field 'body' must be a string")
-    if errors or name is None or description is None:
+    body, body_errors = _normalize_body(draft.body)
+    errors.extend(body_errors)
+    if errors or name is None or description is None or not body:
         return None, errors
     return (
         _PreparedSkill(
@@ -284,10 +307,15 @@ def _normalize_metadata(metadata: object) -> tuple[dict[str, str], list[str]]:
         if not isinstance(key, str) or not key.strip() or "\n" in key or "\r" in key:
             errors.append("Field 'metadata' keys must be non-empty single-line strings")
             continue
-        if not isinstance(value, str):
-            errors.append(f"Field 'metadata' value for {key!r} must be a string")
-            continue
         normalized_key = key.strip()
+        if _METADATA_KEY.fullmatch(normalized_key) is None:
+            errors.append("Field 'metadata' keys must be letters, digits, hyphens, and underscores")
+            continue
+        if not isinstance(value, str) or not value.strip():
+            errors.append(
+                f"Field 'metadata' value for {normalized_key!r} must be a non-empty string"
+            )
+            continue
         if _contains_delimiter(normalized_key) or _contains_delimiter(value):
             errors.append("Frontmatter field 'metadata' cannot contain '---'")
             continue
@@ -305,11 +333,20 @@ def _contains_delimiter(value: str) -> bool:
     return _FRONTMATTER_DELIMITER in value
 
 
+def _normalize_body(body: object) -> tuple[str, list[str]]:
+    if not isinstance(body, str):
+        return "", ["Field 'body' must be a string"]
+    text = body.strip()
+    if not text:
+        return "", ["Field 'body' must be a non-empty string"]
+    return text, []
+
+
 def _render(prepared: _PreparedSkill) -> str:
     lines = [
         _FRONTMATTER_DELIMITER,
         f"name: {_yaml_string(prepared.name)}",
-        f"description: {_yaml_string(prepared.description)}",
+        *_description_lines(prepared.description),
     ]
     if prepared.license is not None:
         lines.append(f"license: {_yaml_string(prepared.license)}")
@@ -318,14 +355,49 @@ def _render(prepared: _PreparedSkill) -> str:
     if prepared.metadata:
         lines.append("metadata:")
         for key in sorted(prepared.metadata):
-            lines.append(f"  {_yaml_string(key)}: {_yaml_string(prepared.metadata[key])}")
+            lines.append(f"  {key}: {_yaml_string(prepared.metadata[key])}")
     if prepared.allowed_tools is not None:
         lines.append(f"allowed-tools: {_yaml_string(prepared.allowed_tools)}")
     lines.append(_FRONTMATTER_DELIMITER)
-    text = "\n".join(lines) + "\n"
-    if prepared.body:
-        text += "\n" + prepared.body + "\n"
-    return text
+    return "\n".join(lines) + "\n\n" + prepared.body + "\n"
+
+
+def _description_lines(description: str) -> list[str]:
+    """Render ``description`` so the skills loader can read it back.
+
+    A single line stays a quoted scalar. A newline becomes a folded block
+    (``>``): one paragraph per line, wrapped so the loader joins wrapped
+    words with spaces and paragraphs with newlines.
+    """
+    if "\n" not in description:
+        return [f"description: {_yaml_string(description)}"]
+    lines = ["description: >"]
+    for index, paragraph in enumerate(description.split("\n")):
+        if index:
+            lines.append("")
+        text = paragraph.strip()
+        if not text:
+            continue
+        lines.extend(f"  {wrapped}" for wrapped in _wrap_plain(text, _FOLD_WIDTH))
+    return lines
+
+
+def _wrap_plain(paragraph: str, width: int) -> list[str]:
+    words = paragraph.split(" ")
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if not word:
+            continue
+        piece = word if not current else f"{current} {word}"
+        if current and len(piece) > width:
+            lines.append(current)
+            current = word
+            continue
+        current = piece
+    if current:
+        lines.append(current)
+    return lines or [paragraph]
 
 
 def _yaml_string(value: str) -> str:
@@ -412,17 +484,118 @@ def _target_errors(path: Path, *, overwrite: bool, label: str) -> list[str]:
     return []
 
 
-def _write_text(path: Path, text: str, *, overwrite: bool) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
-    flags |= os.O_TRUNC if overwrite else os.O_EXCL
-    try:
-        fd = os.open(path, flags, 0o644)
-    except OSError as exc:
-        raise SkillAuthorError([f"Could not write skill file {path.name}: {exc.strerror}"]) from exc
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-        info = os.fstat(handle.fileno())
+def _skill_payload(destination: Path, bundled: Mapping[str, str], rendered: str) -> dict[str, str]:
+    """Files for the replacement tree, including skill files this write does not replace."""
+    payload = _preserved_files(destination, replaced={"SKILL.md", *bundled})
+    payload.update(bundled)
+    payload["SKILL.md"] = rendered
+    return payload
+
+
+def _preserved_files(destination: Path, *, replaced: set[str]) -> dict[str, str]:
+    if not destination.exists():
+        return {}
+    preserved: dict[str, str] = {}
+    for path in sorted(destination.rglob("*")):
+        if path.is_symlink():
+            raise SkillAuthorError(["Skill directory contains a symlink"])
+        if not path.is_file():
+            continue
+        relative = path.relative_to(destination).as_posix()
+        if relative in replaced:
+            continue
+        info = path.stat()
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise SkillAuthorError(
                 ["Skill path is a hardlinked file that may lead outside the skill directory"]
             )
-        handle.write(text)
+        try:
+            preserved[relative] = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise SkillAuthorError(["Skill file is not UTF-8 text"]) from exc
+    return preserved
+
+
+def _reset_staging(staging: Path) -> None:
+    if staging.is_symlink():
+        raise SkillAuthorError(["Skill staging path escapes the skills root"])
+    if staging.exists():
+        if not staging.is_dir():
+            raise SkillAuthorError(["Skill staging path is not a directory"])
+        shutil.rmtree(staging)
+    staging.mkdir()
+
+
+def _write_tree(staging: Path, payload: Mapping[str, str]) -> None:
+    for relative, content in sorted(payload.items()):
+        if not isinstance(relative, str) or not isinstance(content, str):
+            raise SkillAuthorError(["Skill file paths and contents must be strings"])
+        if relative == "SKILL.md":
+            path = staging / "SKILL.md"
+        else:
+            located, locate_error = _locate_file(staging, relative)
+            if located is None:
+                raise SkillAuthorError([locate_error or "Skill file path is invalid"])
+            path = located
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_text(path, content, overwrite=False)
+
+
+def _publish(staging: Path, destination: Path) -> None:
+    """Move ``staging`` to ``destination``.
+
+    A new directory is one rename. Replacing an existing directory renames it
+    aside first, then moves the staging directory into place, then deletes the
+    previous tree. A failed publish puts the previous directory back.
+    """
+    if not destination.exists():
+        _rename(staging, destination)
+        return
+    backup = destination.parent / f".{destination.name}.replacing"
+    if backup.exists() or backup.is_symlink():
+        raise SkillAuthorError(["Skill staging path is not available"])
+    _rename(destination, backup)
+    try:
+        _rename(staging, destination)
+    except SkillAuthorError:
+        _rename(backup, destination)
+        raise
+    shutil.rmtree(backup)
+
+
+def _rename(source: Path, target: Path) -> None:
+    try:
+        os.rename(source, target)
+    except OSError as exc:
+        raise SkillAuthorError([f"Could not write skill: {exc.strerror}"]) from exc
+
+
+def _write_text(path: Path, text: str, *, overwrite: bool) -> None:
+    """Write ``text`` without truncating a hardlink.
+
+    The file is opened without ``O_TRUNC``. ``st_nlink`` is checked on the
+    open descriptor, and the file is truncated only after that check passes.
+    """
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+    if not overwrite:
+        flags |= os.O_EXCL
+    try:
+        fd = os.open(path, flags, 0o644)
+    except OSError as exc:
+        raise SkillAuthorError([f"Could not write skill file {path.name}: {exc.strerror}"]) from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise SkillAuthorError(
+                ["Skill path is a hardlinked file that may lead outside the skill directory"]
+            )
+        os.ftruncate(fd, 0)
+        data = text.encode("utf-8")
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise SkillAuthorError([f"Could not write skill file {path.name}"])
+            view = view[written:]
+    finally:
+        os.close(fd)

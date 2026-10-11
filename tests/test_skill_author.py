@@ -1,22 +1,28 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from atlas.agent.artifacts import LocalArtifactStore
+from atlas.agent.contracts import build_registry, default_registry
 from atlas.agent.skill_author import (
     MAX_COMPATIBILITY_LENGTH,
     MAX_DESCRIPTION_LENGTH,
     MAX_SKILL_NAME_LENGTH,
     SkillAuthorError,
     SkillDraft,
+    _write_text,
     author_skill,
     project_skills_root,
     render_skill_md,
     user_skills_root,
     validate_skill,
 )
+from atlas.agent.tools.author_skill import AuthorSkillTool
 
 
 def _draft(**overrides: object) -> SkillDraft:
@@ -69,8 +75,8 @@ def test_author_skill_writes_optional_frontmatter_in_stable_order(tmp_path: Path
         'license: "Apache-2.0"\n'
         'compatibility: "Requires Python 3.12."\n'
         "metadata:\n"
-        '  "author": "atlas"\n'
-        '  "version": "1.0"\n'
+        '  author: "atlas"\n'
+        '  version: "1.0"\n'
         'allowed-tools: "read_file bash_tool"\n'
         "---\n"
         "\n"
@@ -79,17 +85,20 @@ def test_author_skill_writes_optional_frontmatter_in_stable_order(tmp_path: Path
     assert (tmp_path / "ndvi-change" / "SKILL.md").read_text(encoding="utf-8") == text
 
 
-def test_render_quotes_colons_quotes_and_newlines() -> None:
-    draft = _draft(
-        description='Use when: the user says "ndvi".\nThen continue.',
-        body="Keep the ---\ndelimiter in the body.",
-    )
+def test_render_folds_multiline_descriptions_for_the_loader() -> None:
+    description = 'Use when: the user says "ndvi".\nThen continue.'
+    draft = _draft(description=description, body="Keep the ---\ndelimiter in the body.")
 
     text = render_skill_md(draft)
 
-    assert 'description: "Use when: the user says \\"ndvi\\".\\nThen continue."\n' in text
+    assert "description: >\n" in text
+    assert '  Use when: the user says "ndvi".\n' in text
+    assert "\n\n  Then continue.\n" in text
     assert text.endswith("Keep the ---\ndelimiter in the body.\n")
-    assert text.split("---", 2)[2].lstrip("\n").startswith("Keep the ---")
+    fields, body = _parse_like_skills_loader(text)
+    assert fields["name"] == "ndvi-change"
+    assert fields["description"] == description
+    assert body.startswith("Keep the ---")
 
 
 def test_blank_optional_fields_are_omitted() -> None:
@@ -188,7 +197,7 @@ def test_rejects_oversized_compatibility() -> None:
 def test_rejects_metadata_that_is_not_a_string_mapping() -> None:
     errors = validate_skill(_draft(metadata={"author": 1, "": "atlas"}))
 
-    assert any("must be a string" in error for error in errors)
+    assert any("non-empty string" in error for error in errors)
     assert any("keys must be non-empty" in error for error in errors)
 
 
@@ -326,7 +335,240 @@ def test_rejects_a_skills_root_that_is_a_file(tmp_path: Path) -> None:
     assert root.read_text(encoding="utf-8") == "not a directory"
 
 
+def test_rejects_an_empty_body(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+
+    errors = validate_skill(_draft(body="  \n\t"))
+
+    assert "Field 'body' must be a non-empty string" in errors
+    with pytest.raises(SkillAuthorError, match="body"):
+        author_skill(root, _draft(body=""))
+    assert not root.exists()
+
+
+def test_write_text_rejects_a_hardlink_before_truncating(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret-value", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    try:
+        os.link(outside, link)
+    except OSError:
+        pytest.skip("hardlinks are not supported on this filesystem")
+
+    with pytest.raises(SkillAuthorError, match="hardlinked"):
+        _write_text(link, "changed", overwrite=True)
+
+    assert outside.read_text(encoding="utf-8") == "secret-value"
+    assert link.read_text(encoding="utf-8") == "secret-value"
+
+
+def test_write_text_replaces_a_regular_file_after_the_link_check(tmp_path: Path) -> None:
+    path = tmp_path / "note.txt"
+    path.write_text("old-content", encoding="utf-8")
+
+    _write_text(path, "new", overwrite=True)
+
+    assert path.read_text(encoding="utf-8") == "new"
+
+
+def test_failed_publish_leaves_the_existing_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = author_skill(tmp_path, _draft(), files={"scripts/extract.py": "print(1)\n"})
+    original = (path / "SKILL.md").read_text(encoding="utf-8")
+
+    def fail_rename(*_args: object, **_kwargs: object) -> None:
+        raise OSError(1, "nope")
+
+    monkeypatch.setattr(os, "rename", fail_rename)
+
+    with pytest.raises(SkillAuthorError, match="Could not write skill"):
+        author_skill(tmp_path, _draft(body="changed"), overwrite=True)
+
+    assert (path / "SKILL.md").read_text(encoding="utf-8") == original
+    assert (path / "scripts" / "extract.py").read_text(encoding="utf-8") == "print(1)\n"
+    assert not (tmp_path / ".ndvi-change.authoring").exists()
+    assert not (tmp_path / ".ndvi-change.replacing").exists()
+
+
+def test_loader_parses_quoted_and_folded_frontmatter() -> None:
+    description = "Compare two scenes.\nUse when the user asks about NDVI."
+    draft = _draft(
+        description=description,
+        body="Do the thing.",
+        license="Apache-2.0",
+        compatibility="Requires Python 3.12.",
+        metadata={"version": "1.0", "author": "atlas"},
+        allowed_tools="read_file bash_tool",
+    )
+
+    fields, body = _parse_like_skills_loader(render_skill_md(draft))
+
+    assert fields["name"] == "ndvi-change"
+    assert fields["description"] == description
+    assert fields["license"] == "Apache-2.0"
+    assert fields["compatibility"] == "Requires Python 3.12."
+    assert fields["metadata"] == {"author": "atlas", "version": "1.0"}
+    assert fields["allowed-tools"] == "read_file bash_tool"
+    assert body == "Do the thing."
+
+
+def test_author_skill_tool_writes_through_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    seen: list[str] = []
+    resolve = store.resolve
+
+    def spy(relative: str) -> Path:
+        seen.append(relative)
+        return resolve(relative)
+
+    monkeypatch.setattr(store, "resolve", spy)
+
+    result = AuthorSkillTool().run(
+        {
+            "name": "ndvi-change",
+            "description": "Compare two scenes. Use when the user asks about NDVI.",
+            "body": "Subtract the later scene from the earlier one.",
+        },
+        store,
+    )
+
+    assert seen == ["skills/ndvi-change/SKILL.md"]
+    assert result.artifacts == ["skills/ndvi-change/SKILL.md"]
+    text = (tmp_path / "skills" / "ndvi-change" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Subtract the later scene from the earlier one." in text
+    fields, body = _parse_like_skills_loader(text)
+    assert fields["name"] == "ndvi-change"
+    assert body == "Subtract the later scene from the earlier one."
+
+
+def test_author_skill_tool_does_not_change_the_default_registry() -> None:
+    names = [tool.name for tool in default_registry().definitions]
+
+    assert names == [
+        "bash_tool",
+        "edit_file",
+        "read_file",
+        "write_file",
+        "list_tools",
+        "segment_landcover",
+    ]
+    assert "author_skill" not in names
+    assert "stage_script_proposal" not in names
+    opted_in = [
+        tool.name
+        for tool in build_registry(("atlas.agent.tools",), include_opt_in=True).definitions
+    ]
+    assert "author_skill" in opted_in
+    assert AuthorSkillTool.trust == "opt_in"
+
+
 def test_project_and_user_skills_roots(tmp_path: Path) -> None:
     assert project_skills_root(tmp_path) == tmp_path / ".atlas" / "skills"
     assert user_skills_root(tmp_path) == tmp_path / ".atlas" / "skills"
     assert not project_skills_root(tmp_path).exists()
+
+
+# Mirrors ``_split_frontmatter`` / ``_parse_frontmatter`` on richardtang/skills-loading
+# (atlas.agent.skills). Authoring has to stay readable by that loader.
+_FRONTMATTER_KEY = re.compile(r"^([A-Za-z0-9_-]+):\s*(.*)$")
+
+
+def _parse_like_skills_loader(text: str) -> tuple[dict[str, Any], str]:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise AssertionError("missing frontmatter")
+    frontmatter = ""
+    body = ""
+    closed = False
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            frontmatter = "\n".join(lines[1:index])
+            body = "\n".join(lines[index + 1 :]).strip()
+            closed = True
+            break
+    if not closed:
+        raise AssertionError("frontmatter is not closed")
+    return _parse_frontmatter(frontmatter), body
+
+
+def _parse_frontmatter(text: str) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            index += 1
+            continue
+        if line[0] in {" ", "\t"}:
+            raise AssertionError("frontmatter is not a mapping")
+        match = _FRONTMATTER_KEY.match(line)
+        if match is None:
+            raise AssertionError(f"frontmatter is not a mapping: {line!r}")
+        key, raw = match.group(1), match.group(2).strip()
+        if raw.startswith(">") or raw.startswith("|"):
+            index += 1
+            block: list[str] = []
+            while index < len(lines) and (
+                not lines[index].strip() or lines[index][0] in {" ", "\t"}
+            ):
+                block.append(lines[index])
+                index += 1
+            fields[key] = _block_scalar(raw, block)
+            continue
+        if raw == "":
+            index += 1
+            nested, index = _parse_nested(lines, index)
+            fields[key] = nested
+            continue
+        fields[key] = _unquote(raw)
+        index += 1
+    return fields
+
+
+def _parse_nested(lines: list[str], index: int) -> tuple[dict[str, str], int]:
+    nested: dict[str, str] = {}
+    while index < len(lines) and lines[index][:1] in {" ", "\t"}:
+        stripped = lines[index].strip()
+        index += 1
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _FRONTMATTER_KEY.match(stripped)
+        if match is None or not match.group(2).strip():
+            raise AssertionError("frontmatter is not a mapping")
+        nested[match.group(1)] = _unquote(match.group(2).strip())
+    return nested, index
+
+
+def _block_scalar(style: str, lines: list[str]) -> str:
+    content = [line.strip() for line in lines]
+    while content and content[0] == "":
+        content.pop(0)
+    while content and content[-1] == "":
+        content.pop()
+    if style.startswith(">"):
+        paragraphs: list[str] = []
+        current: list[str] = []
+        for line in content:
+            if line == "":
+                if current:
+                    paragraphs.append(" ".join(current))
+                    current = []
+                continue
+            current.append(line)
+        if current:
+            paragraphs.append(" ".join(current))
+        return "\n".join(paragraphs)
+    return "\n".join(content)
+
+
+def _unquote(value: str) -> str:
+    if len(value) < 2 or value[0] not in {'"', "'"} or value[-1] != value[0]:
+        return value
+    inner = value[1:-1]
+    if value[0] == "'":
+        return inner.replace("''", "'")
+    return inner.replace(r"\n", "\n").replace(r"\"", '"').replace(r"\\", "\\")
