@@ -30,7 +30,7 @@ That opens the agent TUI in the current directory. The first launch builds `tui/
 
 `atlas data` stays on the data CLI. `atlas tui --workspace PATH` opens the TUI on another directory.
 
-Enter sends a line. `/` opens commands. `/new` starts a fresh conversation in the same directory. `/quit` and `/exit` leave Atlas.
+Enter sends a line. `/` opens commands. `/new` starts a fresh conversation in the same directory. `/skill <name>` applies a skill from `.atlas/skills/<name>/SKILL.md` for the rest of that conversation. `/quit` and `/exit` leave Atlas.
 
 ## Data CLI
 
