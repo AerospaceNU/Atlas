@@ -27,16 +27,12 @@ from atlas.agent.skills import (
 from atlas.agent.skills import (
     load_home_skills_enabled as load_home_skills_enabled,
 )
+from atlas.agent.system_prompt import load_system_prompt
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOOL_CALLS = 256
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
-
-_SYSTEM_PROMPT = """You are Atlas, a local workspace assistant.
-Use tools when they help answer the request. Tool paths are relative to the
-artifact workspace; reads may also resolve files in the project workspace. Do
-not claim to have read a file unless a tool has returned its contents."""
 
 _STOPPED_RESPONSE = "Stopped after reaching the configured tool-use limit."
 
@@ -158,8 +154,8 @@ class Agent:
         self.skills = list(skills or [])
 
     def system_prompt(self) -> str:
-        """Return the system prompt, including the skill catalog when skills are loaded."""
-        return render_system_prompt(_SYSTEM_PROMPT, self.skills)
+        """Return the package system prompt, plus the skill catalog when skills are loaded."""
+        return render_system_prompt(load_system_prompt(), self.skills)
 
     def run(self, request: str) -> AgentRun:
         """Answer ``request``, making bounded, registry-approved tool calls."""
