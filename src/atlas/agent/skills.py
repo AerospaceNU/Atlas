@@ -1,28 +1,37 @@
 """Load Agent Skills and activate one by name.
 
 This is the shared loader and ``use_skill`` activation path. Call
-:func:`load_skills` with the session artifact store and, when user skills
-should be visible, the user home. The skill author writes the same ``SKILL.md``
-shape: YAML frontmatter, then markdown. The frontmatter ``name`` must
-NFKC-normalize to the parent directory name. A ``description`` is a YAML
-string. A double-quoted value uses a backslash-n escape for a newline, which
-is how the author writes a multi-line description. Folded (``>``) and literal
-(``|``) block scalars are accepted as well.
+:func:`load_skills` with the session artifact store. Pass ``home`` only when
+user-home skills are explicitly enabled (``ATLAS_HOME_SKILLS=1`` or
+``home_skills = true`` in ``.atlas/agent.toml``). The default is workspace
+only. The skill author writes the same ``SKILL.md`` shape: YAML frontmatter,
+then markdown. The frontmatter ``name`` must NFKC-normalize to the parent
+directory name, and the directory name is NFKC-normalized before that
+comparison so an NFD folder still matches. A ``description`` is a YAML string.
+A double-quoted value uses a backslash-n escape for a newline, which is how
+the author writes a multi-line description. Folded (``>``) and literal (``|``)
+block scalars are accepted as well.
 
-Discovery reads two roots and never the store write root (the session artifact
-directory). The workspace root is ``store.read_root``. The home root is the
-optional ``home`` argument (``~/.atlas/skills`` and ``~/.agents/skills``). Both
-go through the same containment and symlink checks. Precedence, lowest to
-highest, is the whole skill directory: a higher directory replaces every file
-from a lower one, and files are not merged across directories.
+Discovery reads the workspace read root and, when ``home`` is passed, the
+user home. It never reads the store write root (the session artifact
+directory). Both roots go through :func:`atlas.agent.artifacts.resolve_within`.
+Precedence, lowest to highest, is the whole skill directory: a higher
+directory replaces every file from a lower one, and files are not merged
+across directories.
 
-1. ``<home>/.agents/skills/<name>``
+1. ``<home>/.agents/skills/<name>`` (only when ``home`` is passed)
 2. ``<home>/.atlas/skills/<name>``
 3. ``<workspace>/.agents/skills/<name>``
 4. ``<workspace>/.atlas/skills/<name>``
 
+A symlinked ``~/.atlas`` is followed when the resolved skills directory stays
+inside the home directory. A link that leaves home is skipped. A resolved path
+under ``.atlas/artifacts`` is skipped, including a home link into that tree.
+Symlinked skill directories and symlinked ``SKILL.md`` files are skipped.
+
 The system prompt receives names and descriptions only. ``use_skill`` re-reads
-the winning directory when a task matches a description.
+the winning directory when a task matches a description. Wrapper tags in the
+body are escaped without rewriting comparisons.
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ import html
 import logging
 import os
 import re
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,9 +48,9 @@ from typing import Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, Field, create_model
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied, _within
+from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied, resolve_within
 from atlas.agent.contracts import Tool, ToolRegistry, ToolResult
-from atlas.agent.skill_author import _normalize_name
+from atlas.agent.skill_author import normalize_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,6 +61,13 @@ _MAX_LISTED_FILES = 50
 _SKILL_ROOTS = (".agents/skills", ".atlas/skills")
 _CONTENT_TAG = "skill_content"
 _UNTRUSTED_BODY_TAG = "untrusted_skill_body"
+_RESOURCE_TAG = "skill_resources"
+_WRAPPER_TAG_RE = re.compile(
+    rf"<\s*/?\s*(?:{_UNTRUSTED_BODY_TAG}|{_CONTENT_TAG}|{_RESOURCE_TAG})\b[^>]*>",
+    re.IGNORECASE,
+)
+_DIRECTORY_LABEL = "Skill directory:"
+_DIRECTORY_LABEL_RE = re.compile(re.escape(_DIRECTORY_LABEL), re.IGNORECASE)
 
 _SKILL_INSTRUCTIONS = """The following skills provide specialized instructions for specific tasks.
 When a task matches a skill's description, call the use_skill tool with the skill's name to load its full instructions."""
@@ -85,8 +102,9 @@ def load_skills(store: LocalArtifactStore, *, home: Path | None = None) -> list[
     This is the loader a session and later callers use. ``store.root``, the
     session artifact directory, is never scanned: a skill planted there cannot
     override a workspace or home skill, and it is not discovered on its own.
-    ``store.read_root`` is the project workspace. ``home`` is the read-only
-    user home; ``None`` skips home skills and does not create directories.
+    ``store.read_root`` is the project workspace. ``home`` defaults to ``None``,
+    which leaves the result workspace-only. Pass the user home only when home
+    skills are explicitly enabled. Passing ``home`` does not create directories.
 
     Precedence is lowest to highest, and the winning directory supplies every
     file. A higher entry replaces the lower skill instead of merging
@@ -98,14 +116,18 @@ def load_skills(store: LocalArtifactStore, *, home: Path | None = None) -> list[
     4. ``<workspace read root>/.atlas/skills/<name>``
 
     A missing skills directory contributes nothing. A file that cannot be
-    parsed, whose name does not NFKC-normalize to its directory name, or whose
-    description is empty is skipped. Symlinked skill directories are skipped.
-    The result is sorted by name.
+    parsed, whose name does not NFKC-normalize to the NFKC form of its
+    directory name, or whose description is empty is skipped. Symlinked skill
+    directories and symlinked ``SKILL.md`` files are skipped. A skills
+    directory, ``SKILL.md``, or resource whose resolved path is under
+    ``.atlas/artifacts`` is skipped. A symlinked ``~/.atlas`` is followed only
+    when that resolved directory stays inside ``home``. The result is sorted
+    by name.
 
     Args:
         store: Artifact store. Only ``read_root`` is scanned.
-        home: User home, or ``None`` to skip ``~/.atlas/skills`` and
-            ``~/.agents/skills``.
+        home: User home when home skills are enabled, or ``None`` (the default)
+            to skip ``~/.atlas/skills`` and ``~/.agents/skills``.
 
     Returns:
         The skills that should be disclosed to the model.
@@ -171,10 +193,11 @@ class UseSkillTool(Tool):
 
     The name argument is limited to the discovered catalog. The result is the
     markdown body, without frontmatter, plus relative paths of bundled files.
-    Those files are not read here. The body is labeled untrusted. Only the
-    closing wrapper tags are escaped, so comparisons in the instructions stay
-    intact. Reads use the skill's captured read-only base, never the store
-    write root.
+    Those files are not read here. The body is labeled untrusted. Wrapper and
+    resource tags in the body are escaped even when their case or whitespace
+    differs from the tags this tool emits, and a fake skill-directory label is
+    escaped too. Comparisons in the instructions stay intact. Reads use the
+    skill's captured read-only base, never the store write root.
     """
 
     name = "use_skill"
@@ -222,15 +245,30 @@ def _read_bases(store: LocalArtifactStore, home: Path | None) -> list[tuple[Path
     return bases
 
 
+def _under_artifacts(base: Path, path: Path) -> bool:
+    """Return whether ``path`` resolves inside ``<base>/.atlas/artifacts``."""
+    try:
+        resolved = path.resolve()
+        artifact_root = (base / ".atlas" / "artifacts").resolve()
+        resolved.relative_to(artifact_root)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _scan_base(base: Path, root: str, label_prefix: str) -> list[Skill]:
     """Load child skills of one skills directory under one read-only base."""
     directory = base / root
     if directory.is_symlink() or not directory.is_dir():
         return []
     try:
-        directory.resolve().relative_to(base.resolve())
+        resolved = directory.resolve()
+        resolved.relative_to(base.resolve())
     except (OSError, ValueError):
         _LOGGER.warning("Skipping skills directory %s outside its read root", root)
+        return []
+    if _under_artifacts(base, resolved):
+        _LOGGER.warning("Skipping skills directory %s under .atlas/artifacts", root)
         return []
     found: dict[str, Skill] = {}
     for child in sorted(directory.iterdir(), key=lambda path: path.name):
@@ -262,10 +300,20 @@ def _load_skill_dir(
         return None
     if not lexical.is_dir():
         return None
+    if _under_artifacts(base, lexical):
+        _LOGGER.warning("Skipping skill %s under .atlas/artifacts", logical)
+        return None
+    markdown = base / relative_dir / "SKILL.md"
+    if markdown.is_symlink():
+        _LOGGER.warning("Skipping skill %s: SKILL.md is a symlink", logical)
+        return None
     try:
-        path = _within(base, f"{relative_dir}/SKILL.md")
+        path = resolve_within(base, f"{relative_dir}/SKILL.md")
     except SandboxDenied:
         _LOGGER.warning("Skipping skill %s: path escapes its read root", logical)
+        return None
+    if _under_artifacts(base, path):
+        _LOGGER.warning("Skipping skill %s under .atlas/artifacts", logical)
         return None
     if not path.is_file():
         return None
@@ -286,8 +334,9 @@ def _load_skill_dir(
     if not isinstance(description, str) or not description.strip():
         _LOGGER.warning("Skipping skill %s: missing description", logical)
         return None
-    normalized, errors = _normalize_name(name)
-    if errors or normalized is None or normalized != directory_name:
+    normalized, errors = normalize_name(name)
+    directory_key = unicodedata.normalize("NFKC", directory_name)
+    if errors or normalized is None or normalized != directory_key:
         _LOGGER.warning(
             "Skipping skill %s: name must match the directory and the skill name rules",
             logical,
@@ -489,13 +538,25 @@ def _decode_double_quoted(inner: str) -> str:
     return "".join(pieces)
 
 
-def _neutralize_closing_tags(body: str) -> str:
-    """Escape the wrapper closers this renderer emits, and leave other text raw."""
-    neutralized = body
-    for tag in (_UNTRUSTED_BODY_TAG, _CONTENT_TAG):
-        closer = f"</{tag}>"
-        neutralized = neutralized.replace(closer, html.escape(closer))
-    return neutralized
+def _escape_markup(match: re.Match[str]) -> str:
+    return html.escape(match.group(0))
+
+
+def _escape_directory_label(match: re.Match[str]) -> str:
+    return match.group(0).replace(":", "&#58;")
+
+
+def _neutralize_untrusted_body(body: str) -> str:
+    """Escape wrapper markup in ``body`` and leave comparisons raw.
+
+    Opening and closing ``skill_content``, ``untrusted_skill_body``, and
+    ``skill_resources`` tags match case-insensitively, including tags with
+    whitespace or newlines before the name or the closing angle bracket. A
+    ``Skill directory:`` label is escaped so the body cannot forge the trailer
+    this renderer adds after the untrusted region.
+    """
+    neutralized = _WRAPPER_TAG_RE.sub(_escape_markup, body)
+    return _DIRECTORY_LABEL_RE.sub(_escape_directory_label, neutralized)
 
 
 def _render_skill_content(skill: Skill) -> str:
@@ -510,10 +571,10 @@ def _render_skill_content(skill: Skill) -> str:
         f'<{_CONTENT_TAG} name="{name}">',
         _UNTRUSTED_LABEL,
         f"<{_UNTRUSTED_BODY_TAG}>",
-        _neutralize_closing_tags(body),
+        _neutralize_untrusted_body(body),
         f"</{_UNTRUSTED_BODY_TAG}>",
         "",
-        f"Skill directory: {label}",
+        f"{_DIRECTORY_LABEL} {label}",
         "Relative paths in this skill are relative to the skill directory.",
     ]
     files, truncated = _list_resources(skill)
@@ -531,13 +592,16 @@ def _render_skill_content(skill: Skill) -> str:
 def _read_skill_markdown(skill: Skill) -> str:
     """Re-read ``SKILL.md`` from the skill's read-only base."""
     lexical = skill.base / skill.relative_dir
-    if lexical.is_symlink() or not lexical.is_dir():
+    if lexical.is_symlink() or not lexical.is_dir() or _under_artifacts(skill.base, lexical):
+        raise FileNotFoundError(f"Skill {skill.name} is missing")
+    markdown = lexical / "SKILL.md"
+    if markdown.is_symlink():
         raise FileNotFoundError(f"Skill {skill.name} is missing")
     try:
-        path = _within(skill.base, f"{skill.relative_dir}/SKILL.md")
+        path = resolve_within(skill.base, f"{skill.relative_dir}/SKILL.md")
     except SandboxDenied as exc:
         raise FileNotFoundError(f"Skill {skill.name} is missing") from exc
-    if not path.is_file():
+    if _under_artifacts(skill.base, path) or not path.is_file():
         raise FileNotFoundError(f"Skill {skill.name} is missing")
     text = _read_utf8(path, skill.directory)
     if text is None:
@@ -552,13 +616,13 @@ def _list_resources(skill: Skill) -> tuple[list[str], bool]:
     is not consulted.
     """
     lexical = skill.base / skill.relative_dir
-    if lexical.is_symlink() or not lexical.is_dir():
+    if lexical.is_symlink() or not lexical.is_dir() or _under_artifacts(skill.base, lexical):
         return [], False
     try:
-        root = _within(skill.base, skill.relative_dir)
+        root = resolve_within(skill.base, skill.relative_dir)
     except SandboxDenied:
         return [], False
-    if not root.is_dir():
+    if not root.is_dir() or _under_artifacts(skill.base, root):
         return [], False
     files: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -574,10 +638,10 @@ def _list_resources(skill: Skill) -> tuple[list[str], bool]:
             if relative == "SKILL.md":
                 continue
             try:
-                resolved = _within(skill.base, f"{skill.relative_dir}/{relative}")
+                resolved = resolve_within(skill.base, f"{skill.relative_dir}/{relative}")
             except SandboxDenied:
                 continue
-            if not resolved.is_file():
+            if _under_artifacts(skill.base, resolved) or not resolved.is_file():
                 continue
             if len(files) >= _MAX_LISTED_FILES:
                 return files, True

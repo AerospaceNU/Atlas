@@ -36,6 +36,7 @@ from atlas.agent.runtime import (
     AgentRun,
     AgentStep,
     ensure_agent_config,
+    load_home_skills_enabled,
     load_max_tool_calls,
     load_model,
 )
@@ -642,7 +643,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # fall back to the project workspace via the store's read_root.
     artifact_root = project_atlas_root(workspace) / "artifacts" / session_id
     store = LocalArtifactStore(artifact_root, read_root=workspace)
-    skills = load_skills(store, home=home)
+    # Home skills are opt-in. The default session sees only the workspace.
+    skill_home = home if load_home_skills_enabled(workspace) else None
+    skills = load_skills(store, home=skill_home)
     registry = default_registry()
     register_skill_tool(registry, skills)
     model = OpenRouterModel(ModelConfig(model=model_id, api_key=api_key))

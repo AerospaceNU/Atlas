@@ -56,8 +56,12 @@ class ImageInfo(BaseModel):
     format: str | None
 
 
-def _within(base: Path, relative_path: str) -> Path:
+def resolve_within(base: Path, relative_path: str) -> Path:
     """Resolve ``relative_path`` under ``base``, rejecting escapes.
+
+    This is the public containment check. The artifact store and the skill
+    loader both use it, so a skill path is held to the same sandbox rules as
+    a tool path.
 
     Absolute paths and ``..`` escapes raise ``SandboxDenied``. Resolution
     follows symlinks before the containment check, so the result is always
@@ -110,7 +114,7 @@ class LocalArtifactStore:
 
     def resolve(self, relative_path: str) -> Path:
         """Resolve a relative path for writing, following symlinks, and reject escapes."""
-        return _within(self.root, relative_path)
+        return resolve_within(self.root, relative_path)
 
     def resolve_read(self, relative_path: str) -> Path:
         """Resolve a relative path for reading, preferring the write sandbox.
@@ -120,10 +124,10 @@ class LocalArtifactStore:
         neither returns its ``root``-relative form, so the caller's error stays
         root-relative and never leaks a host path.
         """
-        primary = _within(self.root, relative_path)
+        primary = resolve_within(self.root, relative_path)
         if primary.exists() or self.read_root is None:
             return primary
-        fallback = _within(self.read_root, relative_path)
+        fallback = resolve_within(self.read_root, relative_path)
         return fallback if fallback.exists() else primary
 
     def relative(self, path: Path) -> str:
