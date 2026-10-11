@@ -106,13 +106,19 @@ def blob_polygons(
     _reject_oversized(int(heatmap.shape[0]), int(heatmap.shape[1]))
     mask = heatmap >= threshold
     structure = ndimage.generate_binary_structure(2, 1)
-    labeled, count = ndimage.label(np.asarray(mask, dtype=bool), structure=structure)
+    labeled, _count = ndimage.label(np.asarray(mask, dtype=bool), structure=structure)
     polygons: list[dict[str, Any]] = []
-    for index in range(1, int(count) + 1):
-        rows, cols = np.nonzero(labeled == index)
+    for index, window in enumerate(ndimage.find_objects(labeled), start=1):
+        if window is None:
+            continue
+        rows, cols = np.nonzero(labeled[window] == index)
         if int(rows.size) < min_pixels:
             continue
-        pixels = list(zip(cols.tolist(), rows.tolist(), strict=True))
+        y0 = int(window[0].start or 0)
+        x0 = int(window[1].start or 0)
+        pixels = [
+            (x0 + int(x), y0 + int(y)) for y, x in zip(rows.tolist(), cols.tolist(), strict=True)
+        ]
         hull = _convex_hull(pixels)
         if len(hull) < 3:
             continue

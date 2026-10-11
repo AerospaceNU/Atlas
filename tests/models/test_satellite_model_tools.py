@@ -22,7 +22,7 @@ from atlas.models.rgb_change.infer import (
 )
 
 _ROOT = Path(__file__).resolve().parents[2]
-_MODEL_NAMES = {
+_PACKAGED = {
     "segment_landcover",
     "rgb_change",
     "mask_clouds",
@@ -31,6 +31,7 @@ _MODEL_NAMES = {
     "unet_water",
     "lgbm_clouds",
 }
+_LEARNED = {"unet_water", "lgbm_clouds"}
 _HEURISTICS = ("mask_clouds", "burn_scar", "flood_mask")
 
 
@@ -59,13 +60,15 @@ def _split(
     return array
 
 
-def test_plugins_register_as_agent_tools() -> None:
+def test_plugins_register_as_agent_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATLAS_WEIGHTS_DIR", str(tmp_path / "empty"))
     specs = {spec.name for spec in iter_plugin_specs()}
     definitions = {item.name: item for item in default_registry().definitions}
 
-    assert specs == _MODEL_NAMES
-    for name in _MODEL_NAMES:
+    assert specs == _PACKAGED
+    for name in _PACKAGED - _LEARNED:
         assert definitions[name].description
+    assert _LEARNED.isdisjoint(definitions)
     for name in _HEURISTICS:
         assert "heuristic" in definitions[name].description.lower()
     assert "path" in definitions["mask_clouds"].parameters["properties"]

@@ -1,14 +1,15 @@
 name = "lgbm_clouds"
-description = "LightGBM cloud mask on RGB pixels. Weights are a JSON contract (relative key, optional sha256) holding a LightGBM model string. Large mosaics are tiled and stitched to the original size."
+description = "LightGBM cloud mask on raw 0-255 RGB pixels. Weights are a JSON contract (relative key and sha256). Install the lightgbm extra. Large mosaics are tiled at 256 or 512 and stitched to the original size."
 runtime = "lightgbm"
 weight = "lgbm_clouds/model.json"
+# Empty in git: weights are not shipped. export.py prints the digest to paste here.
 sha256 = ""
 
 [input]
 kind = "rgb_png"
 shape = [0, 0, 3]
 dtype = "uint8"
-sizes = [32, 256, 512]
+sizes = [256, 512]
 
 [output]
 kind = "mask"

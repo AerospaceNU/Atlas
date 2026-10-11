@@ -95,7 +95,6 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "httpx" },
-    { name = "lightgbm" },
     { name = "numpy" },
     { name = "pillow" },
     { name = "pydantic" },
@@ -108,9 +107,13 @@ dependencies = [
 gemini = [
     { name = "google-genai" },
 ]
+lightgbm = [
+    { name = "lightgbm" },
+]
 
 [package.dev-dependencies]
 dev = [
+    { name = "lightgbm" },
     { name = "mypy" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -124,7 +127,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.104.1" },
     { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=2.28.0" },
     { name = "httpx", specifier = ">=0.28.1" },
-    { name = "lightgbm", specifier = ">=4.6.0" },
+    { name = "lightgbm", marker = "extra == 'lightgbm'", specifier = ">=4.6.0" },
     { name = "numpy", specifier = ">=2.2.0" },
     { name = "pillow", specifier = ">=11.0.0" },
     { name = "pydantic", specifier = ">=2.13.4" },
@@ -132,10 +135,11 @@ requires-dist = [
     { name = "rich", specifier = ">=13.9.0" },
     { name = "scipy", specifier = ">=1.14.0" },
 ]
-provides-extras = ["gemini"]
+provides-extras = ["gemini", "lightgbm"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "lightgbm", specifier = ">=4.6.0" },
     { name = "mypy", specifier = ">=2.1.0" },
     { name = "pre-commit", specifier = ">=4.6.0" },
     { name = "pytest", specifier = ">=9.0.3" },

@@ -161,6 +161,30 @@ def load_rgb_array(path: Path) -> NDArray[np.uint8]:
     return array
 
 
+def parse_weight_payload(spec: PluginSpec, data: bytes) -> dict[str, Any]:
+    """Check a weight document's runtime and class names.
+
+    Args:
+        spec: Plugin whose ``runtime`` and ``output.classes`` form the contract.
+        data: Raw JSON bytes, already hash-checked.
+
+    Returns:
+        The JSON object.
+
+    Raises:
+        ValueError: If the document is not an object, or the runtime or class
+            list does not match ``spec``.
+    """
+    payload: Any = json.loads(data.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Weight {spec.weight} must be a JSON object")
+    if payload.get("runtime") != spec.runtime:
+        raise ValueError(f"Weight runtime does not match plugin.toml for {spec.name}")
+    if payload.get("classes") != spec.output.classes:
+        raise ValueError("Weight classes do not match plugin.toml")
+    return payload
+
+
 def load_weight_payload(spec: PluginSpec) -> dict[str, Any]:
     """Load a JSON weight file and check its runtime and class names.
 
@@ -176,14 +200,7 @@ def load_weight_payload(spec: PluginSpec) -> dict[str, Any]:
             relative key, not a host path.
         ValueError: If the hash, runtime, or class list does not match.
     """
-    payload: Any = json.loads(read_weight_bytes(spec).decode("utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"Weight {spec.weight} must be a JSON object")
-    if payload.get("runtime") != spec.runtime:
-        raise ValueError(f"Weight runtime does not match plugin.toml for {spec.name}")
-    if payload.get("classes") != spec.output.classes:
-        raise ValueError("Weight classes do not match plugin.toml")
-    return payload
+    return parse_weight_payload(spec, read_weight_bytes(spec))
 
 
 def weight_tile(payload: dict[str, Any], spec: PluginSpec) -> int:

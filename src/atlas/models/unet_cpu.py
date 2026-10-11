@@ -1,30 +1,28 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
-from atlas.models.base import PluginSpec, load_rgb_array, load_weight_payload, weight_tile
+from atlas.models.base import (
+    PluginSpec,
+    load_rgb_array,
+    parse_weight_payload,
+    read_weight_bytes,
+    weight_tile,
+)
+from atlas.models.inputs import SegmentInput
 
-
-class SegmentInput(BaseModel):
-    """Workspace-relative RGB PNG in; same-size class mask out."""
-
-    path: str = Field(description="PNG path relative to the local artifact workspace.")
-    mask_path: str | None = Field(
-        default=None,
-        description="Class-index PNG path relative to the workspace.",
-    )
-    json_path: str | None = Field(
-        default=None,
-        description="JSON summary path relative to the workspace.",
-    )
+_MAX_HIDDEN = 32
+_TILE_MARGIN = 8
+_WEIGHT_CACHE: dict[tuple[str, str, tuple[str, ...]], UnetWeights] = {}
 
 
 class UnetWeights:
@@ -35,8 +33,15 @@ class UnetWeights:
         self.tile = weight_tile(payload, spec)
         if self.tile % 2:
             raise ValueError(f"Weight tile {self.tile} must be even")
+        self.scale = _scalar(payload, "scale")
+        self.mean = _rgb_triple(payload, "mean")
+        self.std = _rgb_triple(payload, "std")
+        if not bool(np.all(np.abs(self.std) > 0)):
+            raise ValueError("Weight std must be a non-zero RGB triple")
         self.enc_w = _kernel(payload, "enc_w", cin=3)
         hidden = int(self.enc_w.shape[0])
+        if hidden > _MAX_HIDDEN:
+            raise ValueError(f"Weight hidden size {hidden} exceeds {_MAX_HIDDEN}")
         self.enc_b = _bias(payload, "enc_b", hidden)
         self.bn_w = _kernel(payload, "bn_w", cin=hidden, cout=hidden)
         self.bn_b = _bias(payload, "bn_b", hidden)
@@ -44,6 +49,41 @@ class UnetWeights:
         self.dec_b = _bias(payload, "dec_b", hidden)
         self.head_w = _kernel(payload, "head_w", cin=hidden, cout=classes)
         self.head_b = _bias(payload, "head_b", classes)
+
+
+def load_unet_weights(spec: PluginSpec) -> UnetWeights:
+    """Load U-Net weights, reusing a previous parse of the same bytes.
+
+    Args:
+        spec: Plugin whose relative weight key points at the JSON contract.
+
+    Returns:
+        Parsed kernels. A second call with the same name, class list, and
+        sha256 returns the same object.
+    """
+    data = read_weight_bytes(spec)
+    digest = hashlib.sha256(data).hexdigest()
+    key = (spec.name, digest, tuple(spec.output.classes))
+    cached = _WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    weights = UnetWeights(spec, parse_weight_payload(spec, data))
+    _WEIGHT_CACHE[key] = weights
+    return weights
+
+
+def _scalar(payload: dict[str, Any], key: str) -> float:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Weight {key} must be a number")
+    return float(value)
+
+
+def _rgb_triple(payload: dict[str, Any], key: str) -> NDArray[np.float32]:
+    array = np.asarray(payload.get(key), dtype=np.float32)
+    if array.shape != (3,):
+        raise ValueError(f"Weight {key} must be an RGB triple")
+    return array
 
 
 def _kernel(
@@ -104,6 +144,11 @@ def _upsample2(image: NDArray[np.float32], height: int, width: int) -> NDArray[n
     return up[:height, :width]
 
 
+def _normalize(rgb: NDArray[np.uint8], weights: UnetWeights) -> NDArray[np.float32]:
+    features = rgb.astype(np.float32) * np.float32(weights.scale)
+    return (features - weights.mean.reshape(1, 1, 3)) / weights.std.reshape(1, 1, 3)
+
+
 def unet_forward(rgb: NDArray[np.uint8], weights: UnetWeights) -> NDArray[np.uint8]:
     """Run one even-sized tile and return a class-index map.
 
@@ -112,9 +157,10 @@ def unet_forward(rgb: NDArray[np.uint8], weights: UnetWeights) -> NDArray[np.uin
         weights: Kernels loaded from the plugin weight file.
 
     Returns:
-        ``HxW`` uint8 class indexes.
+        ``HxW`` uint8 class indexes. Inputs are scaled by ``weights.scale``,
+        then shifted by ``mean`` and ``std``, before the convolutions.
     """
-    features = rgb.astype(np.float32)
+    features = _normalize(rgb, weights)
     encoded = np.maximum(_conv2d(features, weights.enc_w, weights.enc_b), 0)
     pooled = _max_pool2(encoded)
     bottleneck = np.maximum(_conv2d(pooled, weights.bn_w, weights.bn_b), 0)
@@ -125,12 +171,31 @@ def unet_forward(rgb: NDArray[np.uint8], weights: UnetWeights) -> NDArray[np.uin
     return np.argmax(logits, axis=2).astype(np.uint8)
 
 
-def predict_unet(rgb: NDArray[np.uint8], weights: UnetWeights) -> NDArray[np.uint8]:
-    """Tile ``rgb`` at ``weights.tile``, run the U-Net, and stitch to native size.
+def _labels_for_patch(patch: NDArray[np.uint8], weights: UnetWeights) -> NDArray[np.uint8]:
+    patch_h, patch_w = int(patch.shape[0]), int(patch.shape[1])
+    pad_h = patch_h % 2
+    pad_w = patch_w % 2
+    padded = patch
+    if pad_h or pad_w:
+        padded = np.pad(patch, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+    return unet_forward(padded, weights)[:patch_h, :patch_w]
+
+
+def predict_unet(
+    rgb: NDArray[np.uint8],
+    weights: UnetWeights,
+    *,
+    margin: int = _TILE_MARGIN,
+) -> NDArray[np.uint8]:
+    """Tile ``rgb`` with an overlap of ``margin`` and stitch the core of each tile.
 
     Args:
         rgb: ``HxWx3`` uint8 mosaic.
-        weights: Loaded U-Net weights. ``tile`` is the window edge.
+        weights: Loaded U-Net weights. ``tile`` is the core window edge.
+        margin: Context kept around each core, then cropped away. The default
+            is 8 pixels, enough for this network's 3x3 stack. ``tile`` and the
+            default margin are even so 2x2 pooling stays aligned with a
+            single pass over the whole image.
 
     Returns:
         Class-index mask with the same height and width as ``rgb``.
@@ -140,20 +205,21 @@ def predict_unet(rgb: NDArray[np.uint8], weights: UnetWeights) -> NDArray[np.uin
     tile = weights.tile
     for y0 in range(0, height, tile):
         for x0 in range(0, width, tile):
-            patch = rgb[y0 : y0 + tile, x0 : x0 + tile]
-            patch_h, patch_w = int(patch.shape[0]), int(patch.shape[1])
-            pad_h = patch_h % 2
-            pad_w = patch_w % 2
-            padded = patch
-            if pad_h or pad_w:
-                padded = np.pad(patch, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
-            pred = unet_forward(padded, weights)
-            labels[y0 : y0 + patch_h, x0 : x0 + patch_w] = pred[:patch_h, :patch_w]
+            y1 = min(y0 + tile, height)
+            x1 = min(x0 + tile, width)
+            cy0 = max(0, y0 - margin)
+            cx0 = max(0, x0 - margin)
+            cy1 = min(height, y1 + margin)
+            cx1 = min(width, x1 + margin)
+            pred = _labels_for_patch(rgb[cy0:cy1, cx0:cx1], weights)
+            top = y0 - cy0
+            left = x0 - cx0
+            labels[y0:y1, x0:x1] = pred[top : top + (y1 - y0), left : left + (x1 - x0)]
     return labels
 
 
 class UnetCpuTool(Tool):
-    """CPU U-Net over RGB mosaics. Tiles large inputs and stitches the labels."""
+    """CPU U-Net over RGB mosaics. Overlapping tiles are cropped and stitched."""
 
     def __init__(self, spec: PluginSpec) -> None:
         if spec.runtime != "unet_cpu":
@@ -181,7 +247,7 @@ class UnetCpuTool(Tool):
         if json_path.suffix.lower() != ".json":
             raise ValueError("json output must end in .json")
 
-        weights = UnetWeights(self.spec, load_weight_payload(self.spec))
+        weights = load_unet_weights(self.spec)
         rgb = load_rgb_array(store.resolve_read(request.path))
         labels = predict_unet(rgb, weights)
         height, width = int(labels.shape[0]), int(labels.shape[1])
@@ -191,14 +257,20 @@ class UnetCpuTool(Tool):
         mask_path.parent.mkdir(parents=True, exist_ok=True)
         json_path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(labels, mode="L").save(mask_path)
+        total = float(labels.size)
+        fractions = {
+            name: round(float(np.count_nonzero(labels == index)) / total, 6)
+            for index, name in enumerate(self.spec.output.classes)
+        }
         positive = self.spec.output.classes[1]
-        fraction = float(np.count_nonzero(labels == 1)) / float(labels.size)
+        fraction = fractions[positive]
         payload = {
             "path": request.path,
             "width": width,
             "height": height,
             "positive": positive,
-            "positive_fraction": round(fraction, 6),
+            "positive_fraction": fraction,
+            "fractions": fractions,
             "mask": store.relative(mask_path),
         }
         json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
