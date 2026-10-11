@@ -14,10 +14,10 @@ block scalars are accepted as well.
 
 Discovery reads the workspace read root and, when ``home`` is passed, the
 user home. It never reads the store write root (the session artifact
-directory). Both roots go through :func:`atlas.agent.artifacts.resolve_within`.
-Precedence, lowest to highest, is the whole skill directory: a higher
-directory replaces every file from a lower one, and files are not merged
-across directories.
+directory) or ``.atlas/skills-drafts``. Containment uses
+:func:`atlas.agent.skill_author.is_within`. Precedence, lowest to highest,
+is the whole skill directory: a higher directory replaces every file from a
+lower one, and files are not merged across directories.
 
 1. ``<home>/.agents/skills/<name>`` (only when ``home`` is passed)
 2. ``<home>/.atlas/skills/<name>``
@@ -25,9 +25,12 @@ across directories.
 4. ``<workspace>/.atlas/skills/<name>``
 
 A symlinked ``~/.atlas`` is followed when the resolved skills directory stays
-inside the home directory. A link that leaves home is skipped. A resolved path
-under ``.atlas/artifacts`` is skipped, including a home link into that tree.
+inside the home directory. A link that leaves home is skipped. Every base is
+checked against the project artifact directory
+(``<workspace>/.atlas/artifacts``), so a link into that tree is skipped.
 Symlinked skill directories and symlinked ``SKILL.md`` files are skipped.
+Each ``SKILL.md`` is hashed when the catalog loads. ``use_skill`` refuses the
+skill when those bytes have changed.
 
 The system prompt receives names and descriptions only. ``use_skill`` re-reads
 the winning directory when a task matches a description. Wrapper tags in the
@@ -36,10 +39,13 @@ body are escaped without rewriting comparisons.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import logging
 import os
 import re
+import stat
+import tomllib
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -48,9 +54,10 @@ from typing import Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, Field, create_model
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied, resolve_within
+from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolRegistry, ToolResult
-from atlas.agent.skill_author import normalize_name
+from atlas.agent.layout import project_atlas_root, user_atlas_root
+from atlas.agent.skill_author import is_within, normalize_skill_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -62,8 +69,9 @@ _SKILL_ROOTS = (".agents/skills", ".atlas/skills")
 _CONTENT_TAG = "skill_content"
 _UNTRUSTED_BODY_TAG = "untrusted_skill_body"
 _RESOURCE_TAG = "skill_resources"
+# The closing ">" is optional so an unclosed tag still matches.
 _WRAPPER_TAG_RE = re.compile(
-    rf"<\s*/?\s*(?:{_UNTRUSTED_BODY_TAG}|{_CONTENT_TAG}|{_RESOURCE_TAG})\b[^>]*>",
+    rf"<\s*/?\s*(?:{_UNTRUSTED_BODY_TAG}|{_CONTENT_TAG}|{_RESOURCE_TAG})\b[^>]*>?",
     re.IGNORECASE,
 )
 _DIRECTORY_LABEL = "Skill directory:"
@@ -85,8 +93,10 @@ class Skill:
     ``directory`` is a logical label (``.atlas/skills/name`` or
     ``~/.atlas/skills/name``). It is safe to show to the model. ``base`` is the
     workspace read root or the user home that owns the skill, and ``relative_dir``
-    is the path under that base. Host paths are not shown. ``base`` is never the
-    session write root.
+    is the path under that base.     Host paths are not shown. ``base`` is never the
+    session write root. ``content_sha256`` is the ``SKILL.md`` bytes at
+    discovery time. ``artifact_root`` is the project artifact directory those
+    bytes must not resolve into.
     """
 
     name: str
@@ -94,6 +104,8 @@ class Skill:
     directory: str
     base: Path
     relative_dir: str
+    content_sha256: str
+    artifact_root: Path | None
 
 
 def load_skills(store: LocalArtifactStore, *, home: Path | None = None) -> list[Skill]:
@@ -115,14 +127,17 @@ def load_skills(store: LocalArtifactStore, *, home: Path | None = None) -> list[
     3. ``<workspace read root>/.agents/skills/<name>``
     4. ``<workspace read root>/.atlas/skills/<name>``
 
-    A missing skills directory contributes nothing. A file that cannot be
-    parsed, whose name does not NFKC-normalize to the NFKC form of its
-    directory name, or whose description is empty is skipped. Symlinked skill
-    directories and symlinked ``SKILL.md`` files are skipped. A skills
-    directory, ``SKILL.md``, or resource whose resolved path is under
-    ``.atlas/artifacts`` is skipped. A symlinked ``~/.atlas`` is followed only
-    when that resolved directory stays inside ``home``. The result is sorted
-    by name.
+    A missing skills directory contributes nothing. ``.atlas/skills-drafts``
+    is not a discovery root. A file that cannot be parsed, whose name does
+    not NFKC-normalize to the NFKC form of its directory name, or whose
+    description is empty is skipped. Symlinked skill directories and symlinked
+    ``SKILL.md`` files are skipped. A skills directory, ``SKILL.md``, or
+    resource that resolves inside ``<workspace>/.atlas/artifacts`` is skipped
+    on every base. A symlinked ``~/.atlas`` is followed only when that
+    resolved directory stays inside ``home``. The result is sorted by name.
+    Each returned skill carries a SHA-256 of the ``SKILL.md`` bytes.
+    :func:`load_home_skills_enabled` decides whether a session should pass
+    ``home``.
 
     Args:
         store: Artifact store. Only ``read_root`` is scanned.
@@ -132,10 +147,11 @@ def load_skills(store: LocalArtifactStore, *, home: Path | None = None) -> list[
     Returns:
         The skills that should be disclosed to the model.
     """
+    artifact_root = _project_artifact_root(store)
     found: dict[str, Skill] = {}
     for base, label_prefix in _read_bases(store, home):
         for root in _SKILL_ROOTS:
-            for skill in _scan_base(base, root, label_prefix):
+            for skill in _scan_base(base, root, label_prefix, artifact_root):
                 previous = found.get(skill.name)
                 if previous is not None:
                     _LOGGER.warning(
@@ -146,6 +162,33 @@ def load_skills(store: LocalArtifactStore, *, home: Path | None = None) -> list[
                     )
                 found[skill.name] = skill
     return [found[name] for name in sorted(found)]
+
+
+def load_home_skills_enabled(workspace: Path) -> bool:
+    """Return whether user-home skills are enabled.
+
+    Home skills are off by default. A repository ``.atlas/agent.toml`` cannot
+    turn them on. ``ATLAS_HOME_SKILLS`` set to ``1``, ``true``, ``yes``, or
+    ``on`` enables them. Any other value, including an unrecognized one,
+    forces them off and overrides ``~/.atlas/config.toml``. When the variable
+    is unset, ``home_skills = true`` in that user file enables them.
+
+    #31 and #32 call ``load_home_skills_enabled(workspace)``.
+
+    Args:
+        workspace: Caller workspace. The file under this directory is not read.
+
+    Returns:
+        Whether :func:`load_skills` should receive the user home.
+    """
+    if not isinstance(workspace, Path):
+        raise TypeError("workspace must be a path")
+    flag = os.environ.get("ATLAS_HOME_SKILLS", "").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    if flag:
+        return False
+    return _user_config_enables_home_skills()
 
 
 def render_system_prompt(base: str, skills: Sequence[Skill]) -> str:
@@ -195,9 +238,11 @@ class UseSkillTool(Tool):
     markdown body, without frontmatter, plus relative paths of bundled files.
     Those files are not read here. The body is labeled untrusted. Wrapper and
     resource tags in the body are escaped even when their case or whitespace
-    differs from the tags this tool emits, and a fake skill-directory label is
-    escaped too. Comparisons in the instructions stay intact. Reads use the
-    skill's captured read-only base, never the store write root.
+    differs from the tags this tool emits, the closing angle bracket is
+    missing, or zero-width characters split the tag. A fake skill-directory
+    label is escaped too. Comparisons in the instructions stay intact. Reads
+    use the skill's captured read-only base, never the store write root. A
+    ``SKILL.md`` whose bytes changed since discovery is refused.
     """
 
     name = "use_skill"
@@ -245,18 +290,58 @@ def _read_bases(store: LocalArtifactStore, home: Path | None) -> list[tuple[Path
     return bases
 
 
-def _under_artifacts(base: Path, path: Path) -> bool:
-    """Return whether ``path`` resolves inside ``<base>/.atlas/artifacts``."""
-    try:
-        resolved = path.resolve()
-        artifact_root = (base / ".atlas" / "artifacts").resolve()
-        resolved.relative_to(artifact_root)
-    except (OSError, ValueError):
+def _project_artifact_root(store: LocalArtifactStore) -> Path | None:
+    """Return ``<workspace>/.atlas/artifacts``, or None when there is no workspace."""
+    if store.read_root is None:
+        return None
+    return project_atlas_root(store.read_root) / "artifacts"
+
+
+def _under_project_artifacts(artifact_root: Path | None, path: Path) -> bool:
+    """Return whether ``path`` resolves inside the project artifact directory."""
+    if artifact_root is None:
         return False
-    return True
+    return is_within(artifact_root, path)
 
 
-def _scan_base(base: Path, root: str, label_prefix: str) -> list[Skill]:
+def _resolve_contained(base: Path, relative: str) -> Path | None:
+    """Return ``relative`` resolved inside ``base``.
+
+    Containment is :func:`atlas.agent.skill_author.is_within`. A regular file
+    with more than one hardlink is refused.
+    """
+    lexical = base / relative
+    if not is_within(base, lexical):
+        return None
+    resolved = lexical.resolve()
+    try:
+        info = resolved.stat()
+    except OSError:
+        return None
+    if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+        return None
+    return resolved
+
+
+def _user_config_enables_home_skills() -> bool:
+    """Return whether ``~/.atlas/config.toml`` sets ``home_skills`` to true."""
+    path = user_atlas_root(Path.home()) / "config.toml"
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return data.get("home_skills") is True
+
+
+def _scan_base(base: Path, root: str, label_prefix: str, artifact_root: Path | None) -> list[Skill]:
     """Load child skills of one skills directory under one read-only base."""
     directory = base / root
     if directory.is_symlink() or not directory.is_dir():
@@ -267,15 +352,15 @@ def _scan_base(base: Path, root: str, label_prefix: str) -> list[Skill]:
     except (OSError, ValueError):
         _LOGGER.warning("Skipping skills directory %s outside its read root", root)
         return []
-    if _under_artifacts(base, resolved):
-        _LOGGER.warning("Skipping skills directory %s under .atlas/artifacts", root)
+    if _under_project_artifacts(artifact_root, resolved):
+        _LOGGER.warning("Skipping skills directory %s under the project artifacts", root)
         return []
     found: dict[str, Skill] = {}
     for child in sorted(directory.iterdir(), key=lambda path: path.name):
         if child.name.startswith(".") or child.is_symlink() or not child.is_dir():
             continue
         relative_dir = f"{root}/{child.name}"
-        skill = _load_skill_dir(base, relative_dir, child.name, label_prefix)
+        skill = _load_skill_dir(base, relative_dir, child.name, label_prefix, artifact_root)
         if skill is None:
             continue
         if skill.name in found:
@@ -291,7 +376,11 @@ def _scan_base(base: Path, root: str, label_prefix: str) -> list[Skill]:
 
 
 def _load_skill_dir(
-    base: Path, relative_dir: str, directory_name: str, label_prefix: str
+    base: Path,
+    relative_dir: str,
+    directory_name: str,
+    label_prefix: str,
+    artifact_root: Path | None,
 ) -> Skill | None:
     logical = f"{label_prefix}{relative_dir}"
     lexical = base / relative_dir
@@ -300,24 +389,26 @@ def _load_skill_dir(
         return None
     if not lexical.is_dir():
         return None
-    if _under_artifacts(base, lexical):
-        _LOGGER.warning("Skipping skill %s under .atlas/artifacts", logical)
+    if _under_project_artifacts(artifact_root, lexical):
+        _LOGGER.warning("Skipping skill %s under the project artifacts", logical)
         return None
     markdown = base / relative_dir / "SKILL.md"
     if markdown.is_symlink():
         _LOGGER.warning("Skipping skill %s: SKILL.md is a symlink", logical)
         return None
-    try:
-        path = resolve_within(base, f"{relative_dir}/SKILL.md")
-    except SandboxDenied:
+    path = _resolve_contained(base, f"{relative_dir}/SKILL.md")
+    if path is None:
         _LOGGER.warning("Skipping skill %s: path escapes its read root", logical)
         return None
-    if _under_artifacts(base, path):
-        _LOGGER.warning("Skipping skill %s under .atlas/artifacts", logical)
+    if _under_project_artifacts(artifact_root, path):
+        _LOGGER.warning("Skipping skill %s under the project artifacts", logical)
         return None
     if not path.is_file():
         return None
-    text = _read_utf8(path, logical)
+    data = _read_bytes(path, logical)
+    if data is None:
+        return None
+    text = _decode_utf8(data, logical)
     if text is None:
         return None
     try:
@@ -334,7 +425,7 @@ def _load_skill_dir(
     if not isinstance(description, str) or not description.strip():
         _LOGGER.warning("Skipping skill %s: missing description", logical)
         return None
-    normalized, errors = normalize_name(name)
+    normalized, errors = normalize_skill_name(name)
     directory_key = unicodedata.normalize("NFKC", directory_name)
     if errors or normalized is None or normalized != directory_key:
         _LOGGER.warning(
@@ -355,15 +446,20 @@ def _load_skill_dir(
         directory=logical,
         base=base,
         relative_dir=relative_dir,
+        content_sha256=hashlib.sha256(data).hexdigest(),
+        artifact_root=artifact_root,
     )
 
 
-def _read_utf8(path: Path, label: str) -> str | None:
+def _read_bytes(path: Path, label: str) -> bytes | None:
     try:
-        data = path.read_bytes()
+        return path.read_bytes()
     except OSError:
         _LOGGER.warning("Could not read skill %s", label)
         return None
+
+
+def _decode_utf8(data: bytes, label: str) -> str | None:
     if data.startswith(b"\xef\xbb\xbf"):
         data = data[3:]
     try:
@@ -546,16 +642,33 @@ def _escape_directory_label(match: re.Match[str]) -> str:
     return match.group(0).replace(":", "&#58;")
 
 
+def _strip_zero_width(text: str) -> str:
+    """Drop Unicode format characters and the Mongolian vowel separator."""
+    return "".join(
+        character
+        for character in text
+        if character != "\u180e" and unicodedata.category(character) != "Cf"
+    )
+
+
+def _prepare_untrusted_text(text: str) -> str:
+    """NFKC-normalize ``text`` and strip zero-width characters."""
+    stripped = _strip_zero_width(text)
+    return _strip_zero_width(unicodedata.normalize("NFKC", stripped))
+
+
 def _neutralize_untrusted_body(body: str) -> str:
     """Escape wrapper markup in ``body`` and leave comparisons raw.
 
-    Opening and closing ``skill_content``, ``untrusted_skill_body``, and
-    ``skill_resources`` tags match case-insensitively, including tags with
-    whitespace or newlines before the name or the closing angle bracket. A
-    ``Skill directory:`` label is escaped so the body cannot forge the trailer
-    this renderer adds after the untrusted region.
+    The text is NFKC-normalized and zero-width characters are removed before
+    matching. Opening and closing ``skill_content``, ``untrusted_skill_body``,
+    and ``skill_resources`` tags match case-insensitively, including tags with
+    whitespace or newlines before the name. The closing angle bracket may be
+    absent. A ``Skill directory:`` label is escaped so the body cannot forge
+    the trailer this renderer adds after the untrusted region.
     """
-    neutralized = _WRAPPER_TAG_RE.sub(_escape_markup, body)
+    prepared = _prepare_untrusted_text(body)
+    neutralized = _WRAPPER_TAG_RE.sub(_escape_markup, prepared)
     return _DIRECTORY_LABEL_RE.sub(_escape_directory_label, neutralized)
 
 
@@ -590,20 +703,32 @@ def _render_skill_content(skill: Skill) -> str:
 
 
 def _read_skill_markdown(skill: Skill) -> str:
-    """Re-read ``SKILL.md`` from the skill's read-only base."""
+    """Re-read ``SKILL.md`` from the skill's read-only base.
+
+    Raises:
+        ValueError: If the file bytes differ from the catalog hash.
+        FileNotFoundError: If the file is missing, symlinked, or inside the
+            project artifact directory.
+    """
     lexical = skill.base / skill.relative_dir
-    if lexical.is_symlink() or not lexical.is_dir() or _under_artifacts(skill.base, lexical):
+    if (
+        lexical.is_symlink()
+        or not lexical.is_dir()
+        or _under_project_artifacts(skill.artifact_root, lexical)
+    ):
         raise FileNotFoundError(f"Skill {skill.name} is missing")
     markdown = lexical / "SKILL.md"
     if markdown.is_symlink():
         raise FileNotFoundError(f"Skill {skill.name} is missing")
-    try:
-        path = resolve_within(skill.base, f"{skill.relative_dir}/SKILL.md")
-    except SandboxDenied as exc:
-        raise FileNotFoundError(f"Skill {skill.name} is missing") from exc
-    if _under_artifacts(skill.base, path) or not path.is_file():
+    path = _resolve_contained(skill.base, f"{skill.relative_dir}/SKILL.md")
+    if path is None or _under_project_artifacts(skill.artifact_root, path) or not path.is_file():
         raise FileNotFoundError(f"Skill {skill.name} is missing")
-    text = _read_utf8(path, skill.directory)
+    data = _read_bytes(path, skill.directory)
+    if data is None:
+        raise FileNotFoundError(f"Skill {skill.name} is missing")
+    if hashlib.sha256(data).hexdigest() != skill.content_sha256:
+        raise ValueError(f"Skill {skill.name} changed since it was loaded")
+    text = _decode_utf8(data, skill.directory)
     if text is None:
         raise FileNotFoundError(f"Skill {skill.name} is missing")
     return text
@@ -616,13 +741,14 @@ def _list_resources(skill: Skill) -> tuple[list[str], bool]:
     is not consulted.
     """
     lexical = skill.base / skill.relative_dir
-    if lexical.is_symlink() or not lexical.is_dir() or _under_artifacts(skill.base, lexical):
+    if (
+        lexical.is_symlink()
+        or not lexical.is_dir()
+        or _under_project_artifacts(skill.artifact_root, lexical)
+    ):
         return [], False
-    try:
-        root = resolve_within(skill.base, skill.relative_dir)
-    except SandboxDenied:
-        return [], False
-    if not root.is_dir() or _under_artifacts(skill.base, root):
+    root = _resolve_contained(skill.base, skill.relative_dir)
+    if root is None or not root.is_dir() or _under_project_artifacts(skill.artifact_root, root):
         return [], False
     files: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -637,11 +763,12 @@ def _list_resources(skill: Skill) -> tuple[list[str], bool]:
                 continue
             if relative == "SKILL.md":
                 continue
-            try:
-                resolved = resolve_within(skill.base, f"{skill.relative_dir}/{relative}")
-            except SandboxDenied:
-                continue
-            if _under_artifacts(skill.base, resolved) or not resolved.is_file():
+            resolved = _resolve_contained(skill.base, f"{skill.relative_dir}/{relative}")
+            if (
+                resolved is None
+                or _under_project_artifacts(skill.artifact_root, resolved)
+                or not resolved.is_file()
+            ):
                 continue
             if len(files) >= _MAX_LISTED_FILES:
                 return files, True

@@ -12,7 +12,7 @@ The tool loop over one local artifact directory.
 | `contracts` | Tool and model types, the tool registry, and discovery of tool classes. |
 | `runtime` | The bounded agent loop: call a tool, record the step, stop at the call budget. |
 | `session` | A multi-turn conversation on top of that loop, plus the `python -m atlas.agent` entry. |
-| `skills` | Load Agent Skills from the workspace read root and activate one with `use_skill`. Home skills (`~/.atlas/skills` and `~/.agents/skills`) stay off unless `ATLAS_HOME_SKILLS=1` or `home_skills = true` in `.atlas/agent.toml`. |
+| `skills` | Load Agent Skills from the workspace read root and activate one with `use_skill`. `.atlas/skills-drafts` is not loaded. Home skills stay off unless `ATLAS_HOME_SKILLS=1` or `home_skills = true` in `~/.atlas/config.toml`. |
 | `model` | The OpenRouter chat backend. |
 | `tools/` | Concrete tools. `read_file` reads text in the workspace and does not run it. |
 | `skill_author` | Write an Agent Skill directory (`SKILL.md`) that matches the Agent Skills spec. `normalize_skill_name` (`normalize_name`) and `is_within` are the shared name and path checks. |

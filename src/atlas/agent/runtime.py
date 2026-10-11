@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import tomllib
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -21,7 +20,13 @@ from atlas.agent.contracts import (
     ToolResult,
 )
 from atlas.agent.metrics import observe_model_call, tokens_per_second
-from atlas.agent.skills import Skill, render_system_prompt
+from atlas.agent.skills import (
+    Skill,
+    render_system_prompt,
+)
+from atlas.agent.skills import (
+    load_home_skills_enabled as load_home_skills_enabled,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -109,31 +114,6 @@ def ensure_agent_config(root: Path) -> Path:
         encoding="utf-8",
     )
     return config_path
-
-
-def load_home_skills_enabled(root: Path) -> bool:
-    """Return whether user-home skills are enabled for ``root``.
-
-    Home skills are off by default. ``ATLAS_HOME_SKILLS`` set to ``1``,
-    ``true``, ``yes``, or ``on`` enables them. The same variable set to
-    ``0``, ``false``, ``no``, or ``off`` keeps them off even when the config
-    file asks for them. When the variable is unset, ``home_skills = true`` in
-    ``.atlas/agent.toml`` enables them. Any other value leaves them off.
-
-    Args:
-        root: Workspace whose ``.atlas/agent.toml`` is consulted.
-
-    Returns:
-        Whether :func:`atlas.agent.skills.load_skills` should receive the
-        user home.
-    """
-    flag = os.environ.get("ATLAS_HOME_SKILLS", "").strip().lower()
-    if flag in {"1", "true", "yes", "on"}:
-        return True
-    if flag:
-        return False
-    data = _load_agent_config(root)
-    return data.get("home_skills") is True
 
 
 def load_model(root: Path) -> str:
