@@ -62,6 +62,12 @@ pub enum ServerMessage {
         kind: String,
         name: String,
     },
+    Skill {
+        name: String,
+        description: String,
+        location: String,
+        active: Vec<String>,
+    },
     Phase {
         phase: String,
         name: Option<String>,
@@ -227,6 +233,17 @@ enum RawMessage {
         #[serde(default)]
         name: String,
     },
+    #[serde(rename = "skill")]
+    Skill {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        location: String,
+        #[serde(default)]
+        active: Vec<String>,
+    },
 }
 
 /// Parse one protocol line. Blank lines yield `Ok(None)`.
@@ -325,6 +342,17 @@ impl From<RawMessage> for ServerMessage {
             RawMessage::Removed { scope, kind, name } => {
                 ServerMessage::Removed { scope, kind, name }
             }
+            RawMessage::Skill {
+                name,
+                description,
+                location,
+                active,
+            } => ServerMessage::Skill {
+                name,
+                description,
+                location,
+                active,
+            },
             RawMessage::Phase { phase, name } => ServerMessage::Phase { phase, name },
             RawMessage::Thought {
                 text,
@@ -409,6 +437,30 @@ mod tests {
             Some(ServerMessage::Thought {
                 tokens_per_second, ..
             }) => assert_eq!(tokens_per_second, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_skill() {
+        let line = r#"{"type":"skill","name":"flood-check","description":"Check water.","location":"project","active":["flood-check"]}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::Skill {
+                name,
+                description,
+                location,
+                active,
+            }) => {
+                assert_eq!(name, "flood-check");
+                assert_eq!(description, "Check water.");
+                assert_eq!(location, "project");
+                assert_eq!(active, vec!["flood-check".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let omitted = r#"{"type":"skill","name":"flood-check","description":"Check water.","location":"project"}"#;
+        match parse_line(omitted).unwrap() {
+            Some(ServerMessage::Skill { active, .. }) => assert!(active.is_empty()),
             other => panic!("unexpected: {other:?}"),
         }
     }

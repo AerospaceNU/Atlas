@@ -541,6 +541,10 @@ impl App {
                 self.transcript
                     .push(tool_note(format!("removed {scope} {kind} {name}")));
             }
+            ServerMessage::Skill { name, .. } => {
+                self.transcript
+                    .push(tool_note(format!("using skill {name}")));
+            }
             ServerMessage::Unknown => {}
         }
     }
@@ -1335,6 +1339,24 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
             "scope": app.scope_root,
             "kind": "artifacts"
         })),
+        "/skill" => {
+            let rest = text.trim().trim_start_matches("/skill").trim_start();
+            if rest.is_empty() {
+                app.transcript
+                    .push(tool_note("usage: /skill <name> [argument]"));
+                None
+            } else {
+                let (name, argument) = match rest.split_once(char::is_whitespace) {
+                    Some((name, argument)) => (name, argument.trim_start()),
+                    None => (rest, ""),
+                };
+                let mut payload = serde_json::json!({"type": "skill", "name": name});
+                if !argument.is_empty() {
+                    payload["argument"] = serde_json::Value::String(argument.to_string());
+                }
+                Some(payload)
+            }
+        }
         _ => {
             app.transcript
                 .push(tool_note(format!("unknown command {command}")));
@@ -1344,6 +1366,8 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
 }
 
 const PICKER_PAGE: usize = 8;
+/// Slash commands stay on one page so a new command is not clipped off `/`.
+const MENU_PAGE: usize = 12;
 
 /// Slice of the filtered catalog that stays on screen around `index`.
 fn picker_window(len: usize, index: usize, page: usize) -> std::ops::Range<usize> {
@@ -1367,7 +1391,7 @@ struct MenuItem {
 /// Command or fixed-argument options that match `text`, or an empty list when
 /// the menu should stay hidden (free text after a finished command).
 fn menu_options(text: &str) -> Vec<MenuItem> {
-    const COMMANDS: [MenuItem; 8] = [
+    const COMMANDS: [MenuItem; 9] = [
         MenuItem {
             token: "/new",
             description: "Start a fresh conversation",
@@ -1383,6 +1407,10 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
         MenuItem {
             token: "/key",
             description: "Set an OpenRouter key",
+        },
+        MenuItem {
+            token: "/skill",
+            description: "Use a skill in this session",
         },
         MenuItem {
             token: "/sessions",
@@ -1550,6 +1578,7 @@ fn is_finished_command(text: &str) -> bool {
     match command {
         "/model" => text.starts_with("/model"),
         "/key" => matches!(words.next(), Some("session") | Some("user")),
+        "/skill" => words.next().is_some(),
         _ => false,
     }
 }
@@ -1562,7 +1591,7 @@ fn menu_rows(app: &App) -> u16 {
     if options.is_empty() {
         return 0;
     }
-    let count = options.len().clamp(1, PICKER_PAGE) as u16;
+    let count = options.len().clamp(1, MENU_PAGE) as u16;
     count.saturating_add(1)
 }
 
@@ -1572,7 +1601,7 @@ fn render_menu(frame: &mut Frame, app: &App, area: Rect) {
         MENU_HEADER,
         Style::default().fg(GRAY).bg(BG_BASE),
     ))];
-    let window = picker_window(options.len(), app.menu_index, PICKER_PAGE);
+    let window = picker_window(options.len(), app.menu_index, MENU_PAGE);
     for (index, option) in options
         .iter()
         .enumerate()
@@ -2340,9 +2369,9 @@ fn status_hint(app: &App) -> String {
     let mut hint = if !app.session_open {
         "ctrl-c quit".to_string()
     } else if app.status == Status::Stopped {
-        "enter send  /new /model /key /quit  ctrl-r resume".to_string()
+        "enter send  /new /model /skill /key /quit  ctrl-r resume".to_string()
     } else {
-        "enter send  /new /model /key /quit".to_string()
+        "enter send  /new /model /skill /key /quit".to_string()
     };
     if !expandable_tools(app).is_empty() {
         hint.push_str("  ←→ tool");
@@ -2687,6 +2716,38 @@ mod tests {
     }
 
     #[test]
+    fn skill_command_sends_the_name_and_argument() {
+        let mut app = App::new();
+        let payload = slash_outcome(&mut app, "/skill flood-check scene.png").expect("skill");
+        assert_eq!(payload["type"], "skill");
+        assert_eq!(payload["name"], "flood-check");
+        assert_eq!(payload["argument"], "scene.png");
+        let spaced = slash_outcome(&mut app, "/skill flood-check hello  world").expect("spaces");
+        assert_eq!(spaced["argument"], "hello  world");
+        assert!(is_finished_command("/skill flood-check"));
+        assert!(!is_finished_command("/skill"));
+    }
+
+    #[test]
+    fn skill_command_without_a_name_explains_usage() {
+        let mut app = App::new();
+        assert!(slash_outcome(&mut app, "/skill").is_none());
+        assert!(tool_text(&app).contains("usage: /skill <name> [argument]"));
+    }
+
+    #[test]
+    fn skill_message_notes_the_name() {
+        let mut app = App::new();
+        app.apply(ServerMessage::Skill {
+            name: "flood-check".to_string(),
+            description: "Check water".to_string(),
+            location: "project".to_string(),
+            active: vec!["flood-check".to_string()],
+        });
+        assert!(tool_text(&app).contains("using skill flood-check"));
+    }
+
+    #[test]
     fn slash_menu_lists_every_command() {
         let mut app = App::new();
         app.input = "/".to_string();
@@ -2696,6 +2757,7 @@ mod tests {
             "/model",
             "/copy",
             "/key",
+            "/skill",
             "/sessions",
             "/artifacts",
             "/quit",
