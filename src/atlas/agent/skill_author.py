@@ -8,6 +8,9 @@ activating them in a session are separate.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
+import errno
 import os
 import re
 import shutil
@@ -26,6 +29,8 @@ MAX_COMPATIBILITY_LENGTH = 500
 _FRONTMATTER_DELIMITER = "---"
 _METADATA_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 _FOLD_WIDTH = 72
+_RENAME_EXCHANGE = 2
+_AT_FDCWD = -100
 
 
 class SkillAuthorError(ValueError):
@@ -182,17 +187,19 @@ def author_skill(
     bundled: Mapping[str, str] = {} if files is None else files
     root = Path(skills_root).expanduser().resolve()
     destination = root / prepared.name
+    if root.exists():
+        _recover_replacing(destination)
     errors = _destination_errors(root, destination, bundled, overwrite=overwrite)
     if errors:
         raise SkillAuthorError(errors)
 
     rendered = _render(prepared)
-    payload = _skill_payload(destination, bundled, rendered)
     root.mkdir(parents=True, exist_ok=True)
     staging = root / f".{prepared.name}.authoring"
     try:
         _reset_staging(staging)
-        _write_tree(staging, payload)
+        _copy_preserved(destination, staging, replaced={"SKILL.md", *bundled})
+        _write_tree(staging, {**dict(bundled), "SKILL.md": rendered})
         _publish(staging, destination)
     except Exception:
         if staging.is_dir() and not staging.is_symlink():
@@ -267,6 +274,8 @@ def _required_text(value: object, field_name: str, limit: int) -> tuple[str | No
     if not isinstance(value, str) or not value.strip():
         return None, [f"Field '{field_name}' must be a non-empty string"]
     text = value.strip()
+    if field_name == "description":
+        text = _normalize_newlines(text)
     errors: list[str] = []
     if len(text) > limit:
         label = "Description" if field_name == "description" else field_name
@@ -362,13 +371,25 @@ def _render(prepared: _PreparedSkill) -> str:
     return "\n".join(lines) + "\n\n" + prepared.body + "\n"
 
 
+def _normalize_newlines(text: str) -> str:
+    """Turn CR LF and bare CR into LF before a description is folded.
+
+    The skills loader splits the file with ``str.splitlines``, which treats a
+    raw carriage return as a line break. A CR left inside frontmatter splits a
+    field in half and the loader skips the skill.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _description_lines(description: str) -> list[str]:
     """Render ``description`` so the skills loader can read it back.
 
-    A single line stays a quoted scalar. A newline becomes a folded block
-    (``>``): one paragraph per line, wrapped so the loader joins wrapped
-    words with spaces and paragraphs with newlines.
+    Carriage returns are normalized first. A single line stays a quoted
+    scalar. A newline becomes a folded block (``>``): one paragraph per
+    line, wrapped so the loader joins wrapped words with spaces and
+    paragraphs with newlines.
     """
+    description = _normalize_newlines(description)
     if "\n" not in description:
         return [f"description: {_yaml_string(description)}"]
     lines = ["description: >"]
@@ -484,18 +505,14 @@ def _target_errors(path: Path, *, overwrite: bool, label: str) -> list[str]:
     return []
 
 
-def _skill_payload(destination: Path, bundled: Mapping[str, str], rendered: str) -> dict[str, str]:
-    """Files for the replacement tree, including skill files this write does not replace."""
-    payload = _preserved_files(destination, replaced={"SKILL.md", *bundled})
-    payload.update(bundled)
-    payload["SKILL.md"] = rendered
-    return payload
+def _copy_preserved(destination: Path, staging: Path, *, replaced: set[str]) -> None:
+    """Copy files this write does not replace, keeping bytes and permissions.
 
-
-def _preserved_files(destination: Path, *, replaced: set[str]) -> dict[str, str]:
+    ``shutil.copy2`` keeps the mode bit, including execute, and does not
+    decode the file as text. Symlinks and hardlinks are still refused.
+    """
     if not destination.exists():
-        return {}
-    preserved: dict[str, str] = {}
+        return
     for path in sorted(destination.rglob("*")):
         if path.is_symlink():
             raise SkillAuthorError(["Skill directory contains a symlink"])
@@ -509,11 +526,11 @@ def _preserved_files(destination: Path, *, replaced: set[str]) -> dict[str, str]
             raise SkillAuthorError(
                 ["Skill path is a hardlinked file that may lead outside the skill directory"]
             )
-        try:
-            preserved[relative] = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise SkillAuthorError(["Skill file is not UTF-8 text"]) from exc
-    return preserved
+        located, locate_error = _locate_file(staging, relative)
+        if located is None:
+            raise SkillAuthorError([locate_error or "Skill file path is invalid"])
+        located.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, located)
 
 
 def _reset_staging(staging: Path) -> None:
@@ -541,26 +558,91 @@ def _write_tree(staging: Path, payload: Mapping[str, str]) -> None:
         _write_text(path, content, overwrite=False)
 
 
+def _replacing_path(destination: Path) -> Path:
+    return destination.parent / f".{destination.name}.replacing"
+
+
+def _recover_replacing(destination: Path) -> None:
+    """Put a skill back if an earlier publish stopped after the backup rename.
+
+    A crash between moving the live directory to ``.<name>.replacing`` and
+    moving the staging directory into place leaves the skill missing. The next
+    publish restores that backup. If both directories exist, the live one is
+    the finished publish and the backup is removed.
+    """
+    backup = _replacing_path(destination)
+    if backup.is_symlink():
+        raise SkillAuthorError(["Skill staging path escapes the skills root"])
+    if not backup.exists():
+        return
+    if not destination.exists():
+        _rename(backup, destination)
+        return
+    if backup.is_dir():
+        shutil.rmtree(backup)
+        return
+    backup.unlink()
+
+
 def _publish(staging: Path, destination: Path) -> None:
     """Move ``staging`` to ``destination``.
 
-    A new directory is one rename. Replacing an existing directory renames it
-    aside first, then moves the staging directory into place, then deletes the
-    previous tree. A failed publish puts the previous directory back.
+    A new directory is one rename. Replacing an existing directory swaps the
+    two with ``renameat2(RENAME_EXCHANGE)`` when the kernel allows it, so the
+    skill name is never absent. Otherwise the live directory is renamed to
+    ``.<name>.replacing``, the staging directory takes its place, and the
+    backup is removed. ``_recover_replacing`` heals a backup left by a crash.
     """
+    _recover_replacing(destination)
     if not destination.exists():
         _rename(staging, destination)
         return
-    backup = destination.parent / f".{destination.name}.replacing"
+    if _exchange_directories(staging, destination):
+        shutil.rmtree(staging)
+        return
+    backup = _replacing_path(destination)
     if backup.exists() or backup.is_symlink():
         raise SkillAuthorError(["Skill staging path is not available"])
     _rename(destination, backup)
     try:
         _rename(staging, destination)
     except SkillAuthorError:
-        _rename(backup, destination)
+        if not destination.exists() and (backup.exists() or backup.is_symlink()):
+            _rename(backup, destination)
         raise
     shutil.rmtree(backup)
+
+
+def _exchange_directories(source: Path, target: Path) -> bool:
+    """Atomically swap two directories. False when the kernel cannot do it."""
+    library = ctypes.util.find_library("c")
+    if not library:
+        return False
+    libc = ctypes.CDLL(library, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        return False
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(target),
+        _RENAME_EXCHANGE,
+    )
+    if result == 0:
+        return True
+    err = ctypes.get_errno()
+    if err in {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM}:
+        return False
+    raise SkillAuthorError([f"Could not write skill: {os.strerror(err)}"])
 
 
 def _rename(source: Path, target: Path) -> None:

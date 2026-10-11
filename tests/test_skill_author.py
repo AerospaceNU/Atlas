@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -380,6 +382,10 @@ def test_failed_publish_leaves_the_existing_skill(
     def fail_rename(*_args: object, **_kwargs: object) -> None:
         raise OSError(1, "nope")
 
+    def refuse_exchange(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr("atlas.agent.skill_author._exchange_directories", refuse_exchange)
     monkeypatch.setattr(os, "rename", fail_rename)
 
     with pytest.raises(SkillAuthorError, match="Could not write skill"):
@@ -389,6 +395,64 @@ def test_failed_publish_leaves_the_existing_skill(
     assert (path / "scripts" / "extract.py").read_text(encoding="utf-8") == "print(1)\n"
     assert not (tmp_path / ".ndvi-change.authoring").exists()
     assert not (tmp_path / ".ndvi-change.replacing").exists()
+
+
+def test_next_publish_recovers_a_leftover_replacing_directory(tmp_path: Path) -> None:
+    path = author_skill(tmp_path, _draft())
+    original = (path / "SKILL.md").read_text(encoding="utf-8")
+    backup = tmp_path / ".ndvi-change.replacing"
+    os.rename(path, backup)
+
+    with pytest.raises(SkillAuthorError, match="already exists"):
+        author_skill(tmp_path, _draft(body="changed"), overwrite=False)
+
+    assert (path / "SKILL.md").read_text(encoding="utf-8") == original
+    assert not backup.exists()
+
+    author_skill(tmp_path, _draft(body="changed"), overwrite=True)
+
+    assert "changed" in (path / "SKILL.md").read_text(encoding="utf-8")
+    assert not backup.exists()
+    assert not (tmp_path / ".ndvi-change.authoring").exists()
+
+
+def test_live_skill_wins_when_a_replacing_backup_is_also_present(tmp_path: Path) -> None:
+    path = author_skill(tmp_path, _draft())
+    backup = tmp_path / ".ndvi-change.replacing"
+    shutil.copytree(path, backup)
+    (path / "SKILL.md").write_text("live-marker\n", encoding="utf-8")
+
+    with pytest.raises(SkillAuthorError, match="already exists"):
+        author_skill(tmp_path, _draft(), overwrite=False)
+
+    assert (path / "SKILL.md").read_text(encoding="utf-8") == "live-marker\n"
+    assert not backup.exists()
+
+
+def test_overwrite_copies_preserved_bytes_and_permissions(tmp_path: Path) -> None:
+    path = author_skill(tmp_path, _draft(), files={"scripts/extract.py": "print(1)\n"})
+    binary = path / "scripts" / "run.bin"
+    binary.write_bytes(b"\x00\xff")
+    binary.chmod(0o755)
+
+    author_skill(tmp_path, _draft(body="changed"), overwrite=True)
+
+    assert binary.read_bytes() == b"\x00\xff"
+    assert stat.S_IMODE(binary.stat().st_mode) == 0o755
+    assert (path / "scripts" / "extract.py").read_text(encoding="utf-8") == "print(1)\n"
+    assert "changed" in (path / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_description_carriage_returns_are_normalized_before_folding(tmp_path: Path) -> None:
+    description = "Compare scenes.\r\nUse when asked.\rThen stop."
+
+    path = author_skill(tmp_path, _draft(description=description, body="Do the thing."))
+    text = (path / "SKILL.md").read_bytes()
+
+    assert b"\r" not in text
+    fields, body = _parse_like_skills_loader(text.decode("utf-8"))
+    assert fields["description"] == "Compare scenes.\nUse when asked.\nThen stop."
+    assert body == "Do the thing."
 
 
 def test_loader_parses_quoted_and_folded_frontmatter() -> None:
@@ -413,35 +477,116 @@ def test_loader_parses_quoted_and_folded_frontmatter() -> None:
     assert body == "Do the thing."
 
 
-def test_author_skill_tool_writes_through_the_store(
+def test_author_skill_tool_writes_the_project_skills_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = LocalArtifactStore(tmp_path)
-    seen: list[str] = []
-    resolve = store.resolve
+    store, workspace = _project_store(tmp_path)
+    calls: list[Path] = []
 
-    def spy(relative: str) -> Path:
-        seen.append(relative)
-        return resolve(relative)
+    def spy(root: Path, draft: SkillDraft, **kwargs: Any) -> Path:
+        calls.append(root)
+        return author_skill(root, draft, **kwargs)
 
-    monkeypatch.setattr(store, "resolve", spy)
+    monkeypatch.setattr("atlas.agent.tools.author_skill.author_skill", spy)
 
-    result = AuthorSkillTool().run(
-        {
-            "name": "ndvi-change",
-            "description": "Compare two scenes. Use when the user asks about NDVI.",
-            "body": "Subtract the later scene from the earlier one.",
-        },
-        store,
-    )
+    result = AuthorSkillTool().run(_tool_arguments(), store)
 
-    assert seen == ["skills/ndvi-change/SKILL.md"]
-    assert result.artifacts == ["skills/ndvi-change/SKILL.md"]
-    text = (tmp_path / "skills" / "ndvi-change" / "SKILL.md").read_text(encoding="utf-8")
-    assert "Subtract the later scene from the earlier one." in text
-    fields, body = _parse_like_skills_loader(text)
+    skill = workspace / ".atlas" / "skills" / "ndvi-change" / "SKILL.md"
+    assert calls == [project_skills_root(store.read_root or workspace)]
+    assert skill.is_file()
+    assert not (workspace / ".atlas" / "artifacts" / "session" / "skills").exists()
+    assert result.artifacts == [".atlas/skills/ndvi-change/SKILL.md"]
+    fields, body = _parse_like_skills_loader(skill.read_text(encoding="utf-8"))
     assert fields["name"] == "ndvi-change"
     assert body == "Subtract the later scene from the earlier one."
+
+
+def test_author_skill_tool_writes_user_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    store, workspace = _project_store(tmp_path)
+
+    result = AuthorSkillTool().run(_tool_arguments(scope="user"), store)
+
+    skill = home / ".atlas" / "skills" / "ndvi-change" / "SKILL.md"
+    assert skill.is_file()
+    assert not (workspace / ".atlas" / "skills").exists()
+    assert result.artifacts == ["~/.atlas/skills/ndvi-change/SKILL.md"]
+    fields, _body = _parse_like_skills_loader(skill.read_text(encoding="utf-8"))
+    assert fields["name"] == "ndvi-change"
+
+
+def test_author_skill_tool_refuses_a_skills_symlink_outside_the_workspace(tmp_path: Path) -> None:
+    store, workspace = _project_store(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / ".atlas" / "skills").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="escapes"):
+        AuthorSkillTool().run(_tool_arguments(), store)
+
+    assert not any(outside.rglob("SKILL.md"))
+
+
+def test_author_skill_tool_refuses_an_atlas_symlink_outside_the_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / ".atlas").symlink_to(outside, target_is_directory=True)
+    store = LocalArtifactStore(tmp_path / "artifacts", read_root=workspace)
+
+    with pytest.raises(ValueError, match="escapes"):
+        AuthorSkillTool().run(_tool_arguments(), store)
+
+    assert not any(outside.rglob("SKILL.md"))
+
+
+def test_author_skill_tool_requires_a_workspace_read_root(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts")
+
+    with pytest.raises(ValueError, match="read root"):
+        AuthorSkillTool().run(_tool_arguments(), store)
+
+    assert not (tmp_path / "artifacts" / "skills").exists()
+
+
+def test_author_skill_tool_overwrite_goes_through_author_skill(tmp_path: Path) -> None:
+    store, workspace = _project_store(tmp_path)
+    tool = AuthorSkillTool()
+    tool.run(_tool_arguments(), store)
+    skill = workspace / ".atlas" / "skills" / "ndvi-change" / "SKILL.md"
+    original = skill.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="already exists"):
+        tool.run(_tool_arguments(body="changed"), store)
+
+    assert skill.read_text(encoding="utf-8") == original
+
+    result = tool.run(_tool_arguments(body="changed", overwrite=True), store)
+
+    assert "changed" in skill.read_text(encoding="utf-8")
+    assert result.artifacts == [".atlas/skills/ndvi-change/SKILL.md"]
+
+
+def _project_store(tmp_path: Path) -> tuple[LocalArtifactStore, Path]:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    artifact_root = workspace / ".atlas" / "artifacts" / "session"
+    return LocalArtifactStore(artifact_root, read_root=workspace), workspace
+
+
+def _tool_arguments(**overrides: object) -> dict[str, object]:
+    arguments: dict[str, object] = {
+        "name": "ndvi-change",
+        "description": "Compare two scenes. Use when the user asks about NDVI.",
+        "body": "Subtract the later scene from the earlier one.",
+    }
+    arguments.update(overrides)
+    return arguments
 
 
 def test_author_skill_tool_does_not_change_the_default_registry() -> None:

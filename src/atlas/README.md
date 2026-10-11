@@ -15,7 +15,7 @@ The tool loop over one local artifact directory.
 | `model` | The OpenRouter chat backend. |
 | `tools/` | Concrete tools. `read_file` reads text in the workspace and does not run it. |
 | `skill_author` | Write an Agent Skill directory (`SKILL.md`) that matches the Agent Skills spec. |
-| `tools/author_skill` | Opt-in tool that writes one skill through the artifact store. It is not in the default registry. |
+| `tools/author_skill` | Opt-in tool that writes one skill under `.atlas/skills` (project workspace or user home). It is not in the default registry. |
 | `__main__` | Module entry that starts a session. |
 
 ## `cli`
