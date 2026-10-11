@@ -20,6 +20,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from atlas.agent.layout import project_atlas_root, user_atlas_root
 
@@ -32,6 +33,9 @@ _METADATA_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 _FOLD_WIDTH = 72
 _RENAME_EXCHANGE = 2
 _AT_FDCWD = -100
+_libc: ctypes.CDLL | None = None
+_renameat2: Any = None
+_renameat2_loaded = False
 
 
 class SkillAuthorError(ValueError):
@@ -87,6 +91,20 @@ def project_skills_root(workspace: Path) -> Path:
         The project skills directory.
     """
     return project_atlas_root(workspace) / "skills"
+
+
+def project_skill_drafts_root(workspace: Path) -> Path:
+    """Return ``<workspace>/.atlas/skills-drafts`` without creating it.
+
+    Drafts are not loaded from ``.atlas/skills``. A person promotes one later.
+
+    Args:
+        workspace: Project directory that contains ``.atlas``.
+
+    Returns:
+        The project skill drafts directory.
+    """
+    return project_atlas_root(workspace) / "skills-drafts"
 
 
 def user_skills_root(home: Path | None = None) -> Path:
@@ -251,11 +269,12 @@ def author_skill(
     bundled: Mapping[str, str] = {} if files is None else files
     root = Path(skills_root).expanduser().resolve()
     destination = root / prepared.name
-    if root.exists():
-        _recover_replacing(destination)
     errors = _destination_errors(root, destination, bundled, overwrite=overwrite)
+    errors.extend(_stranded_backup_errors(destination, overwrite=overwrite))
     if errors:
         raise SkillAuthorError(errors)
+    if root.exists():
+        _recover_replacing(destination)
 
     rendered = _render(prepared)
     root.mkdir(parents=True, exist_ok=True)
@@ -603,6 +622,20 @@ def _replacing_path(destination: Path) -> Path:
     return destination.parent / f".{destination.name}.replacing"
 
 
+def _stranded_backup_errors(destination: Path, *, overwrite: bool) -> list[str]:
+    """Report a leftover ``.replacing`` directory without moving it.
+
+    A refusing call must leave that backup where it is. Recovery runs only
+    after these checks pass.
+    """
+    if overwrite or destination.exists() or destination.is_symlink():
+        return []
+    backup = _replacing_path(destination)
+    if backup.exists() or backup.is_symlink():
+        return ["Skill already exists: SKILL.md"]
+    return []
+
+
 def _recover_replacing(destination: Path) -> None:
     """Put a skill back if an earlier publish stopped after the backup rename.
 
@@ -655,22 +688,15 @@ def _publish(staging: Path, destination: Path) -> None:
 
 
 def _exchange_directories(source: Path, target: Path) -> bool:
-    """Atomically swap two directories. False when the kernel cannot do it."""
-    library = ctypes.util.find_library("c")
-    if not library:
-        return False
-    libc = ctypes.CDLL(library, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
+    """Atomically swap two directories.
+
+    False for any errno other than ``ENOENT``, including ``EXDEV`` and
+    ``EBUSY``, so the caller can fall back to a rename. A missing path is a
+    real failure and is not treated as "the kernel cannot swap".
+    """
+    renameat2 = _cached_renameat2()
     if renameat2 is None:
         return False
-    renameat2.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    renameat2.restype = ctypes.c_int
     result = renameat2(
         _AT_FDCWD,
         os.fsencode(source),
@@ -680,10 +706,34 @@ def _exchange_directories(source: Path, target: Path) -> bool:
     )
     if result == 0:
         return True
-    err = ctypes.get_errno()
-    if err in {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM}:
-        return False
-    raise SkillAuthorError([f"Could not write skill: {os.strerror(err)}"])
+    if ctypes.get_errno() == errno.ENOENT:
+        raise SkillAuthorError([f"Could not write skill: {os.strerror(errno.ENOENT)}"])
+    return False
+
+
+def _cached_renameat2() -> Any:
+    """Return ``renameat2`` from libc, loading it once."""
+    global _libc, _renameat2, _renameat2_loaded
+    if _renameat2_loaded:
+        return _renameat2
+    _renameat2_loaded = True
+    library = ctypes.util.find_library("c")
+    if not library:
+        return None
+    _libc = ctypes.CDLL(library, use_errno=True)
+    renameat2 = getattr(_libc, "renameat2", None)
+    if renameat2 is None:
+        return None
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    _renameat2 = renameat2
+    return renameat2
 
 
 def _rename(source: Path, target: Path) -> None:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
+import errno
 import os
 import re
 import shutil
@@ -9,6 +12,7 @@ from typing import Any
 
 import pytest
 
+import atlas.agent.skill_author as skill_author
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import build_registry, default_registry
 from atlas.agent.skill_author import (
@@ -17,17 +21,19 @@ from atlas.agent.skill_author import (
     MAX_SKILL_NAME_LENGTH,
     SkillAuthorError,
     SkillDraft,
+    _exchange_directories,
     _write_text,
     author_skill,
     is_within,
     normalize_name,
     normalize_skill_name,
+    project_skill_drafts_root,
     project_skills_root,
     render_skill_md,
     user_skills_root,
     validate_skill,
 )
-from atlas.agent.tools.author_skill import AuthorSkillTool
+from atlas.agent.tools.author_skill import AuthorSkillInput, AuthorSkillTool
 
 
 def _draft(**overrides: object) -> SkillDraft:
@@ -439,7 +445,7 @@ def test_failed_publish_leaves_the_existing_skill(
     assert not (tmp_path / ".ndvi-change.replacing").exists()
 
 
-def test_next_publish_recovers_a_leftover_replacing_directory(tmp_path: Path) -> None:
+def test_refusing_a_write_leaves_a_replacing_backup_untouched(tmp_path: Path) -> None:
     path = author_skill(tmp_path, _draft())
     original = (path / "SKILL.md").read_text(encoding="utf-8")
     backup = tmp_path / ".ndvi-change.replacing"
@@ -448,8 +454,14 @@ def test_next_publish_recovers_a_leftover_replacing_directory(tmp_path: Path) ->
     with pytest.raises(SkillAuthorError, match="already exists"):
         author_skill(tmp_path, _draft(body="changed"), overwrite=False)
 
-    assert (path / "SKILL.md").read_text(encoding="utf-8") == original
-    assert not backup.exists()
+    assert not path.exists()
+    assert (backup / "SKILL.md").read_text(encoding="utf-8") == original
+
+
+def test_overwrite_recovers_a_replacing_backup_before_it_publishes(tmp_path: Path) -> None:
+    path = author_skill(tmp_path, _draft())
+    backup = tmp_path / ".ndvi-change.replacing"
+    os.rename(path, backup)
 
     author_skill(tmp_path, _draft(body="changed"), overwrite=True)
 
@@ -458,17 +470,79 @@ def test_next_publish_recovers_a_leftover_replacing_directory(tmp_path: Path) ->
     assert not (tmp_path / ".ndvi-change.authoring").exists()
 
 
-def test_live_skill_wins_when_a_replacing_backup_is_also_present(tmp_path: Path) -> None:
+def test_failed_validation_does_not_touch_a_replacing_backup(tmp_path: Path) -> None:
     path = author_skill(tmp_path, _draft())
     backup = tmp_path / ".ndvi-change.replacing"
     shutil.copytree(path, backup)
     (path / "SKILL.md").write_text("live-marker\n", encoding="utf-8")
+    backup_text = (backup / "SKILL.md").read_text(encoding="utf-8")
 
     with pytest.raises(SkillAuthorError, match="already exists"):
-        author_skill(tmp_path, _draft(), overwrite=False)
+        author_skill(tmp_path, _draft(body="changed"), overwrite=False)
+    with pytest.raises(SkillAuthorError, match="body"):
+        author_skill(tmp_path, _draft(body=""))
 
     assert (path / "SKILL.md").read_text(encoding="utf-8") == "live-marker\n"
-    assert not backup.exists()
+    assert (backup / "SKILL.md").read_text(encoding="utf-8") == backup_text
+
+
+def test_exchange_falls_back_on_any_errno_except_enoent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = author_skill(tmp_path, _draft(), files={"scripts/extract.py": "print(1)\n"})
+    original = (path / "SKILL.md").read_text(encoding="utf-8")
+
+    def fail_with(code: int) -> Any:
+        def fail(*_args: object) -> int:
+            ctypes.set_errno(code)
+            return -1
+
+        return fail
+
+    monkeypatch.setattr(skill_author, "_renameat2_loaded", True)
+    monkeypatch.setattr(skill_author, "_renameat2", fail_with(errno.EXDEV))
+
+    author_skill(tmp_path, _draft(body="changed"), overwrite=True)
+
+    assert "changed" in (path / "SKILL.md").read_text(encoding="utf-8")
+    assert not (tmp_path / ".ndvi-change.replacing").exists()
+
+    monkeypatch.setattr(skill_author, "_renameat2", fail_with(errno.EBUSY))
+    author_skill(tmp_path, _draft(body="busy"), overwrite=True)
+    assert "busy" in (path / "SKILL.md").read_text(encoding="utf-8")
+
+    monkeypatch.setattr(skill_author, "_renameat2", fail_with(errno.ENOENT))
+    with pytest.raises(SkillAuthorError, match="No such file"):
+        author_skill(tmp_path, _draft(body="missing"), overwrite=True)
+
+    assert "missing" not in (path / "SKILL.md").read_text(encoding="utf-8")
+    assert "busy" in (path / "SKILL.md").read_text(encoding="utf-8")
+    assert original != (path / "SKILL.md").read_text(encoding="utf-8")
+    assert not (tmp_path / ".ndvi-change.authoring").exists()
+    assert not (tmp_path / ".ndvi-change.replacing").exists()
+
+
+def test_renameat2_lookup_is_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    calls: list[str] = []
+    real = ctypes.util.find_library
+
+    def counted(name: str) -> str | None:
+        calls.append(name)
+        return real(name)
+
+    monkeypatch.setattr(skill_author, "_renameat2_loaded", False)
+    monkeypatch.setattr(skill_author, "_renameat2", None)
+    monkeypatch.setattr(skill_author, "_libc", None)
+    monkeypatch.setattr(ctypes.util, "find_library", counted)
+
+    assert _exchange_directories(source, target) is True
+    assert _exchange_directories(source, target) is True
+
+    assert calls == ["c"]
 
 
 def test_overwrite_copies_preserved_bytes_and_permissions(tmp_path: Path) -> None:
@@ -519,53 +593,55 @@ def test_loader_parses_quoted_and_folded_frontmatter() -> None:
     assert body == "Do the thing."
 
 
-def test_author_skill_tool_writes_the_project_skills_root(
+def test_author_skill_tool_writes_a_draft_not_a_live_skill(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store, workspace = _project_store(tmp_path)
-    calls: list[Path] = []
+    vetted = workspace / ".atlas" / "skills" / "ndvi-change"
+    vetted.mkdir(parents=True)
+    (vetted / "SKILL.md").write_text("vetted\n", encoding="utf-8")
+    calls: list[tuple[Path, dict[str, Any]]] = []
 
     def spy(root: Path, draft: SkillDraft, **kwargs: Any) -> Path:
-        calls.append(root)
+        calls.append((root, kwargs))
         return author_skill(root, draft, **kwargs)
 
     monkeypatch.setattr("atlas.agent.tools.author_skill.author_skill", spy)
 
     result = AuthorSkillTool().run(_tool_arguments(), store)
 
-    skill = workspace / ".atlas" / "skills" / "ndvi-change" / "SKILL.md"
-    assert calls == [project_skills_root(store.read_root or workspace)]
-    assert skill.is_file()
+    draft = workspace / ".atlas" / "skills-drafts" / "ndvi-change" / "SKILL.md"
+    assert calls == [(project_skill_drafts_root(store.read_root or workspace), {})]
+    assert draft.is_file()
+    assert (vetted / "SKILL.md").read_text(encoding="utf-8") == "vetted\n"
     assert not (workspace / ".atlas" / "artifacts" / "session" / "skills").exists()
-    assert result.artifacts == [".atlas/skills/ndvi-change/SKILL.md"]
-    fields, body = _parse_like_skills_loader(skill.read_text(encoding="utf-8"))
+    assert result.artifacts == [".atlas/skills-drafts/ndvi-change/SKILL.md"]
+    assert "/enable-skill ndvi-change" in result.text
+    fields, body = _parse_like_skills_loader(draft.read_text(encoding="utf-8"))
     assert fields["name"] == "ndvi-change"
     assert body == "Subtract the later scene from the earlier one."
 
 
-def test_author_skill_tool_writes_user_skills(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setattr(Path, "home", lambda: home)
+def test_author_skill_tool_has_no_overwrite_or_user_scope(tmp_path: Path) -> None:
+    assert set(AuthorSkillInput.model_fields) == {"name", "description", "body"}
     store, workspace = _project_store(tmp_path)
+    tool = AuthorSkillTool()
+    tool.run(_tool_arguments(), store)
+    draft = workspace / ".atlas" / "skills-drafts" / "ndvi-change" / "SKILL.md"
+    original = draft.read_text(encoding="utf-8")
 
-    result = AuthorSkillTool().run(_tool_arguments(scope="user"), store)
+    with pytest.raises(ValueError, match="already exists"):
+        tool.run(_tool_arguments(body="changed", overwrite=True, scope="user"), store)
 
-    skill = home / ".atlas" / "skills" / "ndvi-change" / "SKILL.md"
-    assert skill.is_file()
-    assert not (workspace / ".atlas" / "skills").exists()
-    assert result.artifacts == ["~/.atlas/skills/ndvi-change/SKILL.md"]
-    fields, _body = _parse_like_skills_loader(skill.read_text(encoding="utf-8"))
-    assert fields["name"] == "ndvi-change"
+    assert draft.read_text(encoding="utf-8") == original
+    assert not (workspace / ".atlas" / "skills" / "ndvi-change").exists()
 
 
-def test_author_skill_tool_refuses_a_skills_symlink_outside_the_workspace(tmp_path: Path) -> None:
+def test_author_skill_tool_refuses_a_drafts_symlink_outside_the_workspace(tmp_path: Path) -> None:
     store, workspace = _project_store(tmp_path)
     outside = tmp_path / "outside"
     outside.mkdir()
-    (workspace / ".atlas" / "skills").symlink_to(outside, target_is_directory=True)
+    (workspace / ".atlas" / "skills-drafts").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(ValueError, match="escapes"):
         AuthorSkillTool().run(_tool_arguments(), store)
@@ -593,25 +669,8 @@ def test_author_skill_tool_requires_a_workspace_read_root(tmp_path: Path) -> Non
     with pytest.raises(ValueError, match="read root"):
         AuthorSkillTool().run(_tool_arguments(), store)
 
+    assert not (tmp_path / "artifacts" / "skills-drafts").exists()
     assert not (tmp_path / "artifacts" / "skills").exists()
-
-
-def test_author_skill_tool_overwrite_goes_through_author_skill(tmp_path: Path) -> None:
-    store, workspace = _project_store(tmp_path)
-    tool = AuthorSkillTool()
-    tool.run(_tool_arguments(), store)
-    skill = workspace / ".atlas" / "skills" / "ndvi-change" / "SKILL.md"
-    original = skill.read_text(encoding="utf-8")
-
-    with pytest.raises(ValueError, match="already exists"):
-        tool.run(_tool_arguments(body="changed"), store)
-
-    assert skill.read_text(encoding="utf-8") == original
-
-    result = tool.run(_tool_arguments(body="changed", overwrite=True), store)
-
-    assert "changed" in skill.read_text(encoding="utf-8")
-    assert result.artifacts == [".atlas/skills/ndvi-change/SKILL.md"]
 
 
 def _project_store(tmp_path: Path) -> tuple[LocalArtifactStore, Path]:
@@ -654,8 +713,10 @@ def test_author_skill_tool_does_not_change_the_default_registry() -> None:
 
 def test_project_and_user_skills_roots(tmp_path: Path) -> None:
     assert project_skills_root(tmp_path) == tmp_path / ".atlas" / "skills"
+    assert project_skill_drafts_root(tmp_path) == tmp_path / ".atlas" / "skills-drafts"
     assert user_skills_root(tmp_path) == tmp_path / ".atlas" / "skills"
     assert not project_skills_root(tmp_path).exists()
+    assert not project_skill_drafts_root(tmp_path).exists()
 
 
 # Mirrors ``_split_frontmatter`` / ``_parse_frontmatter`` on richardtang/skills-loading
