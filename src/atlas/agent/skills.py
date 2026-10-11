@@ -3,7 +3,7 @@
 This is the shared loader and ``use_skill`` activation path. Call
 :func:`load_skills` with the session artifact store. Pass ``home`` only when
 user-home skills are explicitly enabled (``ATLAS_HOME_SKILLS=1`` or
-``home_skills = true`` in ``.atlas/agent.toml``). The default is workspace
+``home_skills = true`` in ``~/.atlas/config.toml``). The default is workspace
 only. The skill author writes the same ``SKILL.md`` shape: YAML frontmatter,
 then markdown. The frontmatter ``name`` must NFKC-normalize to the parent
 directory name, and the directory name is NFKC-normalized before that
