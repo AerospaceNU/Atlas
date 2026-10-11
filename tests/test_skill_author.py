@@ -706,14 +706,20 @@ def _tool_arguments(**overrides: object) -> dict[str, object]:
 def test_author_skill_tool_does_not_change_the_default_registry() -> None:
     names = [tool.name for tool in default_registry().definitions]
 
-    assert names == [
+    assert names[:5] == [
         "bash_tool",
         "edit_file",
         "read_file",
         "write_file",
         "list_tools",
-        "segment_landcover",
     ]
+    assert set(names[5:]) == {
+        "mask_clouds",
+        "rgb_change",
+        "flood_mask",
+        "burn_scar",
+        "segment_landcover",
+    }
     assert "author_skill" not in names
     assert "stage_script_proposal" not in names
     opted_in = [
