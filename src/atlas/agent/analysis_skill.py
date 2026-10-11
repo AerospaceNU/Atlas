@@ -20,10 +20,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import unicodedata
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from pydantic import BaseModel, Field
 
@@ -40,7 +41,10 @@ from atlas.agent.skill_author import (
     skill_directory_name,
     user_skills_root,
 )
-from atlas.agent.skills import _parse_frontmatter, _split_frontmatter
+from atlas.agent.skill_author import (
+    _rename as _atomic_rename,
+)
+from atlas.agent.skills import parse_skill_document
 
 _MAX_DESCRIPTION = 200
 _MAX_STEP_TEXT = 500
@@ -82,7 +86,6 @@ _REPLACE_NOTE = (
     "replace=True overwrites a draft of the same name, "
     "including one written by the author_skill tool."
 )
-_PREVIEW_LIMIT = 400
 _SECRET_QUERY_NAMES = frozenset(
     {
         "api_key",
@@ -98,6 +101,13 @@ _SECRET_QUERY_NAMES = frozenset(
         "client_secret",
         "sig",
         "signature",
+        "x-amz-signature",
+        "x-amz-credential",
+        "x-amz-security-token",
+        "x-goog-signature",
+        "key",
+        "auth",
+        "code",
     }
 )
 
@@ -146,7 +156,10 @@ class SkillPreview(BaseModel):
     description: str
     path: str
     content_sha256: str
-    preview: str
+    body: str
+    body_characters: int
+    body_lines: int
+    resources: list[str] = Field(default_factory=list)
     confirm: str
 
 
@@ -265,9 +278,11 @@ def preview_skill(
 ) -> SkillPreview:
     """Describe a draft without moving it.
 
-    The description comes from the loader's frontmatter parser. ``content_sha256``
+    The description comes from :func:`parse_skill_document`. ``content_sha256``
     is the SHA-256 of the ``SKILL.md`` bytes enable would publish, which is the
-    same hash the loader records. ``preview`` is the start of the body.
+    same hash the loader records. ``body`` is the full instruction text. The
+    character count, line count, path, and bundled resources are included so
+    nothing in the draft is omitted without being counted.
 
     Args:
         workspace: Project directory that contains ``.atlas``.
@@ -276,7 +291,8 @@ def preview_skill(
         home: User home for ``scope="user"``.
 
     Returns:
-        The description, hash, and preview to show before promotion.
+        The description, full body, hash, and confirm command. The command
+        ends with the first eight hex characters of ``content_sha256``.
 
     Raises:
         SkillSaveError: If the draft is missing or the loader would skip it.
@@ -287,33 +303,39 @@ def preview_skill(
     except OSError as exc:
         raise SkillSaveError("could not enable skill") from exc
     published = _published_text(loaded.text)
+    digest = hashlib.sha256(published.encode("utf-8")).hexdigest()
+    body = _published_body(loaded.body)
     return SkillPreview(
         name=loaded.slug,
         description=loaded.description,
         path=logical_skill_path(scope, _DRAFTS_DIR, loaded.slug),
-        content_sha256=hashlib.sha256(published.encode("utf-8")).hexdigest(),
-        preview=_body_preview(loaded.body),
-        confirm=f"{enable_command(loaded.slug)} confirm",
+        content_sha256=digest,
+        body=body,
+        body_characters=len(body),
+        body_lines=len(body.splitlines()),
+        resources=_bundled_resources(loaded.source),
+        confirm=f"{enable_command(loaded.slug)} confirm {digest[:8]}",
     )
 
 
 def enable_skill(
     workspace: Path,
     name: str,
+    expected_sha256: str,
     *,
     scope: str = "project",
     home: Path | None = None,
 ) -> SavedSkill:
     """Move ``skills-drafts/<name>`` into ``.atlas/skills``.
 
-    Call :func:`preview_skill` first so a person can see the description and
-    body hash. The frontmatter is checked with the skills loader's parser
-    before the directory moves. The ``name`` must match the folder. The draft
-    notice is removed from the enabled file.
+    The draft notice is removed before the directory moves. Immediately
+    before that move, the ``SKILL.md`` bytes are hashed again and refused
+    when they are not ``expected_sha256``.
 
     Args:
         workspace: Project directory that contains ``.atlas``.
         name: Skill slug previously written by :func:`save_skill`.
+        expected_sha256: Hex digest shown by :func:`preview_skill`.
         scope: ``project`` or ``user``.
         home: User home for ``scope="user"``.
 
@@ -322,12 +344,19 @@ def enable_skill(
         ``description`` is the parsed frontmatter description.
 
     Raises:
-        SkillSaveError: If the draft is missing, the frontmatter would be
-            skipped by the loader, or the destination is not a real directory
-            inside the workspace or home. The message never includes a host path.
+        SkillSaveError: If the draft is missing, the hash does not match, the
+            frontmatter would be skipped by the loader, or the destination is
+            not a real directory inside the workspace or home. The message
+            never includes a host path.
     """
     try:
-        return _enable_skill(workspace, name, scope=scope, home=home)
+        return _enable_skill(
+            workspace,
+            name,
+            expected_sha256,
+            scope=scope,
+            home=home,
+        )
     except OSError as exc:
         raise SkillSaveError("could not enable skill") from exc
 
@@ -335,20 +364,28 @@ def enable_skill(
 def _enable_skill(
     workspace: Path,
     name: str,
+    expected_sha256: str,
     *,
     scope: str,
     home: Path | None,
 ) -> SavedSkill:
     loaded = _load_draft(workspace, name, scope=scope, home=home)
+    published = _published_text(loaded.text)
+    expected = expected_sha256.strip().lower()
+    if hashlib.sha256(published.encode("utf-8")).hexdigest() != expected:
+        raise SkillSaveError("skill hash does not match the preview")
+    skill_file = loaded.source / "SKILL.md"
+    _write_published(skill_file, published)
+    if hashlib.sha256(skill_file.read_bytes()).hexdigest() != expected:
+        raise SkillSaveError("skill hash does not match the preview")
     skills = _skills_root(workspace, scope, home)
     if not skills.exists():
         skills.mkdir(parents=True)
     destination = skills / loaded.slug
-    if destination.is_symlink() or not is_within(_scope_base(workspace, scope, home), destination):
+    base = _scope_base(workspace, scope, home)
+    if destination.is_symlink() or not is_within(base, destination):
         raise SkillSaveError("skill path escapes the atlas root")
     _rename_exclusive(loaded.source, destination)
-    published = _published_text(loaded.text)
-    _write_published(destination / "SKILL.md", published)
     return SavedSkill(
         name=loaded.slug,
         description=loaded.description,
@@ -511,19 +548,31 @@ def _published_text(text: str) -> str:
     return _DRAFT_NOTICE.sub("", text, count=1)
 
 
+def _published_body(body: str) -> str:
+    """Return the instruction body with the draft notice removed."""
+    return _published_text(body).strip()
+
+
+def _bundled_resources(directory: Path) -> list[str]:
+    """Return every file under ``directory`` except ``SKILL.md``."""
+    resources: list[str] = []
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        relative = path.relative_to(directory).as_posix()
+        if relative == "SKILL.md":
+            continue
+        resources.append(relative)
+    return resources
+
+
 def _write_published(skill_file: Path, published: str) -> None:
-    if skill_file.read_text(encoding="utf-8") == published:
+    data = published.encode("utf-8")
+    if skill_file.read_bytes() == data:
         return
     temporary = skill_file.with_name(".SKILL.md.enabling")
-    temporary.write_text(published, encoding="utf-8")
+    temporary.write_bytes(data)
     os.replace(temporary, skill_file)
-
-
-def _body_preview(body: str) -> str:
-    notice_free = _published_text(body).strip()
-    if len(notice_free) <= _PREVIEW_LIMIT:
-        return notice_free
-    return notice_free[: _PREVIEW_LIMIT - 1].rstrip() + "…"
 
 
 def _refuse_symlinks(directory: Path) -> None:
@@ -535,8 +584,7 @@ def _refuse_symlinks(directory: Path) -> None:
 def _validated_description(text: str, folder: str) -> tuple[str, str]:
     """Return the description and body when the loader would accept this skill."""
     try:
-        frontmatter, body = _split_frontmatter(text)
-        fields = _parse_frontmatter(frontmatter)
+        fields, body = parse_skill_document(text)
     except ValueError as exc:
         raise SkillSaveError("draft skill frontmatter is invalid") from exc
     normalized, errors = normalize_skill_name(fields.get("name"))
@@ -553,23 +601,77 @@ def _rename_exclusive(source: Path, target: Path) -> None:
     """Move ``source`` to ``target`` without replacing an existing path.
 
     ``renameat2(RENAME_NOREPLACE)`` claims the destination in one call. When
-    the kernel cannot do that, ``mkdir`` claims the name and the children
-    move in afterwards.
+    that call is unavailable, the move uses skill authoring's atomic rename.
+    ``EXDEV`` from either call copies onto a sibling of ``target`` and that
+    sibling is renamed into place with the same helper. The destination name
+    appears only after the copy is complete.
     """
     result = _renameat2(source, target, _RENAME_NOREPLACE)
     if result == 0:
         return
     if result == errno.EEXIST:
         raise SkillSaveError(f"Skill already exists: {target.name}")
-    if result is not None:
+    if result not in {None, errno.EXDEV}:
+        raise SkillSaveError("could not enable skill")
+    if result == errno.EXDEV:
+        _copy_then_rename(source, target)
+        return
+    if target.exists() or target.is_symlink():
+        raise SkillSaveError(f"Skill already exists: {target.name}")
+    try:
+        _atomic_rename(source, target)
+    except SkillAuthorError as exc:
+        if _errno_of(exc) == errno.EXDEV:
+            _copy_then_rename(source, target)
+            return
+        _raise_move_error(target, exc)
+
+
+def _copy_then_rename(source: Path, target: Path) -> None:
+    """Copy ``source`` beside ``target``, then rename that copy into place."""
+    if target.exists() or target.is_symlink():
+        raise SkillSaveError(f"Skill already exists: {target.name}")
+    temporary = target.with_name(f".{target.name}.enabling")
+    if temporary.exists() or temporary.is_symlink():
         raise SkillSaveError("could not enable skill")
     try:
-        os.mkdir(target)
+        shutil.copytree(source, temporary, symlinks=False)
+        _atomic_rename(temporary, target)
+    except SkillAuthorError as exc:
+        _discard_tree(temporary)
+        _raise_move_error(target, exc)
     except FileExistsError as exc:
+        _discard_tree(temporary)
         raise SkillSaveError(f"Skill already exists: {target.name}") from exc
-    for child in list(source.iterdir()):
-        os.rename(child, target / child.name)
-    os.rmdir(source)
+    except OSError as exc:
+        _discard_tree(temporary)
+        if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise SkillSaveError(f"Skill already exists: {target.name}") from exc
+        raise
+    _discard_tree(source)
+
+
+def _errno_of(exc: SkillAuthorError) -> int | None:
+    cause = exc.__cause__
+    if isinstance(cause, OSError):
+        return cause.errno
+    return None
+
+
+def _raise_move_error(target: Path, exc: SkillAuthorError) -> NoReturn:
+    """Turn a failed atomic rename into a path-free :class:`SkillSaveError`."""
+    if _errno_of(exc) in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise SkillSaveError(f"Skill already exists: {target.name}") from exc
+    raise SkillSaveError("could not enable skill") from exc
+
+
+def _discard_tree(path: Path) -> None:
+    if path.is_symlink() or not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    path.unlink(missing_ok=True)
 
 
 def _renameat2(source: Path, target: Path, flags: int) -> int | None:

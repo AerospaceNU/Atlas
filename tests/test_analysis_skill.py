@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
 from pathlib import Path
@@ -13,6 +14,8 @@ from atlas.agent.analysis_skill import (
     AnalysisTurn,
     FinishedAnalysis,
     SkillSaveError,
+    enable_skill,
+    preview_skill,
     save_skill,
 )
 from atlas.agent.artifacts import LocalArtifactStore
@@ -27,7 +30,8 @@ from atlas.agent.contracts import (
 )
 from atlas.agent.runtime import Agent
 from atlas.agent.session import AgentSession, serve
-from atlas.agent.skills import Skill
+from atlas.agent.skill_author import SkillAuthorError
+from atlas.agent.skills import Skill, register_skill_tool
 
 
 class ScriptedModel:
@@ -488,11 +492,12 @@ def test_new_turn_keeps_steps_from_a_limited_turn(tmp_path: Path) -> None:
     text = (
         tmp_path / "project" / ".atlas" / "skills-drafts" / "kept-steps" / "SKILL.md"
     ).read_text(encoding="utf-8")
-    assert "Request: first request" in text
+    assert "Request: first request" not in text
+    assert '{"value": 1}' not in text
     assert "Request: second request" in text
-    assert '{"value": 1}' in text
     assert '{"value": 2}' in text
     assert "Result: finished the second request" in text
+    assert text.count("## Turn") == 1
 
 
 def test_redact_scrubs_absolute_paths_and_key_shaped_strings(tmp_path: Path) -> None:
@@ -502,6 +507,12 @@ def test_redact_scrubs_absolute_paths_and_key_shaped_strings(tmp_path: Path) -> 
     scene = "LC08_L1TP_044034_20200101_20200101_01_T1"
     url = "https://example.com/coast/scene.png"
     secret_url = "https://user:s3cret@example.com/a?api_key=abc&scene=LC08&token=zzz"
+    signed_url = (
+        "https://bucket.example/scene.png?X-Amz-Signature=sigvalue"
+        "&X-Amz-Credential=credvalue&X-Amz-Security-Token=tokvalue"
+        "&X-Goog-Signature=googvalue&key=keyvalue&auth=authvalue&code=codevalue"
+        "&scene=LC08"
+    )
     windows = "C:\\Atlas\\secret.txt"
     file_url = "file:///home/ubuntu/secret.txt"
     jwt = (
@@ -515,7 +526,7 @@ def test_redact_scrubs_absolute_paths_and_key_shaped_strings(tmp_path: Path) -> 
                 request=(
                     f"read /home/ubuntu/project/scene.png and {url} "
                     f"via host:/srv/data PATH=/usr/bin:/home/alice out:/home/bob/scene.png "
-                    f"{file_url} {secret_url}"
+                    f"{file_url} {secret_url} {signed_url}"
                 ),
                 response=f"token {openrouter} lives at {windows} jwt {jwt}",
                 steps=[
@@ -555,6 +566,15 @@ def test_redact_scrubs_absolute_paths_and_key_shaped_strings(tmp_path: Path) -> 
     assert "https:***" not in text
     assert url in text
     assert "https://example.com/a?scene=LC08" in text
+    assert "sigvalue" not in text
+    assert "credvalue" not in text
+    assert "tokvalue" not in text
+    assert "googvalue" not in text
+    assert "keyvalue" not in text
+    assert "authvalue" not in text
+    assert "codevalue" not in text
+    assert "X-Amz-Signature" not in text
+    assert "scene=LC08" in text
     assert "user:s3cret" not in text
     assert "api_key" not in text
     assert "s3cret" not in text
@@ -588,7 +608,12 @@ def test_enable_skill_moves_the_draft_into_atlas_skills(tmp_path: Path) -> None:
     draft = tmp_path / "project" / ".atlas" / "skills-drafts" / "coast-check"
     assert draft.is_dir()
 
-    enabled = session.enable_saved_skill("coast-check")
+    preview = session.preview_saved_skill("coast-check")
+    assert preview.body_characters == len(preview.body)
+    assert preview.body_lines == len(preview.body.splitlines())
+    assert "echo:4" in preview.body
+    assert preview.confirm.endswith(preview.content_sha256[:8])
+    enabled = session.enable_saved_skill("coast-check", preview.content_sha256)
     assert enabled.enabled is True
     assert enabled.path == ".atlas/skills/coast-check/SKILL.md"
     assert not draft.exists()
@@ -601,8 +626,12 @@ def test_enable_skill_moves_the_draft_into_atlas_skills(tmp_path: Path) -> None:
     assert any(item.name == "coast-check" for item in session.agent.skills)
     assert not (tmp_path / "project" / ".agents" / "skills").exists()
 
+    with pytest.raises(SkillSaveError, match="enable needs a preview"):
+        session.enable_saved_skill("coast-check", preview.content_sha256)
+    workspace = session.workspace
+    assert workspace is not None
     with pytest.raises(SkillSaveError, match="not found"):
-        session.enable_saved_skill("coast-check")
+        enable_skill(workspace, "coast-check", preview.content_sha256)
 
 
 def test_start_fresh_keeps_the_skill_catalog(tmp_path: Path) -> None:
@@ -650,13 +679,26 @@ def test_protocol_enable_skill_reports_the_skills_path(tmp_path: Path) -> None:
     assert preview["description"] == "compare the coast"
     assert preview["path"] == ".atlas/skills-drafts/coast-check/SKILL.md"
     assert len(preview["content_sha256"]) == 64
-    assert "echo:4" in preview["preview"]
-    assert preview["confirm"] == "/enable-skill coast-check confirm"
+    assert preview["body"]
+    assert preview["body_characters"] == len(preview["body"])
+    assert preview["body_lines"] == len(preview["body"].splitlines())
+    assert "echo:4" in preview["body"]
+    assert (
+        preview["confirm"] == f"/enable-skill coast-check confirm {preview['content_sha256'][:8]}"
+    )
     assert not any(event["type"] == "enabled_skill" for event in preview_events)
 
     events = _serve(
         [
-            '{"type":"enable_skill","name":"coast-check","scope":"project","confirm":true}',
+            json.dumps(
+                {
+                    "type": "enable_skill",
+                    "name": "coast-check",
+                    "scope": "project",
+                    "confirm": True,
+                    "expected_sha256": preview["content_sha256"],
+                }
+            ),
             '{"type":"enable_skill"}',
         ],
         session,
@@ -683,16 +725,12 @@ def test_enable_refuses_a_name_that_does_not_match_the_folder(tmp_path: Path) ->
         encoding="utf-8",
     )
     with pytest.raises(SkillSaveError, match="name must match"):
-        from atlas.agent.analysis_skill import enable_skill
-
-        enable_skill(tmp_path, "coast-check")
+        enable_skill(tmp_path, "coast-check", "0" * 64)
     assert skill.is_file()
     assert not (tmp_path / ".atlas" / "skills" / "coast-check").exists()
 
 
 def test_enable_reads_a_folded_description(tmp_path: Path) -> None:
-    from atlas.agent.analysis_skill import enable_skill
-
     save_skill(tmp_path, _finished("compare the coast"), "coast-check")
     skill = tmp_path / ".atlas" / "skills-drafts" / "coast-check" / "SKILL.md"
     skill.write_text(
@@ -702,7 +740,9 @@ def test_enable_reads_a_folded_description(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    enabled = enable_skill(tmp_path, "coast-check")
+    preview = preview_skill(tmp_path, "coast-check")
+    assert preview.description == "compare the coast from orbit"
+    enabled = enable_skill(tmp_path, "coast-check", preview.content_sha256)
     assert enabled.description == "compare the coast from orbit"
 
 
@@ -726,10 +766,12 @@ def test_user_scope_enable_refuses_while_home_skills_are_off(
     assert draft.is_file()
     assert session.workspace is not None
     assert load_home_skills_enabled(session.workspace) is False
-    with pytest.raises(SkillSaveError, match="home skills are off"):
+    with pytest.raises(SkillSaveError, match="home skills are off") as refused:
         session.preview_saved_skill("coast-check", scope="user")
+    assert "ATLAS_HOME_SKILLS" in str(refused.value)
+    assert "~/.atlas/config.toml" in str(refused.value)
     with pytest.raises(SkillSaveError, match="home skills are off"):
-        session.enable_saved_skill("coast-check", scope="user")
+        session.enable_saved_skill("coast-check", "ab" * 32, scope="user")
     assert draft.is_file()
     assert not (tmp_path / "home" / ".atlas" / "skills" / "coast-check").exists()
 
@@ -756,7 +798,7 @@ def test_user_scope_enable_loads_when_home_skills_are_on(
     assert preview.description == "compare the coast"
     assert len(preview.content_sha256) == 64
     assert (tmp_path / "home" / ".atlas" / "skills-drafts" / "coast-check").is_dir()
-    enabled = session.enable_saved_skill("coast-check", scope="user")
+    enabled = session.enable_saved_skill("coast-check", preview.content_sha256, scope="user")
     assert enabled.enabled is True
     assert enabled.path == "~/.atlas/skills/coast-check/SKILL.md"
     events = _serve(
@@ -785,9 +827,26 @@ def test_enable_oserror_stays_inside_the_protocol(
     def explode(*_args: object, **_kwargs: object) -> None:
         raise OSError(13, "Permission denied", "/home/secret/atlas")
 
+    preview_events = _serve(
+        ['{"type":"enable_skill","name":"coast-check","scope":"project"}'],
+        session,
+    )
+    digest = next(
+        event["content_sha256"] for event in preview_events if event["type"] == "enable_preview"
+    )
     monkeypatch.setattr("atlas.agent.analysis_skill._rename_exclusive", explode)
     events = _serve(
-        ['{"type":"enable_skill","name":"coast-check","scope":"project","confirm":true}'],
+        [
+            json.dumps(
+                {
+                    "type": "enable_skill",
+                    "name": "coast-check",
+                    "scope": "project",
+                    "confirm": True,
+                    "expected_sha256": digest,
+                }
+            )
+        ],
         session,
     )
     errors = [event for event in events if event["type"] == "error"]
@@ -798,17 +857,314 @@ def test_enable_oserror_stays_inside_the_protocol(
 
 
 def test_enable_does_not_replace_an_existing_skill(tmp_path: Path) -> None:
-    from atlas.agent.analysis_skill import enable_skill
-
     save_skill(tmp_path, _finished("compare the coast"), "coast-check")
     destination = tmp_path / ".atlas" / "skills" / "coast-check"
     destination.mkdir(parents=True)
     marker = destination / "SKILL.md"
     marker.write_text("keep me\n", encoding="utf-8")
     with pytest.raises(SkillSaveError, match="already exists"):
-        enable_skill(tmp_path, "coast-check")
+        enable_skill(tmp_path, "coast-check", preview_skill(tmp_path, "coast-check").content_sha256)
     assert marker.read_text(encoding="utf-8") == "keep me\n"
     assert (tmp_path / ".atlas" / "skills-drafts" / "coast-check" / "SKILL.md").is_file()
+
+
+def test_confirm_requires_the_preview_hash(tmp_path: Path) -> None:
+    session = _saved_session(tmp_path)
+    draft = tmp_path / "project" / ".atlas" / "skills-drafts" / "coast-check" / "SKILL.md"
+    original = draft.read_text(encoding="utf-8")
+    assert "This skill is a draft" in original
+
+    with pytest.raises(SkillSaveError, match="enable needs a preview"):
+        session.enable_saved_skill("coast-check", "ab" * 32)
+    assert draft.read_text(encoding="utf-8") == original
+
+    preview = session.preview_saved_skill("coast-check")
+    with pytest.raises(SkillSaveError, match="skill hash does not match the preview"):
+        session.enable_saved_skill("coast-check", "ab" * 32)
+    with pytest.raises(SkillSaveError, match="skill hash does not match the preview"):
+        session.enable_saved_skill("coast-check", "00000000")
+    assert draft.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "project" / ".atlas" / "skills" / "coast-check").exists()
+
+    enabled = session.enable_saved_skill("coast-check", preview.content_sha256[:8])
+    assert enabled.enabled is True
+    assert not draft.exists()
+    published = tmp_path / "project" / ".atlas" / "skills" / "coast-check" / "SKILL.md"
+    assert published.is_file()
+    assert "This skill is a draft" not in published.read_text(encoding="utf-8")
+
+
+def test_protocol_confirm_without_a_hash_is_refused(tmp_path: Path) -> None:
+    session = _saved_session(tmp_path)
+    preview_events = _serve(
+        ['{"type":"enable_skill","name":"coast-check","confirm":false}'],
+        session,
+    )
+    digest = next(
+        event["content_sha256"] for event in preview_events if event["type"] == "enable_preview"
+    )
+    events = _serve(
+        [
+            '{"type":"enable_skill","name":"coast-check","confirm":true}',
+            json.dumps(
+                {
+                    "type": "enable_skill",
+                    "name": "coast-check",
+                    "confirm": True,
+                    "expected_sha256": "00000000",
+                }
+            ),
+        ],
+        session,
+    )
+    messages = [event["message"] for event in events if event["type"] == "error"]
+    assert messages == [
+        "enable needs a preview",
+        "skill hash does not match the preview",
+    ]
+    draft = tmp_path / "project" / ".atlas" / "skills-drafts" / "coast-check"
+    assert draft.is_dir()
+    assert "This skill is a draft" in (draft / "SKILL.md").read_text(encoding="utf-8")
+    confirmed = _serve(
+        [
+            json.dumps(
+                {
+                    "type": "enable_skill",
+                    "name": "coast-check",
+                    "confirm": True,
+                    "expected_sha256": digest[:8],
+                }
+            )
+        ],
+        session,
+    )
+    assert any(event["type"] == "enabled_skill" for event in confirmed)
+    assert not draft.exists()
+
+
+def test_preview_shows_the_full_body_and_bundled_resources(tmp_path: Path) -> None:
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    draft = tmp_path / ".atlas" / "skills-drafts" / "coast-check"
+    skill = draft / "SKILL.md"
+    extra = "Keep the full instruction.\n" * 30
+    skill.write_text(skill.read_text(encoding="utf-8") + extra, encoding="utf-8")
+    (draft / "scripts").mkdir()
+    (draft / "scripts" / "run.py").write_text("print(1)\n", encoding="utf-8")
+    (draft / "notes").mkdir()
+    (draft / "notes" / "readme.txt").write_text("bundled\n", encoding="utf-8")
+
+    preview = preview_skill(tmp_path, "coast-check")
+    assert len(preview.body) > 400
+    assert extra.strip() in preview.body
+    assert "…" not in preview.body
+    assert preview.body_characters == len(preview.body)
+    assert preview.body_lines == len(preview.body.splitlines())
+    assert preview.path == ".atlas/skills-drafts/coast-check/SKILL.md"
+    assert preview.resources == ["notes/readme.txt", "scripts/run.py"]
+    assert preview.confirm.endswith(preview.content_sha256[:8])
+
+
+def test_enable_strips_the_notice_before_the_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    preview = preview_skill(tmp_path, "coast-check")
+    source = tmp_path / ".atlas" / "skills-drafts" / "coast-check"
+
+    def stop(draft: Path, _target: Path) -> None:
+        text = (draft / "SKILL.md").read_text(encoding="utf-8")
+        assert "This skill is a draft" not in text
+        raise OSError(1, "stopped")
+
+    monkeypatch.setattr("atlas.agent.analysis_skill._rename_exclusive", stop)
+    with pytest.raises(SkillSaveError, match="could not enable skill"):
+        enable_skill(tmp_path, "coast-check", preview.content_sha256)
+    assert source.is_dir()
+    assert not (tmp_path / ".atlas" / "skills" / "coast-check").exists()
+
+
+def test_enable_rechecks_the_bytes_immediately_before_the_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    preview = preview_skill(tmp_path, "coast-check")
+    real_read = Path.read_bytes
+
+    def tamper(self: Path) -> bytes:
+        data = real_read(self)
+        if self.name == "SKILL.md" and b"This skill is a draft" not in data:
+            return b"tampered\n"
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", tamper)
+    with pytest.raises(SkillSaveError, match="skill hash does not match the preview"):
+        enable_skill(tmp_path, "coast-check", preview.content_sha256)
+    assert not (tmp_path / ".atlas" / "skills" / "coast-check").exists()
+    assert (tmp_path / ".atlas" / "skills-drafts" / "coast-check").is_dir()
+
+
+def test_enable_uses_the_atomic_rename_when_renameat2_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    preview = preview_skill(tmp_path, "coast-check")
+    calls: list[tuple[str, str, str]] = []
+    from atlas.agent import analysis_skill
+
+    original = analysis_skill._atomic_rename
+
+    def spy(source: Path, target: Path) -> None:
+        calls.append((source.parent.name, source.name, target.name))
+        original(source, target)
+
+    monkeypatch.setattr(analysis_skill, "_renameat2", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(analysis_skill, "_atomic_rename", spy)
+    enabled = enable_skill(tmp_path, "coast-check", preview.content_sha256)
+    assert enabled.path == ".atlas/skills/coast-check/SKILL.md"
+    assert calls == [("skills-drafts", "coast-check", "coast-check")]
+    published = tmp_path / ".atlas" / "skills" / "coast-check" / "SKILL.md"
+    assert "This skill is a draft" not in published.read_text(encoding="utf-8")
+    assert not (tmp_path / ".atlas" / "skills-drafts" / "coast-check").exists()
+    assert not (tmp_path / ".atlas" / "skills" / ".coast-check.enabling").exists()
+
+
+def test_enable_copies_across_devices_on_exdev(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    preview = preview_skill(tmp_path, "coast-check")
+    calls: list[str] = []
+    from atlas.agent import analysis_skill
+
+    original = analysis_skill._atomic_rename
+
+    def cross_device(source: Path, target: Path) -> None:
+        calls.append(source.name)
+        if source.name.startswith("."):
+            original(source, target)
+            return
+        try:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        except OSError as exc:
+            raise SkillAuthorError(["Could not write skill: Invalid cross-device link"]) from exc
+
+    monkeypatch.setattr(analysis_skill, "_renameat2", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(analysis_skill, "_atomic_rename", cross_device)
+    enable_skill(tmp_path, "coast-check", preview.content_sha256)
+    assert calls == ["coast-check", ".coast-check.enabling"]
+    published = tmp_path / ".atlas" / "skills" / "coast-check" / "SKILL.md"
+    assert published.is_file()
+    assert "This skill is a draft" not in published.read_text(encoding="utf-8")
+    assert not (tmp_path / ".atlas" / "skills-drafts" / "coast-check").exists()
+
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    again = preview_skill(tmp_path, "coast-check")
+    kept = tmp_path / ".atlas" / "skills" / "coast-check" / "SKILL.md"
+    previous = kept.read_text(encoding="utf-8")
+    with pytest.raises(SkillSaveError, match="already exists"):
+        enable_skill(tmp_path, "coast-check", again.content_sha256)
+    assert kept.read_text(encoding="utf-8") == previous
+    assert (tmp_path / ".atlas" / "skills-drafts" / "coast-check").is_dir()
+
+
+def test_renameat2_exdev_copies_before_it_renames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    preview = preview_skill(tmp_path, "coast-check")
+    calls: list[str] = []
+    from atlas.agent import analysis_skill
+
+    original = analysis_skill._atomic_rename
+
+    def spy(source: Path, target: Path) -> None:
+        calls.append(source.name)
+        original(source, target)
+
+    monkeypatch.setattr(analysis_skill, "_renameat2", lambda *_args, **_kwargs: errno.EXDEV)
+    monkeypatch.setattr(analysis_skill, "_atomic_rename", spy)
+    enable_skill(tmp_path, "coast-check", preview.content_sha256)
+    assert calls == [".coast-check.enabling"]
+    assert (tmp_path / ".atlas" / "skills" / "coast-check" / "SKILL.md").is_file()
+    assert not (tmp_path / ".atlas" / "skills-drafts" / "coast-check").exists()
+
+
+def test_fallback_does_not_replace_an_existing_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
+    destination = tmp_path / ".atlas" / "skills" / "coast-check"
+    destination.mkdir(parents=True)
+    marker = destination / "SKILL.md"
+    marker.write_text("keep me\n", encoding="utf-8")
+    digest = preview_skill(tmp_path, "coast-check").content_sha256
+    monkeypatch.setattr("atlas.agent.analysis_skill._renameat2", lambda *_args, **_kwargs: None)
+    with pytest.raises(SkillSaveError, match="already exists"):
+        enable_skill(tmp_path, "coast-check", digest)
+    monkeypatch.setattr(
+        "atlas.agent.analysis_skill._renameat2", lambda *_args, **_kwargs: errno.EXDEV
+    )
+    with pytest.raises(SkillSaveError, match="already exists"):
+        enable_skill(tmp_path, "coast-check", digest)
+    assert marker.read_text(encoding="utf-8") == "keep me\n"
+    draft = tmp_path / ".atlas" / "skills-drafts" / "coast-check" / "SKILL.md"
+    assert draft.is_file()
+    assert "This skill is a draft" not in draft.read_text(encoding="utf-8")
+
+
+def test_enable_keeps_hashes_of_skills_already_loaded(tmp_path: Path) -> None:
+    session = _saved_session(tmp_path)
+    existing = Skill(
+        name="kept-hash",
+        description="already loaded",
+        directory=".atlas/skills/kept-hash",
+        base=tmp_path / "project",
+        relative_dir=".atlas/skills/kept-hash",
+        content_sha256="cd" * 32,
+        artifact_root=None,
+    )
+    session.agent.skills = [existing]
+    register_skill_tool(session.agent.tools, [existing])
+    echo = session.agent.tools._tools["echo"]
+    preview = session.preview_saved_skill("coast-check")
+    session.enable_saved_skill("coast-check", preview.content_sha256[:8])
+    assert session.agent.tools._tools["echo"] is echo
+    loaded = session.agent.tools._tools["use_skill"]
+    assert loaded._by_name["kept-hash"] is existing
+    assert existing.content_sha256 == "cd" * 32
+    added = loaded._by_name["coast-check"]
+    assert added is not existing
+    assert added.content_sha256 == preview.content_sha256
+    assert [item.name for item in session.agent.skills] == ["coast-check", "kept-hash"]
+
+
+def test_registry_replace_overwrites_one_name() -> None:
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    with pytest.raises(ValueError, match="already registered"):
+        registry.register(EchoTool())
+
+    class ReplacedEcho(EchoTool):
+        description = "replaced echo"
+
+    registry.replace(ReplacedEcho())
+    registry.replace(NoteTool())
+    assert registry._tools["echo"].description == "replaced echo"
+    assert "note" in registry._tools
+
+
+def _saved_session(tmp_path: Path) -> AgentSession:
+    model = ScriptedModel(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="1", name="echo", arguments={"value": 4})]),
+            ModelResponse(content="The coast is clear."),
+        ]
+    )
+    session = _session(model, tmp_path)
+    session.agent.tools.register(EchoTool())
+    session.turn("compare the coast")
+    session.save_finished_skill("coast-check")
+    return session
 
 
 def _finished(request: str) -> FinishedAnalysis:
