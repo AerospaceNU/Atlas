@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Self
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -56,6 +58,40 @@ class StacApiClient(DataPullClient):
         await self.aclose()
 
     async def search(self, request: PullRequest) -> PullResult:
+        resp = await self._client.post(self.search_url, json=self._search_body(request))
+        resp.raise_for_status()
+        return self._result_from_payload(request, resp.json())
+
+    async def search_from_cursor(self, request: PullRequest, page_cursor: str) -> PullResult:
+        """Request the STAC page named by ``page_cursor``.
+
+        An absolute http(s) URL on this client's search host is fetched with
+        GET. Any other cursor is a pagination token posted with the original
+        search body. The page-one request is not sent.
+
+        Args:
+            request: Pull whose filters produced ``page_cursor``.
+            page_cursor: Token or same-host next link from an earlier search.
+
+        Returns:
+            That page, including the following cursor when the response has one.
+
+        Raises:
+            ValueError: ``page_cursor`` is an HTTP URL on a different host.
+        """
+        cursor = page_cursor.strip()
+        if _is_http_url(cursor):
+            if not _same_origin(cursor, self.search_url):
+                raise ValueError("next-page cursor host does not match the STAC search host")
+            resp = await self._client.get(cursor)
+        else:
+            resp = await self._client.post(
+                self.search_url, json=self._search_body(request, token=cursor)
+            )
+        resp.raise_for_status()
+        return self._result_from_payload(request, resp.json())
+
+    def _search_body(self, request: PullRequest, *, token: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {
             "collections": [self.collection],
             "bbox": request.bbox.as_list(),
@@ -71,13 +107,13 @@ class StacApiClient(DataPullClient):
         query = self._build_query_filter(request)
         if query:
             body["query"] = query
+        if token:
+            body["token"] = token
+        return body
 
-        resp = await self._client.post(self.search_url, json=body)
-        resp.raise_for_status()
-        payload = resp.json()
+    def _result_from_payload(self, request: PullRequest, payload: Any) -> PullResult:
         if not isinstance(payload, dict):
             raise TypeError(f"Expected STAC FeatureCollection, got {type(payload)}")
-
         scenes: list[Scene] = []
         for feature in payload.get("features") or []:
             if not isinstance(feature, dict):
@@ -91,7 +127,11 @@ class StacApiClient(DataPullClient):
             )
             if scene is not None:
                 scenes.append(scene)
-        return PullResult(request=request, scenes=scenes)
+        return PullResult(
+            request=request,
+            scenes=scenes,
+            next_cursor=_next_page_cursor(payload, self.search_url),
+        )
 
     def _cloud_query(self, request: PullRequest) -> dict[str, Any] | None:
         if self.scene_kind not in _CLOUD_QUERY_KINDS:
@@ -107,6 +147,64 @@ class StacApiClient(DataPullClient):
 
     def _build_query_filter(self, request: PullRequest) -> dict[str, Any] | None:
         return self._cloud_query(request)
+
+
+def _is_http_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _same_origin(url: str, search_url: str) -> bool:
+    left, right = urlparse(url), urlparse(search_url)
+    return left.scheme == right.scheme and bool(left.netloc) and left.netloc == right.netloc
+
+
+def _next_page_cursor(payload: Mapping[str, Any], search_url: str) -> str | None:
+    """Return the next-page cursor from a STAC Item Search response.
+
+    A ``links`` entry with ``rel`` ``next`` is the cursor. ``body.token`` is
+    that cursor when it is present. Otherwise the cursor is the absolute
+    next ``href`` on the search host. The bare search URL is page one and is
+    not a cursor. One page is read; the cursor is only recorded.
+
+    Args:
+        payload: STAC FeatureCollection.
+        search_url: This client's item-search URL, used to resolve relative links.
+
+    Returns:
+        The token or same-host next URL, or None when there is no next page.
+    """
+    links = payload.get("links")
+    if not isinstance(links, list):
+        return None
+    for link in links:
+        if not isinstance(link, dict) or link.get("rel") != "next":
+            continue
+        cursor = _cursor_from_link(link, search_url)
+        if cursor:
+            return cursor
+    return None
+
+
+def _cursor_from_link(link: Mapping[str, Any], search_url: str) -> str | None:
+    body = link.get("body")
+    if isinstance(body, dict):
+        token = body.get("token")
+        if isinstance(token, str):
+            text = token.strip()
+            if text and not _is_http_url(text):
+                return text
+    href = link.get("href")
+    if not isinstance(href, str) or not href.strip():
+        return None
+    absolute = urljoin(search_url, href.strip())
+    if not _same_origin(absolute, search_url):
+        return None
+    parsed = urlparse(absolute)
+    search = urlparse(search_url)
+    if parsed.path.rstrip("/") == search.path.rstrip("/") and not parsed.query:
+        return None
+    return absolute
 
 
 def item_to_scene(

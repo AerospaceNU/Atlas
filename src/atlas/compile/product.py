@@ -12,6 +12,8 @@ class SourceScenes(BaseModel):
     collection: str
     scenes: list[Scene] = Field(default_factory=list)
     error: str | None = None  # populated if this source's search failed
+    # Next STAC page for this source. None means the search has no further page.
+    next_cursor: str | None = None
 
 
 class SceneCatalog(BaseModel):

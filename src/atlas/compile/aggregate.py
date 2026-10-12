@@ -142,16 +142,28 @@ def _stamp_source(name: str, collection: str, result: PullResult) -> SourceScene
         if not scene.collection and collection:
             updates["collection"] = collection
         stamped.append(scene.model_copy(update=updates) if updates else scene)
-    return SourceScenes(source=name, collection=collection, scenes=stamped)
+    return SourceScenes(
+        source=name,
+        collection=collection,
+        scenes=stamped,
+        next_cursor=result.next_cursor,
+    )
 
 
 async def _search_attempts(
-    name: str, collection: str, client: DataPullClient, request: PullRequest
+    name: str,
+    collection: str,
+    client: DataPullClient,
+    request: PullRequest,
+    page_cursor: str | None,
 ) -> SourceScenes:
     failure: Exception | None = None
     for attempt in range(1, _MAX_SEARCH_ATTEMPTS + 1):
         try:
-            result = await client.search(request)
+            if page_cursor:
+                result = await client.search_from_cursor(request, page_cursor)
+            else:
+                result = await client.search(request)
         except Exception as exc:
             failure = exc
         else:
@@ -161,27 +173,43 @@ async def _search_attempts(
         else:
             break
     if failure is None:
-        return SourceScenes(source=name, collection=collection, scenes=[])
+        return SourceScenes(source=name, collection=collection, scenes=[], next_cursor=page_cursor)
     return SourceScenes(
         source=name,
         collection=collection,
         scenes=[],
         error=_error_text(failure),
+        next_cursor=page_cursor,
     )
 
 
-async def _search_one(name: str, client: DataPullClient, request: PullRequest) -> SourceScenes:
+async def _search_one(
+    name: str,
+    client: DataPullClient,
+    request: PullRequest,
+    *,
+    page_cursor: str | None = None,
+    resume: bool = False,
+) -> SourceScenes:
     collection = getattr(client, "collection", "")
+    if resume and not page_cursor:
+        return SourceScenes(source=name, collection=collection, scenes=[], next_cursor=None)
     budget: asyncio.Timeout | None = None
     try:
         async with asyncio.timeout(_SOURCE_BUDGET_SECONDS) as budget:
-            return await _search_attempts(name, collection, client, request)
+            return await _search_attempts(name, collection, client, request, page_cursor)
     except TimeoutError as exc:
         if budget is not None and budget.expired():
             error = "TimeoutError: source search exceeded the time budget"
         else:
             error = _error_text(exc)
-        return SourceScenes(source=name, collection=collection, scenes=[], error=error)
+        return SourceScenes(
+            source=name,
+            collection=collection,
+            scenes=[],
+            error=error,
+            next_cursor=page_cursor,
+        )
 
 
 async def aggregate(
@@ -189,6 +217,7 @@ async def aggregate(
     clients: Mapping[str, DataPullClient],
     *,
     on_source: Callable[[SourceScenes], None] | None = None,
+    page_cursors: Mapping[str, str | None] | None = None,
 ) -> SceneCatalog:
     """Search every source for `request` and collect results into one catalog.
 
@@ -204,10 +233,34 @@ async def aggregate(
     the budget runs out. Any other error is recorded on the first failure.
     An HTTP failure is stored as its status and reason phrase, with no
     request URL or query string.
+
+    ``page_cursors`` resumes a pull. A source whose cursor is a string is
+    searched from that cursor. A source present in the map with no cursor is
+    already finished and is not searched again, so page one is not repeated.
+    Sources absent from the map start at page one. Omit the map for a fresh pull.
+
+    Args:
+        request: Shared search window and area of interest.
+        clients: Registry name to pull client.
+        on_source: Called as each source finishes.
+        page_cursors: Per-source next-page cursor. None starts every source
+            at page one.
+
+    Returns:
+        Catalog of scenes, errors, and the next cursor for each source.
     """
 
     async def run(name: str, client: DataPullClient) -> SourceScenes:
-        result = await _search_one(name, client, request)
+        if page_cursors is None:
+            result = await _search_one(name, client, request)
+        else:
+            result = await _search_one(
+                name,
+                client,
+                request,
+                page_cursor=page_cursors.get(name),
+                resume=name in page_cursors,
+            )
         if on_source is not None:
             on_source(result)
         return result
