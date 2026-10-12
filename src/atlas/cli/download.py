@@ -11,7 +11,14 @@ from urllib.parse import urlparse
 import httpx
 
 from atlas.data.base import Asset, BBox, DataPullClient, Scene
-from atlas.data.cog import CogError, CogMissError, encode_cog, model_bounds, open_cog
+from atlas.data.cog import (
+    CogError,
+    CogMissError,
+    CogRangeError,
+    encode_cog,
+    model_bounds,
+    open_cog,
+)
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
 _BROWSE_KEYS = frozenset({"rendered_preview", "thumbnail", "preview"})
@@ -233,7 +240,7 @@ async def download_assets(
                         with path.open("wb") as handle:
                             async for chunk in response.aiter_bytes():
                                 handle.write(chunk)
-        except CogMissError as exc:
+        except (CogMissError, CogRangeError) as exc:
             await record(
                 DownloadOutcome(
                     source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
@@ -317,7 +324,7 @@ async def _windowed_cog(
             return None
         west, south, east, north = bounds
         read = await cog.read_window(west=west, south=south, east=east, north=north)
-    except CogMissError:
+    except (CogMissError, CogRangeError):
         raise
     except (CogError, httpx.HTTPError):
         return None

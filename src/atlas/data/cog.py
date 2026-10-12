@@ -56,6 +56,7 @@ _GEO_GEOGRAPHIC: Final[int] = 2048
 _GEO_PROJECTED: Final[int] = 3072
 _COMPRESS_NONE: Final[int] = 1
 _COMPRESS_DEFLATE: Final[frozenset[int]] = frozenset({8, 32946})
+_MAX_RANGE_BYTES: Final[int] = 8 * 1024 * 1024
 _MISS: Final[str] = "AOI does not overlap the COG"
 
 
@@ -132,26 +133,47 @@ class _RangeReader:
         cached = self._cached(start, end)
         if cached is not None:
             return cached
-        response = await self._http.get(
-            self._href,
-            headers={"Range": f"bytes={start}-{end}"},
-            follow_redirects=True,
-        )
-        if response.status_code == 200:
-            raise CogRangeError("server returned the whole object instead of the requested range")
-        if response.status_code == 416:
-            raise CogRangeError("server rejected the byte range")
-        if response.status_code != 206:
-            response.raise_for_status()
-            raise CogRangeError(f"unexpected status {response.status_code} for a range request")
-        data = response.content
         expected = end - start + 1
-        if len(data) != expected:
-            raise CogRangeError("range response was not the requested length")
-        self._note_granule_size(response.headers.get("content-range"))
+        if expected > _MAX_RANGE_BYTES:
+            raise CogRangeError("requested range exceeds the byte limit")
+        data = await self._stream_range(start, end, expected)
         self._spans.append((start, end, data))
         self.bytes_fetched += len(data)
         return data
+
+    async def _stream_range(self, start: int, end: int, expected: int) -> bytes:
+        """Read one range, and do not buffer a body the server did not slice.
+
+        Status is checked before any body byte is pulled. A 200 means the
+        server ignored Range; closing the stream leaves that body unread.
+        """
+        async with self._http.stream(
+            "GET",
+            self._href,
+            headers={"Range": f"bytes={start}-{end}"},
+            follow_redirects=True,
+        ) as response:
+            status = response.status_code
+            if status == 200:
+                raise CogRangeError(
+                    "server returned the whole object instead of the requested range"
+                )
+            if status == 416:
+                raise CogRangeError("server rejected the byte range")
+            if status != 206:
+                response.raise_for_status()
+                raise CogRangeError(f"unexpected status {status} for a range request")
+            self._note_granule_size(response.headers.get("content-range"))
+            chunks = bytearray()
+            async for piece in response.aiter_bytes():
+                if len(piece) > expected - len(chunks):
+                    raise CogRangeError("range response exceeded the requested length")
+                chunks.extend(piece)
+                if len(chunks) == expected:
+                    break
+        if len(chunks) != expected:
+            raise CogRangeError("range response was not the requested length")
+        return bytes(chunks)
 
     def _note_granule_size(self, content_range: str | None) -> None:
         if self.granule_size is not None or content_range is None:

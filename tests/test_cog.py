@@ -8,6 +8,7 @@ import json
 import math
 import struct
 import zlib
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -97,6 +98,7 @@ def build_cog(
     endian: str = "<",
     trailer: int = 0,
     pad: int = 0,
+    declared_tile_bytes: int | None = None,
 ) -> BuiltCog:
     """Build a classic tiled GeoTIFF the production reader does not share code with."""
     bands, height, width = (int(pixels.shape[0]), int(pixels.shape[1]), int(pixels.shape[2]))
@@ -133,7 +135,15 @@ def build_cog(
         _field(322, 4, [tile], endian),
         _field(323, 4, [tile], endian),
         _field(324, 4, [0] * ntiles, endian),
-        _field(325, 4, [len(blob) for blob in stored], endian),
+        _field(
+            325,
+            4,
+            [
+                declared_tile_bytes if declared_tile_bytes is not None else len(blob)
+                for blob in stored
+            ],
+            endian,
+        ),
         _field(339, 3, [1], endian),
         _field(33550, 12, [pixel_size_x, pixel_size_y, 0.0], endian),
         _field(33922, 12, [0.0, 0.0, 0.0, origin_x, origin_y, 0.0], endian),
@@ -158,7 +168,11 @@ def build_cog(
     offset_field = next(field for field in fields if field.tag == 324)
     offset_field.data = _pack_values(endian, 4, offsets)
     count_field = next(field for field in fields if field.tag == 325)
-    count_field.data = _pack_values(endian, 4, [len(blob) for blob in stored])
+    count_field.data = _pack_values(
+        endian,
+        4,
+        [declared_tile_bytes if declared_tile_bytes is not None else len(blob) for blob in stored],
+    )
 
     order = 0x4949 if endian == "<" else 0x4D4D
     out = bytearray(struct.pack(endian + "HHI", order, 42, ifd_at))
@@ -209,12 +223,28 @@ def _geographic() -> BuiltCog:
     )
 
 
+class _CountingStream(httpx.AsyncByteStream):
+    """Yields nothing until iterated, so a closed 200 is observable."""
+
+    def __init__(self, log: _RangeLog, payload: bytes) -> None:
+        self._log = log
+        self._payload = payload
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self._log.body_reads += 1
+        yield self._payload
+
+    async def aclose(self) -> None:
+        return None
+
+
 class _RangeLog:
     def __init__(self, blob: bytes, *, honor_range: bool = True, allow_full: bool = False) -> None:
         self.blob = blob
         self.honor_range = honor_range
         self.allow_full = allow_full
         self.calls: list[tuple[int, int] | None] = []
+        self.body_reads = 0
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
@@ -230,7 +260,7 @@ class _RangeLog:
         start, end = int(start_s), int(end_s)
         self.calls.append((start, end))
         if not self.honor_range:
-            return httpx.Response(200, content=self.blob)
+            return httpx.Response(200, stream=_CountingStream(self, self.blob))
         if start < 0 or end < start or end >= len(self.blob):
             return httpx.Response(416)
         body = self.blob[start : end + 1]
@@ -440,6 +470,8 @@ async def test_server_that_ignores_range_is_rejected() -> None:
                 east=-9.0,
                 north=9.0,
             )
+    assert log.body_reads == 0
+    assert len(log.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -631,7 +663,7 @@ async def test_download_miss_does_not_fetch_the_granule(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_range_ignored_falls_back_to_the_whole_asset(tmp_path: Path) -> None:
+async def test_range_ignored_is_not_buffered_or_downloaded_again(tmp_path: Path) -> None:
     built = _geographic()
     log = _RangeLog(built.blob, honor_range=False, allow_full=True)
     async with httpx.AsyncClient(transport=log.transport()) as http:
@@ -642,9 +674,36 @@ async def test_range_ignored_falls_back_to_the_whole_asset(tmp_path: Path) -> No
             clients={},
             bbox=BBox(west=-9.5, south=8.5, east=-9.0, north=9.0),
         )
-    assert report.outcomes[0].status == "saved"
-    assert None in log.calls
-    assert report.saved_paths()["sentinel2"][0].read_bytes() == built.blob
+    assert report.outcomes[0].status == "failed"
+    assert "whole object" in (report.outcomes[0].error or "")
+    assert None not in log.calls
+    assert log.body_reads == 0
+    assert list(tmp_path.rglob("*.tif")) == []
+
+
+@pytest.mark.asyncio
+async def test_range_above_the_byte_limit_is_not_requested() -> None:
+    built = build_cog(
+        _grid(4, 4),
+        tile=2,
+        origin_x=0.0,
+        origin_y=4.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        declared_tile_bytes=8 * 1024 * 1024 + 1,
+    )
+    log = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogRangeError, match="byte limit"):
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=0.0,
+                south=2.0,
+                east=2.0,
+                north=4.0,
+            )
+    assert all(end - start + 1 <= 8 * 1024 * 1024 for start, end in log.range_calls())
 
 
 def test_run_data_passes_the_aoi_into_the_cog_read(tmp_path: Path) -> None:
