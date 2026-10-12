@@ -310,25 +310,136 @@ def test_vertex_cap_rejects_before_the_intersection_check() -> None:
         Polygon(ring=_square_with_vertices(MAX_POLYGON_VERTICES + 1))
     huge = [(float(index), 0.0) for index in range(10_000)]
     huge.append(huge[0])
-    with pytest.raises(ValidationError, match="more than"):
+    with pytest.raises(ValidationError, match="simplify the polygon"):
         Polygon(ring=huge)
 
 
+def _assert_ccw_ring(ring: list[list[float]]) -> None:
+    assert ring[0] == ring[-1]
+    assert len(ring) >= 4
+    area = 0.0
+    for (x1, y1), (x2, y2) in pairwise(ring):
+        assert (x1, y1) != (x2, y2)
+        assert abs(x1 - x2) < 180
+        area += x1 * y2 - x2 * y1
+    assert area / 2.0 > 1e-6
+    lons = [point[0] for point in ring[:-1]]
+    lats = [point[1] for point in ring[:-1]]
+    assert max(lons) - min(lons) > 1e-6
+    assert max(lats) - min(lats) > 1e-6
+
+
+# Fiji cut at 180 into the eastern and western pieces, each closed counter-clockwise
+# and starting at its lowest longitude, then latitude.
+FIJI_INTERSECTS = {
+    "type": "MultiPolygon",
+    "coordinates": [
+        [[[-180.0, -18.0], [-178.0, -18.0], [-178.0, -16.0], [-180.0, -16.0], [-180.0, -18.0]]],
+        [[[178.0, -18.0], [180.0, -18.0], [180.0, -16.0], [178.0, -16.0], [178.0, -18.0]]],
+    ],
+}
+
+# Two eastward spikes across 180, joined only on the west. A single clipped ring
+# would bridge y=1 to y=2 along the meridian; the split keeps three polygons.
+TWO_SPIKES = [
+    (170.0, 0.0),
+    (-175.0, 0.0),
+    (-175.0, 1.0),
+    (175.0, 1.0),
+    (175.0, 2.0),
+    (-175.0, 2.0),
+    (-175.0, 3.0),
+    (170.0, 3.0),
+    (170.0, 0.0),
+]
+TWO_SPIKES_INTERSECTS = {
+    "type": "MultiPolygon",
+    "coordinates": [
+        [[[-180.0, 0.0], [-175.0, 0.0], [-175.0, 1.0], [-180.0, 1.0], [-180.0, 0.0]]],
+        [[[-180.0, 2.0], [-175.0, 2.0], [-175.0, 3.0], [-180.0, 3.0], [-180.0, 2.0]]],
+        [
+            [
+                [170.0, 0.0],
+                [180.0, 0.0],
+                [180.0, 1.0],
+                [175.0, 1.0],
+                [175.0, 2.0],
+                [180.0, 2.0],
+                [180.0, 3.0],
+                [170.0, 3.0],
+                [170.0, 0.0],
+            ]
+        ],
+    ],
+}
+
+
 def test_dateline_ring_splits_into_a_multipolygon() -> None:
-    polygon = Polygon(ring=FIJI)
-    geometry = polygon.as_stac_geometry()
-    assert geometry["type"] == "MultiPolygon"
-    rings = geometry["coordinates"]
-    assert len(rings) == 2
-    lon_sets = [{point[0] for point in ring[0]} for ring in rings]
-    assert any(178.0 in lons and 180.0 in lons for lons in lon_sets)
-    assert any(-178.0 in lons and -180.0 in lons for lons in lon_sets)
-    for ring in rings:
-        assert ring[0] == ring[-1]
-        for (x1, _y1), (x2, _y2) in pairwise(ring):
-            assert abs(x1 - x2) < 180
+    geometry = Polygon(ring=FIJI).as_stac_geometry()
+    assert geometry == FIJI_INTERSECTS
+    for part in geometry["coordinates"]:
+        _assert_ccw_ring(part[0])
     touching = [(170.0, -1.0), (180.0, -1.0), (180.0, 1.0), (170.0, 1.0), (170.0, -1.0)]
-    assert Polygon(ring=touching).as_stac_geometry()["type"] == "Polygon"
+    assert Polygon(ring=touching).as_stac_geometry() == {
+        "type": "Polygon",
+        "coordinates": [[[170.0, -1.0], [180.0, -1.0], [180.0, 1.0], [170.0, 1.0], [170.0, -1.0]]],
+    }
+
+
+def test_nonconvex_dateline_ring_splits_without_a_bridge() -> None:
+    geometry = Polygon(ring=TWO_SPIKES).as_stac_geometry()
+    assert geometry == TWO_SPIKES_INTERSECTS
+    assert len(geometry["coordinates"]) == 3
+    for part in geometry["coordinates"]:
+        _assert_ccw_ring(part[0])
+    east = [part[0] for part in geometry["coordinates"] if part[0][0][0] == -180.0]
+    assert len(east) == 2
+    assert {round(ring[0][1], 6) for ring in east} == {0.0, 2.0}
+
+
+# A bowl east of 180 with a west-facing notch. The eastern piece stays one ring;
+# closing each meridian chain on its own would fill the notch or bridge it.
+NOTCHED_BOWL = [
+    (175.0, 0.0),
+    (-170.0, 0.0),
+    (-170.0, 3.0),
+    (175.0, 3.0),
+    (175.0, 2.0),
+    (-175.0, 2.0),
+    (-175.0, 1.0),
+    (175.0, 1.0),
+    (175.0, 0.0),
+]
+NOTCHED_BOWL_INTERSECTS = {
+    "type": "MultiPolygon",
+    "coordinates": [
+        [
+            [
+                [-180.0, 0.0],
+                [-170.0, 0.0],
+                [-170.0, 3.0],
+                [-180.0, 3.0],
+                [-180.0, 2.0],
+                [-175.0, 2.0],
+                [-175.0, 1.0],
+                [-180.0, 1.0],
+                [-180.0, 0.0],
+            ]
+        ],
+        [[[175.0, 0.0], [180.0, 0.0], [180.0, 1.0], [175.0, 1.0], [175.0, 0.0]]],
+        [[[175.0, 2.0], [180.0, 2.0], [180.0, 3.0], [175.0, 3.0], [175.0, 2.0]]],
+    ],
+}
+
+
+def test_notched_dateline_ring_stays_one_polygon_across_the_notch() -> None:
+    geometry = Polygon(ring=NOTCHED_BOWL).as_stac_geometry()
+    assert geometry == NOTCHED_BOWL_INTERSECTS
+    for part in geometry["coordinates"]:
+        _assert_ccw_ring(part[0])
+    east = next(part[0] for part in geometry["coordinates"] if part[0][0][0] == -180.0)
+    assert [-175.0, 2.0] in east
+    assert [-175.0, 1.0] in east
 
 
 @pytest.mark.asyncio
@@ -342,9 +453,7 @@ async def test_stac_search_sends_a_dateline_multipolygon() -> None:
     )
     async with Sentinel2Client(client=cast(httpx.AsyncClient, fake)) as client:
         await client.search(request)
-    intersects = fake.calls[0]["intersects"]
-    assert intersects["type"] == "MultiPolygon"
-    assert intersects == Polygon(ring=FIJI).as_stac_geometry()
+    assert fake.calls[0]["intersects"] == FIJI_INTERSECTS
     assert fake.calls[0]["bbox"] == [178.0, -18.0, -178.0, -16.0]
 
 
@@ -435,6 +544,7 @@ def test_manifest_round_trips_polygon_and_source_bbox(tmp_path: Path) -> None:
     assert restored.bbox.as_list() == manifest["catalog_bbox"]
     assert Polygon.from_geojson(manifest["polygon"]).ring == restored.polygon.ring
     assert "only accept a bounding box" in manifest["catalog_bbox_note"]
+    assert "footprint bounding-box overlap" in manifest["catalog_bbox_note"]
     assert {item["source"] for item in manifest["sources"]} == {"sentinel2", "modis"}
     for item in manifest["sources"]:
         assert item["bbox"] == manifest["catalog_bbox"]

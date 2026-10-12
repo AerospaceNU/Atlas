@@ -559,7 +559,9 @@ def _catalog_bbox_note(request: PullRequest) -> str:
         return "Every catalog was searched with this bounding box."
     return (
         "Catalogs that only accept a bounding box were searched with this box. "
-        "The polygon is the area of interest, and scenes from every source are filtered to it."
+        "The polygon is the area of interest. Scenes from every source are filtered "
+        "to it by footprint bounding-box overlap; point scenes must fall inside the ring. "
+        "A scene stores that box, not the full footprint outline."
     )
 
 
