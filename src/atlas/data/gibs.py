@@ -17,6 +17,9 @@ from atlas.data.base import (
 )
 
 GIBS_WMS = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
+# Two dateline halves share this width budget so a long, thin box cannot
+# request a GetMap tens of thousands of pixels wide.
+_MAX_GETMAP_WIDTH = 4096
 
 
 class GibsClient(DataPullClient):
@@ -26,11 +29,12 @@ class GibsClient(DataPullClient):
     side of ±180°. WMS 1.3 with EPSG:4326 requires west <= east. One BBOX with
     west greater than east is rejected by GIBS or drawn the long way around
     the globe, which is an empty or wrapped image of the wrong hemisphere.
-    Each map is ``image_size`` pixels tall. A dateline half's width is that
-    height times the half's longitude span divided by the latitude span, so
-    a narrow side is not stretched into a square. A box that does not cross
-    180° stays square. ``limit`` caps days, and both sides of a selected day
-    are kept together.
+    Width and height use the same degrees per pixel. Height starts at
+    ``image_size`` and each width follows that part's longitude span. If the
+    widths would sum to more than 4096, both dimensions shrink by the same
+    factor, so a long thin box stays under that cap and the two halves still
+    match. ``limit`` caps days, and both sides of a selected day are kept
+    together.
     """
 
     layer: ClassVar[str] = ""
@@ -74,12 +78,13 @@ class GibsClient(DataPullClient):
         """
         parts = request.bbox.antimeridian_parts()
         split = request.bbox.west > request.bbox.east
+        sizes = _preview_sizes(parts, self.image_size)
         days = _dates_inclusive(request.start_date, request.end_date)[: request.limit]
         scenes: list[Scene] = []
         for day in days:
             start = datetime(day.year, day.month, day.day, tzinfo=UTC)
             end = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=UTC)
-            for part in parts:
+            for part, (width, height) in zip(parts, sizes, strict=True):
                 side = _dateline_side(part) if split else None
                 scene_id = f"{self.layer}:{day.isoformat()}"
                 if side is not None:
@@ -91,7 +96,6 @@ class GibsClient(DataPullClient):
                 }
                 if side is not None:
                     properties["antimeridian_part"] = side
-                width, height = _preview_size(part, self.image_size, scale_width=split)
                 scene = Scene.try_new(
                     id=scene_id,
                     collection=self.layer,
@@ -195,19 +199,25 @@ def _dateline_side(part: BBox) -> str:
     return "west"
 
 
-def _preview_size(bbox: BBox, size: int, *, scale_width: bool) -> tuple[int, int]:
-    """Pixel width and height for one GetMap.
+def _preview_sizes(parts: list[BBox], size: int) -> list[tuple[int, int]]:
+    """Pixel width and height for one GetMap per part.
 
-    Height is ``size``. When ``scale_width`` is set, width uses the same
-    degrees per pixel as that height, so a dateline half keeps its longitude
-    span instead of being drawn as a square.
+    Height starts at ``size``. Each width uses the same degrees per pixel, so
+    a part keeps its longitude span. When those widths would sum to more than
+    ``_MAX_GETMAP_WIDTH``, width and height shrink by the same factor and the
+    degrees per pixel still match across parts.
     """
-    if not scale_width:
-        return size, size
-    lat_span = bbox.north - bbox.south
-    if lat_span <= 0:
-        return size, size
-    return max(1, round(size * bbox.lon_span / lat_span)), size
+    if size < 1:
+        size = 1
+    lat_span = parts[0].north - parts[0].south if parts else 0.0
+    lon_spans = [part.lon_span for part in parts]
+    total_lon = sum(lon_spans)
+    if lat_span <= 0 or total_lon <= 0:
+        return [(size, size) for _ in parts]
+    combined = size * total_lon / lat_span
+    scale = _MAX_GETMAP_WIDTH / combined if combined > _MAX_GETMAP_WIDTH else 1.0
+    height = max(1, round(size * scale))
+    return [(max(1, round(size * lon_span / lat_span * scale)), height) for lon_span in lon_spans]
 
 
 def _wms_url(layer: str, day: date, bbox: BBox, width: int, height: int) -> str:

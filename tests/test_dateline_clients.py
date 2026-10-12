@@ -181,14 +181,29 @@ async def test_gibs_dateline_halves_scale_width_to_longitude_span() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gibs_non_dateline_preview_stays_square() -> None:
+async def test_gibs_non_dateline_preview_matches_aspect() -> None:
+    # 0.10° by 0.08°, under the width cap, so height stays 512 and width grows.
     boston = BBox(west=-71.12, south=42.32, east=-71.02, north=42.40)
     async with GibsModisTrueColorClient(
         client=cast(httpx.AsyncClient, FakeAsyncClient())
     ) as client:
         result = await client.search(_request(boston, limit=1))
     assert len(result.scenes) == 1
-    assert _wms_pixels(result.scenes[0].assets["rendered_preview"].href) == (512, 512)
+    assert _wms_pixels(result.scenes[0].assets["rendered_preview"].href) == (640, 512)
+
+
+@pytest.mark.asyncio
+async def test_gibs_long_thin_dateline_caps_combined_width() -> None:
+    # 50° east of 180 and 10° west, 1° of latitude. At 512px tall the two
+    # halves would be 25,600 and 5,120 pixels wide.
+    thin = BBox(west=130.0, south=0.0, east=-170.0, north=1.0)
+    async with GibsModisTrueColorClient(
+        client=cast(httpx.AsyncClient, FakeAsyncClient())
+    ) as client:
+        result = await client.search(_request(thin, limit=1))
+    pixels = [_wms_pixels(scene.assets["rendered_preview"].href) for scene in result.scenes]
+    assert pixels == [(3413, 68), (683, 68)]
+    assert sum(width for width, _height in pixels) == 4096
 
 
 @pytest.mark.asyncio
