@@ -1,7 +1,7 @@
 [project]
 name = "atlas"
-version = "0.11.1"
-description = "Local AI agent deployment"
+version = "0.11.0"
+description = "Automated satellite data analysis framework"
 readme = "README.md"
 authors = [
     { name = "Richard Tang", email = "tang.ri@northeastern.edu" },
@@ -10,7 +10,9 @@ authors = [
     { name = "Sunny Shen", email = "shen.su@northeastern.edu" },
     { name = "Mason King", email = "king.mas@northeastern.edu" }, 
     { name = "Sabrina Valerjev", email = "sabrinaelena.v@gmail.com"}, 
-    { name = "Gabriel Ortiz", email = "ortiz.gabr@northeastern.edu"}
+    { name = "Gabriel Ortiz", email = "ortiz.gabr@northeastern.edu"}, 
+    { name = "Lea kwan", email = "kwan.le@northeastern.edu"},
+    { name = "Ray Bui", email = "raybui02@gmail.com"}
 ]
 requires-python = ">=3.12"
 dependencies = [
