@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import errno
 import logging
 import os
 import stat
@@ -101,6 +102,9 @@ class LocalArtifactStore:
     tree -- the project workspace -- so an agent can inspect source files and
     inputs without gaining write access to them. Writes always stay in
     ``root``, and both roots reject absolute paths and ``..`` escapes.
+    ``read_project_bytes`` reads the project root only: ``read_root`` when one
+    is mounted, otherwise ``root``. A same-named file in the write sandbox
+    does not replace it.
     """
 
     def __init__(self, root: Path, *, read_root: Path | None = None) -> None:
@@ -125,6 +129,61 @@ class LocalArtifactStore:
             return primary
         fallback = _within(self.read_root, relative_path)
         return fallback if fallback.exists() else primary
+
+    def read_project_bytes(self, relative_path: str, *, max_bytes: int | None = None) -> bytes:
+        """Read one file from the project workspace, not the write sandbox.
+
+        The project root is ``read_root`` when this store has one, and ``root``
+        otherwise. A file that exists only under ``root`` is not read when
+        ``read_root`` is set. Absolute paths, ``..`` escapes, symlinks, and
+        hardlinks are refused. The final path component is not followed when
+        it is a symlink.
+
+        Args:
+            relative_path: Path relative to the project root.
+            max_bytes: When set, a longer file is refused instead of truncated.
+
+        Returns:
+            The file bytes, at most ``max_bytes`` when that limit is set.
+
+        Raises:
+            SandboxDenied: The path leaves the project root, is a symlink or
+                hardlink, is not a regular file, or exceeds ``max_bytes``.
+            FileNotFoundError: The file is missing.
+            OSError: The file could not be read.
+        """
+        if "\x00" in relative_path:
+            raise SandboxDenied("Project path is invalid")
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise SandboxDenied("Project path escapes the project root")
+        base = self.read_root if self.read_root is not None else self.root
+        lexical = base / relative
+        if lexical.is_symlink():
+            raise SandboxDenied("Project path is a symlink")
+        path = _within(base, relative_path)
+        flags = os.O_RDONLY
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if isinstance(nofollow, int):
+            flags |= nofollow
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EISDIR}:
+                raise SandboxDenied("Project path is not a readable regular file") from exc
+            raise
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise SandboxDenied("Project path is not a single-link regular file")
+            if max_bytes is None:
+                return handle.read()
+            data = handle.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise SandboxDenied(f"{relative_path} exceeds the {max_bytes} byte read limit")
+        return data
 
     def relative(self, path: Path) -> str:
         """Return a root-relative, portable artifact path."""
