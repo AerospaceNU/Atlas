@@ -31,9 +31,7 @@ def test_status_line_shows_context_tokens_spend_and_speed() -> None:
     )
 
     assert "context 12/128K" in text
-    assert "tokens 16" in text
-    assert "prompt" not in text
-    assert "completion" not in text
+    assert "tokens 16 (prompt 12 completion 4)" in text
     assert "spend $0.02" in text
     assert "8.0 tok/s" in text
     assert "http" not in text
@@ -47,6 +45,8 @@ def test_status_line_does_not_invent_a_context_window() -> None:
 
     assert "context 9/unknown" in text
     assert "128000" not in text
+    assert "prompt" not in text
+    assert "completion" not in text
     assert "spend $0" in text
     assert "0.0 tok/s" in text
     assert "http" not in text
@@ -89,9 +89,7 @@ def test_token_counts_use_three_sigfigs_in_k_m_and_b() -> None:
         )
     )
     assert "context 355/1.05M" in text
-    assert "tokens 380" in text
-    assert "prompt" not in text
-    assert "completion" not in text
+    assert "tokens 380 (prompt 355 completion 25)" in text
 
 
 def test_bare_atlas_opens_the_tui(monkeypatch: pytest.MonkeyPatch) -> None:

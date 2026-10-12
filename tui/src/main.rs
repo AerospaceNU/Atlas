@@ -3837,7 +3837,7 @@ mod tests {
         let painted = screen(&mut app, 80, 24);
         let flat = painted.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        for field in ["spend $0.02", "8.0 tok/s"] {
+        for field in ["prompt 12", "completion 4", "spend $0.02", "8.0 tok/s"] {
             assert!(
                 flat.contains(field),
                 "missing {field} in status rect:\n{painted}"

@@ -701,9 +701,7 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     assert done[1]["context_used"] == 20
     assert done[1]["tokens_per_second"] == 12.0
     line = done[1]["status_line"]
-    assert "tokens 38" in line
-    assert "prompt" not in line
-    assert "completion" not in line
+    assert "tokens 38 (prompt 30 completion 8)" in line
     assert "12.0 tok/s" in line
     assert "http" not in line
     assert "latency" not in line
@@ -811,9 +809,7 @@ def test_catalog_fills_the_active_model_context_on_the_dashboard(tmp_path: Path)
     assert session.totals.context_limit == 1_048_576
     line = events[1]["status_line"]
     assert "context 355/1.05M" in line
-    assert "tokens 380" in line
-    assert "prompt" not in line
-    assert "completion" not in line
+    assert "tokens 380 (prompt 355 completion 25)" in line
 
 
 def test_session_key_overrides_the_user_key_and_is_not_stored_in_the_project(
