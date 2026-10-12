@@ -34,6 +34,10 @@ Enter sends a line. `/` opens commands. `/new` starts a fresh conversation in th
 
 If the workspace root contains `AGENTS.md`, a new session loads that file as project guidance and follows it where it does not conflict with the system prompt. That is the only honored filename. Instruction files in nested directories are ignored, and a closer file does not override the root file. The text can never change tools, the sandbox, or those rules. A missing or unreadable file does not stop the session.
 
+## Layout
+
+Project files go in `.atlas/` in the working directory: `sessions/`, `artifacts/`, and `data/`. User files go in `~/.atlas/`: `keys/`, `weights/`, and `defaults/`. The directory list is in [docs/atlas-layout.md](docs/atlas-layout.md).
+
 ## Data CLI
 
 `atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`. A polygon AOI is `--polygon` as `lon,lat` pairs separated by semicolons, or a GeoJSON Polygon. Without `--coords`, the search box is that ring's envelope. A ring that winds around a pole is rejected: the boundary does not close inside one 360-degree window, so the interior is not a box or a STAC polygon. Rings longer than 4096 vertices are rejected so the caller can simplify them first. The written manifest stores the polygon and the box sent to catalogs that only accept a bounding box. Scenes from every source are then kept only when they meet the ring: a point must lie inside it, and every other scene is kept when its footprint bounding box meets the ring, because a scene record stores that box rather than the full footprint outline. A box with west greater than east crosses the antimeridian. GIBS and FIRMS request each side of 180° separately. GOES chooses the satellite from each side. Himawari lists its full-disk slot once when either side meets the disk. A rejected dateline request is a source error, not an empty scene.

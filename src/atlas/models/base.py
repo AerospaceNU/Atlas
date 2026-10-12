@@ -67,7 +67,8 @@ def weights_root() -> Path:
     """Directory that holds exported weights (not the artifact sandbox).
 
     ``ATLAS_WEIGHTS_DIR`` wins. Otherwise ``<repo>/weights``, then
-    ``~/.atlas/weights`` when no checkout is visible.
+    :func:`atlas.agent.layout.user_weights_dir` (``~/.atlas/weights``) when
+    no checkout is visible.
     """
     env = os.environ.get(_WEIGHTS_ENV)
     if env:
@@ -75,7 +76,9 @@ def weights_root() -> Path:
     root = repo_root()
     if root is not None:
         return (root / "weights").resolve()
-    return (Path.home() / ".atlas" / "weights").resolve()
+    from atlas.agent.layout import user_weights_dir
+
+    return user_weights_dir().resolve()
 
 
 def weight_path(spec: PluginSpec) -> Path:

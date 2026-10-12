@@ -1,9 +1,10 @@
 """Project ``.atlas/`` and user ``~/.atlas/`` locations.
 
-Project root (the workspace):
+Project root (the workspace, the current directory):
 
-- ``sessions/`` — one directory per session, no keys
-- ``artifacts/`` — files that belong to a session id
+- ``sessions/<id>/`` — one directory per session. ``meta.json`` records the
+  id and model. ``transcript.jsonl`` is the redacted TUI transcript. No keys.
+- ``artifacts/<id>/`` — files that belong to that session id
 - ``data/`` — pulls from the data CLI (existing ``.atlas/data``)
 
 User root (the home directory):
@@ -15,6 +16,8 @@ User root (the home directory):
   memory and wins over the environment, which wins over the file.
 - ``weights/`` — user-level weights (existing ``~/.atlas/weights``)
 - ``defaults/`` — user defaults
+
+The directory list other tickets should point at is ``docs/atlas-layout.md``.
 
 Removing a session removes its artifacts. Removing entries from the project
 root does not touch the user root. Absolute paths and ``..`` fail closed.
@@ -31,8 +34,6 @@ import warnings
 from pathlib import Path
 from typing import Literal
 
-_PROJECT_DIRS = ("sessions", "artifacts", "data")
-_USER_DIRS = ("keys", "weights", "defaults")
 _LIST_KINDS = frozenset({"sessions", "artifacts"})
 _REMOVE_KINDS = frozenset({"sessions", "artifacts", "keys", "weights"})
 OPENROUTER_API_KEY = "OPENROUTER_API_KEY"
@@ -170,14 +171,76 @@ def user_atlas_root(home: Path | None = None) -> Path:
     return base / ".atlas"
 
 
+def project_sessions_dir(workspace: Path) -> Path:
+    """Return ``<workspace>/.atlas/sessions`` (it may not exist yet)."""
+    return project_atlas_root(workspace) / "sessions"
+
+
+def project_artifacts_dir(workspace: Path) -> Path:
+    """Return ``<workspace>/.atlas/artifacts`` (it may not exist yet)."""
+    return project_atlas_root(workspace) / "artifacts"
+
+
+def project_data_dir(workspace: Path | None = None) -> Path:
+    """Return the project data-pull directory.
+
+    Args:
+        workspace: Project folder. ``None`` uses ``.`` so the result stays the
+            cwd-relative ``.atlas/data`` path the data CLI already defaults to.
+
+    Returns:
+        ``<workspace>/.atlas/data``.
+    """
+    base = Path(".") if workspace is None else workspace
+    return project_atlas_root(base) / "data"
+
+
+def project_session_dir(workspace: Path, session_id: str) -> Path:
+    """Return one session directory under the project ``.atlas`` root."""
+    return project_sessions_dir(workspace) / session_id
+
+
+def project_artifact_dir(workspace: Path, session_id: str) -> Path:
+    """Return one session's artifact directory under the project ``.atlas`` root."""
+    return project_artifacts_dir(workspace) / session_id
+
+
+def project_transcript_path(workspace: Path, session_id: str) -> Path:
+    """Return the redacted TUI transcript for one project session.
+
+    The agent appends protocol lines here. The file sits beside ``meta.json``
+    and is removed with the session.
+    """
+    return project_session_dir(workspace, session_id) / "transcript.jsonl"
+
+
+def user_keys_dir(home: Path | None = None) -> Path:
+    """Return ``<home>/.atlas/keys`` (it may not exist yet)."""
+    return user_atlas_root(home) / "keys"
+
+
+def user_weights_dir(home: Path | None = None) -> Path:
+    """Return ``<home>/.atlas/weights`` (it may not exist yet)."""
+    return user_atlas_root(home) / "weights"
+
+
+def user_defaults_dir(home: Path | None = None) -> Path:
+    """Return ``<home>/.atlas/defaults`` (it may not exist yet)."""
+    return user_atlas_root(home) / "defaults"
+
+
 def ensure_project_layout(workspace: Path) -> Path:
     """Create project session, artifact, and data directories if missing.
 
     Existing files, including ``.atlas/data``, are left in place.
     """
     root = project_atlas_root(workspace)
-    for name in _PROJECT_DIRS:
-        (root / name).mkdir(parents=True, exist_ok=True)
+    for directory in (
+        project_sessions_dir(workspace),
+        project_artifacts_dir(workspace),
+        project_data_dir(workspace),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -189,8 +252,12 @@ def ensure_user_layout(home: Path | None = None) -> Path:
     is requested but not enforced; the directory ACL is the real control.
     """
     root = user_atlas_root(home)
-    for name in _USER_DIRS:
-        (root / name).mkdir(parents=True, exist_ok=True)
+    for directory in (
+        user_keys_dir(home),
+        user_weights_dir(home),
+        user_defaults_dir(home),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
     _tighten_keys_dir(root)
     return root
 
@@ -390,7 +457,7 @@ def user_key_path(home: Path | None = None, *, name: str = OPENROUTER_API_KEY) -
     Raises:
         ValueError: if ``name`` is not a stored variable.
     """
-    return user_atlas_root(home) / "keys" / key_filename(name)
+    return user_keys_dir(home) / key_filename(name)
 
 
 def resolve_credential(

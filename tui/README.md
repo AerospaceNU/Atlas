@@ -36,6 +36,11 @@ the repo root is found. The first session writes `<workspace>/.atlas/agent.toml`
 when that file is missing, with `model` set to `deepseek/deepseek-v4.1-flash`.
 `ATLAS_MODEL` or `--model` on the Python session overrides the file.
 
+The agent writes each new session under `<workspace>/.atlas/sessions/<id>/`
+and its files under `<workspace>/.atlas/artifacts/<id>/`. The redacted
+transcript is `<workspace>/.atlas/sessions/<id>/transcript.jsonl`. The
+directory list is `docs/atlas-layout.md`.
+
 Keys: `enter` sends the input line, `ctrl-r` resumes a turn that stopped at the
 tool-call limit, `ctrl-c` / `esc` quits. `PageUp` / `PageDown` scroll. `/new`
 starts a fresh conversation and clears the transcript. `/skill <name>` applies

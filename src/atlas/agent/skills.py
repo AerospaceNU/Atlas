@@ -56,7 +56,7 @@ from pydantic import BaseModel, Field, create_model
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolRegistry, ToolResult
-from atlas.agent.layout import project_atlas_root, user_atlas_root
+from atlas.agent.layout import project_artifacts_dir, user_atlas_root
 from atlas.agent.skill_author import is_within, normalize_skill_name
 
 _LOGGER = logging.getLogger(__name__)
@@ -343,7 +343,7 @@ def _project_artifact_root(store: LocalArtifactStore) -> Path | None:
     """Return ``<workspace>/.atlas/artifacts``, or None when there is no workspace."""
     if store.read_root is None:
         return None
-    return project_atlas_root(store.read_root) / "artifacts"
+    return project_artifacts_dir(store.read_root)
 
 
 def _under_project_artifacts(artifact_root: Path | None, path: Path) -> bool:

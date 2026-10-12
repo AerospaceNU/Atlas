@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import json
 import os
 import sys
@@ -44,7 +45,11 @@ from atlas.agent.layout import (
     list_entries,
     prepare_credential,
     prepare_openrouter_key,
+    project_artifact_dir,
+    project_artifacts_dir,
     project_atlas_root,
+    project_session_dir,
+    project_transcript_path,
     quiet_http_client_logs,
     read_user_key,
     remove_entry,
@@ -80,6 +85,10 @@ from atlas.agent.skills import Skill, load_skills, register_skill_tool
 
 _REDACTED = "***"
 _STDOUT_LOCK = threading.Lock()
+_transcript: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "atlas_session_transcript",
+    default=None,
+)
 
 
 class AgentSession:
@@ -98,6 +107,8 @@ class AgentSession:
         self.credential_keys: dict[str, str] = {}
         self.home: Path | None = None
         self.workspace: Path | None = None
+        self.session_id: str | None = None
+        self.transcript_path: Path | None = None
         self.requires_api_key = False
         self.active_key: str | None = None
         self.secrets: list[str] = []
@@ -193,7 +204,9 @@ class AgentSession:
         self._clear_analysis()
         if self.workspace is not None:
             session_id = _remember_session(self.workspace, self.model_id)
-            artifact_root = project_atlas_root(self.workspace) / "artifacts" / session_id
+            self.session_id = session_id
+            self.transcript_path = project_transcript_path(self.workspace, session_id)
+            artifact_root = project_artifact_dir(self.workspace, session_id)
             read_root = self.agent.artifacts.read_root
             self.agent.artifacts = LocalArtifactStore(artifact_root, read_root=read_root)
         self.messages = self.agent.opening_messages()
@@ -377,6 +390,41 @@ def _write_line(stdout: IO[str], payload: dict[str, Any], secrets: list[str]) ->
     with _STDOUT_LOCK:
         stdout.write(text + "\n")
         stdout.flush()
+        _append_transcript(text)
+
+
+def _append_transcript(text: str) -> None:
+    """Append one redacted line to the bound session transcript.
+
+    No transcript is bound outside a project session, and then this does
+    nothing. A missing session directory is left missing, so a reply after
+    that session is removed does not recreate it. A symlink at the transcript
+    path is refused. The caller holds ``_STDOUT_LOCK`` so the file stays in
+    the same order as stdout.
+    """
+    path = _transcript.get()
+    if path is None:
+        return
+    if path.is_symlink():
+        raise OSError("refusing to follow a transcript symlink")
+    # The session directory is created with the session. A missing parent
+    # means that session was removed; do not recreate it to store this line.
+    if not path.parent.is_dir():
+        return
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if isinstance(no_follow, int):
+        flags |= no_follow
+    fd = os.open(path, flags, 0o644)
+    try:
+        payload = memoryview((text + "\n").encode("utf-8"))
+        while payload:
+            written = os.write(fd, payload)
+            if written <= 0:
+                raise OSError("could not write the session transcript")
+            payload = payload[written:]
+    finally:
+        os.close(fd)
 
 
 def _redact_value(value: Any, secrets: list[str]) -> Any:
@@ -425,10 +473,12 @@ def serve(
     bind_session_credentials(session.credential_keys)
     bind_session_secrets(session.secrets)
     quiet_http_client_logs()
+    transcript = _transcript.set(session.transcript_path)
     try:
         _remember_resolved_credentials(session)
         return _serve_bound(session, stdin, stdout)
     finally:
+        _transcript.reset(transcript)
         unbind_session_credentials()
         unbind_session_secrets()
 
@@ -511,6 +561,13 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
     on_step = _step_writer(stdout, session.secrets)
     on_phase = _phase_writer(stdout, session.secrets)
     on_thought = _thought_writer(stdout, session.secrets)
+    with _STDOUT_LOCK:
+        _append_transcript(
+            json.dumps(
+                {"type": "user", "text": _redact_value(text, session.secrets)},
+                ensure_ascii=False,
+            )
+        )
     try:
         run = session.turn(text, on_step=on_step, on_phase=on_phase, on_thought=on_thought)
     except MissingOpenRouterKey as exc:
@@ -554,6 +611,7 @@ def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
 def _handle_new(session: AgentSession, stdout: IO[str]) -> None:
     """Start a fresh conversation and report the reset status."""
     session.start_fresh()
+    _transcript.set(session.transcript_path)
     _write_line(stdout, _ready_event(session), session.secrets)
 
 
@@ -1113,7 +1171,7 @@ def _add_enabled_skill(session: AgentSession, name: str, scope: str) -> str:
             base,
             f".atlas/skills/{name}",
             label_prefix=label,
-            artifact_root=project_atlas_root(workspace) / "artifacts",
+            artifact_root=project_artifacts_dir(workspace),
         )
     except OSError:
         return restart
@@ -1323,11 +1381,11 @@ def resolve_model(workspace: Path, cli_model: str | None) -> str:
 
 def _remember_session(workspace: Path, model_id: str) -> str:
     """Create a project session directory and a matching artifact directory."""
-    root = ensure_project_layout(workspace)
+    ensure_project_layout(workspace)
     session_id = uuid.uuid4().hex[:12]
-    session_dir = root / "sessions" / session_id
+    session_dir = project_session_dir(workspace, session_id)
     session_dir.mkdir(parents=True, exist_ok=True)
-    (root / "artifacts" / session_id).mkdir(parents=True, exist_ok=True)
+    project_artifact_dir(workspace, session_id).mkdir(parents=True, exist_ok=True)
     (session_dir / "meta.json").write_text(
         json.dumps(
             {
@@ -1371,7 +1429,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Writes stay inside this session's artifact directory so removing the
     # session removes them and cannot touch the workspace root. Reads may
     # fall back to the project workspace via the store's read_root.
-    artifact_root = project_atlas_root(workspace) / "artifacts" / session_id
+    artifact_root = project_artifact_dir(workspace, session_id)
     store = LocalArtifactStore(artifact_root, read_root=workspace)
     # Home skills are opt-in. The default session sees only the workspace.
     skill_home = home if load_home_skills_enabled(workspace) else None
@@ -1393,6 +1451,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         session.requires_api_key = True
         session.home = home
         session.workspace = workspace
+        session.session_id = session_id
+        session.transcript_path = project_transcript_path(workspace, session_id)
         session.active_key = api_key or None
         session.fetch_models = model.list_models
         return serve(session, sys.stdin, sys.stdout, redact=api_key or None)

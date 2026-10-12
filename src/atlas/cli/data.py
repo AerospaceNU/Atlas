@@ -18,7 +18,7 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
-from atlas.agent.layout import EARTHDATA_TOKEN, resolve_credential
+from atlas.agent.layout import EARTHDATA_TOKEN, project_data_dir, resolve_credential
 from atlas.cli.catalog import (
     CatalogError,
     only_kind,
@@ -118,7 +118,7 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     data.add_argument(
         "--out",
         type=Path,
-        default=Path(".atlas/data"),
+        default=project_data_dir(),
         help="Output directory (default: .atlas/data)",
     )
     data.add_argument("--limit", type=int, default=100, help="Max scenes per source (1-1000)")
