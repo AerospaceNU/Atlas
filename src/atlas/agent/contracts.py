@@ -70,11 +70,19 @@ class ChatMessage(BaseModel):
 
 
 class TokenUsage(BaseModel):
-    """Provider token counts and optional spend for one completion."""
+    """Provider token counts and optional spend for one completion.
+
+    ``cached_tokens`` is the portion of the prompt served from cache.
+    ``reasoning_tokens`` is the portion of the completion spent on reasoning.
+    Both stay zero when the provider omits them. They are not added on top of
+    ``prompt_tokens`` or ``completion_tokens``.
+    """
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
     cost: float | None = None
 
 
@@ -113,6 +121,10 @@ class CatalogModel(BaseModel):
     context_length: int | None = None
     prompt_price: str | None = None
     completion_price: str | None = None
+    # OpenRouter ``pricing.input_cache_read``, dollars per cached token.
+    # Unset when the row has no cache-read rate. Estimates then price cached
+    # tokens at ``prompt_price``, because prompt tokens already include them.
+    cache_read_price: str | None = None
     supports_tools: bool = False
 
 

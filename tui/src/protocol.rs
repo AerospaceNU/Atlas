@@ -137,6 +137,10 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub total_tokens: i64,
     #[serde(default)]
+    pub cached_tokens: i64,
+    #[serde(default)]
+    pub reasoning_tokens: i64,
+    #[serde(default)]
     pub spend: Option<f64>,
     #[serde(default)]
     pub tokens_per_second: Option<f64>,
@@ -534,7 +538,7 @@ impl From<RawMessage> for ServerMessage {
 /// The words match `format_tui_status` for an empty session so the first
 /// frame is never a blank status row.
 pub fn default_status_line() -> String {
-    "model unset  context 0/unknown  tokens 0  spend $0  0.0 tok/s".to_string()
+    "model unset  context 0/unknown  tokens 0  spend $0  last n/a tok/s".to_string()
 }
 
 pub fn status_text(status: &StatusSnapshot) -> String {
@@ -676,7 +680,10 @@ mod tests {
         assert!(!text.contains("prompt"));
         assert!(!text.contains("completion"));
         assert!(text.contains("spend $0"));
-        assert!(text.contains("0.0 tok/s"));
+        assert!(!text.contains("spend unknown"));
+        assert!(!text.contains("~$"));
+        assert!(text.contains("last n/a tok/s"));
+        assert!(!text.contains("0.0 tok/s"));
         assert!(text.contains("tok/s"));
         assert!(!text.contains("http"));
         assert!(!text.contains("latency"));

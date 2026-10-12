@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import os
 import subprocess
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from atlas.agent.contracts import CallTiming, ModelCall, TokenUsage
-from atlas.agent.metrics import SessionTotals, apply_call, format_token_count, format_tui_status
+from atlas.agent.metrics import (
+    SessionTotals,
+    apply_call,
+    catalog_spend,
+    format_token_count,
+    format_tui_status,
+)
 from atlas.cli import main
 from atlas.cli.tui import TuiLaunchError, ensure_tui_binary, launch_tui
 
@@ -31,11 +38,11 @@ def test_status_line_shows_context_tokens_spend_and_speed() -> None:
     )
 
     assert "context 12/128K" in text
-    assert "tokens 16" in text
-    assert "prompt" not in text
-    assert "completion" not in text
+    assert "tokens 16 (prompt 12 completion 4)" in text
+    assert "cached" not in text
+    assert "reasoning" not in text
     assert "spend $0.02" in text
-    assert "8.0 tok/s" in text
+    assert "last 8.0 tok/s" in text
     assert "http" not in text
     assert "latency" not in text
     assert "ttft" not in text
@@ -47,8 +54,13 @@ def test_status_line_does_not_invent_a_context_window() -> None:
 
     assert "context 9/unknown" in text
     assert "128000" not in text
+    assert "prompt" not in text
+    assert "completion" not in text
     assert "spend $0" in text
-    assert "0.0 tok/s" in text
+    assert "spend unknown" not in text
+    assert "spend ~" not in text
+    assert "last n/a tok/s" in text
+    assert "0.0 tok/s" not in text
     assert "http" not in text
     assert "latency" not in text
     assert "ttft" not in text
@@ -66,7 +78,205 @@ def test_output_speed_stays_when_a_later_call_writes_no_tokens() -> None:
     )
 
     assert totals.tokens_per_second == 8.0
-    assert "8.0 tok/s" in format_tui_status(totals)
+    assert "last 8.0 tok/s" in format_tui_status(totals)
+
+
+def test_output_speed_is_the_last_call_after_the_first_token() -> None:
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(completion_tokens=4),
+            timing=CallTiming(
+                http_status=200,
+                elapsed_seconds=0.5,
+                time_to_first_token_seconds=0.1,
+            ),
+        ),
+    )
+
+    assert totals.tokens_per_second == 10.0
+    assert "last 10.0 tok/s" in format_tui_status(totals)
+
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(completion_tokens=100),
+            timing=CallTiming(http_status=200, elapsed_seconds=1.0),
+        ),
+    )
+
+    assert totals.tokens_per_second == 10.0
+
+
+def test_fresh_session_spend_is_zero() -> None:
+    text = format_tui_status(SessionTotals())
+
+    assert "spend $0" in text
+    assert "spend unknown" not in text
+    assert "spend ~" not in text
+
+
+def test_unknown_cost_is_not_rendered_as_zero() -> None:
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(usage=TokenUsage(prompt_tokens=3, completion_tokens=1, total_tokens=4)),
+    )
+    text = format_tui_status(totals)
+
+    assert totals.estimated is False
+    assert "spend unknown" in text
+    assert "spend $0" not in text
+
+
+def test_missing_provider_cost_uses_catalog_prices() -> None:
+    assert catalog_spend(3, 1, "0.1", "0.2") == Decimal("0.5")
+    assert catalog_spend(1_000_000, 2_000_000, "0.000002", "0.00001") == Decimal("22")
+    assert catalog_spend(3, 1, "-1", "0.2") is None
+    assert catalog_spend(3, 1, "0.1", None) is None
+
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+        ),
+        prompt_price="0.1",
+        completion_price="0.2",
+    )
+
+    assert totals.cost == Decimal("0.5")
+    assert totals.spend_known is True
+    assert totals.estimated is True
+    assert "spend ~$0.5" in format_tui_status(totals)
+    assert "spend $0.5" not in format_tui_status(totals)
+
+    priced = SessionTotals()
+    apply_call(
+        priced,
+        ModelCall(
+            usage=TokenUsage(
+                prompt_tokens=3,
+                completion_tokens=1,
+                total_tokens=4,
+                cost=0.02,
+            ),
+        ),
+        prompt_price="0.1",
+        completion_price="0.2",
+    )
+    assert priced.cost == Decimal("0.02")
+    assert priced.estimated is False
+    text = format_tui_status(priced)
+    assert "spend $0.02" in text
+    assert "spend ~" not in text
+
+
+def test_catalog_estimate_renders_with_a_tilde() -> None:
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+        ),
+        prompt_price="0.004",
+        completion_price="0.0003",
+    )
+
+    assert totals.estimated is True
+    assert totals.cost == Decimal("0.0123")
+    text = format_tui_status(totals)
+    assert "spend ~$0.0123" in text
+    assert "spend $0.0123" not in text
+
+
+def test_cache_read_price_is_used_when_the_catalog_has_one() -> None:
+    # 10 prompt tokens include 6 cached. Uncached 4 * 0.002 = 0.008,
+    # cached 6 * 0.0005 = 0.003, completion 4 * 0.01 = 0.04.
+    priced = catalog_spend(
+        10,
+        4,
+        "0.002",
+        "0.01",
+        cached_tokens=6,
+        cache_read_price="0.0005",
+    )
+    assert priced == Decimal("0.051")
+
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(
+                prompt_tokens=10,
+                completion_tokens=4,
+                total_tokens=14,
+                cached_tokens=6,
+            ),
+        ),
+        prompt_price="0.002",
+        completion_price="0.01",
+        cache_read_price="0.0005",
+    )
+    assert totals.estimated is True
+    assert totals.cost == Decimal("0.051")
+    assert "spend ~$0.051" in format_tui_status(totals)
+
+
+def test_cached_tokens_use_the_prompt_rate_without_a_cache_price() -> None:
+    # No cache-read price: all 10 prompt tokens, including the 6 cached,
+    # are charged at the prompt rate. 10 * 0.002 + 4 * 0.01 = 0.06.
+    fallback = catalog_spend(
+        10,
+        4,
+        "0.002",
+        "0.01",
+        cached_tokens=6,
+        cache_read_price=None,
+    )
+    assert fallback == Decimal("0.06")
+
+
+def test_explicit_zero_cost_stays_zero() -> None:
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(usage=TokenUsage(prompt_tokens=2, completion_tokens=2, total_tokens=4, cost=0)),
+    )
+
+    assert totals.cost == Decimal("0")
+    assert "spend $0" in format_tui_status(totals)
+    assert "spend unknown" not in format_tui_status(totals)
+
+
+def test_unpriced_call_hides_a_partial_total() -> None:
+    totals = SessionTotals()
+    apply_call(totals, ModelCall(usage=TokenUsage(prompt_tokens=1, completion_tokens=1, cost=0.02)))
+    apply_call(totals, ModelCall(usage=TokenUsage(prompt_tokens=4, completion_tokens=1)))
+
+    assert totals.spend_known is False
+    assert "spend unknown" in format_tui_status(totals)
+
+
+def test_cached_and_reasoning_tokens_join_the_status_line() -> None:
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(
+                prompt_tokens=12,
+                completion_tokens=4,
+                total_tokens=16,
+                cached_tokens=8,
+                reasoning_tokens=3,
+                cost=0.02,
+            ),
+        ),
+    )
+
+    text = format_tui_status(totals)
+    assert "tokens 16 (prompt 12 completion 4 cached 8 reasoning 3)" in text
 
 
 def test_token_counts_use_three_sigfigs_in_k_m_and_b() -> None:
@@ -89,9 +299,7 @@ def test_token_counts_use_three_sigfigs_in_k_m_and_b() -> None:
         )
     )
     assert "context 355/1.05M" in text
-    assert "tokens 380" in text
-    assert "prompt" not in text
-    assert "completion" not in text
+    assert "tokens 380 (prompt 355 completion 25)" in text
 
 
 def test_bare_atlas_opens_the_tui(monkeypatch: pytest.MonkeyPatch) -> None:

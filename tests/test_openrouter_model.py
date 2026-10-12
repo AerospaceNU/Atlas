@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from atlas.agent.contracts import ChatMessage, Role, ToolDefinition
+from atlas.agent.metrics import output_tokens_per_second
 from atlas.agent.model import (
     MISSING_KEY_MESSAGE,
     OPENROUTER_MODELS_URL,
@@ -19,6 +20,7 @@ from atlas.agent.model import (
     fetch_model_catalog,
     filter_model_catalog,
     parse_model_catalog,
+    parse_usage,
 )
 
 
@@ -270,7 +272,160 @@ def test_complete_keeps_usage_cost_status_and_elapsed_time() -> None:
     assert response.timing.http_status == 200
     assert response.timing.elapsed_seconds == 0.5
     assert response.timing.time_to_first_token_seconds == 0.1
+    speed = output_tokens_per_second(response.usage.completion_tokens, response.timing)
+    assert speed == 10.0
     assert client.calls[0]["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_complete_reads_the_trailing_usage_frame_without_replacing_content() -> None:
+    client = FakeClient({"choices": []}, elapsed_seconds=0.4)
+    client.lines = [
+        'data: {"choices":[{"delta":{"content":"clear"}}]}',
+        (
+            'data: {"choices":[{"index":0,"delta":{"content":"","role":"assistant"},'
+            '"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4,'
+            '"total_tokens":16,"cost":0.02,"cost_details":{"upstream_inference_cost":19}}}'
+        ),
+        "data: [DONE]",
+    ]
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test"), client)
+
+    response = model.complete([ChatMessage(role=Role.USER, content="look")], [])
+
+    assert response.content == "clear"
+    assert response.usage.prompt_tokens == 12
+    assert response.usage.completion_tokens == 4
+    assert response.usage.total_tokens == 16
+    assert response.usage.cost == 0.02
+    assert response.timing is not None
+    speed = output_tokens_per_second(response.usage.completion_tokens, response.timing)
+    assert speed is None
+
+
+def test_complete_omitted_usage_is_zero_and_has_no_cost() -> None:
+    client = FakeClient(
+        {"choices": [{"message": {"content": "ok", "tool_calls": []}}]},
+        elapsed_seconds=0.2,
+    )
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test"), client)
+
+    response = model.complete([ChatMessage(role=Role.USER, content="look")], [])
+
+    assert response.usage.prompt_tokens == 0
+    assert response.usage.completion_tokens == 0
+    assert response.usage.total_tokens == 0
+    assert response.usage.cost is None
+    assert response.timing is not None
+    speed = output_tokens_per_second(response.usage.completion_tokens, response.timing)
+    assert speed is None
+
+
+def test_scripted_completions_record_separate_usage_offline() -> None:
+    payloads = [
+        {
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+                "cost": 0.01,
+            },
+            "choices": [{"message": {"content": "one", "tool_calls": []}}],
+        },
+        {
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 6,
+                "total_tokens": 26,
+                "cost": 0.03,
+            },
+            "choices": [{"message": {"content": "two", "tool_calls": []}}],
+        },
+    ]
+
+    class Queue:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream(self, _method: str, _url: str, **_kwargs: Any) -> _Opened:
+            self.calls += 1
+            return _Opened(FakeResponse(payloads.pop(0), elapsed_seconds=0.5))
+
+    client = Queue()
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test"), client)
+
+    first = model.complete([ChatMessage(role=Role.USER, content="one")], [])
+    second = model.complete([ChatMessage(role=Role.USER, content="two")], [])
+
+    assert client.calls == 2
+    assert first.usage.prompt_tokens == 10
+    assert first.usage.completion_tokens == 2
+    assert first.usage.cost == 0.01
+    assert second.usage.prompt_tokens == 20
+    assert second.usage.completion_tokens == 6
+    assert second.usage.cost == 0.03
+    assert first.usage.prompt_tokens + second.usage.prompt_tokens == 30
+    assert first.usage.completion_tokens + second.usage.completion_tokens == 8
+    assert first.usage.total_tokens + second.usage.total_tokens == 38
+    assert (first.usage.cost or 0) + (second.usage.cost or 0) == pytest.approx(0.04)
+
+
+def test_parse_usage_sums_a_missing_total_and_ignores_non_numeric_fields() -> None:
+    summed = parse_usage({"prompt_tokens": 3, "completion_tokens": 5})
+    assert summed.total_tokens == 8
+    assert summed.cost is None
+
+    present_zero = parse_usage(
+        {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "cost": 0}
+    )
+    assert present_zero.cost == 0.0
+
+    ignored = parse_usage({"prompt_tokens": True, "completion_tokens": "4", "cost": "0.02"})
+    assert ignored.prompt_tokens == 0
+    assert ignored.completion_tokens == 0
+    assert ignored.total_tokens == 0
+    assert ignored.cached_tokens == 0
+    assert ignored.reasoning_tokens == 0
+    assert ignored.cost is None
+    assert parse_usage(None).cost is None
+    assert parse_usage([]).total_tokens == 0
+
+
+def test_parse_usage_reads_cached_and_reasoning_details() -> None:
+    parsed = parse_usage(
+        {
+            "prompt_tokens": 12,
+            "completion_tokens": 4,
+            "total_tokens": 16,
+            "prompt_tokens_details": {"cached_tokens": 8, "audio_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 3},
+            "cached_tokens": 99,
+            "reasoning_tokens": 99,
+        }
+    )
+    assert parsed.cached_tokens == 8
+    assert parsed.reasoning_tokens == 3
+
+    aliases = parse_usage(
+        {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "cache_read_input_tokens": 4,
+            "reasoning_tokens": 1,
+        }
+    )
+    assert aliases.cached_tokens == 4
+    assert aliases.reasoning_tokens == 1
+    assert aliases.total_tokens == 7
+
+    present_zero = parse_usage(
+        {
+            "prompt_tokens": 2,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "cached_tokens": 6,
+        }
+    )
+    assert present_zero.cached_tokens == 0
 
 
 def test_complete_keeps_non_2xx_status_and_a_short_body() -> None:
@@ -320,7 +475,11 @@ def test_fetch_model_catalog_reads_id_context_and_price() -> None:
                         {
                             "id": "google/gemini-3.8-flash",
                             "context_length": 128000,
-                            "pricing": {"prompt": "0.1", "completion": "0.4"},
+                            "pricing": {
+                                "prompt": "0.1",
+                                "completion": "0.4",
+                                "input_cache_read": "0.02",
+                            },
                             "supported_parameters": ["tools"],
                         },
                         {"id": "local/no-meta", "supported_parameters": ["tools"]},
@@ -341,6 +500,8 @@ def test_fetch_model_catalog_reads_id_context_and_price() -> None:
     assert models[0].context_length == 128000
     assert models[0].prompt_price == "0.1"
     assert models[0].completion_price == "0.4"
+    assert models[0].cache_read_price == "0.02"
+    assert models[1].cache_read_price is None
     assert models[1].id == "local/no-meta"
     assert models[1].context_length is None
     assert models[1].prompt_price is None
