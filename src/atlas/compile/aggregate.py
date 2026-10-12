@@ -133,7 +133,35 @@ def _error_text(exc: Exception) -> str:
     return f"{type(exc).__name__}: {message}"
 
 
-def _stamp_source(name: str, collection: str, result: PullResult) -> SourceScenes:
+_CURSOR_CLEARED = (
+    "The stored next-page cursor was rejected and cleared. "
+    "A pull without --resume starts at page one."
+)
+
+
+def _client_meta(client: DataPullClient) -> tuple[str, str]:
+    collection = getattr(client, "collection", "")
+    search_url = getattr(client, "search_url", "")
+    if not isinstance(collection, str):
+        collection = ""
+    if not isinstance(search_url, str):
+        search_url = ""
+    return collection, search_url
+
+
+def _cursor_was_rejected(exc: BaseException) -> bool:
+    """True when the stored cursor itself failed and must not be tried again.
+
+    HTTP 408 and 429 are left in place so a later resume can retry. Other
+    4xx statuses, and a cursor this process refuses to send, are dead.
+    """
+    status = _status_code(exc)
+    if status is not None:
+        return 400 <= status <= 499 and status not in {408, 429}
+    return isinstance(exc, ValueError)
+
+
+def _stamp_source(name: str, collection: str, search_url: str, result: PullResult) -> SourceScenes:
     stamped: list[Scene] = []
     for scene in result.scenes:
         updates: dict[str, str] = {}
@@ -142,46 +170,109 @@ def _stamp_source(name: str, collection: str, result: PullResult) -> SourceScene
         if not scene.collection and collection:
             updates["collection"] = collection
         stamped.append(scene.model_copy(update=updates) if updates else scene)
-    return SourceScenes(source=name, collection=collection, scenes=stamped)
+    return SourceScenes(
+        source=name,
+        collection=collection,
+        scenes=stamped,
+        next_cursor=result.next_cursor,
+        next_cursor_unavailable=result.next_cursor_unavailable,
+        search_url=search_url,
+    )
+
+
+def _failed_source(
+    name: str,
+    collection: str,
+    search_url: str,
+    page_cursor: str | None,
+    failure: Exception,
+) -> SourceScenes:
+    rejected = bool(page_cursor) and _cursor_was_rejected(failure)
+    error = _error_text(failure)
+    if rejected:
+        joiner = " " if error.endswith(".") else ". "
+        error = f"{error}{joiner}{_CURSOR_CLEARED}"
+    return SourceScenes(
+        source=name,
+        collection=collection,
+        scenes=[],
+        error=error,
+        next_cursor=None if rejected else page_cursor,
+        search_url=search_url,
+        cursor_rejected=rejected,
+    )
 
 
 async def _search_attempts(
-    name: str, collection: str, client: DataPullClient, request: PullRequest
+    name: str,
+    collection: str,
+    client: DataPullClient,
+    request: PullRequest,
+    page_cursor: str | None,
 ) -> SourceScenes:
+    search_url = _client_meta(client)[1]
     failure: Exception | None = None
     for attempt in range(1, _MAX_SEARCH_ATTEMPTS + 1):
         try:
-            result = await client.search(request)
+            if page_cursor:
+                result = await client.search_from_cursor(request, page_cursor)
+            else:
+                result = await client.search(request)
         except Exception as exc:
             failure = exc
         else:
-            return _stamp_source(name, collection, result)
+            return _stamp_source(name, collection, search_url, result)
         if attempt < _MAX_SEARCH_ATTEMPTS and _is_rate_limited(failure):
             await asyncio.sleep(_retry_delay(failure, attempt))
         else:
             break
     if failure is None:
-        return SourceScenes(source=name, collection=collection, scenes=[])
-    return SourceScenes(
-        source=name,
-        collection=collection,
-        scenes=[],
-        error=_error_text(failure),
-    )
+        return SourceScenes(
+            source=name,
+            collection=collection,
+            scenes=[],
+            next_cursor=page_cursor,
+            search_url=search_url,
+        )
+    return _failed_source(name, collection, search_url, page_cursor, failure)
 
 
-async def _search_one(name: str, client: DataPullClient, request: PullRequest) -> SourceScenes:
-    collection = getattr(client, "collection", "")
+async def _search_one(
+    name: str,
+    client: DataPullClient,
+    request: PullRequest,
+    *,
+    page_cursor: str | None = None,
+    resume: bool = False,
+    unavailable: str | None = None,
+) -> SourceScenes:
+    collection, search_url = _client_meta(client)
+    if resume and not page_cursor:
+        return SourceScenes(
+            source=name,
+            collection=collection,
+            scenes=[],
+            next_cursor=None,
+            next_cursor_unavailable=unavailable,
+            search_url=search_url,
+        )
     budget: asyncio.Timeout | None = None
     try:
         async with asyncio.timeout(_SOURCE_BUDGET_SECONDS) as budget:
-            return await _search_attempts(name, collection, client, request)
+            return await _search_attempts(name, collection, client, request, page_cursor)
     except TimeoutError as exc:
         if budget is not None and budget.expired():
             error = "TimeoutError: source search exceeded the time budget"
         else:
             error = _error_text(exc)
-        return SourceScenes(source=name, collection=collection, scenes=[], error=error)
+        return SourceScenes(
+            source=name,
+            collection=collection,
+            scenes=[],
+            error=error,
+            next_cursor=page_cursor,
+            search_url=search_url,
+        )
 
 
 async def aggregate(
@@ -189,6 +280,8 @@ async def aggregate(
     clients: Mapping[str, DataPullClient],
     *,
     on_source: Callable[[SourceScenes], None] | None = None,
+    page_cursors: Mapping[str, str | None] | None = None,
+    unavailable_cursors: Mapping[str, str] | None = None,
 ) -> SceneCatalog:
     """Search every source for `request` and collect results into one catalog.
 
@@ -204,10 +297,42 @@ async def aggregate(
     the budget runs out. Any other error is recorded on the first failure.
     An HTTP failure is stored as its status and reason phrase, with no
     request URL or query string.
+
+    ``page_cursors`` resumes a pull. A source whose cursor is a string is
+    searched from that cursor. A source present in the map with no cursor is
+    already finished and is not searched again, so page one is not repeated.
+    Sources absent from the map start at page one. Omit the map for a fresh pull.
+    A source with no cursor and an entry in ``unavailable_cursors`` is not
+    finished: the reason is kept so resume can say the next page was not fetched.
+    A resume that fails with HTTP 4xx, other than 408 and 429, or with a
+    cursor this client refuses to send, clears that cursor. HTTP 5xx, 408,
+    and 429 keep it.
+
+    Args:
+        request: Shared search window and area of interest.
+        clients: Registry name to pull client.
+        on_source: Called as each source finishes.
+        page_cursors: Per-source next-page cursor. None starts every source
+            at page one.
+        unavailable_cursors: Per-source reason a next page exists but was not
+            stored. Used when that source's cursor is absent.
+
+    Returns:
+        Catalog of scenes, errors, and the next cursor for each source.
     """
 
     async def run(name: str, client: DataPullClient) -> SourceScenes:
-        result = await _search_one(name, client, request)
+        if page_cursors is None:
+            result = await _search_one(name, client, request)
+        else:
+            result = await _search_one(
+                name,
+                client,
+                request,
+                page_cursor=page_cursors.get(name),
+                resume=name in page_cursors,
+                unavailable=None if unavailable_cursors is None else unavailable_cursors.get(name),
+            )
         if on_source is not None:
             on_source(result)
         return result

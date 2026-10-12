@@ -952,6 +952,12 @@ class Scene(BaseModel):
 class PullResult(BaseModel):
     request: PullRequest
     scenes: list[Scene]
+    # Opaque STAC next-page cursor. None when the response has no next link.
+    next_cursor: str | None = None
+    # Why the next page could not be recorded. None when the cursor is present
+    # or the response has no next link. "signed" means the only continuation
+    # was a signed href, which is not stored.
+    next_cursor_unavailable: str | None = None
 
     @model_validator(mode="after")
     def _clip_to_polygon(self) -> Self:
@@ -976,3 +982,18 @@ class DataPullClient(ABC):
     @abstractmethod
     async def search(self, request: PullRequest) -> PullResult:
         raise NotImplementedError
+
+    async def search_from_cursor(self, request: PullRequest, page_cursor: str) -> PullResult:
+        """Continue a search from a stored page cursor.
+
+        Sources that do not page return no new scenes and keep the cursor.
+        Resume then does not send the page-one request again.
+
+        Args:
+            request: Pull whose filters produced ``page_cursor``.
+            page_cursor: Cursor recorded for this source.
+
+        Returns:
+            An empty page that still carries ``page_cursor``.
+        """
+        return PullResult(request=request, scenes=[], next_cursor=page_cursor)

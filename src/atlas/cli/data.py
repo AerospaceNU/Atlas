@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
+import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import httpx
 from pydantic import ValidationError
@@ -45,6 +49,7 @@ from atlas.data.sources.fldas import (
     resolve_variables,
     split_variables,
 )
+from atlas.data.stac import encode_page_cursor
 
 _EXAMPLE = (
     "atlas data sentinel2 optical --date 2024-07-01:2024-07-07 "
@@ -66,7 +71,9 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         description=(
             "List discovered satellites, or search a satellite and download native assets. "
             "A geographic, Web Mercator, or WGS84 UTM COG is read as the window "
-            "overlapping --coords. fldas landsurface writes a CSV training table."
+            "overlapping --coords. fldas landsurface writes a CSV training table. "
+            "A signed STAC next link is not stored, so later pages can stay unfetched. "
+            "That pull prints a warning and still exits 0."
         ),
         epilog=f"example:\n  {_EXAMPLE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -131,6 +138,15 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         "--search-only",
         action="store_true",
         help="Search and write a manifest; do not download assets",
+    )
+    data.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue from next-page cursors in the output manifest "
+            "instead of requesting page one again. A signed next link leaves "
+            "later pages unfetched and prints a warning; the exit status stays 0."
+        ),
     )
     data.add_argument(
         "--asset",
@@ -281,6 +297,18 @@ def run_data(
         return 1
 
     reporter = pick_reporter(stream=sys.stderr)
+    page_cursors: Mapping[str, str | None] | None = None
+    prior_manifest: Mapping[str, Any] | None = None
+    if getattr(args, "resume", False):
+        try:
+            prior_manifest = _load_pull_manifest(args.out / "manifest.json")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if not _same_pull(prior_manifest.get("request"), request):
+            print("resume query does not match the pull manifest", file=sys.stderr)
+            return 2
+        page_cursors = _page_cursors(prior_manifest)
     return asyncio.run(
         execute_pull(
             source_names=names,
@@ -296,6 +324,8 @@ def run_data(
             variables=variables,
             points=points,
             extract_tables=extracting,
+            page_cursors=page_cursors,
+            prior_manifest=prior_manifest,
         )
     )
 
@@ -395,6 +425,8 @@ async def execute_pull(
     variables: Sequence[str] | None = None,
     points: Sequence[tuple[float, float]] | None = None,
     extract_tables: bool = False,
+    page_cursors: Mapping[str, str | None] | None = None,
+    prior_manifest: Mapping[str, Any] | None = None,
 ) -> int:
     """Fan out search, then extract training tables or download native assets.
 
@@ -408,6 +440,19 @@ async def execute_pull(
         http if http is not None else httpx.AsyncClient(timeout=300.0, follow_redirects=True)
     )
     try:
+        if prior_manifest is not None:
+            mismatch = _resume_mismatch(prior_manifest, live_clients)
+            if mismatch is not None:
+                print(mismatch, file=sys.stderr)
+                return 2
+        unavailable = _unavailable_cursors(prior_manifest) if prior_manifest is not None else None
+        if unavailable:
+            for name in sorted(unavailable):
+                if name in live_clients:
+                    print(
+                        _unavailable_warning(name, unavailable[name]),
+                        file=sys.stderr,
+                    )
         for name in live_clients:
             reporter.source_start(name)
         catalog = await aggregate(
@@ -416,6 +461,8 @@ async def execute_pull(
             on_source=lambda src: reporter.source_search_done(
                 src.source, scenes=len(src.scenes), error=src.error
             ),
+            page_cursors=page_cursors,
+            unavailable_cursors=unavailable,
         )
         report = DownloadReport()
         table_failed = False
@@ -472,7 +519,7 @@ async def execute_pull(
                     table_usage = table_usage or usage_error
         for src in catalog.sources:
             reporter.source_done(src.source)
-        _write_manifest(out_dir, catalog, report)
+        _write_manifest(out_dir, catalog, report, prior=prior_manifest)
         reporter.close()
         _print_run_summary(catalog, report, search_only=search_only)
         if catalog.sources and all(src.error for src in catalog.sources):
@@ -567,25 +614,88 @@ def _catalog_bbox_note(request: PullRequest) -> str:
     )
 
 
+def _load_pull_manifest(path: Path) -> dict[str, Any]:
+    """Read a pull manifest that resume can continue.
+
+    Args:
+        path: ``manifest.json`` written by an earlier pull.
+
+    Returns:
+        The parsed manifest object.
+
+    Raises:
+        ValueError: The file is missing or has no source list.
+    """
+    if not path.is_file():
+        raise ValueError(f"no pull manifest at {path}; cannot resume")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("sources"), list):
+        raise ValueError(f"pull manifest at {path} has no sources")
+    return payload
+
+
+def _same_pull(stored: object, request: PullRequest) -> bool:
+    """True when ``stored`` is the same search window as ``request``.
+
+    The page cursor is only valid for that window. ``limit`` may change.
+    """
+    if not isinstance(stored, dict):
+        return False
+    try:
+        previous = PullRequest.model_validate(stored)
+    except ValueError:
+        return False
+    return (
+        previous.start_date == request.start_date
+        and previous.end_date == request.end_date
+        and previous.bbox == request.bbox
+        and previous.polygon == request.polygon
+        and previous.min_cloud_cover == request.min_cloud_cover
+        and previous.max_cloud_cover == request.max_cloud_cover
+    )
+
+
+def _page_cursors(payload: Mapping[str, Any]) -> dict[str, str | None]:
+    """Return each source's stored next-page cursor, including explicit nulls."""
+    cursors: dict[str, str | None] = {}
+    sources = payload.get("sources")
+    if not isinstance(sources, list):
+        return cursors
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("source")
+        if not isinstance(name, str) or not name:
+            continue
+        cursors[name] = _wire_cursor(item.get("next_cursor"))
+    return cursors
+
+
 def _write_manifest(
     out_dir: Path,
     catalog: SceneCatalog,
     report: DownloadReport,
+    *,
+    prior: Mapping[str, Any] | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     request = catalog.request
     bbox = request.bbox.as_list()
-    payload = {
-        "request": request.model_dump(mode="json"),
-        "polygon": None if request.polygon is None else request.polygon.as_geojson(),
-        "catalog_bbox": bbox,
-        "catalog_bbox_note": _catalog_bbox_note(request),
-        "sources": [
+    prior_sources = _prior_sources(prior)
+    sources_payload = [
+        _merge_source(
             {
                 "source": src.source,
                 "collection": src.collection,
                 "bbox": bbox,
+                "search_url": src.search_url,
+                "next_cursor": _manifest_cursor(src.next_cursor),
+                "next_cursor_unavailable": src.next_cursor_unavailable,
+                "note": _unavailable_note(src.next_cursor_unavailable)
+                if src.next_cursor_unavailable
+                else None,
                 "error": src.error,
+                "_cursor_rejected": src.cursor_rejected,
                 "n_scenes": len(src.scenes),
                 "scene_ids": [scene.id for scene in src.scenes],
                 "saved": [
@@ -612,11 +722,284 @@ def _write_manifest(
                     for item in report.for_source(src.source)
                     if item.bytes_read is not None and item.granule_size is not None
                 ],
-            }
-            for src in catalog.sources
-        ],
+            },
+            prior_sources.get(src.source),
+        )
+        for src in catalog.sources
+    ]
+    payload = {
+        "request": request.model_dump(mode="json"),
+        "polygon": None if request.polygon is None else request.polygon.as_geojson(),
+        "catalog_bbox": bbox,
+        "catalog_bbox_note": _catalog_bbox_note(request),
+        "sources": sources_payload,
     }
-    (out_dir / "manifest.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _write_json_atomic(out_dir / "manifest.json", json.dumps(payload, indent=2) + "\n")
+
+
+def _prior_sources(prior: Mapping[str, Any] | None) -> dict[str, Mapping[str, Any]]:
+    if prior is None:
+        return {}
+    rows = prior.get("sources")
+    if not isinstance(rows, list):
+        return {}
+    found: dict[str, Mapping[str, Any]] = {}
+    for item in rows:
+        if isinstance(item, dict) and isinstance(item.get("source"), str):
+            found[item["source"]] = item
+    return found
+
+
+def _resume_mismatch(prior: Mapping[str, Any], clients: Mapping[str, DataPullClient]) -> str | None:
+    """Return why this resume cannot use ``prior``, or None when it can.
+
+    The cursor is only valid for the sources, collections, and search
+    endpoints that produced it.
+    """
+    recorded = _prior_sources(prior)
+    if set(clients) != set(recorded):
+        return "resume sources do not match the pull manifest"
+    for name in sorted(clients):
+        row = recorded[name]
+        client = clients[name]
+        collection = getattr(client, "collection", "")
+        if not isinstance(collection, str):
+            collection = ""
+        if row.get("collection") != collection:
+            return f"resume collection for {name} does not match the pull manifest"
+        search_url = getattr(client, "search_url", "")
+        if not isinstance(search_url, str):
+            search_url = ""
+        stored_url = row.get("search_url")
+        if not isinstance(stored_url, str):
+            stored_url = ""
+        if stored_url != search_url:
+            return f"resume search endpoint for {name} does not match the pull manifest"
+    return None
+
+
+def _manifest_cursor(value: object) -> str | dict[str, Any] | None:
+    """Return the cursor as stored in ``manifest.json``.
+
+    A JSON cursor is an object. A legacy token or URL stays a string.
+    """
+    if isinstance(value, dict):
+        text = encode_page_cursor(value)
+        if not text:
+            return None
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+            if isinstance(parsed, dict):
+                return _manifest_cursor(parsed)
+        return text
+    return None
+
+
+def _wire_cursor(value: object) -> str | None:
+    """Return the cursor string ``search_from_cursor`` accepts."""
+    if isinstance(value, dict):
+        text = encode_page_cursor(value)
+        return text or None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _cursor_present(value: object) -> bool:
+    return _wire_cursor(value) is not None
+
+
+def _unavailable_note(reason: str) -> str:
+    """Return the source note for a cursor that was not stored."""
+    if reason == "signed":
+        return "The next page link was signed and was not stored. Later pages were not fetched."
+    return "The next page cursor is unavailable. Later pages were not fetched."
+
+
+def _unavailable_warning(name: str, reason: str) -> str:
+    """Return the stderr warning for pages left unfetched. The pull still exits 0."""
+    return f"warning: {name}: {_unavailable_note(reason)}"
+
+
+def _unavailable_cursors(payload: Mapping[str, Any]) -> dict[str, str]:
+    """Return sources whose next page exists but was not stored."""
+    found: dict[str, str] = {}
+    sources = payload.get("sources")
+    if not isinstance(sources, list):
+        return found
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("source")
+        if not isinstance(name, str) or not name or _wire_cursor(item.get("next_cursor")):
+            continue
+        reason = item.get("next_cursor_unavailable")
+        if isinstance(reason, str) and reason.strip():
+            found[name] = reason.strip()
+    return found
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flush the directory entry written by ``os.replace``."""
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+# A temp newer than this may belong to a pull that is still writing it.
+_MANIFEST_TEMP_MAX_AGE_SECONDS = 15 * 60
+
+
+def _manifest_file_mode() -> int:
+    """Return ``0o666`` with the process umask cleared."""
+    umask = os.umask(0)
+    try:
+        return 0o666 & ~umask
+    finally:
+        os.umask(umask)
+
+
+def _sweep_manifest_temps(directory: Path) -> None:
+    """Remove manifest temp files left by a crash more than 15 minutes ago.
+
+    A newer ``.manifest.json.*.tmp`` is left alone so a concurrent pull can
+    finish its own replace.
+    """
+    if not directory.is_dir():
+        return
+    now = time.time()
+    for leftover in directory.glob(".manifest.json.*.tmp"):
+        if leftover.is_dir() and not leftover.is_symlink():
+            continue
+        try:
+            modified = leftover.stat(follow_symlinks=False).st_mtime
+        except OSError:
+            continue
+        if now - modified <= _MANIFEST_TEMP_MAX_AGE_SECONDS:
+            continue
+        with contextlib.suppress(OSError):
+            leftover.unlink()
+
+
+def _write_json_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via an exclusive temp file, fsync, and ``os.replace``.
+
+    The temp name is random. ``.manifest.json.*.tmp`` files in the same
+    directory that are older than 15 minutes are removed first. The file
+    mode is ``0o666`` with the process umask cleared. The directory is
+    fsynced after the replace.
+    A failed replace leaves the previous file in place and removes the temp
+    file this write created.
+    """
+    directory = path.parent
+    _sweep_manifest_temps(directory)
+    fd, name = tempfile.mkstemp(dir=directory, prefix=".manifest.json.", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, _manifest_file_mode())
+        os.replace(tmp, path)
+        _fsync_directory(directory)
+    except Exception:
+        if tmp.exists():
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        raise
+
+
+def _merge_source(current: dict[str, Any], prior: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Append this page to the previous source record.
+
+    A failed resume keeps the previous scenes, windows, and cursor so the
+    next resume can try the same page again. A rejected cursor is cleared
+    instead of being copied back.
+    """
+    rejected = bool(current.pop("_cursor_rejected", False))
+    if prior is None:
+        return current
+    if current.get("error"):
+        kept = dict(current)
+        kept["scene_ids"] = _extend_str(prior.get("scene_ids"), [])
+        kept["n_scenes"] = len(kept["scene_ids"])
+        kept["saved"] = _extend_str(prior.get("saved"), [])
+        kept["skipped"] = _extend_str(prior.get("skipped"), [])
+        kept["failed"] = _merge_failed(prior.get("failed"), [])
+        kept["windows"] = _merge_windows(prior.get("windows"), [])
+        if rejected:
+            kept["next_cursor"] = None
+        elif not _cursor_present(current.get("next_cursor")):
+            kept["next_cursor"] = _manifest_cursor(prior.get("next_cursor"))
+        return kept
+    scene_ids = _extend_str(prior.get("scene_ids"), current.get("scene_ids"))
+    merged = dict(current)
+    merged["scene_ids"] = scene_ids
+    merged["n_scenes"] = len(scene_ids)
+    merged["saved"] = _extend_str(prior.get("saved"), current.get("saved"))
+    merged["skipped"] = _extend_str(prior.get("skipped"), current.get("skipped"))
+    merged["failed"] = _merge_failed(prior.get("failed"), current.get("failed"))
+    merged["windows"] = _merge_windows(prior.get("windows"), current.get("windows"))
+    return merged
+
+
+def _extend_str(prior: object, current: object) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in _as_list(prior) + _as_list(current):
+        if isinstance(item, str) and item not in seen:
+            seen.add(item)
+            values.append(item)
+    return values
+
+
+def _merge_failed(prior: object, current: object) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    index: dict[str, int] = {}
+    for item in _as_dicts(prior) + _as_dicts(current):
+        scene_id = item.get("id")
+        if not isinstance(scene_id, str):
+            continue
+        if scene_id in index:
+            rows[index[scene_id]] = dict(item)
+        else:
+            index[scene_id] = len(rows)
+            rows.append(dict(item))
+    return rows
+
+
+def _merge_windows(prior: object, current: object) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in _as_dicts(prior) + _as_dicts(current):
+        scene_id = item.get("id")
+        if not isinstance(scene_id, str) or scene_id in seen:
+            continue
+        seen.add(scene_id)
+        rows.append(dict(item))
+    return rows
+
+
+def _as_list(value: object) -> list[object]:
+    if isinstance(value, list):
+        return list(value)
+    return []
+
+
+def _as_dicts(value: object) -> list[dict[str, Any]]:
+    return [item for item in _as_list(value) if isinstance(item, dict)]
 
 
 def _print_run_summary(
@@ -651,6 +1034,8 @@ def _print_run_summary(
         )
         if src.error:
             failure_lines.append(f"{src.source}: search {src.error}")
+        elif src.next_cursor_unavailable:
+            failure_lines.append(_unavailable_warning(src.source, src.next_cursor_unavailable))
         for item in items:
             if item.error:
                 failure_lines.append(f"{src.source} {item.scene_id}: {item.error}")

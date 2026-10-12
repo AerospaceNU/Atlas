@@ -12,6 +12,16 @@ class SourceScenes(BaseModel):
     collection: str
     scenes: list[Scene] = Field(default_factory=list)
     error: str | None = None  # populated if this source's search failed
+    # Next STAC page for this source. None means the search has no further page,
+    # or the next page could not be recorded. See next_cursor_unavailable.
+    next_cursor: str | None = None
+    # Set when a next page exists but its cursor was not stored, for example
+    # "signed". None means the source is exhausted or the cursor is present.
+    next_cursor_unavailable: str | None = None
+    # Item-search URL. Empty when the client does not search a STAC API.
+    search_url: str = ""
+    # The resume cursor was rejected and must not be copied back from the manifest.
+    cursor_rejected: bool = False
 
 
 class SceneCatalog(BaseModel):
