@@ -27,7 +27,10 @@ from atlas.data.cmr_stac import (
 )
 from atlas.data.cop_dem import CopDemGlo30Client, CopDemGlo90Client
 from atlas.data.digitalearth import DeAfricaS2Client, DeaS2ArdClient, DeaS2BmArdClient
-from atlas.data.earth_search import EarthSearchSentinel1GrdClient
+from atlas.data.earth_search import (
+    EarthSearchSentinel1GrdClient,
+    EarthSearchSentinel2L2aClient,
+)
 from atlas.data.firms import (
     FirmsClient,
     FirmsLandsatClient,
@@ -110,6 +113,7 @@ __all__ = [
     "DeaS2ArdClient",
     "DeaS2BmArdClient",
     "EarthSearchSentinel1GrdClient",
+    "EarthSearchSentinel2L2aClient",
     "EsaWorldCoverClient",
     "FirmsClient",
     "FirmsLandsatClient",
