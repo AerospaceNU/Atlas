@@ -27,7 +27,10 @@ from atlas.cli.download import (
     DownloadOutcome,
     DownloadReport,
     download_assets,
+    inside_output,
     is_forbidden_asset_name,
+    plain_source_name,
+    retire_product,
 )
 from atlas.cli.progress import ProgressReporter, pick_reporter
 from atlas.compile.aggregate import aggregate
@@ -478,7 +481,6 @@ async def execute_pull(
             live_clients,
             out_dir,
             search_only=search_only,
-            table_path=table_path,
         )
         for src in catalog.sources:
             reporter.source_done(src.source)
@@ -532,8 +534,8 @@ async def _extract_table(
         )
         table.write_csv(path)
     except FldasRequestError as exc:
-        if "grid-cell" in str(exc):
-            _discard_file(path)
+        if _empty_fldas_window(exc):
+            _retire_inside(out_dir, path)
         return (
             DownloadOutcome(
                 source=source,
@@ -554,7 +556,8 @@ async def _extract_table(
             False,
         )
     except (FldasError, httpx.HTTPError, OSError) as exc:
-        _discard_file(path)
+        if _empty_fldas_window(exc):
+            _retire_inside(out_dir, path)
         return (
             DownloadOutcome(
                 source=source,
@@ -596,14 +599,14 @@ def _record_empty_windows(
     out_dir: Path,
     *,
     search_only: bool,
-    table_path: Path | None,
 ) -> None:
-    """Record an empty date window and drop a product it did not write.
+    """Record an empty date window without presenting an older product.
 
-    A source that has not published the window, or whose search failed, must
-    not leave the previous CSV or chip as the result of this pull. Search-only
-    records the failure and leaves files alone. FLDAS pulls record the failure
-    from the extract itself.
+    Search-only records the failure and leaves files alone. A search that
+    failed, including an outage, rate limit, or timeout, also leaves files
+    alone. A window that really is empty moves aside only the files the
+    previous manifest listed for this source and this request. FLDAS pulls
+    record the failure from the extract itself.
 
     The source object keeps the fields already written on main. A page cursor
     can be added beside them without a new manifest shape.
@@ -611,14 +614,7 @@ def _record_empty_windows(
     for src in catalog.sources:
         client = clients.get(src.source)
         fldas = isinstance(client, FldasClient)
-        if src.error is not None:
-            if not search_only:
-                if fldas:
-                    _discard_file(table_path or (out_dir / _TABLE_NAME))
-                else:
-                    _discard_source_files(out_dir, src.source)
-            continue
-        if src.scenes:
+        if src.error is not None or src.scenes:
             continue
         if not search_only and fldas:
             continue
@@ -630,24 +626,92 @@ def _record_empty_windows(
                 error=_EMPTY_WINDOW,
             )
         )
-        if not search_only:
-            _discard_source_files(out_dir, src.source)
+        if search_only or not plain_source_name(src.source):
+            continue
+        for product in _products_for_request(out_dir, src.source, catalog.request):
+            retire_product(product)
 
 
-def _discard_file(path: Path) -> None:
-    """Remove one previous product file. A symlink is unlinked, not followed."""
-    if path.is_symlink() or path.is_file():
-        path.unlink()
+def _empty_fldas_window(exc: BaseException) -> bool:
+    """True when FLDAS found no granules or no grid cell in the window."""
+    text = str(exc)
+    if isinstance(exc, FldasRequestError) and "grid-cell" in text:
+        return True
+    return (
+        isinstance(exc, FldasError)
+        and not isinstance(exc, FldasAuthError)
+        and ("no FLDAS granules" in text)
+    )
 
 
-def _discard_source_files(out_dir: Path, source: str) -> None:
-    """Remove chip files written for ``source`` by an earlier pull."""
-    directory = out_dir / source
-    if directory.is_symlink() or not directory.is_dir():
-        return
-    for child in directory.iterdir():
-        if child.is_symlink() or child.is_file():
-            child.unlink()
+def _retire_inside(out_dir: Path, path: Path) -> None:
+    """Move one table aside when it resolves inside ``out_dir``."""
+    if inside_output(out_dir, path):
+        retire_product(path)
+
+
+def _products_for_request(out_dir: Path, source: str, request: PullRequest) -> list[Path]:
+    """Return manifest-listed products for this source and this request.
+
+    Files from another date or area, and files the manifest did not list, are
+    not included. A listed path that leaves ``out_dir`` is skipped.
+    """
+    manifest_path = out_dir / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        return []
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict) or not _same_window(payload.get("request"), request):
+        return []
+    products: list[Path] = []
+    sources = payload.get("sources")
+    if not isinstance(sources, list):
+        return []
+    for item in sources:
+        if not isinstance(item, dict) or item.get("source") != source:
+            continue
+        for key in ("saved", "skipped"):
+            listed = item.get(key)
+            if not isinstance(listed, list):
+                continue
+            for rel in listed:
+                candidate = _listed_product(out_dir, source, rel)
+                if candidate is not None:
+                    products.append(candidate)
+    return products
+
+
+def _same_window(previous: object, request: PullRequest) -> bool:
+    """True when a stored request is the same date window and area."""
+    if not isinstance(previous, dict):
+        return False
+    if previous.get("start_date") != request.start_date.isoformat():
+        return False
+    if previous.get("end_date") != request.end_date.isoformat():
+        return False
+    bbox = previous.get("bbox")
+    if not isinstance(bbox, dict):
+        return False
+    current = request.bbox.model_dump(mode="json")
+    if any(bbox.get(key) != current[key] for key in ("west", "south", "east", "north")):
+        return False
+    current_polygon = None if request.polygon is None else request.polygon.model_dump(mode="json")
+    return previous.get("polygon") == current_polygon
+
+
+def _listed_product(out_dir: Path, source: str, rel: object) -> Path | None:
+    """Resolve one manifest path that belongs to ``source`` and stays in ``out_dir``."""
+    if not isinstance(rel, str) or not rel or rel.startswith(("/", "\\")) or "\\" in rel:
+        return None
+    parts = Path(rel).parts
+    if not parts or parts[0] != source or any(part in {".", ".."} for part in parts):
+        return None
+    candidate = out_dir.joinpath(*parts)
+    if not inside_output(out_dir, candidate):
+        return None
+    return candidate
 
 
 def _catalog_bbox_note(request: PullRequest) -> str:

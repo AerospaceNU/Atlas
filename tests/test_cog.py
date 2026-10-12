@@ -710,6 +710,8 @@ async def test_empty_window_does_not_reuse_an_older_chip(tmp_path: Path) -> None
     dest = tmp_path / "sentinel2" / "chip_visual.tif"
     dest.parent.mkdir(parents=True)
     dest.write_bytes(b"yesterday")
+    notes = dest.parent / "notes.txt"
+    notes.write_text("mine", encoding="utf-8")
     async with httpx.AsyncClient(transport=log.transport()) as http:
         report = await download_assets(
             [_scene("https://example.com/granule.tif")],
@@ -723,6 +725,8 @@ async def test_empty_window_does_not_reuse_an_older_chip(tmp_path: Path) -> None
     assert "does not overlap" in (report.outcomes[0].error or "")
     assert report.saved_paths() == {}
     assert not dest.exists()
+    assert dest.with_name(dest.name + ".stale").read_bytes() == b"yesterday"
+    assert notes.read_text(encoding="utf-8") == "mine"
 
 
 @pytest.mark.asyncio
@@ -748,7 +752,7 @@ async def test_window_with_pixels_replaces_an_older_chip(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_ignored_range_does_not_keep_an_older_chip(tmp_path: Path) -> None:
+async def test_ignored_range_keeps_the_older_chip(tmp_path: Path) -> None:
     built = _geographic()
     log = _RangeLog(built.blob, honor_range=False, allow_full=True)
     dest = tmp_path / "sentinel2" / "chip_visual.tif"
@@ -764,8 +768,63 @@ async def test_ignored_range_does_not_keep_an_older_chip(tmp_path: Path) -> None
         )
     assert report.outcomes[0].status == "failed"
     assert "whole object" in (report.outcomes[0].error or "")
-    assert not dest.exists()
+    assert dest.read_bytes() == b"yesterday"
+    assert not dest.with_name(dest.name + ".stale").exists()
     assert log.body_reads == 0
+
+
+@pytest.mark.asyncio
+async def test_window_limit_keeps_the_older_chip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def limited(*_args: object, **_kwargs: object) -> None:
+        raise CogLimitError("window has too many pixels")
+
+    monkeypatch.setattr("atlas.cli.download._windowed_cog", limited)
+    dest = tmp_path / "sentinel2" / "chip_visual.tif"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"yesterday")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=-9.5, south=8.5, east=-9.0, north=9.0),
+        )
+    assert report.outcomes[0].status == "failed"
+    assert "too many pixels" in (report.outcomes[0].error or "")
+    assert dest.read_bytes() == b"yesterday"
+    assert not dest.with_name(dest.name + ".stale").exists()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_keeps_the_older_chip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("atlas.data.cog._retry_delay", lambda _exc, _attempt: 0.0)
+    dest = tmp_path / "sentinel2" / "chip_visual.tif"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"yesterday")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=-9.5, south=8.5, east=-9.0, north=9.0),
+        )
+    assert report.outcomes[0].status == "failed"
+    assert dest.read_bytes() == b"yesterday"
+    assert not dest.with_name(dest.name + ".stale").exists()
 
 
 @pytest.mark.asyncio

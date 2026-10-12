@@ -884,6 +884,11 @@ def test_empty_fldas_window_drops_the_previous_csv(
         "windows",
     }
     assert not table.exists()
+    assert (
+        table.with_name(table.name + ".stale")
+        .read_text(encoding="utf-8")
+        .startswith("longitude,latitude,time\n")
+    )
     assert leftover.read_text(encoding="utf-8") == "not-the-requested-table\n"
 
 
@@ -918,9 +923,44 @@ def test_empty_cell_window_drops_the_previous_csv(
         asyncio.run(client.aclose())
     assert "no X grid-cell center" in capsys.readouterr().err
     assert not table.exists()
+    assert table.with_name(table.name + ".stale").read_text(encoding="utf-8") == "yesterday\n"
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["sources"][0]["saved"] == []
     assert "grid-cell" in manifest["sources"][0]["failed"][0]["error"]
+
+
+def test_empty_fldas_window_does_not_touch_a_table_outside_out_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _EmptyFldasSource(token="token")
+    _injected(monkeypatch, client)
+    out = tmp_path / "out"
+    out.mkdir()
+    outside = tmp_path / "custom.csv"
+    outside.write_text("yesterday\n", encoding="utf-8")
+    try:
+        assert run_data(_pull_args(out, table=outside)) == 1
+    finally:
+        asyncio.run(client.aclose())
+    assert outside.read_text(encoding="utf-8") == "yesterday\n"
+    assert not outside.with_name(outside.name + ".stale").exists()
+
+
+def test_empty_fldas_window_unlinks_a_table_symlink_without_following_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _EmptyFldasSource(token="token")
+    _injected(monkeypatch, client)
+    target = tmp_path / "secret.csv"
+    target.write_text("secret\n", encoding="utf-8")
+    table = tmp_path / "fldas.csv"
+    table.symlink_to(target)
+    try:
+        assert run_data(_pull_args(tmp_path)) == 1
+    finally:
+        asyncio.run(client.aclose())
+    assert not table.exists()
+    assert target.read_text(encoding="utf-8") == "secret\n"
 
 
 def test_empty_cell_window_is_usage_exit_2(
