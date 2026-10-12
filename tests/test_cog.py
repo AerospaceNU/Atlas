@@ -106,6 +106,7 @@ def build_cog(
     tile_blobs: list[bytes] | None = None,
     place_tiles_at: int | None = None,
     nodata: str | None = None,
+    tile_gap: int = 0,
 ) -> BuiltCog:
     """Build a classic tiled GeoTIFF the production reader does not share code with."""
     if dimensions is None:
@@ -187,10 +188,12 @@ def build_cog(
     spans: list[tuple[int, int]] = []
     offsets: list[int] = []
     if place_tiles_at is None:
-        for blob in stored:
+        for index, blob in enumerate(stored):
             offsets.append(cursor)
             spans.append((cursor, cursor + len(blob) - 1))
             cursor += len(blob)
+            if tile_gap and index + 1 < len(stored):
+                cursor += tile_gap
     else:
         tile_cursor = place_tiles_at
         for blob in stored:
@@ -218,8 +221,10 @@ def build_cog(
         if not field.inline:
             out += field.data
     if place_tiles_at is None:
-        for blob in stored:
+        for index, blob in enumerate(stored):
             out += blob
+            if tile_gap and index + 1 < len(stored):
+                out += bytes(tile_gap)
     out += bytes(trailer)
     return BuiltCog(
         blob=bytes(out),
@@ -971,6 +976,61 @@ async def test_adjacent_tile_ranges_are_fetched_together() -> None:
     assert len(tile_calls) == 1
     assert _tiles_touched(tile_calls, built.tile_spans) == {0, 1}
     assert np.array_equal(read.array, pixels[:, 0:2, 0:4])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tile_gap", [100, 9000])
+async def test_small_gaps_between_tiles_are_coalesced(tile_gap: int) -> None:
+    pixels = _grid(8, 8)
+    built = build_cog(
+        pixels,
+        tile=2,
+        origin_x=-10.0,
+        origin_y=10.0,
+        pixel_size_x=0.25,
+        pixel_size_y=0.25,
+        tile_gap=tile_gap,
+    )
+    log = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        read = await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-10.0,
+            south=9.5,
+            east=-9.0,
+            north=10.0,
+        )
+    tile_calls = [call for call in log.range_calls() if _tiles_touched([call], built.tile_spans)]
+    assert len(tile_calls) == (1 if tile_gap <= cog._COALESCE_GAP else 2)
+    assert _tiles_touched(tile_calls, built.tile_spans) == {0, 1}
+    assert np.array_equal(read.array, pixels[:, 0:2, 0:4])
+
+
+@pytest.mark.asyncio
+async def test_a_short_deflate_tile_does_not_say_exceeded() -> None:
+    built = build_cog(
+        np.zeros((1, 2, 2), dtype=np.uint8),
+        tile=2,
+        origin_x=0.0,
+        origin_y=2.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        compression="deflate",
+        tile_blobs=[zlib.compress(b"\x00")],
+    )
+    log = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogError, match="shorter than its dimensions") as raised:
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=0.0,
+                south=0.0,
+                east=2.0,
+                north=2.0,
+            )
+    assert "exceeded" not in str(raised.value)
 
 
 def _patch_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:

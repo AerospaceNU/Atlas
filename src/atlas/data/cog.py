@@ -77,6 +77,7 @@ _MAX_IFD_ENTRIES: Final[int] = 128
 _MAX_TILES: Final[int] = 8192
 _MAX_WINDOW_PIXELS: Final[int] = 16_000_000
 _MAX_FIELD_BYTES: Final[int] = 1024 * 1024
+_COALESCE_GAP: Final[int] = 8192
 _MISS: Final[str] = "AOI does not overlap the COG"
 
 
@@ -952,15 +953,17 @@ def _parse_retry_after(value: str) -> float | None:
 
 
 def _coalesce(spans: list[tuple[int, int]], limit: int) -> list[tuple[int, int]]:
-    """Merge ranges that touch and still fit in one limited request."""
+    """Merge ranges that touch, or sit across a small gap, within the byte cap."""
     if not spans:
         return []
     ordered = sorted(spans)
     merged: list[tuple[int, int]] = [ordered[0]]
     for start, end in ordered[1:]:
         prev_start, prev_end = merged[-1]
-        if start <= prev_end + 1 and end - prev_start + 1 <= limit:
-            merged[-1] = (prev_start, max(prev_end, end))
+        gap = start - (prev_end + 1)
+        merged_end = max(prev_end, end)
+        if gap <= _COALESCE_GAP and merged_end - prev_start + 1 <= limit:
+            merged[-1] = (prev_start, merged_end)
         else:
             merged.append((start, end))
     return merged
@@ -1022,10 +1025,20 @@ def _inflate_bounded(payload: bytes, expected: int) -> bytes:
     decoder = zlib.decompressobj()
     try:
         raw = decoder.decompress(payload, expected + 1)
-        if len(raw) != expected or not decoder.eof or decoder.unconsumed_tail:
-            raise CogLimitError("deflate tile exceeded its dimensions")
-        if decoder.flush():
-            raise CogLimitError("deflate tile exceeded its dimensions")
     except zlib.error as exc:
         raise CogError("deflate tile could not be decoded") from exc
+    if len(raw) > expected or decoder.unconsumed_tail:
+        raise CogLimitError("deflate tile exceeded its dimensions")
+    if not decoder.eof:
+        if len(raw) < expected:
+            raise CogError("deflate tile is shorter than its dimensions")
+        raise CogLimitError("deflate tile exceeded its dimensions")
+    try:
+        extra = decoder.flush()
+    except zlib.error as exc:
+        raise CogError("deflate tile could not be decoded") from exc
+    if extra:
+        raise CogLimitError("deflate tile exceeded its dimensions")
+    if len(raw) < expected:
+        raise CogError("deflate tile is shorter than its dimensions")
     return raw
