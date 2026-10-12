@@ -55,7 +55,13 @@ from atlas.agent.layout import (
     user_atlas_root,
     write_user_key,
 )
-from atlas.agent.metrics import SessionTotals, apply_call, apply_http_error, format_tui_status
+from atlas.agent.metrics import (
+    SessionTotals,
+    apply_call,
+    apply_http_error,
+    format_tui_status,
+    reported_spend,
+)
 from atlas.agent.model import (
     _CATALOG_TIME_LIMIT,
     MISSING_KEY_MESSAGE,
@@ -252,8 +258,14 @@ class AgentSession:
             raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
 
     def _note(self, run: AgentRun) -> None:
+        prompt_price, completion_price = _catalog_prices(self)
         for call in run.calls:
-            apply_call(self.totals, call)
+            apply_call(
+                self.totals,
+                call,
+                prompt_price=prompt_price,
+                completion_price=completion_price,
+            )
 
     def save_finished_skill(
         self,
@@ -1243,6 +1255,18 @@ def _key_set(session: AgentSession) -> bool:
     return bool(session.active_key and session.active_key.strip())
 
 
+def _catalog_prices(session: AgentSession) -> tuple[str | None, str | None]:
+    """Return the active model's per-token catalog prices, when both exist."""
+    model_id = session.totals.model or session.model_id
+    if not model_id:
+        return None, None
+    with session._catalog_lock:
+        chosen = next((item for item in session.catalog if item.id == model_id), None)
+    if chosen is None:
+        return None, None
+    return chosen.prompt_price, chosen.completion_price
+
+
 def _apply_known_context_limit(session: AgentSession) -> None:
     """Copy the active model's catalog window onto the dashboard totals.
 
@@ -1270,7 +1294,9 @@ def _status_fields(session: AgentSession) -> dict[str, Any]:
         "prompt_tokens": totals.prompt_tokens,
         "completion_tokens": totals.completion_tokens,
         "total_tokens": totals.total_tokens,
-        "spend": totals.cost,
+        "cached_tokens": totals.cached_tokens,
+        "reasoning_tokens": totals.reasoning_tokens,
+        "spend": reported_spend(totals),
         "tokens_per_second": totals.tokens_per_second,
         "http_status": totals.last_http_status,
         "elapsed_seconds": totals.last_elapsed_seconds,

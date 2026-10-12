@@ -2074,11 +2074,20 @@ fn draw(frame: &mut Frame, app: &mut App) {
     render_status(frame, app, status_area);
 }
 
+/// How many dashboard rows the status block may use before the hint.
+const STATUS_DASHBOARD_LINES: usize = 6;
+
+/// Wrapped dashboard rows, capped so a long status line cannot eat the screen.
+fn dashboard_row_count(dashboard: &str, width: u16) -> usize {
+    let text_width = usize::from(width.max(1));
+    wrap_text(dashboard, text_width)
+        .len()
+        .clamp(1, STATUS_DASHBOARD_LINES)
+}
+
 /// Wrapped dashboard line, plus the hint row.
 fn status_block_rows(dashboard: &str, width: u16) -> u16 {
-    let text_width = usize::from(width.max(1));
-    let lines = wrap_text(dashboard, text_width).len().clamp(1, 6) as u16;
-    lines.saturating_add(1)
+    (dashboard_row_count(dashboard, width) as u16).saturating_add(1)
 }
 
 fn picker_rows(app: &App) -> u16 {
@@ -2614,27 +2623,16 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
-    let (label, color) = status_label(app);
-    let model = model_name(app);
-    let metrics = strip_model_field(&app.status_line);
-    let mut spans = vec![
-        Span::styled("Atlas", Style::default().fg(GRAY_BRIGHT).bg(BG_BASE)),
-        Span::styled("  ", Style::default().bg(BG_BASE)),
-        Span::styled(label, Style::default().fg(color).bg(BG_BASE)),
-        Span::styled(format!("  {model}"), Style::default().fg(GRAY).bg(BG_BASE)),
-    ];
-    if !metrics.is_empty() {
-        spans.push(Span::styled(
-            format!("  {metrics}"),
-            Style::default().fg(FG_SECONDARY).bg(BG_BASE),
-        ));
+    let width = usize::from(area.width.max(1));
+    let pieces = dashboard_pieces(app);
+    let mut lines = wrap_dashboard(&pieces, width);
+    if lines.len() > STATUS_DASHBOARD_LINES {
+        lines.truncate(STATUS_DASHBOARD_LINES);
     }
     let [dashboard_area, hint_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     frame.render_widget(
-        Paragraph::new(Line::from(spans))
-            .style(Style::default().bg(BG_BASE))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).style(Style::default().bg(BG_BASE)),
         dashboard_area,
     );
     frame.render_widget(
@@ -2646,15 +2644,110 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+struct DashPiece {
+    text: String,
+    style: Style,
+}
+
 /// One dashboard line. The model is already named here, so the metrics field
 /// that repeats it is left off. `scope` is not shown; it stays `project`.
 fn dashboard_text(app: &App) -> String {
-    let (label, _) = status_label(app);
+    dashboard_pieces(app)
+        .into_iter()
+        .map(|piece| piece.text)
+        .collect()
+}
+
+fn dashboard_pieces(app: &App) -> Vec<DashPiece> {
+    let (label, color) = status_label(app);
     let metrics = strip_model_field(&app.status_line);
-    if metrics.is_empty() {
-        format!("Atlas  {label}  {}", model_name(app))
+    let mut pieces = vec![
+        DashPiece {
+            text: "Atlas".to_string(),
+            style: Style::default().fg(GRAY_BRIGHT).bg(BG_BASE),
+        },
+        DashPiece {
+            text: "  ".to_string(),
+            style: Style::default().bg(BG_BASE),
+        },
+        DashPiece {
+            text: label.to_string(),
+            style: Style::default().fg(color).bg(BG_BASE),
+        },
+        DashPiece {
+            text: format!("  {}", model_name(app)),
+            style: Style::default().fg(GRAY).bg(BG_BASE),
+        },
+    ];
+    if !metrics.is_empty() {
+        pieces.push(DashPiece {
+            text: format!("  {metrics}"),
+            style: Style::default().fg(FG_SECONDARY).bg(BG_BASE),
+        });
+    }
+    pieces
+}
+
+/// Word-wrap the dashboard so a narrow terminal keeps each field intact.
+fn wrap_dashboard(pieces: &[DashPiece], width: usize) -> Vec<Line<'static>> {
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    for piece in pieces {
+        for ch in piece.text.chars() {
+            chars.push((ch, piece.style));
+        }
+    }
+    let text: String = chars.iter().map(|(ch, _)| *ch).collect();
+    let wrapped = wrap_text(&text, width.max(1));
+    let mut search_from = 0;
+    let mut lines = Vec::new();
+    for line in wrapped {
+        if line.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        let Some(byte) = text[search_from..].find(&line) else {
+            lines.push(Line::from(line));
+            continue;
+        };
+        let start = search_from + byte;
+        let start_char = text[..start].chars().count();
+        let end_char = start_char + line.chars().count();
+        lines.push(spans_for(&chars[start_char..end_char]));
+        search_from = start + line.len();
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn spans_for(chars: &[(char, Style)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut style: Option<Style> = None;
+    for (ch, next) in chars {
+        match style {
+            Some(current) if current == *next => buf.push(*ch),
+            Some(current) => {
+                spans.push(Span::styled(std::mem::take(&mut buf), current));
+                buf.push(*ch);
+                style = Some(*next);
+            }
+            None => {
+                buf.push(*ch);
+                style = Some(*next);
+            }
+        }
+    }
+    if let Some(current) = style {
+        if !buf.is_empty() {
+            spans.push(Span::styled(buf, current));
+        }
+    }
+    if spans.is_empty() {
+        Line::from("")
     } else {
-        format!("Atlas  {label}  {}  {metrics}", model_name(app))
+        Line::from(spans)
     }
 }
 
@@ -2781,8 +2874,9 @@ fn note_session_closed(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_streams, collapse_selected, delete_word_backward, draw, expand_selected,
-        finish_streams, format_context, is_finished_command, menu_action, menu_options,
+        advance_streams, collapse_selected, dashboard_text, delete_word_backward, draw,
+        expand_selected, finish_streams, format_context, is_finished_command, menu_action,
+        menu_options,
         nudge_scroll, picker_selection, price_per_million, select_tool, select_tool_at,
         slash_outcome, wrap_text, Activity, App, MenuAction, Mode, Status, StreamText, ToolHit,
         TranscriptLine,
@@ -3832,12 +3926,12 @@ mod tests {
     fn status_on_an_80_column_terminal_keeps_the_metrics() {
         let mut app = App::new();
         app.model_id = "example/model".to_string();
-        app.status_line = "model example/model  context 12/128000  tokens 16 (prompt 12 completion 4)  spend $0.02  8.0 tok/s".to_string();
+        app.status_line = "model example/model  context 12/128000  tokens 16 (prompt 12 completion 4)  spend $0.02  last 8.0 tok/s".to_string();
 
         let painted = screen(&mut app, 80, 24);
         let flat = painted.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        for field in ["prompt 12", "completion 4", "spend $0.02", "8.0 tok/s"] {
+        for field in ["prompt 12", "completion 4", "spend $0.02", "last 8.0 tok/s"] {
             assert!(
                 flat.contains(field),
                 "missing {field} in status rect:\n{painted}"
@@ -3849,6 +3943,58 @@ mod tests {
         assert!(!flat.contains("recent"));
         assert_eq!(flat.matches("example/model").count(), 1);
         assert!(!flat.contains("scope"));
+    }
+
+    #[test]
+    fn status_on_a_60_column_terminal_wraps_without_dropping_metrics() {
+        let mut app = App::new();
+        app.model_id = "google/gemini-3.8-flash".to_string();
+        app.status_line = "model google/gemini-3.8-flash  context 355/1.05M  tokens 380 (prompt 355 completion 25 cached 128 reasoning 40)  spend $0.00036  last 15.2 tok/s".to_string();
+
+        let text = dashboard_text(&app);
+        // The frame is inset by two columns, so a 60-column terminal paints
+        // the dashboard at 56. The line is wider than that and must wrap.
+        let content_width = 56usize;
+        let wrapped = wrap_text(&text, content_width);
+        assert!(
+            wrapped.len() >= 2,
+            "expected a wrap at {content_width}, got {}: {text}",
+            wrapped.len()
+        );
+        for line in &wrapped {
+            assert!(
+                line.chars().count() <= content_width,
+                "wrapped row is {} cols: {line}",
+                line.chars().count()
+            );
+            assert!(
+                !line.ends_with(' ') && !line.starts_with(' '),
+                "wrapped row should break on a word: {line:?}"
+            );
+        }
+
+        let painted = screen(&mut app, 60, 24);
+        for line in painted.lines() {
+            assert!(
+                line.chars().count() <= 60,
+                "painted row exceeds 60 columns: {line:?}"
+            );
+        }
+        let flat = painted.split_whitespace().collect::<Vec<_>>().join(" ");
+        for field in [
+            "prompt 355",
+            "completion 25",
+            "cached 128",
+            "reasoning 40",
+            "spend $0.00036",
+            "last 15.2 tok/s",
+            "1.05M",
+            "enter send",
+        ] {
+            assert!(flat.contains(field), "missing {field} in:\n{painted}");
+        }
+        assert!(!flat.contains("spend $0 "));
+        assert!(!flat.contains("0.0 tok/s"));
     }
 
     #[test]

@@ -23,7 +23,7 @@ from atlas.agent.contracts import (
 )
 from atlas.agent.images import ingest_image, ingest_images, is_model_image
 from atlas.agent.instructions import load_project_instructions
-from atlas.agent.metrics import observe_model_call, tokens_per_second
+from atlas.agent.metrics import observe_model_call, output_tokens_per_second
 from atlas.agent.skills import (
     Skill,
     render_system_prompt,
@@ -241,12 +241,10 @@ class Agent:
             # The call is blocking, so the thought arrives with the completion,
             # ahead of this round's tool steps and ahead of the final answer.
             if response.reasoning and on_thought is not None:
-                speed = None
-                if response.timing is not None:
-                    speed = tokens_per_second(
-                        response.usage.completion_tokens,
-                        response.timing.elapsed_seconds,
-                    )
+                speed = output_tokens_per_second(
+                    response.usage.completion_tokens,
+                    response.timing,
+                )
                 on_thought(response.reasoning, speed)
             if not response.tool_calls:
                 return AgentRun(response=response.content or "", steps=steps, calls=calls)

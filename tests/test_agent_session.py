@@ -495,7 +495,11 @@ def test_protocol_emits_thoughts_before_steps_and_the_answer(tmp_path: Path) -> 
             ModelResponse(
                 reasoning="check the file",
                 usage=TokenUsage(completion_tokens=8),
-                timing=CallTiming(http_status=200, elapsed_seconds=0.5),
+                timing=CallTiming(
+                    http_status=200,
+                    elapsed_seconds=0.5,
+                    time_to_first_token_seconds=0.1,
+                ),
                 tool_calls=[ToolCall(id="1", name="echo", arguments={"value": 4})],
             ),
             ModelResponse(reasoning="that was enough", content="done"),
@@ -510,7 +514,7 @@ def test_protocol_emits_thoughts_before_steps_and_the_answer(tmp_path: Path) -> 
     steps = [event for event in events if event["type"] == "step"]
     dones = [event for event in events if event["type"] == "done"]
     assert [event["text"] for event in thoughts] == ["check the file", "that was enough"]
-    assert thoughts[0]["tokens_per_second"] == 16.0
+    assert thoughts[0]["tokens_per_second"] == 20.0
     assert "tokens_per_second" not in thoughts[1]
     assert events.index(thoughts[0]) < events.index(steps[0])
     assert events.index(steps[0]) < events.index(thoughts[1])
@@ -681,8 +685,10 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     assert done[0]["completion_tokens"] == 2
     assert done[0]["total_tokens"] == 12
     assert done[0]["spend"] == 0.01
-    assert done[0]["tokens_per_second"] == 4.0
-    assert "4.0 tok/s" in done[0]["status_line"]
+    assert done[0]["cached_tokens"] == 0
+    assert done[0]["reasoning_tokens"] == 0
+    assert done[0]["tokens_per_second"] == 5.0
+    assert "last 5.0 tok/s" in done[0]["status_line"]
     assert done[0]["http_status"] == 200
     assert done[0]["elapsed_seconds"] == 0.5
     assert done[0]["time_to_first_token_seconds"] == 0.1
@@ -699,10 +705,10 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     assert done[1]["total_tokens"] == 38
     assert done[1]["spend"] == pytest.approx(0.04)
     assert done[1]["context_used"] == 20
-    assert done[1]["tokens_per_second"] == 12.0
+    assert done[1]["tokens_per_second"] == 15.0
     line = done[1]["status_line"]
     assert "tokens 38 (prompt 30 completion 8)" in line
-    assert "12.0 tok/s" in line
+    assert "last 15.0 tok/s" in line
     assert "http" not in line
     assert "latency" not in line
     assert done[1]["recent"] == ["200 0.50s", "200 0.50s"]
@@ -867,12 +873,17 @@ def test_session_key_overrides_the_user_key_and_is_not_stored_in_the_project(
 
 class _HeaderResponse:
     def __init__(
-        self, payload: dict[str, Any], *, status_code: int, elapsed_seconds: float
+        self,
+        payload: dict[str, Any],
+        *,
+        status_code: int,
+        elapsed_seconds: float,
+        time_to_first_token_seconds: float | None = None,
     ) -> None:
         self.payload = payload
         self.status_code = status_code
         self.elapsed_seconds = elapsed_seconds
-        self.time_to_first_token_seconds = None
+        self.time_to_first_token_seconds = time_to_first_token_seconds
 
     def json(self) -> dict[str, Any]:
         return self.payload
@@ -916,6 +927,7 @@ class _HeaderClient:
             },
             status_code=200,
             elapsed_seconds=0.5,
+            time_to_first_token_seconds=0.1,
         )
 
     def close(self) -> None:
@@ -1239,8 +1251,8 @@ def test_session_key_is_what_the_next_completion_sends(tmp_path: Path) -> None:
     assert model.config.api_key == "session-key"
     assert session.session_key == "session-key"
     done = [event for event in events if event["type"] == "done"]
-    assert done[0]["tokens_per_second"] == 4.0
-    assert "4.0 tok/s" in done[0]["status_line"]
+    assert done[0]["tokens_per_second"] == 5.0
+    assert "last 5.0 tok/s" in done[0]["status_line"]
     dumped = json.dumps(events)
     assert "user-key" not in dumped
     assert "session-key" not in dumped
@@ -1340,12 +1352,56 @@ def test_omitted_provider_cost_stays_unset(tmp_path: Path) -> None:
     assert done["prompt_tokens"] == 3
     assert done["completion_tokens"] == 1
     assert done["total_tokens"] == 4
-    assert done["tokens_per_second"] == 4.0
+    assert done["tokens_per_second"] == 5.0
     assert done["time_to_first_token_seconds"] == 0.05
     assert done["recent"] == ["200 0.25s"]
-    assert "spend $0" in done["status_line"]
+    assert "spend unknown" in done["status_line"]
+    assert "spend $0" not in done["status_line"]
+    assert "last 5.0 tok/s" in done["status_line"]
     assert "ttft" not in done["status_line"]
     assert "recent" not in done["status_line"]
+    assert "test-key" not in json.dumps(events)
+
+
+def test_omitted_cost_uses_catalog_prices_and_token_details(tmp_path: Path) -> None:
+    client = _QueueClient(
+        [
+            {
+                "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 100,
+                    "total_tokens": 1100,
+                    "prompt_tokens_details": {"cached_tokens": 800},
+                    "completion_tokens_details": {"reasoning_tokens": 40},
+                },
+                "choices": [{"message": {"content": "ok", "tool_calls": []}}],
+            }
+        ],
+        elapsed_seconds=0.5,
+        time_to_first_token_seconds=0.1,
+    )
+    model = OpenRouterModel(ModelConfig(model="priced/model", api_key="test-key"), client)
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
+    session.catalog = [
+        CatalogModel(
+            id="priced/model",
+            prompt_price="0.000002",
+            completion_price="0.00001",
+        )
+    ]
+
+    events = _run_protocol(['{"type":"user","text":"hi"}'], session, redact="test-key")
+
+    done = next(event for event in events if event["type"] == "done")
+    assert done["cached_tokens"] == 800
+    assert done["reasoning_tokens"] == 40
+    assert done["spend"] == pytest.approx(0.003)
+    assert "spend $0.003" in done["status_line"]
+    assert "spend unknown" not in done["status_line"]
+    assert "cached 800" in done["status_line"]
+    assert "reasoning 40" in done["status_line"]
+    assert done["tokens_per_second"] == 250.0
+    assert "last 250.0 tok/s" in done["status_line"]
     assert "test-key" not in json.dumps(events)
 
 

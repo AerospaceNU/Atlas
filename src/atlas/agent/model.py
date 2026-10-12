@@ -598,7 +598,14 @@ def _next_catalog_page(payload: dict[str, Any], current: str) -> str | None:
 
 
 def parse_usage(raw: object) -> TokenUsage:
-    """Read prompt, completion, total, and cost from a provider usage object."""
+    """Read token counts and cost from a provider usage object.
+
+    Cached tokens come from ``prompt_tokens_details.cached_tokens``, then
+    ``cached_tokens``, then ``cache_read_input_tokens``. Reasoning tokens come
+    from ``completion_tokens_details.reasoning_tokens``, then a top-level
+    ``reasoning_tokens``. The first present field wins, including an explicit
+    zero, so a later alias does not replace it.
+    """
     if not isinstance(raw, dict):
         return TokenUsage()
     prompt = _as_int(raw.get("prompt_tokens"))
@@ -609,8 +616,43 @@ def parse_usage(raw: object) -> TokenUsage:
         prompt_tokens=prompt,
         completion_tokens=completion,
         total_tokens=total,
+        cached_tokens=_cached_tokens(raw),
+        reasoning_tokens=_reasoning_tokens(raw),
         cost=_as_cost(raw.get("cost")),
     )
+
+
+def _cached_tokens(raw: dict[str, Any]) -> int:
+    cached = _detail_count(raw, "prompt_tokens_details", "cached_tokens")
+    if cached is not None:
+        return cached
+    for key in ("cached_tokens", "cache_read_input_tokens"):
+        if key in raw:
+            return _as_count(raw.get(key))
+    return 0
+
+
+def _reasoning_tokens(raw: dict[str, Any]) -> int:
+    reasoning = _detail_count(raw, "completion_tokens_details", "reasoning_tokens")
+    if reasoning is not None:
+        return reasoning
+    if "reasoning_tokens" in raw:
+        return _as_count(raw.get("reasoning_tokens"))
+    return 0
+
+
+def _detail_count(raw: dict[str, Any], group: str, key: str) -> int | None:
+    details = raw.get(group)
+    if not isinstance(details, dict) or key not in details:
+        return None
+    return _as_count(details.get(key))
+
+
+def _as_count(value: object) -> int:
+    number = _as_int(value)
+    if number < 0:
+        return 0
+    return number
 
 
 def parse_model_catalog(payload: object) -> list[CatalogModel]:

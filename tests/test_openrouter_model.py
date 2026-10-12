@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from atlas.agent.contracts import ChatMessage, Role, ToolDefinition
-from atlas.agent.metrics import tokens_per_second
+from atlas.agent.metrics import output_tokens_per_second
 from atlas.agent.model import (
     MISSING_KEY_MESSAGE,
     OPENROUTER_MODELS_URL,
@@ -272,8 +272,8 @@ def test_complete_keeps_usage_cost_status_and_elapsed_time() -> None:
     assert response.timing.http_status == 200
     assert response.timing.elapsed_seconds == 0.5
     assert response.timing.time_to_first_token_seconds == 0.1
-    speed = tokens_per_second(response.usage.completion_tokens, response.timing.elapsed_seconds)
-    assert speed == 8.0
+    speed = output_tokens_per_second(response.usage.completion_tokens, response.timing)
+    assert speed == 10.0
     assert client.calls[0]["headers"]["Authorization"] == "Bearer test-key"
 
 
@@ -298,8 +298,8 @@ def test_complete_reads_the_trailing_usage_frame_without_replacing_content() -> 
     assert response.usage.total_tokens == 16
     assert response.usage.cost == 0.02
     assert response.timing is not None
-    speed = tokens_per_second(response.usage.completion_tokens, response.timing.elapsed_seconds)
-    assert speed == 10.0
+    speed = output_tokens_per_second(response.usage.completion_tokens, response.timing)
+    assert speed is None
 
 
 def test_complete_omitted_usage_is_zero_and_has_no_cost() -> None:
@@ -316,7 +316,7 @@ def test_complete_omitted_usage_is_zero_and_has_no_cost() -> None:
     assert response.usage.total_tokens == 0
     assert response.usage.cost is None
     assert response.timing is not None
-    speed = tokens_per_second(response.usage.completion_tokens, response.timing.elapsed_seconds)
+    speed = output_tokens_per_second(response.usage.completion_tokens, response.timing)
     assert speed is None
 
 
@@ -383,9 +383,49 @@ def test_parse_usage_sums_a_missing_total_and_ignores_non_numeric_fields() -> No
     assert ignored.prompt_tokens == 0
     assert ignored.completion_tokens == 0
     assert ignored.total_tokens == 0
+    assert ignored.cached_tokens == 0
+    assert ignored.reasoning_tokens == 0
     assert ignored.cost is None
     assert parse_usage(None).cost is None
     assert parse_usage([]).total_tokens == 0
+
+
+def test_parse_usage_reads_cached_and_reasoning_details() -> None:
+    parsed = parse_usage(
+        {
+            "prompt_tokens": 12,
+            "completion_tokens": 4,
+            "total_tokens": 16,
+            "prompt_tokens_details": {"cached_tokens": 8, "audio_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 3},
+            "cached_tokens": 99,
+            "reasoning_tokens": 99,
+        }
+    )
+    assert parsed.cached_tokens == 8
+    assert parsed.reasoning_tokens == 3
+
+    aliases = parse_usage(
+        {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "cache_read_input_tokens": 4,
+            "reasoning_tokens": 1,
+        }
+    )
+    assert aliases.cached_tokens == 4
+    assert aliases.reasoning_tokens == 1
+    assert aliases.total_tokens == 7
+
+    present_zero = parse_usage(
+        {
+            "prompt_tokens": 2,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "cached_tokens": 6,
+        }
+    )
+    assert present_zero.cached_tokens == 0
 
 
 def test_complete_keeps_non_2xx_status_and_a_short_body() -> None:
