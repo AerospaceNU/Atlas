@@ -36,7 +36,7 @@ If the workspace root contains `AGENTS.md`, a new session loads that file as pro
 
 ## Layout
 
-Project files go in `.atlas/` in the working directory: `sessions/`, `artifacts/`, and `data/`. User files go in `~/.atlas/`: `keys/`, `weights/`, and `defaults/`. The directory list is in [docs/atlas-layout.md](docs/atlas-layout.md).
+Project files go in `.atlas/` in the working directory: `sessions/`, `artifacts/`, `data/`, `skills/`, and `skills-drafts/`. User files go in `~/.atlas/` (`%USERPROFILE%\.atlas` on Windows): `keys/`, `weights/`, `defaults/`, and `skills/`. `ATLAS_HOME` overrides that user directory. The directory list is in [docs/atlas-layout.md](docs/atlas-layout.md).
 
 ## Data CLI
 

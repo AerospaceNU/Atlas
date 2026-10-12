@@ -18,7 +18,15 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
-from atlas.agent.layout import EARTHDATA_TOKEN, project_data_dir, resolve_credential
+from atlas.agent.layout import (
+    EARTHDATA_TOKEN,
+    MANIFEST_TEMP_GLOB,
+    MANIFEST_TEMP_PREFIX,
+    MANIFEST_TEMP_SUFFIX,
+    project_data_dir,
+    pull_manifest_path,
+    resolve_credential,
+)
 from atlas.cli.catalog import (
     CatalogError,
     only_kind,
@@ -307,7 +315,7 @@ def run_data(
     prior_manifest: Mapping[str, Any] | None = None
     if getattr(args, "resume", False):
         try:
-            prior_manifest = _load_pull_manifest(args.out / "manifest.json")
+            prior_manifest = _load_pull_manifest(pull_manifest_path(args.out))
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
@@ -706,7 +714,7 @@ def _products_for_request(out_dir: Path, source: str, request: PullRequest) -> l
     Files from another date or area, and files the manifest did not list, are
     not included. A listed path that leaves ``out_dir`` is skipped.
     """
-    manifest_path = out_dir / "manifest.json"
+    manifest_path = pull_manifest_path(out_dir)
     if manifest_path.is_symlink() or not manifest_path.is_file():
         return []
     try:
@@ -895,7 +903,7 @@ def _write_manifest(
         "catalog_bbox_note": _catalog_bbox_note(request),
         "sources": sources_payload,
     }
-    _write_json_atomic(out_dir / "manifest.json", json.dumps(payload, indent=2) + "\n")
+    _write_json_atomic(pull_manifest_path(out_dir), json.dumps(payload, indent=2) + "\n")
 
 
 def _prior_sources(prior: Mapping[str, Any] | None) -> dict[str, Mapping[str, Any]]:
@@ -1040,7 +1048,7 @@ def _sweep_manifest_temps(directory: Path) -> None:
     if not directory.is_dir():
         return
     now = time.time()
-    for leftover in directory.glob(".manifest.json.*.tmp"):
+    for leftover in directory.glob(MANIFEST_TEMP_GLOB):
         if leftover.is_dir() and not leftover.is_symlink():
             continue
         try:
@@ -1065,7 +1073,9 @@ def _write_json_atomic(path: Path, text: str) -> None:
     """
     directory = path.parent
     _sweep_manifest_temps(directory)
-    fd, name = tempfile.mkstemp(dir=directory, prefix=".manifest.json.", suffix=".tmp")
+    fd, name = tempfile.mkstemp(
+        dir=directory, prefix=MANIFEST_TEMP_PREFIX, suffix=MANIFEST_TEMP_SUFFIX
+    )
     tmp = Path(name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

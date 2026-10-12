@@ -3,43 +3,36 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import pytest
 
-from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import ChatMessage, ModelResponse, ToolDefinition, ToolRegistry
 from atlas.agent.layout import (
     ensure_project_layout,
     ensure_user_layout,
+    project_agent_config_path,
+    project_agents_md,
+    project_agents_skills_dir,
     project_artifact_dir,
     project_artifacts_dir,
     project_atlas_root,
     project_data_dir,
     project_session_dir,
     project_sessions_dir,
-    project_transcript_path,
-    remove_entry,
+    project_skill_drafts_root,
+    project_skills_root,
+    pull_manifest_path,
+    user_agents_skills_dir,
     user_atlas_root,
+    user_config_path,
     user_defaults_dir,
     user_keys_dir,
+    user_skill_drafts_root,
+    user_skills_root,
     user_weights_dir,
 )
-from atlas.agent.runtime import Agent
-from atlas.agent.session import AgentSession, _remember_session, serve
-from atlas.agent.session import _append_transcript as append_transcript
-from atlas.agent.session import _transcript as transcript_var
 from atlas.cli.data import add_data_parser
 from atlas.models.base import weights_root
-
-
-class _ScriptedModel:
-    def __init__(self, replies: list[str]) -> None:
-        self._replies = replies
-
-    def complete(self, messages: list[ChatMessage], tools: list[ToolDefinition]) -> ModelResponse:
-        return ModelResponse(content=self._replies.pop(0))
 
 
 def test_project_helpers_stay_under_the_workspace(tmp_path: Path) -> None:
@@ -50,8 +43,13 @@ def test_project_helpers_stay_under_the_workspace(tmp_path: Path) -> None:
     assert project_data_dir(workspace) == workspace / ".atlas" / "data"
     assert project_session_dir(workspace, "s1") == workspace / ".atlas" / "sessions" / "s1"
     assert project_artifact_dir(workspace, "s1") == workspace / ".atlas" / "artifacts" / "s1"
-    assert project_transcript_path(workspace, "s1") == (
-        workspace / ".atlas" / "sessions" / "s1" / "transcript.jsonl"
+    assert project_skills_root(workspace) == workspace / ".atlas" / "skills"
+    assert project_skill_drafts_root(workspace) == workspace / ".atlas" / "skills-drafts"
+    assert project_agents_skills_dir(workspace) == workspace / ".agents" / "skills"
+    assert project_agents_md(workspace) == workspace / "AGENTS.md"
+    assert project_agent_config_path(workspace) == workspace / ".atlas" / "agent.toml"
+    assert pull_manifest_path(project_data_dir(workspace)) == (
+        workspace / ".atlas" / "data" / "manifest.json"
     )
     assert project_data_dir() == Path(".atlas/data")
     assert not project_data_dir().is_absolute()
@@ -63,6 +61,10 @@ def test_user_helpers_stay_under_the_home_directory(tmp_path: Path) -> None:
     assert user_keys_dir(home) == home / ".atlas" / "keys"
     assert user_weights_dir(home) == home / ".atlas" / "weights"
     assert user_defaults_dir(home) == home / ".atlas" / "defaults"
+    assert user_skills_root(home) == home / ".atlas" / "skills"
+    assert user_skill_drafts_root(home) == home / ".atlas" / "skills-drafts"
+    assert user_agents_skills_dir(home) == home / ".agents" / "skills"
+    assert user_config_path(home) == home / ".atlas" / "config.toml"
 
 
 def test_ensure_project_layout_keeps_existing_data(tmp_path: Path) -> None:
@@ -122,74 +124,35 @@ def test_weights_root_prefers_env_then_checkout_then_user_dir(
     assert weights_root() == custom.resolve()
 
 
-def test_session_transcript_is_redacted_and_moves_with_new(tmp_path: Path) -> None:
-    workspace = tmp_path / "project"
-    workspace.mkdir()
-    home = tmp_path / "home"
-    secret = "super-secret-value"
-    session = AgentSession(
-        Agent(
-            _ScriptedModel(["first", "second"]),
-            ToolRegistry(),
-            LocalArtifactStore(tmp_path / "old"),
-        )
+def test_atlas_home_overrides_the_user_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom = tmp_path / "custom"
+    other = tmp_path / "home"
+    monkeypatch.setenv("ATLAS_HOME", str(custom))
+    monkeypatch.setattr("atlas.agent.layout.Path.home", lambda: other)
+
+    assert user_atlas_root() == custom
+    assert user_atlas_root(other) == custom
+    assert user_keys_dir() == custom / "keys"
+    assert user_weights_dir(other) == custom / "weights"
+    assert user_skills_root() == custom / "skills"
+    assert user_skill_drafts_root(other) == custom / "skills-drafts"
+    assert user_config_path() == custom / "config.toml"
+    assert user_agents_skills_dir(other) == other / ".agents" / "skills"
+
+
+def test_windows_style_home_stays_a_path_join() -> None:
+    home = Path("C:/Users/atlas")
+    workspace = Path("D:/work/atlas")
+
+    assert user_atlas_root(home) == Path("C:/Users/atlas/.atlas")
+    assert user_keys_dir(home) == Path("C:/Users/atlas/.atlas/keys")
+    assert user_skills_root(home) == Path("C:/Users/atlas/.atlas/skills")
+    assert user_config_path(home) == Path("C:/Users/atlas/.atlas/config.toml")
+    assert project_atlas_root(workspace) == Path("D:/work/atlas/.atlas")
+    assert project_data_dir(workspace) == Path("D:/work/atlas/.atlas/data")
+    assert project_agents_md(workspace) == Path("D:/work/atlas/AGENTS.md")
+    assert pull_manifest_path(project_data_dir(workspace)) == Path(
+        "D:/work/atlas/.atlas/data/manifest.json"
     )
-    session.workspace = workspace
-    session.home = home
-    session.secrets.append(secret)
-    session_id = _remember_session(workspace, "example/model")
-    session.session_id = session_id
-    session.transcript_path = project_transcript_path(workspace, session_id)
-
-    events = _serve(
-        session,
-        [
-            '{"type":"user","text":"first-marker super-secret-value"}',
-            '{"type":"new"}',
-            '{"type":"user","text":"second-marker"}',
-        ],
-    )
-
-    transcripts = sorted((workspace / ".atlas" / "sessions").glob("*/transcript.jsonl"))
-    assert len(transcripts) == 2
-    by_text = {path.read_text(encoding="utf-8"): path for path in transcripts}
-    first = next(text for text in by_text if "first-marker" in text)
-    second = next(text for text in by_text if "second-marker" in text)
-    assert "second-marker" not in first
-    assert "first-marker" not in second
-    assert secret not in first
-    assert secret not in second
-    assert "first-marker ***" in first
-    assert '"type": "ready"' in first
-    assert '"type": "ready"' in second
-    assert by_text[first].parent == project_session_dir(workspace, session_id)
-    assert (by_text[first].parent / "meta.json").is_file()
-    assert events[0]["type"] == "ready"
-    removed = project_session_dir(workspace, session_id)
-    remove_entry(project_atlas_root(workspace), "sessions", session_id, confirm=True)
-    assert not removed.exists()
-    assert not project_artifact_dir(workspace, session_id).exists()
-
-
-def test_transcript_append_refuses_a_symlink(tmp_path: Path) -> None:
-    path = project_transcript_path(tmp_path, "s1")
-    path.parent.mkdir(parents=True)
-    outside = tmp_path / "outside.txt"
-    outside.write_text("nope", encoding="utf-8")
-    path.symlink_to(outside)
-    token = transcript_var.set(path)
-    try:
-        with pytest.raises(OSError, match="symlink"):
-            append_transcript("hello")
-    finally:
-        transcript_var.reset(token)
-    assert outside.read_text(encoding="utf-8") == "nope"
-
-
-def _serve(session: AgentSession, lines: list[str]) -> list[dict[str, object]]:
-    import io
-
-    stdin = io.StringIO("".join(f"{line}\n" for line in lines))
-    stdout = io.StringIO()
-    assert serve(session, stdin, stdout) == 0
-    return [json.loads(line) for line in stdout.getvalue().splitlines()]

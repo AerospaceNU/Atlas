@@ -13,7 +13,7 @@ The tool loop over one local artifact directory.
 | `runtime` | The bounded agent loop: call a tool, record the step, stop at the call budget. A run starts with the system prompt, then project instructions when the workspace root has `AGENTS.md`. |
 | `instructions` | Load `AGENTS.md` from the workspace root. Nested directories are not searched, and a closer file does not win over the root file. The text is delimited project guidance after the system prompt, not part of it. A missing file is silent. An unreadable or malformed file, including a FIFO, is skipped. Loading it cannot add tools or change the sandbox. |
 | `system_prompt` | The package system prompt (`system_prompt.md`). A workspace file cannot replace it. The text is cached for the life of the process, so an edit applies on the next start. |
-| `layout` | Project `.atlas/` and user `~/.atlas/` paths. The directory list is `docs/atlas-layout.md`. |
+| `layout` | Project `.atlas/` and user `~/.atlas/` paths. `ATLAS_HOME` overrides the user root. The directory list is `docs/atlas-layout.md`. |
 | `session` | A multi-turn conversation on top of that loop, plus the `python -m atlas.agent` entry. New sessions and artifacts are created under the project layout. |
 | `skills` | Load Agent Skills from the workspace read root and activate one with `use_skill`. `.atlas/skills-drafts` is not loaded. Home skills stay off unless `ATLAS_HOME_SKILLS=1` or `home_skills = true` in `~/.atlas/config.toml`. |
 | `analysis_skill` | Save a finished analysis as a draft under `.atlas/skills-drafts/`. `/enable-skill` shows the description and body hash before moving it into `.atlas/skills`. |
