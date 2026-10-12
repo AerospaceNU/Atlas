@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import tomllib
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -21,6 +22,7 @@ from atlas.agent.contracts import (
     ToolResult,
 )
 from atlas.agent.images import ingest_image, ingest_images, is_model_image
+from atlas.agent.instructions import load_project_instructions
 from atlas.agent.metrics import observe_model_call, tokens_per_second
 from atlas.agent.skills import (
     Skill,
@@ -154,24 +156,43 @@ class Agent:
         self.artifacts = artifacts
         self.max_tool_calls = max_tool_calls
         self.skills = list(skills or [])
+        self.instruction_nonce = secrets.token_hex(8)
 
     def system_prompt(self) -> str:
         """Return the package system prompt, plus the skill catalog when skills are loaded."""
         return render_system_prompt(load_system_prompt(), self.skills)
+
+    def opening_messages(self) -> list[ChatMessage]:
+        """Return the trusted system prompt and any project instructions.
+
+        The first message is :meth:`system_prompt` and nothing else. When the
+        project root has a readable instruction file, the next message is that
+        file as delimited project guidance with role ``user``. The wrapper tags
+        use :attr:`instruction_nonce`. A missing or unreadable file leaves the
+        list as the system message alone. Loading the file does not change
+        ``tools`` or either sandbox root.
+
+        Returns:
+            The messages that start a run or a session.
+        """
+        messages = [ChatMessage(role=Role.SYSTEM, content=self.system_prompt())]
+        instructions = load_project_instructions(self.artifacts, nonce=self.instruction_nonce)
+        if instructions is not None:
+            messages.append(ChatMessage(role=Role.USER, content=instructions))
+        return messages
 
     def run(self, request: str, *, images: Sequence[str] = ()) -> AgentRun:
         """Answer ``request``, making bounded, registry-approved tool calls.
 
         ``images`` are paths in the write sandbox or the project workspace.
         Each one is read through the store and sent with the user message.
+        Project instructions, when present, are inserted after the system
+        prompt and before ``request``.
         """
         user = ChatMessage(role=Role.USER, content=request)
         if images:
             user.images = ingest_images(self.artifacts, list(images))
-        messages = [
-            ChatMessage(role=Role.SYSTEM, content=self.system_prompt()),
-            user,
-        ]
+        messages = [*self.opening_messages(), user]
         return self.advance(messages)
 
     def advance(
