@@ -37,11 +37,12 @@ import unicodedata
 from collections.abc import Sequence
 
 from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.layout import AGENTS_MD_FILENAME
 
 _LOGGER = logging.getLogger(__name__)
 
 # Exact project-root filenames. Nested paths are not in this list.
-INSTRUCTION_FILENAMES: tuple[str, ...] = ("AGENTS.md",)
+INSTRUCTION_FILENAMES: tuple[str, ...] = (AGENTS_MD_FILENAME,)
 MAX_INSTRUCTION_BYTES = 100_000
 
 _OUTER_TAG = "untrusted_project_instructions"

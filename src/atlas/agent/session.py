@@ -31,6 +31,7 @@ from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
 from atlas.agent.images import ingest_images
 from atlas.agent.layout import (
+    ATLAS_SKILLS_RELATIVE,
     EARTHDATA_TOKEN,
     FIRMS_MAP_KEY,
     KEY_VARIABLES,
@@ -44,7 +45,10 @@ from atlas.agent.layout import (
     list_entries,
     prepare_credential,
     prepare_openrouter_key,
+    project_artifact_dir,
+    project_artifacts_dir,
     project_atlas_root,
+    project_session_dir,
     quiet_http_client_logs,
     read_user_key,
     remove_entry,
@@ -193,7 +197,7 @@ class AgentSession:
         self._clear_analysis()
         if self.workspace is not None:
             session_id = _remember_session(self.workspace, self.model_id)
-            artifact_root = project_atlas_root(self.workspace) / "artifacts" / session_id
+            artifact_root = project_artifact_dir(self.workspace, session_id)
             read_root = self.agent.artifacts.read_root
             self.agent.artifacts = LocalArtifactStore(artifact_root, read_root=read_root)
         self.messages = self.agent.opening_messages()
@@ -1094,7 +1098,7 @@ def _skill_scope(scope: object) -> str:
 
 def _add_enabled_skill(session: AgentSession, name: str, scope: str) -> str:
     """Add ``name`` to the live catalog without rehashing skills already loaded."""
-    from atlas.agent.skills import UseSkillTool, load_skill_directory
+    from atlas.agent.skills import UseSkillTool, load_skill_directory, user_skill_load_parts
 
     restart = "Restart Atlas to load this skill."
     workspace = session.workspace
@@ -1103,17 +1107,17 @@ def _add_enabled_skill(session: AgentSession, name: str, scope: str) -> str:
     if scope == "user":
         if session.home is None or not load_home_skills_enabled(workspace):
             return restart
-        base = session.home
-        label = "~/"
+        base, relative, label = user_skill_load_parts(session.home, name)
     else:
         base = workspace
+        relative = f"{ATLAS_SKILLS_RELATIVE}/{name}"
         label = ""
     try:
         skill = load_skill_directory(
             base,
-            f".atlas/skills/{name}",
+            relative,
             label_prefix=label,
-            artifact_root=project_atlas_root(workspace) / "artifacts",
+            artifact_root=project_artifacts_dir(workspace),
         )
     except OSError:
         return restart
@@ -1323,11 +1327,11 @@ def resolve_model(workspace: Path, cli_model: str | None) -> str:
 
 def _remember_session(workspace: Path, model_id: str) -> str:
     """Create a project session directory and a matching artifact directory."""
-    root = ensure_project_layout(workspace)
+    ensure_project_layout(workspace)
     session_id = uuid.uuid4().hex[:12]
-    session_dir = root / "sessions" / session_id
+    session_dir = project_session_dir(workspace, session_id)
     session_dir.mkdir(parents=True, exist_ok=True)
-    (root / "artifacts" / session_id).mkdir(parents=True, exist_ok=True)
+    project_artifact_dir(workspace, session_id).mkdir(parents=True, exist_ok=True)
     (session_dir / "meta.json").write_text(
         json.dumps(
             {
@@ -1371,7 +1375,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Writes stay inside this session's artifact directory so removing the
     # session removes them and cannot touch the workspace root. Reads may
     # fall back to the project workspace via the store's read_root.
-    artifact_root = project_atlas_root(workspace) / "artifacts" / session_id
+    artifact_root = project_artifact_dir(workspace, session_id)
     store = LocalArtifactStore(artifact_root, read_root=workspace)
     # Home skills are opt-in. The default session sees only the workspace.
     skill_home = home if load_home_skills_enabled(workspace) else None

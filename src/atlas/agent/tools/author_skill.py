@@ -19,12 +19,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.layout import (
+    ATLAS_SKILL_DRAFTS_RELATIVE,
+    project_atlas_root,
+    project_skill_drafts_root,
+)
 from atlas.agent.skill_author import (
     SkillAuthorError,
     SkillDraft,
     author_skill,
     is_within,
-    project_skill_drafts_root,
 )
 
 
@@ -71,7 +75,7 @@ class AuthorSkillTool(Tool):
             written = author_skill(root, draft)
         except SkillAuthorError as exc:
             raise ValueError(str(exc)) from exc
-        artifact = f".atlas/skills-drafts/{written.name}/SKILL.md"
+        artifact = f"{ATLAS_SKILL_DRAFTS_RELATIVE}/{written.name}/SKILL.md"
         return ToolResult(
             text=(
                 f"Wrote draft skill {written.name} at {artifact}. "
@@ -98,12 +102,12 @@ def _contained_drafts_root(base: Path, drafts_root: Path) -> Path:
     also be that exact directory.
     """
     root = base.expanduser().resolve()
-    atlas = base / ".atlas"
+    atlas = project_atlas_root(base)
     if atlas.is_symlink() and not is_within(root, atlas):
         raise ValueError("Skills root escapes the sandbox")
     if drafts_root.is_symlink():
         raise ValueError("Skills root escapes the sandbox")
-    expected = root / ".atlas" / "skills-drafts"
+    expected = project_skill_drafts_root(root)
     try:
         resolved = drafts_root.resolve()
     except OSError as exc:

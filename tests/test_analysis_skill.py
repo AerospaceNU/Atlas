@@ -1319,7 +1319,7 @@ def test_user_scope_error_names_the_home_skills_setting(
 ) -> None:
     monkeypatch.delenv("ATLAS_HOME_SKILLS", raising=False)
     home = tmp_path / "home"
-    monkeypatch.setattr("atlas.agent.skills.Path.home", lambda: home)
+    monkeypatch.setattr("atlas.agent.layout.Path.home", lambda: home)
     session = _saved_session(tmp_path)
     session.save_finished_skill("coast-check", scope="user")
     project = tmp_path / "project"

@@ -30,7 +30,13 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from atlas.agent.layout import user_atlas_root
+from atlas.agent.layout import (
+    SKILL_DRAFTS_DIR_NAME,
+    SKILLS_DIR_NAME,
+    project_atlas_root,
+    user_atlas_root,
+    user_skill_drafts_root,
+)
 from atlas.agent.runtime import AgentRun
 from atlas.agent.skill_author import (
     SkillAuthorError,
@@ -49,8 +55,8 @@ _MAX_DESCRIPTION = 200
 _MAX_STEP_TEXT = 500
 _MAX_RESPONSE = 2000
 _SMALL_RESOURCE_CHARACTERS = 2000
-_DRAFTS_DIR = "skills-drafts"
-_SKILLS_DIR = "skills"
+_DRAFTS_DIR = SKILL_DRAFTS_DIR_NAME
+_SKILLS_DIR = SKILLS_DIR_NAME
 _REDACTED = "***"
 _RENAME_NOREPLACE = 1
 _AT_FDCWD = -100
@@ -399,7 +405,7 @@ def _enable_skill(
         skills.mkdir(parents=True)
     destination = skills / loaded.slug
     base = _scope_base(workspace, scope, home)
-    if destination.is_symlink() or not is_within(base, destination):
+    if destination.is_symlink() or not _inside_layout(base, destination, skills.parent):
         raise SkillSaveError("skill path escapes the atlas root")
     _rename_exclusive(loaded.source, destination)
     return SavedSkill(
@@ -518,10 +524,12 @@ def _drafts_root(workspace: Path, scope: str, home: Path | None) -> Path:
     """Return the drafts directory the ``author_skill`` tool writes."""
     base = _scope_base(workspace, scope, home)
     if scope == "user":
-        drafts = user_atlas_root(base) / _DRAFTS_DIR
+        atlas = user_atlas_root(base)
+        drafts = user_skill_drafts_root(base)
     else:
+        atlas = project_atlas_root(base)
         drafts = project_skill_drafts_root(base)
-    _refuse_escape(base, drafts)
+    _refuse_escape(base, drafts, atlas=atlas)
     if drafts.exists() and not drafts.is_dir():
         raise SkillSaveError("skills-drafts directory is not a directory")
     return drafts
@@ -529,25 +537,37 @@ def _drafts_root(workspace: Path, scope: str, home: Path | None) -> Path:
 
 def _skills_root(workspace: Path, scope: str, home: Path | None) -> Path:
     base = _scope_base(workspace, scope, home)
-    skills = user_skills_root(base) if scope == "user" else project_skills_root(base)
-    _refuse_escape(base, skills)
+    if scope == "user":
+        atlas = user_atlas_root(base)
+        skills = user_skills_root(base)
+    else:
+        atlas = project_atlas_root(base)
+        skills = project_skills_root(base)
+    _refuse_escape(base, skills, atlas=atlas)
     if skills.exists() and not skills.is_dir():
         raise SkillSaveError("skills directory is not a directory")
     return skills
 
 
-def _refuse_escape(base: Path, path: Path) -> None:
-    """Refuse a symlink, then require :func:`is_within` to keep ``path`` in ``base``.
+def _refuse_escape(base: Path, path: Path, *, atlas: Path) -> None:
+    """Refuse a symlink, then keep ``path`` inside ``base`` or ``atlas``.
 
     ``author_skill`` follows a directory symlink, so a drafts or skills
     directory that is itself a symlink is refused even when the target stays
-    inside ``base``.
+    inside ``base``. ``atlas`` is the project or user ``.atlas`` root from the
+    layout helpers. ``ATLAS_HOME`` may sit outside ``base``; a path inside
+    that root is still accepted.
     """
-    for candidate in (base / ".atlas", path):
+    for candidate in (atlas, path):
         if candidate.is_symlink():
             raise SkillSaveError(f"{candidate.name} directory must not be a symlink")
-    if not is_within(base, path):
+    if not _inside_layout(base, path, atlas):
         raise SkillSaveError("skill path escapes the atlas root")
+
+
+def _inside_layout(base: Path, path: Path, atlas: Path) -> bool:
+    """Return whether ``path`` stays inside the scope base or the atlas root."""
+    return is_within(base, path) or is_within(atlas, path)
 
 
 class _LoadedDraft:
@@ -564,11 +584,16 @@ def _load_draft(workspace: Path, name: str, *, scope: str, home: Path | None) ->
     base = _scope_base(workspace, scope, home)
     drafts = _drafts_root(workspace, scope, home)
     source = drafts / slug
-    if source.is_symlink() or not source.is_dir() or not is_within(base, source):
+    atlas = drafts.parent
+    if source.is_symlink() or not source.is_dir() or not _inside_layout(base, source, atlas):
         raise SkillSaveError("draft skill was not found")
     _refuse_symlinks(source)
     skill_file = source / "SKILL.md"
-    if skill_file.is_symlink() or not skill_file.is_file() or not is_within(base, skill_file):
+    if (
+        skill_file.is_symlink()
+        or not skill_file.is_file()
+        or not _inside_layout(base, skill_file, atlas)
+    ):
         raise SkillSaveError("draft skill was not found")
     try:
         text = skill_file.read_text(encoding="utf-8")

@@ -22,7 +22,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from atlas.agent.layout import project_atlas_root, user_atlas_root
+from atlas.agent.layout import project_skill_drafts_root as project_skill_drafts_root
+from atlas.agent.layout import project_skills_root as project_skills_root
+from atlas.agent.layout import user_skills_root as user_skills_root
 
 MAX_SKILL_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
@@ -79,44 +81,6 @@ class _PreparedSkill:
     compatibility: str | None
     metadata: dict[str, str]
     allowed_tools: str | None
-
-
-def project_skills_root(workspace: Path) -> Path:
-    """Return ``<workspace>/.atlas/skills`` without creating it.
-
-    Args:
-        workspace: Project directory that contains ``.atlas``.
-
-    Returns:
-        The project skills directory.
-    """
-    return project_atlas_root(workspace) / "skills"
-
-
-def project_skill_drafts_root(workspace: Path) -> Path:
-    """Return ``<workspace>/.atlas/skills-drafts`` without creating it.
-
-    Drafts are not loaded from ``.atlas/skills``. A person promotes one later.
-
-    Args:
-        workspace: Project directory that contains ``.atlas``.
-
-    Returns:
-        The project skill drafts directory.
-    """
-    return project_atlas_root(workspace) / "skills-drafts"
-
-
-def user_skills_root(home: Path | None = None) -> Path:
-    """Return ``<home>/.atlas/skills`` without creating it.
-
-    Args:
-        home: Directory that contains ``.atlas``. ``None`` uses the real home.
-
-    Returns:
-        The user skills directory.
-    """
-    return user_atlas_root(home) / "skills"
 
 
 def normalize_skill_name(name: object) -> tuple[str | None, list[str]]:

@@ -552,7 +552,7 @@ def test_home_skills_stay_off_unless_explicitly_enabled(
     assert load_skills(store, home=None) == []
     assert load_home_skills_enabled(workspace) is False
 
-    monkeypatch.setattr("atlas.agent.skills.Path.home", lambda: home)
+    monkeypatch.setattr("atlas.agent.layout.Path.home", lambda: home)
     (workspace / ".atlas").mkdir()
     (workspace / ".atlas" / "agent.toml").write_text("home_skills = true\n", encoding="utf-8")
     assert load_home_skills_enabled(workspace) is False
@@ -567,6 +567,34 @@ def test_home_skills_stay_off_unless_explicitly_enabled(
     assert load_home_skills_enabled(workspace) is True
     monkeypatch.setenv("ATLAS_HOME_SKILLS", "0")
     assert load_home_skills_enabled(workspace) is False
+
+
+def test_atlas_home_skills_use_the_overridden_user_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ATLAS_HOME_SKILLS", raising=False)
+    custom = tmp_path / "custom"
+    other = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("ATLAS_HOME", str(custom))
+    monkeypatch.setattr("atlas.agent.layout.Path.home", lambda: other)
+    (other / ".atlas").mkdir(parents=True)
+    (other / ".atlas" / "config.toml").write_text("home_skills = true\n", encoding="utf-8")
+    assert load_home_skills_enabled(workspace) is False
+
+    custom.mkdir()
+    (custom / "config.toml").write_text("home_skills = true\n", encoding="utf-8")
+    assert load_home_skills_enabled(workspace) is True
+
+    _write_skill(custom / "skills", "coast", _coast_skill("from atlas home"))
+    _write_skill(other / ".atlas" / "skills", "ignored", _named_skill("ignored", "process home"))
+    _write_skill(other / ".agents" / "skills", "agents", _named_skill("agents", "from agents"))
+    skills = {skill.name: skill for skill in load_skills(_store(workspace), home=other)}
+
+    assert set(skills) == {"coast", "agents"}
+    assert skills["coast"].directory == "~/.atlas/skills/coast"
+    assert skills["agents"].directory == "~/.agents/skills/agents"
 
 
 def test_skill_body_cannot_close_the_untrusted_wrapper(tmp_path: Path) -> None:
