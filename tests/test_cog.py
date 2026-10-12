@@ -280,11 +280,13 @@ class _RangeLog:
         honor_range: bool = True,
         allow_full: bool = False,
         fail_first: int = 0,
+        retry_after: str | None = None,
     ) -> None:
         self.blob = blob
         self.honor_range = honor_range
         self.allow_full = allow_full
         self.fail_first = fail_first
+        self.retry_after = retry_after
         self.failures = 0
         self.calls: list[tuple[int, int] | None] = []
         self.body_reads = 0
@@ -305,7 +307,8 @@ class _RangeLog:
         if self.fail_first > 0:
             self.fail_first -= 1
             self.failures += 1
-            return httpx.Response(503, content=b"busy")
+            headers = {} if self.retry_after is None else {"Retry-After": self.retry_after}
+            return httpx.Response(503, headers=headers, content=b"busy")
         if not self.honor_range:
             return httpx.Response(200, stream=_CountingStream(self, self.blob))
         if start < 0 or end < start or end >= len(self.blob):
@@ -965,8 +968,21 @@ async def test_adjacent_tile_ranges_are_fetched_together() -> None:
     assert np.array_equal(read.array, pixels[:, 0:2, 0:4])
 
 
+def _patch_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record range waits and pin jitter at zero. ``Retry-After`` is not jittered."""
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(cog.random, "uniform", lambda _low, _high: 0.0)
+    monkeypatch.setattr(cog.asyncio, "sleep", fake_sleep)
+    return delays
+
+
 @pytest.mark.asyncio
-async def test_transient_range_status_is_retried() -> None:
+async def test_transient_range_status_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _patch_backoff(monkeypatch)
     built = _geographic()
     log = _RangeLog(built.blob, fail_first=1)
     async with httpx.AsyncClient(transport=log.transport()) as http:
@@ -979,8 +995,130 @@ async def test_transient_range_status_is_retried() -> None:
             north=9.0,
         )
     assert log.failures == 1
+    assert delays == [0.5]
     assert np.array_equal(read.array, np.array([[[42, 43], [52, 53]]], dtype=np.uint8))
     assert _tiles_touched(log.range_calls(), built.tile_spans) == {9}
+
+
+@pytest.mark.asyncio
+async def test_range_retries_wait_half_a_second_then_one_then_two(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays = _patch_backoff(monkeypatch)
+    built = _geographic()
+    log = _RangeLog(built.blob, fail_first=3)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        read = await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-9.5,
+            south=8.5,
+            east=-9.0,
+            north=9.0,
+        )
+    assert log.failures == 3
+    assert delays == [0.5, 1.0, 2.0]
+    assert np.array_equal(read.array, np.array([[[42, 43], [52, 53]]], dtype=np.uint8))
+
+
+@pytest.mark.asyncio
+async def test_range_backoff_includes_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _patch_backoff(monkeypatch)
+
+    def uniform(low: float, high: float) -> float:
+        assert low < 0.0 < high
+        return high
+
+    monkeypatch.setattr(cog.random, "uniform", uniform)
+    built = _geographic()
+    log = _RangeLog(built.blob, fail_first=3)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-9.5,
+            south=8.5,
+            east=-9.0,
+            north=9.0,
+        )
+    fraction = cog._JITTER_FRACTION
+    assert delays == [
+        0.5 + 0.5 * fraction,
+        1.0 + 1.0 * fraction,
+        2.0 + 2.0 * fraction,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_header_sets_the_range_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _patch_backoff(monkeypatch)
+    built = _geographic()
+    log = _RangeLog(built.blob, fail_first=1, retry_after="2")
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-9.5,
+            south=8.5,
+            east=-9.0,
+            north=9.0,
+        )
+    assert delays == [2.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _patch_backoff(monkeypatch)
+    built = _geographic()
+    log = _RangeLog(built.blob, fail_first=1, retry_after="120")
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-9.5,
+            south=8.5,
+            east=-9.0,
+            north=9.0,
+        )
+    assert delays == [60.0]
+
+
+@pytest.mark.asyncio
+async def test_past_retry_after_date_waits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _patch_backoff(monkeypatch)
+    built = _geographic()
+    log = _RangeLog(built.blob, fail_first=1, retry_after="Wed, 21 Oct 2015 07:28:00 GMT")
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-9.5,
+            south=8.5,
+            east=-9.0,
+            north=9.0,
+        )
+    assert delays == [0.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", ["inf", "+inf", "-inf", "nan", "NaN"])
+async def test_non_finite_retry_after_falls_back_to_backoff(
+    monkeypatch: pytest.MonkeyPatch, header: str
+) -> None:
+    delays = _patch_backoff(monkeypatch)
+    built = _geographic()
+    log = _RangeLog(built.blob, fail_first=1, retry_after=header)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-9.5,
+            south=8.5,
+            east=-9.0,
+            north=9.0,
+        )
+    assert delays == [0.5]
+    assert all(math.isfinite(delay) for delay in delays)
 
 
 @pytest.mark.asyncio

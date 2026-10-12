@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import math
+import random
 import struct
 import zlib
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Final
 from urllib.parse import urlparse
 
@@ -64,7 +67,11 @@ _COMPRESS_NONE: Final[int] = 1
 _COMPRESS_LZW: Final[int] = 5
 _COMPRESS_DEFLATE: Final[frozenset[int]] = frozenset({8, 32946})
 _MAX_RANGE_BYTES: Final[int] = 8 * 1024 * 1024
-_RANGE_ATTEMPTS: Final[int] = 3
+# First try plus three retries. The waits are about 0.5s, 1s, and 2s.
+_RANGE_ATTEMPTS: Final[int] = 4
+_BACKOFF_SECONDS: Final[float] = 0.5
+_JITTER_FRACTION: Final[float] = 0.2
+_MAX_BACKOFF_SECONDS: Final[float] = 60.0
 _RETRY_STATUS: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
 _MAX_IFD_ENTRIES: Final[int] = 128
 _MAX_TILES: Final[int] = 8192
@@ -161,16 +168,20 @@ class _RangeReader:
         return data
 
     async def _fetch_with_retries(self, start: int, end: int, expected: int) -> bytes:
-        """Retry transport failures and a few server statuses, not a refused range."""
+        """Retry transport failures and a few server statuses, not a refused range.
+
+        A 200 or 416 is not retried. The wait is a finite ``Retry-After`` when
+        the response has one, otherwise about 0.5s, 1s, and 2s with jitter.
+        """
         attempt = 0
         while True:
             try:
                 return await self._stream_range(start, end, expected)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 attempt += 1
                 if attempt >= _RANGE_ATTEMPTS:
                     raise
-                await asyncio.sleep(0.05 * attempt)
+                await asyncio.sleep(_retry_delay(exc, attempt))
 
     async def _stream_range(self, start: int, end: int, expected: int) -> bytes:
         """Read one range, and do not buffer a body the server did not slice.
@@ -868,6 +879,66 @@ def _snap(value: float) -> float:
     if abs(value - nearest) <= 1e-8:
         return float(nearest)
     return value
+
+
+def _apply_jitter(delay: float) -> float:
+    """Return ``delay`` shifted by a fraction of itself, still inside the cap."""
+    if delay <= 0.0 or not math.isfinite(delay):
+        return 0.0
+    span = delay * _JITTER_FRACTION
+    jittered = delay + random.uniform(-span, span)
+    if not math.isfinite(jittered):
+        return min(delay, _MAX_BACKOFF_SECONDS)
+    return min(_MAX_BACKOFF_SECONDS, max(0.0, jittered))
+
+
+def _retry_delay(exc: BaseException, attempt: int) -> float:
+    """Return the seconds to wait before the next range attempt.
+
+    ``attempt`` is the 1-based number of the attempt that just failed.
+    A parsed finite ``Retry-After`` is used as given, capped. The computed
+    backoff is jittered: about 0.5s, then 1s, then 2s.
+    """
+    header = _retry_after_seconds(exc)
+    if header is None:
+        base = _BACKOFF_SECONDS * (2 ** (attempt - 1))
+        return _apply_jitter(min(base, _MAX_BACKOFF_SECONDS))
+    return min(header, _MAX_BACKOFF_SECONDS)
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    raw = getter("Retry-After")
+    if raw is None:
+        raw = getter("retry-after")
+    if not isinstance(raw, str):
+        return None
+    return _parse_retry_after(raw.strip())
+
+
+def _parse_retry_after(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        # inf and nan would sleep forever or raise inside asyncio.sleep.
+        if not math.isfinite(parsed):
+            return None
+        return max(0.0, parsed)
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
 def _coalesce(spans: list[tuple[int, int]], limit: int) -> list[tuple[int, int]]:
