@@ -440,6 +440,11 @@ async def execute_pull(
             if mismatch is not None:
                 print(mismatch, file=sys.stderr)
                 return 2
+        unavailable = _unavailable_cursors(prior_manifest) if prior_manifest is not None else None
+        if unavailable:
+            for name in sorted(unavailable):
+                if name in live_clients:
+                    print(f"{name}: {_unavailable_note(unavailable[name])}", file=sys.stderr)
         for name in live_clients:
             reporter.source_start(name)
         catalog = await aggregate(
@@ -449,6 +454,7 @@ async def execute_pull(
                 src.source, scenes=len(src.scenes), error=src.error
             ),
             page_cursors=page_cursors,
+            unavailable_cursors=unavailable,
         )
         report = DownloadReport()
         table_failed = False
@@ -676,6 +682,10 @@ def _write_manifest(
                 "bbox": bbox,
                 "search_url": src.search_url,
                 "next_cursor": _manifest_cursor(src.next_cursor),
+                "next_cursor_unavailable": src.next_cursor_unavailable,
+                "note": _unavailable_note(src.next_cursor_unavailable)
+                if src.next_cursor_unavailable
+                else None,
                 "error": src.error,
                 "_cursor_rejected": src.cursor_rejected,
                 "n_scenes": len(src.scenes),
@@ -800,20 +810,63 @@ def _cursor_present(value: object) -> bool:
     return _wire_cursor(value) is not None
 
 
-def _write_json_atomic(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` via a temp file, fsync, and ``os.replace``.
+def _unavailable_note(reason: str) -> str:
+    """Return the source note for a cursor that was not stored."""
+    if reason == "signed":
+        return "The next page link was signed and was not stored. Later pages were not fetched."
+    return "The next page cursor is unavailable. Later pages were not fetched."
 
-    A failed replace leaves the previous file in place and removes the temp file.
+
+def _unavailable_cursors(payload: Mapping[str, Any]) -> dict[str, str]:
+    """Return sources whose next page exists but was not stored."""
+    found: dict[str, str] = {}
+    sources = payload.get("sources")
+    if not isinstance(sources, list):
+        return found
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("source")
+        if not isinstance(name, str) or not name or _wire_cursor(item.get("next_cursor")):
+            continue
+        reason = item.get("next_cursor_unavailable")
+        if isinstance(reason, str) and reason.strip():
+            found[name] = reason.strip()
+    return found
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flush the directory entry written by ``os.replace``."""
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_json_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via an exclusive temp file, fsync, and ``os.replace``.
+
+    The directory is fsynced after the replace. A failed replace leaves the
+    previous file in place and removes the temp file this write created.
     """
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd: int | None = None
+    created = False
     try:
-        with tmp.open("w", encoding="utf-8") as handle:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        created = True
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        _fsync_directory(path.parent)
     except Exception:
-        if tmp.exists():
+        if fd is not None:
+            os.close(fd)
+        if created and tmp.exists():
             with contextlib.suppress(OSError):
                 tmp.unlink()
         raise
@@ -932,6 +985,8 @@ def _print_run_summary(
         )
         if src.error:
             failure_lines.append(f"{src.source}: search {src.error}")
+        elif src.next_cursor_unavailable:
+            failure_lines.append(f"{src.source}: {_unavailable_note(src.next_cursor_unavailable)}")
         for item in items:
             if item.error:
                 failure_lines.append(f"{src.source} {item.scene_id}: {item.error}")

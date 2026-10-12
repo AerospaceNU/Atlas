@@ -128,10 +128,12 @@ class StacApiClient(DataPullClient):
             )
             if scene is not None:
                 scenes.append(scene)
+        cursor, unavailable = _next_page_cursor(payload, self.search_url)
         return PullResult(
             request=request,
             scenes=scenes,
-            next_cursor=_next_page_cursor(payload, self.search_url),
+            next_cursor=cursor,
+            next_cursor_unavailable=unavailable,
         )
 
     def _cloud_query(self, request: PullRequest) -> dict[str, Any] | None:
@@ -236,32 +238,38 @@ def _query_is_signed(url: str) -> bool:
     return False
 
 
-def _next_page_cursor(payload: Mapping[str, Any], search_url: str) -> str | None:
+def _next_page_cursor(payload: Mapping[str, Any], search_url: str) -> tuple[str | None, str | None]:
     """Return the next-page cursor from a STAC Item Search response.
 
     A ``links`` entry with ``rel`` ``next`` is the cursor. Its body is kept
     whole, including keys other than ``token``, along with ``method`` and
     ``merge``. A GET href on the search host is stored when the query is not
-    signed. A signed query is not stored. One page is read; the cursor is
-    only recorded.
+    signed. A signed query is not stored. When that signed href is the only
+    continuation, the cursor is unavailable with reason ``signed`` rather
+    than looking like the last page. One page is read; the cursor is only
+    recorded.
 
     Args:
         payload: STAC FeatureCollection.
         search_url: This client's item-search URL, used to resolve relative links.
 
     Returns:
-        A JSON cursor, or None when there is no next page worth storing.
+        The JSON cursor and None, or None and an unavailable reason. Both are
+        None when the response has no next page.
     """
     links = payload.get("links")
     if not isinstance(links, list):
-        return None
+        return None, None
+    unavailable: str | None = None
     for link in links:
         if not isinstance(link, dict) or link.get("rel") != "next":
             continue
-        cursor = _cursor_from_link(link, search_url)
+        cursor, reason = _cursor_from_link(link, search_url)
         if cursor:
-            return cursor
-    return None
+            return cursor, None
+        if reason and unavailable is None:
+            unavailable = reason
+    return None, unavailable
 
 
 def _json_object(value: object) -> dict[str, Any] | None:
@@ -305,25 +313,30 @@ def _classify_href(href: object, search_url: str) -> tuple[str | None, str]:
     return absolute, "ok"
 
 
-def _cursor_from_link(link: Mapping[str, Any], search_url: str) -> str | None:
+def _cursor_from_link(link: Mapping[str, Any], search_url: str) -> tuple[str | None, str | None]:
+    """Return a stored cursor, or None and ``signed`` when that is the only continuation."""
     body = _json_object(link.get("body"))
     method = _link_method(link, body)
     if method is None:
-        return None
+        return None, None
     href, status = _classify_href(link.get("href"), search_url)
     if method == "GET":
-        if status != "ok" or href is None:
-            return None
-        return encode_page_cursor({"method": "GET", "href": href}) or None
+        if status == "ok" and href is not None:
+            return encode_page_cursor({"method": "GET", "href": href}) or None, None
+        if status == "signed" and body is None:
+            return None, "signed"
+        return None, None
     stored_href = href if status in {"ok", "bare"} else None
+    if body is None and status == "signed":
+        return None, "signed"
     if body is None and (stored_href is None or status == "bare"):
-        return None
+        return None, None
     spec: dict[str, Any] = {"method": "POST", "merge": link.get("merge") is True}
     if stored_href is not None:
         spec["href"] = stored_href
     if body is not None:
         spec["body"] = body
-    return encode_page_cursor(spec) or None
+    return encode_page_cursor(spec) or None, None
 
 
 def _cursor_request(

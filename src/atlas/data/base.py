@@ -924,6 +924,10 @@ class PullResult(BaseModel):
     scenes: list[Scene]
     # Opaque STAC next-page cursor. None when the response has no next link.
     next_cursor: str | None = None
+    # Why the next page could not be recorded. None when the cursor is present
+    # or the response has no next link. "signed" means the only continuation
+    # was a signed href, which is not stored.
+    next_cursor_unavailable: str | None = None
 
     @model_validator(mode="after")
     def _clip_to_polygon(self) -> Self:

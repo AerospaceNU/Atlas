@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import stat
 from datetime import date
 from pathlib import Path
 from typing import Any, ClassVar
@@ -233,6 +234,9 @@ async def test_cross_origin_and_bare_next_links_are_not_cursors() -> None:
     assert cross.next_cursor is None
     assert bare.next_cursor is None
     assert missing.next_cursor is None
+    assert cross.next_cursor_unavailable is None
+    assert bare.next_cursor_unavailable is None
+    assert missing.next_cursor_unavailable is None
 
 
 @pytest.mark.asyncio
@@ -789,6 +793,7 @@ async def test_signed_next_href_is_not_stored(query: str) -> None:
     finally:
         await http.aclose()
     assert result.next_cursor is None
+    assert result.next_cursor_unavailable == "signed"
     assert "secret-value" not in json.dumps(result.model_dump(mode="json"))
 
 
@@ -903,9 +908,11 @@ def test_manifest_is_replaced_after_fsync(tmp_path: Path, monkeypatch: pytest.Mo
     order: list[str] = []
     real_fsync = os.fsync
     real_replace = os.replace
+    real_open = os.open
 
     def spy_fsync(fd: int) -> None:
-        order.append("fsync")
+        kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        order.append(kind)
         real_fsync(fd)
 
     def spy_replace(src: str | Path, dst: str | Path) -> None:
@@ -916,13 +923,78 @@ def test_manifest_is_replaced_after_fsync(tmp_path: Path, monkeypatch: pytest.Mo
         order.append("replace")
         real_replace(src, dst)
 
+    def spy_open(
+        path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if str(path).endswith(".tmp"):
+            assert flags & os.O_CREAT
+            assert flags & os.O_EXCL
+            assert flags & os.O_WRONLY
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
     monkeypatch.setattr(os, "fsync", spy_fsync)
     monkeypatch.setattr(os, "replace", spy_replace)
+    monkeypatch.setattr(os, "open", spy_open)
     _write_manifest(tmp_path, _sample_catalog("page-2"), DownloadReport())
-    assert order == ["fsync", "replace"]
+    assert order == ["file", "replace", "dir"]
     assert list(tmp_path.glob(".manifest.json.*.tmp")) == []
     written = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
     assert written["sources"][0]["next_cursor"] == "page-2"
+
+
+def test_manifest_temp_file_is_created_exclusively(tmp_path: Path) -> None:
+    tmp = tmp_path / f".manifest.json.{os.getpid()}.tmp"
+    tmp.write_text("keep-me", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        _write_manifest(tmp_path, _sample_catalog("page-2"), DownloadReport())
+    assert tmp.read_text(encoding="utf-8") == "keep-me"
+    assert not (tmp_path / "manifest.json").exists()
+
+
+def test_signed_get_without_a_body_stays_unavailable_on_resume(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=_page("scene-a", None, href="?sig=secret-value"))
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    clients = {"sentinel2": _SentinelStac(client=http)}
+    note = "The next page link was signed and was not stored. Later pages were not fetched."
+    try:
+        assert run_data(_pull_args(tmp_path), clients=clients) == 0
+        manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+        source = manifest["sources"][0]
+        assert source["scene_ids"] == ["scene-a"]
+        assert source["next_cursor"] is None
+        assert source["next_cursor_unavailable"] == "signed"
+        assert source["note"] == note
+        stored = (tmp_path / "manifest.json").read_text(encoding="utf-8")
+        assert "secret-value" not in stored
+        assert "sig=" not in stored
+        first_err = capsys.readouterr().err
+        assert "signed and was not stored" in first_err
+        assert "not fetched" in first_err
+        assert "secret-value" not in first_err
+        assert run_data(_pull_args(tmp_path, "--resume"), clients=clients) == 0
+        assert calls == 1
+        again = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+        resumed = again["sources"][0]
+        assert resumed["scene_ids"] == ["scene-a"]
+        assert resumed["next_cursor"] is None
+        assert resumed["next_cursor_unavailable"] == "signed"
+        assert resumed["note"] == note
+        err = capsys.readouterr().err
+        assert f"sentinel2: {note}" in err
+        assert "secret-value" not in err
+        assert "://" not in resumed["note"]
+    finally:
+        asyncio.run(http.aclose())
 
 
 def test_failed_manifest_replace_keeps_the_previous_file(

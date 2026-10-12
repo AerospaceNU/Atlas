@@ -175,6 +175,7 @@ def _stamp_source(name: str, collection: str, search_url: str, result: PullResul
         collection=collection,
         scenes=stamped,
         next_cursor=result.next_cursor,
+        next_cursor_unavailable=result.next_cursor_unavailable,
         search_url=search_url,
     )
 
@@ -243,6 +244,7 @@ async def _search_one(
     *,
     page_cursor: str | None = None,
     resume: bool = False,
+    unavailable: str | None = None,
 ) -> SourceScenes:
     collection, search_url = _client_meta(client)
     if resume and not page_cursor:
@@ -251,6 +253,7 @@ async def _search_one(
             collection=collection,
             scenes=[],
             next_cursor=None,
+            next_cursor_unavailable=unavailable,
             search_url=search_url,
         )
     budget: asyncio.Timeout | None = None
@@ -278,6 +281,7 @@ async def aggregate(
     *,
     on_source: Callable[[SourceScenes], None] | None = None,
     page_cursors: Mapping[str, str | None] | None = None,
+    unavailable_cursors: Mapping[str, str] | None = None,
 ) -> SceneCatalog:
     """Search every source for `request` and collect results into one catalog.
 
@@ -298,6 +302,8 @@ async def aggregate(
     searched from that cursor. A source present in the map with no cursor is
     already finished and is not searched again, so page one is not repeated.
     Sources absent from the map start at page one. Omit the map for a fresh pull.
+    A source with no cursor and an entry in ``unavailable_cursors`` is not
+    finished: the reason is kept so resume can say the next page was not fetched.
     A resume that fails with HTTP 4xx, other than 408 and 429, or with a
     cursor this client refuses to send, clears that cursor. HTTP 5xx, 408,
     and 429 keep it.
@@ -308,6 +314,8 @@ async def aggregate(
         on_source: Called as each source finishes.
         page_cursors: Per-source next-page cursor. None starts every source
             at page one.
+        unavailable_cursors: Per-source reason a next page exists but was not
+            stored. Used when that source's cursor is absent.
 
     Returns:
         Catalog of scenes, errors, and the next cursor for each source.
@@ -323,6 +331,7 @@ async def aggregate(
                 request,
                 page_cursor=page_cursors.get(name),
                 resume=name in page_cursors,
+                unavailable=None if unavailable_cursors is None else unavailable_cursors.get(name),
             )
         if on_source is not None:
             on_source(result)
