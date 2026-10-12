@@ -32,6 +32,13 @@ class HimawariClient(DataPullClient):
     """List AHI full-disk slots. Imagery covers the Asia-Pacific disk, not the Americas.
 
     One scene is one 10-minute slot; its assets are every band/segment file in it.
+    The disk crosses the antimeridian, from about 80°E through 180° to 160°W.
+
+    A dateline AOI is cut at ±180° and the slot is listed once when either side
+    meets the disk. Both sides share the same full-disk prefix, so a second
+    request would repeat the slot. The scene footprint stays the wrapping disk.
+    An HTTP failure while listing is raised rather than reported as no imagery.
+    An AOI that misses the disk is an empty result, not an error.
     """
 
     satellite: ClassVar[str] = "himawari"
@@ -61,7 +68,12 @@ class HimawariClient(DataPullClient):
         await self.aclose()
 
     async def search(self, request: PullRequest) -> PullResult:
-        if not _HIMAWARI_DISK.intersects(request.bbox):
+        """List settled full-disk slots when the AOI meets the Himawari disk.
+
+        A dateline AOI is tested one side at a time. The listing itself is not
+        split: the prefix does not depend on longitude.
+        """
+        if not _intersects_disk(request.bbox):
             return PullResult(request=request, scenes=[])
         cutoff = datetime.now(UTC) - _SETTLE
         scenes: list[Scene] = []
@@ -83,6 +95,11 @@ class HimawariClient(DataPullClient):
                 break
         scenes.reverse()
         return PullResult(request=request, scenes=scenes)
+
+
+def _intersects_disk(bbox: BBox) -> bool:
+    """True when any non-wrapping side of ``bbox`` meets the Himawari disk."""
+    return any(_HIMAWARI_DISK.intersects(part) for part in bbox.antimeridian_parts())
 
 
 def _days_inclusive(start: date, end: date) -> list[date]:

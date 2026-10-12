@@ -47,7 +47,8 @@ class BBox(BaseModel):
 
     Boxes may cross the antimeridian. ``west > east`` means the box runs east
     from ``west`` through 180° to ``east``, as in RFC 7946 and STAC. Geometry
-    helpers must handle wrapping boxes instead of splitting or rejecting them.
+    helpers keep that wrapping box. :meth:`antimeridian_parts` is the cut for
+    an API that requires ``west <= east``.
     """
 
     west: float = Field(..., ge=-180, le=180)
@@ -113,6 +114,35 @@ class BBox(BaseModel):
         if self.west > self.east:
             return [(self.west, 180.0), (-180.0, self.east)]
         return [(self.west, self.east)]
+
+    def antimeridian_parts(self) -> list[Self]:
+        """Non-wrapping boxes that cover this one.
+
+        WMS, the FIRMS area API, and GOES disk selection all require the west
+        edge to be less than or equal to the east edge. A box that does not
+        cross 180° is returned unchanged. A box that crosses is cut at ±180°.
+        A cut with no width is omitted, because +180° and -180° are the same
+        meridian and are already the edge of the other part.
+
+        Returns:
+            One or two boxes. Each has ``west <= east``.
+
+        Raises:
+            ValueError: The box crosses the antimeridian but neither side has width.
+        """
+        if self.west <= self.east:
+            return [self]
+        parts: list[Self] = []
+        for west, east in self._lon_ranges():
+            if east <= west:
+                continue
+            parts.append(type(self)(west=west, south=self.south, east=east, north=self.north))
+        if not parts:
+            raise ValueError(
+                "bbox crosses the antimeridian but has no width on either side of 180 "
+                f"(west={self.west}, east={self.east})"
+            )
+        return parts
 
     def as_list(self) -> list[float]:
         return [self.west, self.south, self.east, self.north]
