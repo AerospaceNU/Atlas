@@ -4,6 +4,9 @@ The header and the internal tiles that overlap the requested box are fetched
 with HTTP Range requests. Pixel tiles outside that box stay on the server.
 The full-resolution IFD is the one that is read; overview levels are not
 substituted for it.
+
+BigTIFF and LZW compression are later work. A BigTIFF header or an LZW tile
+is rejected instead of being read as a classic TIFF.
 """
 
 from __future__ import annotations
@@ -58,6 +61,7 @@ _TAG_NODATA: Final[int] = 42113
 _GEO_GEOGRAPHIC: Final[int] = 2048
 _GEO_PROJECTED: Final[int] = 3072
 _COMPRESS_NONE: Final[int] = 1
+_COMPRESS_LZW: Final[int] = 5
 _COMPRESS_DEFLATE: Final[frozenset[int]] = frozenset({8, 32946})
 _MAX_RANGE_BYTES: Final[int] = 8 * 1024 * 1024
 _RANGE_ATTEMPTS: Final[int] = 3
@@ -622,6 +626,8 @@ async def _parse_image(reader: _RangeReader) -> _Image:
     else:
         raise CogUnsupportedError("not a TIFF")
     magic = struct.unpack_from(endian + "H", header, 2)[0]
+    if magic == 43:
+        raise CogUnsupportedError("BigTIFF is later work")
     if magic != 42:
         raise CogUnsupportedError("only classic TIFF COGs can be windowed")
     ifd_at = struct.unpack_from(endian + "I", header, 4)[0]
@@ -669,6 +675,8 @@ async def _image_from_entries(
     compression = _COMPRESS_NONE
     if _TAG_COMPRESSION in entries:
         compression = _int_value(await _entry_ints(reader, endian, entries[_TAG_COMPRESSION]))
+    if compression == _COMPRESS_LZW:
+        raise CogUnsupportedError("LZW compression is later work")
     if compression != _COMPRESS_NONE and compression not in _COMPRESS_DEFLATE:
         raise CogUnsupportedError(f"TIFF compression {compression} is not windowed")
     predictor = 1

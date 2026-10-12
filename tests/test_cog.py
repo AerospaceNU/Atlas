@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
+import atlas.data.cog as cog
 from atlas.cli.data import run_data
 from atlas.cli.download import download_assets
 from atlas.data.base import Asset, BBox, DataPullClient, PullRequest, PullResult, Scene, SceneKind
@@ -115,6 +116,12 @@ def build_cog(
     dtype = np.dtype(f"{endian}u{pixels.dtype.itemsize}")
     tiles_x = math.ceil(width / tile)
     tiles_y = math.ceil(height / tile)
+    if compression == "deflate":
+        compression_code = 8
+    elif compression == "lzw":
+        compression_code = 5
+    else:
+        compression_code = 1
     if tile_blobs is not None:
         stored = list(tile_blobs)
     elif dimensions is not None:
@@ -142,7 +149,7 @@ def build_cog(
         _field(256, 4, [width], endian),
         _field(257, 4, [height], endian),
         _field(258, 3, [pixels.dtype.itemsize * 8] * bands, endian),
-        _field(259, 3, [8 if compression == "deflate" else 1], endian),
+        _field(259, 3, [compression_code], endian),
         _field(262, 3, [2 if bands == 3 else 1], endian),
         _field(277, 3, [bands], endian),
         _field(284, 3, [1], endian),
@@ -1010,6 +1017,55 @@ async def test_gdal_nodata_is_carried_through_the_window(nodata: str | None) -> 
         )
     assert again.nodata == nodata
     assert np.array_equal(again.array, read.array)
+
+
+def test_bigtiff_and_lzw_are_documented_as_later_work() -> None:
+    text = cog.__doc__ or ""
+    assert "BigTIFF" in text
+    assert "LZW" in text
+    assert "later work" in text
+
+
+@pytest.mark.asyncio
+async def test_bigtiff_is_rejected_as_later_work() -> None:
+    blob = struct.pack("<HHI", 0x4949, 43, 8)
+    log = _RangeLog(blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogUnsupportedError, match="BigTIFF is later work"):
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=0.0,
+                south=0.0,
+                east=1.0,
+                north=1.0,
+            )
+    assert log.range_calls() == [(0, 7)]
+
+
+@pytest.mark.asyncio
+async def test_lzw_is_rejected_as_later_work() -> None:
+    built = build_cog(
+        _grid(4, 4),
+        tile=2,
+        origin_x=0.0,
+        origin_y=4.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        compression="lzw",
+    )
+    log = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogUnsupportedError, match="LZW compression is later work"):
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=0.0,
+                south=2.0,
+                east=2.0,
+                north=4.0,
+            )
+    assert _tiles_touched(log.range_calls(), built.tile_spans) == set()
 
 
 def test_encode_rejects_an_empty_window() -> None:

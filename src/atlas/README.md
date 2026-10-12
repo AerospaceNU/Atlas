@@ -52,7 +52,7 @@ STAC and related search clients. `search` is the only required method, and it is
 | Module | What it holds |
 |---|---|
 | `base` | Shared models: bbox, scene, pull request/result, and the client interface. |
-| `cog` | Read a COG window with HTTP range requests instead of the whole granule. |
+| `cog` | Read a COG window with HTTP range requests instead of the whole granule. BigTIFF and LZW are later work. |
 | `registry` | Stable source names and `sources()` / `all_sources()`. |
 | `stac` | Generic STAC API client. |
 | `planetary_computer` | Microsoft Planetary Computer search and asset signing. |
