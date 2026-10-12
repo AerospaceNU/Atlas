@@ -9,6 +9,7 @@ from email.utils import parsedate_to_datetime
 
 from atlas.compile.product import SceneCatalog, SourceScenes
 from atlas.data.base import DataPullClient, PullRequest, PullResult, Scene
+from atlas.data.credentials import CredentialRejectedError, MissingCredentialError
 
 # One search plus two retries. A 429 after that is recorded like any other failure.
 _MAX_SEARCH_ATTEMPTS = 3
@@ -117,7 +118,11 @@ def _error_text(exc: Exception) -> str:
     """Return a status and reason, never the request URL or query string.
 
     ``str`` of an HTTP error includes the full URL, which can carry a key.
+    A missing or rejected credential is returned as its own message, which
+    names the variable and does not include a value.
     """
+    if isinstance(exc, (MissingCredentialError, CredentialRejectedError)):
+        return str(exc)
     status = _status_code(exc)
     response = getattr(exc, "response", None)
     reason = _reason_phrase(response) if response is not None else None
@@ -296,7 +301,17 @@ async def aggregate(
     ``asyncio.timeout``. Other sources keep running during that wait and if
     the budget runs out. Any other error is recorded on the first failure.
     An HTTP failure is stored as its status and reason phrase, with no
-    request URL or query string.
+    request URL or query string. A 401 or 403 from Earthdata or CDSE while
+    the credential is unset, and a FIRMS search with no map key, is stored
+    as the missing variable instead of that provider status. The message
+    names the variable and how to set it: Earthdata and FIRMS mention
+    ``/key`` and the env var, and CDSE mentions the env var only. Earthdata
+    and CDSE notice a missing credential only after that 401 or 403; they
+    do not check before the request. FIRMS checks before the request. A
+    401 or 403 while the credential is present names the variable and the
+    status, for example ``EARTHDATA_TOKEN was rejected (HTTP 401)``. The
+    variables are ``EARTHDATA_TOKEN``, ``FIRMS_MAP_KEY``, and the CDSE pair
+    ``CDSE_USERNAME`` and ``CDSE_PASSWORD``. The value is not included.
 
     ``page_cursors`` resumes a pull. A source whose cursor is a string is
     searched from that cursor. A source present in the map with no cursor is

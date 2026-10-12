@@ -60,19 +60,19 @@ STAC and related search clients. `search` is the only required method, and it is
 | `planetary_computer` | Microsoft Planetary Computer search and asset signing. |
 | `sentinel1`, `sentinel2`, `landsat8`, `landsat9` | Those collections on Planetary Computer. Landsat 8 and 9 share a collection and are split by platform. |
 | `pc_more` | Extra Planetary Computer collections (ASTER, ALOS, DEM, WorldCover, GOES CMI, MODIS, precipitation). |
-| `modis_base` | Shared NASA CMR client for MODIS granules. |
+| `modis_base` | Shared NASA CMR client for MODIS granules. A 401 or 403 names `EARTHDATA_TOKEN` as missing or rejected and does not print the value. |
 | `modis_active_fire`, `modis_land_cover`, `modis_surface`, `modis_vegetation` | Those MODIS products. |
 | `hls_landsat`, `hls_sentinel` | Harmonized Landsat–Sentinel. |
 | `naip` | NAIP aerial imagery. |
 | `cop_dem` | Copernicus DEM (30 m and 90 m). |
 | `earth_search` | Element84 Earth Search (Sentinel-1 GRD). |
 | `usgs` | USGS Landsat Collection 2. |
-| `cdse` | Copernicus Data Space: Sentinel-3, Sentinel-5P, burnt area. |
-| `cmr_stac` | NASA CMR STAC: GEDI, ICESat-2, SMAP, VIIRS. |
+| `cdse` | Copernicus Data Space: Sentinel-3, Sentinel-5P, burnt area. A 401 or 403 names `CDSE_USERNAME` and `CDSE_PASSWORD` as missing or rejected. CDSE is set with the env var only. The value is not printed. |
+| `cmr_stac` | NASA CMR STAC: GEDI, ICESat-2, SMAP, VIIRS. A 401 or 403 names `EARTHDATA_TOKEN` as missing or rejected and does not print the value. |
 | `digitalearth` | Digital Earth Australia and Africa Sentinel-2. |
 | `inpe` | CBERS-4 and Amazonia-1. |
 | `maxar_opendata` | Maxar Open Data. |
-| `firms` | NASA FIRMS active-fire detections. `FIRMS_MAP_KEY` comes from the session, the environment, or `~/.atlas/keys`. A dateline box is two area requests. |
+| `firms` | NASA FIRMS active-fire detections. `FIRMS_MAP_KEY` comes from the session, the environment, or `~/.atlas/keys`. A missing key names `FIRMS_MAP_KEY` and says to set it with `/key firms` or the env var. A rejected key names the variable and the status. The value is not printed. A dateline box is two area requests. |
 | `gibs` | NASA GIBS browse imagery (true color, night lights, flood, snow, thermal). A dateline box is two WMS GetMap requests. |
 | `goes`, `himawari` | Geostationary imagery. GOES picks a satellite per side of a dateline box. Himawari lists the full-disk slot once when either side meets the disk. |
 

@@ -5,15 +5,25 @@ from typing import ClassVar
 import httpx
 
 from atlas.data.base import SceneKind
+from atlas.data.credentials import CDSE_CREDENTIALS
 from atlas.data.stac import StacApiClient
 
 CDSE_SEARCH_URL = "https://stac.dataspace.copernicus.eu/v1/search"
 
 
 class CdseStacClient(StacApiClient):
-    """Copernicus Data Space Ecosystem STAC. Search is public; S3 download needs a CDSE account."""
+    """Copernicus Data Space Ecosystem STAC.
+
+    Search is public when the catalog allows it. A 401 or 403 while
+    ``CDSE_USERNAME`` or ``CDSE_PASSWORD`` is unset is a source error that
+    names each missing variable and says to set the env var. The same status
+    with both values present names the rejection and the status. The value
+    is not included. CDSE has no ``/key`` command. The check runs after the
+    response, not before the request.
+    """
 
     search_url: ClassVar[str] = CDSE_SEARCH_URL
+    required_credentials: ClassVar[tuple[str, ...]] = CDSE_CREDENTIALS
 
     def __init__(
         self,
