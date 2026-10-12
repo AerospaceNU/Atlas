@@ -10,7 +10,8 @@ The tool loop over one local artifact directory.
 |---|---|
 | `artifacts` | The workspace sandbox (`LocalArtifactStore`) and image metadata. Paths stay relative to the store root. |
 | `contracts` | Tool and model types, the tool registry, and discovery of tool classes. |
-| `runtime` | The bounded agent loop: call a tool, record the step, stop at the call budget. |
+| `runtime` | The bounded agent loop: call a tool, record the step, stop at the call budget. A run starts with the system prompt, then project instructions when the workspace root has `AGENTS.md`. |
+| `instructions` | Load `AGENTS.md` from the workspace root. Nested directories are not searched, and a closer file does not win over the root file. The text is delimited project guidance after the system prompt, not part of it. A missing file is silent. An unreadable or malformed file, including a FIFO, is skipped. Loading it cannot add tools or change the sandbox. |
 | `system_prompt` | The package system prompt (`system_prompt.md`). A workspace file cannot replace it. The text is cached for the life of the process, so an edit applies on the next start. |
 | `session` | A multi-turn conversation on top of that loop, plus the `python -m atlas.agent` entry. |
 | `skills` | Load Agent Skills from the workspace read root and activate one with `use_skill`. `.atlas/skills-drafts` is not loaded. Home skills stay off unless `ATLAS_HOME_SKILLS=1` or `home_skills = true` in `~/.atlas/config.toml`. |
@@ -71,9 +72,9 @@ STAC and related search clients. `search` is the only required method, and it is
 | `digitalearth` | Digital Earth Australia and Africa Sentinel-2. |
 | `inpe` | CBERS-4 and Amazonia-1. |
 | `maxar_opendata` | Maxar Open Data. |
-| `firms` | NASA FIRMS active-fire detections. `FIRMS_MAP_KEY` comes from the session, the environment, or `~/.atlas/keys`. |
-| `gibs` | NASA GIBS browse imagery (true color, night lights, flood, snow, thermal). |
-| `goes`, `himawari` | Geostationary imagery. |
+| `firms` | NASA FIRMS active-fire detections. `FIRMS_MAP_KEY` comes from the session, the environment, or `~/.atlas/keys`. A dateline box is two area requests. |
+| `gibs` | NASA GIBS browse imagery (true color, night lights, flood, snow, thermal). A dateline box is two WMS GetMap requests. |
+| `goes`, `himawari` | Geostationary imagery. GOES picks a satellite per side of a dateline box. Himawari lists the full-disk slot once when either side meets the disk. |
 
 ## `models`
 

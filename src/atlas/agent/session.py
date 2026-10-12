@@ -83,13 +83,16 @@ _STDOUT_LOCK = threading.Lock()
 
 
 class AgentSession:
-    """A persistent agent conversation that survives across turns."""
+    """A persistent agent conversation that survives across turns.
+
+    The first message is the trusted system prompt. When the project root
+    contains an honored instruction file, the next message is that file as
+    delimited project guidance.
+    """
 
     def __init__(self, agent: Agent) -> None:
         self.agent = agent
-        self.messages: list[ChatMessage] = [
-            ChatMessage(role=Role.SYSTEM, content=self.agent.system_prompt())
-        ]
+        self.messages: list[ChatMessage] = self.agent.opening_messages()
         self.stopped_for_limit = False
         self.session_key: str | None = None
         self.credential_keys: dict[str, str] = {}
@@ -174,12 +177,13 @@ class AgentSession:
 
         History and running totals return to their initial state. A skill
         applied during this conversation leaves with that history. The skill
-        catalog on the system prompt stays. The current model id and context
+        catalog on the system prompt stays. Project instructions are loaded
+        again from the project root after writes move; they are not copied
+        from the previous transcript. The current model id and context
         window are kept, and writes move to a new session artifact directory
         inside the same workspace. Reads keep the previous read root, so this
         never widens write access to the workspace.
         """
-        self.messages = [ChatMessage(role=Role.SYSTEM, content=self.agent.system_prompt())]
         self.active_skills = []
         self.stopped_for_limit = False
         self.totals = SessionTotals(
@@ -187,12 +191,12 @@ class AgentSession:
             context_limit=self.totals.context_limit,
         )
         self._clear_analysis()
-        if self.workspace is None:
-            return
-        session_id = _remember_session(self.workspace, self.model_id)
-        artifact_root = project_atlas_root(self.workspace) / "artifacts" / session_id
-        read_root = self.agent.artifacts.read_root
-        self.agent.artifacts = LocalArtifactStore(artifact_root, read_root=read_root)
+        if self.workspace is not None:
+            session_id = _remember_session(self.workspace, self.model_id)
+            artifact_root = project_atlas_root(self.workspace) / "artifacts" / session_id
+            read_root = self.agent.artifacts.read_root
+            self.agent.artifacts = LocalArtifactStore(artifact_root, read_root=read_root)
+        self.messages = self.agent.opening_messages()
 
     def use_skill(self, name: str, argument: str | None = None) -> Skill:
         """Apply a named skill for later turns in this conversation.
