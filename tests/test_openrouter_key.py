@@ -547,7 +547,12 @@ def test_delete_key_removes_the_file_and_keeps_redacting_it(tmp_path: Path) -> N
     assert session.active_key is None
     assert echo.config.api_key == ""
     deleted = next(event for event in events if event.get("scope") == "deleted")
-    assert deleted == {"type": "key", "scope": "deleted", "saved": False}
+    assert deleted == {
+        "type": "key",
+        "scope": "deleted",
+        "saved": False,
+        "warning": ("OPENROUTER_API_KEY in the environment will still be used on the next launch"),
+    }
     assert "sk-or-delete-me" not in json.dumps(events)
     assert "***" in json.dumps(events)
     assert client.posts == []

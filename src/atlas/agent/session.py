@@ -663,7 +663,11 @@ def _handle_set_key(session: AgentSession, stdout: IO[str], message: dict[str, A
 
 
 def _handle_delete_key(session: AgentSession, stdout: IO[str]) -> None:
-    """Remove the saved user key and stop using any key in this process."""
+    """Remove the saved user key and stop using any key in this process.
+
+    The reply warns that ``OPENROUTER_API_KEY`` in the environment is still
+    used on the next launch.
+    """
     try:
         delete_user_key(session.home)
     except Exception as exc:
@@ -675,7 +679,18 @@ def _handle_delete_key(session: AgentSession, stdout: IO[str]) -> None:
         return
     session.session_key = None
     _clear_installed_key(session)
-    _write_line(stdout, {"type": "key", "scope": "deleted", "saved": False}, session.secrets)
+    _write_line(
+        stdout,
+        {
+            "type": "key",
+            "scope": "deleted",
+            "saved": False,
+            "warning": (
+                "OPENROUTER_API_KEY in the environment will still be used on the next launch"
+            ),
+        },
+        session.secrets,
+    )
 
 
 def _handle_list(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:

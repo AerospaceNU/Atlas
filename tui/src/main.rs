@@ -531,13 +531,16 @@ impl App {
                 self.mode = Mode::Compose;
                 self.input.clear();
                 let note = if scope == "deleted" {
-                    "OpenRouter key deleted".to_string()
+                    "OpenRouter key deleted. OPENROUTER_API_KEY in the environment \
+                     will still be used on the next launch."
+                        .to_string()
                 } else {
                     let label = if saved { "saved" } else { "not saved" };
                     format!("{scope} key {label}")
                 };
+                let warning_already_shown = note.contains(warning.as_str());
                 self.transcript.push(tool_note(note));
-                if !warning.is_empty() {
+                if !warning.is_empty() && !warning_already_shown {
                     self.transcript.push(tool_note(warning));
                 }
             }
@@ -3372,6 +3375,24 @@ mod tests {
         let payload = slash_outcome(&mut app, "/key delete").expect("delete request");
         assert_eq!(payload["type"], "delete_key");
         assert!(slash_outcome(&mut app, "/key delete extra").is_none());
+    }
+
+    #[test]
+    fn key_delete_says_the_environment_key_returns_next_launch() {
+        let mut app = App::new();
+        app.apply(ServerMessage::KeySet {
+            scope: "deleted".to_string(),
+            saved: false,
+            warning: "OPENROUTER_API_KEY in the environment will still be used on the next launch"
+                .to_string(),
+        });
+        let text = tool_text(&app);
+        assert!(
+            text.contains(
+                "OPENROUTER_API_KEY in the environment will still be used on the next launch"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
