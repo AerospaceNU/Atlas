@@ -96,6 +96,10 @@ class CogRangeError(CogError):
     """The server did not return the requested byte range."""
 
 
+class _ShortRead(CogRangeError):
+    """A 206 body ended before the requested number of bytes."""
+
+
 class CogLimitError(CogError):
     """A COG would exceed a read limit, so the whole granule is not fetched."""
 
@@ -174,9 +178,15 @@ class _RangeReader:
         the response has one, otherwise about 0.5s, 1s, and 2s with jitter.
         """
         attempt = 0
+        retried_short = False
         while True:
             try:
                 return await self._stream_range(start, end, expected)
+            except _ShortRead:
+                if retried_short:
+                    raise
+                retried_short = True
+                continue
             except httpx.HTTPError as exc:
                 attempt += 1
                 if attempt >= _RANGE_ATTEMPTS:
@@ -215,7 +225,7 @@ class _RangeReader:
                 if len(chunks) == expected:
                     break
         if len(chunks) != expected:
-            raise CogRangeError("range response was not the requested length")
+            raise _ShortRead("range response was not the requested length")
         return bytes(chunks)
 
     def _note_granule_size(self, content_range: str | None) -> None:

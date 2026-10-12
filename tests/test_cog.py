@@ -281,12 +281,14 @@ class _RangeLog:
         allow_full: bool = False,
         fail_first: int = 0,
         retry_after: str | None = None,
+        short_reads: int = 0,
     ) -> None:
         self.blob = blob
         self.honor_range = honor_range
         self.allow_full = allow_full
         self.fail_first = fail_first
         self.retry_after = retry_after
+        self.short_reads = short_reads
         self.failures = 0
         self.calls: list[tuple[int, int] | None] = []
         self.body_reads = 0
@@ -314,6 +316,9 @@ class _RangeLog:
         if start < 0 or end < start or end >= len(self.blob):
             return httpx.Response(416)
         body = self.blob[start : end + 1]
+        if self.short_reads > 0:
+            self.short_reads -= 1
+            body = body[:-1]
         return httpx.Response(
             206,
             content=body,
@@ -1119,6 +1124,54 @@ async def test_non_finite_retry_after_falls_back_to_backoff(
         )
     assert delays == [0.5]
     assert all(math.isfinite(delay) for delay in delays)
+
+
+@pytest.mark.asyncio
+async def test_a_short_range_is_retried_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _patch_backoff(monkeypatch)
+    built = _geographic()
+    log = _RangeLog(built.blob, short_reads=1)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        read = await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-9.5,
+            south=8.5,
+            east=-9.0,
+            north=9.0,
+        )
+    assert log.calls[0] == log.calls[1] == (0, 7)
+    assert delays == []
+    assert np.array_equal(read.array, np.array([[[42, 43], [52, 53]]], dtype=np.uint8))
+
+
+@pytest.mark.asyncio
+async def test_a_second_short_range_fails_the_scene(tmp_path: Path) -> None:
+    built = _geographic()
+    log = _RangeLog(built.blob, short_reads=10, allow_full=True)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogRangeError, match="not the requested length"):
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=-9.5,
+                south=8.5,
+                east=-9.0,
+                north=9.0,
+            )
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=-9.5, south=8.5, east=-9.0, north=9.0),
+        )
+    assert log.calls[:2] == [(0, 7), (0, 7)]
+    assert log.calls[2:4] == [(0, 7), (0, 7)]
+    assert None not in log.calls
+    assert report.outcomes[0].status == "failed"
+    assert "not the requested length" in (report.outcomes[0].error or "")
+    assert list(tmp_path.rglob("*.tif")) == []
 
 
 @pytest.mark.asyncio
