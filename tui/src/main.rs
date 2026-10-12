@@ -499,22 +499,27 @@ impl App {
                     self.adopt_status(&status);
                 }
                 let user_asked = matches!(self.mode, Mode::ModelWait | Mode::ModelPicker);
-                if !ok {
-                    if user_asked {
-                        self.transcript
-                            .push(tool_note(format!("model list failed: {message}")));
-                        if self.mode == Mode::ModelWait {
-                            self.mode = Mode::Compose;
-                        }
+                if !ok && !message.is_empty() && user_asked {
+                    self.transcript
+                        .push(tool_note(format!("model list failed: {message}")));
+                }
+                // A later page can fail after earlier rows arrived. Keep those
+                // rows and still show the error. An empty failure leaves the
+                // picker alone so a blip cannot wipe rows already shown.
+                if models.is_empty() && !ok {
+                    if user_asked && self.mode == Mode::ModelWait {
+                        self.mode = Mode::Compose;
                     }
-                } else if user_asked {
-                    self.picker_models = models;
-                    self.picker_index = 0;
-                    self.mode = Mode::ModelPicker;
-                    let count = self.filtered_models().len();
-                    self.transcript.push(tool_note(format!("models: {count}")));
                 } else {
+                    let models = with_selected_model(models, &self.model_id);
                     self.picker_models = models;
+                    if user_asked {
+                        self.picker_index = 0;
+                        self.mode = Mode::ModelPicker;
+                        let count = self.filtered_models().len();
+                        self.transcript
+                            .push(tool_note(format!("models: {count}")));
+                    }
                 }
             }
             ServerMessage::ModelSelected { id, status, .. } => {
@@ -2363,6 +2368,35 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn with_selected_model(mut models: Vec<CatalogEntry>, model_id: &str) -> Vec<CatalogEntry> {
+    if model_id.is_empty() || models.iter().any(|model| model.id == model_id) {
+        return models;
+    }
+    models.push(CatalogEntry {
+        id: model_id.to_string(),
+        context_length: None,
+        prompt_price: None,
+        completion_price: None,
+        supports_tools: true,
+    });
+    models
+}
+
+fn model_picker_label(
+    mark: &str,
+    model: &CatalogEntry,
+    context: &str,
+    input: &str,
+    output: &str,
+) -> String {
+    let tools = if model.supports_tools {
+        ""
+    } else {
+        "  no tools"
+    };
+    format!("{mark} {}  ctx {context}  {input}  {output}{tools}", model.id)
+}
+
 fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
     if app.mode == Mode::Compose && !menu_options(&app.input).is_empty() {
         render_menu(frame, app, area);
@@ -2411,7 +2445,7 @@ fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(FG_SECONDARY).bg(BG_BASE)
             };
             lines.push(Line::from(Span::styled(
-                format!("{mark} {}  ctx {context}  {input}  {output}", model.id),
+                model_picker_label(mark, model, &context, &input, &output),
                 style,
             )));
         }
@@ -2672,6 +2706,106 @@ mod tests {
     }
 
     #[test]
+    fn partial_model_list_keeps_rows_and_shows_the_error() {
+        let mut app = App::new();
+        app.model_id = "keep-me".to_string();
+        app.mode = Mode::ModelWait;
+        app.apply(ServerMessage::Models {
+            ok: false,
+            message: "OpenRouter HTTP 500: down".to_string(),
+            models: vec![CatalogEntry {
+                id: "vendor/model".to_string(),
+                context_length: Some(1024),
+                prompt_price: None,
+                completion_price: None,
+                supports_tools: true,
+            }],
+            status: crate::protocol::StatusSnapshot::default(),
+        });
+
+        assert_eq!(app.model_id, "keep-me");
+        assert_eq!(app.mode, Mode::ModelPicker);
+        assert_eq!(app.picker_models.len(), 2);
+        assert_eq!(app.picker_models[0].id, "vendor/model");
+        assert_eq!(app.picker_models[1].id, "keep-me");
+        let text = tool_text(&app);
+        assert!(text.contains("model list failed"));
+        assert!(text.contains("500"));
+        assert!(text.contains("models: 2"));
+    }
+
+    #[test]
+    fn picker_marks_models_without_tools_and_keeps_the_selected_model() {
+        let mut app = App::new();
+        app.model_id = "keep-me".to_string();
+        app.mode = Mode::ModelWait;
+        app.apply(ServerMessage::Models {
+            ok: true,
+            message: String::new(),
+            models: vec![CatalogEntry {
+                id: "plain/text".to_string(),
+                context_length: None,
+                prompt_price: None,
+                completion_price: None,
+                supports_tools: false,
+            }],
+            status: crate::protocol::StatusSnapshot::default(),
+        });
+
+        assert_eq!(app.mode, Mode::ModelPicker);
+        assert_eq!(app.picker_models.len(), 2);
+        assert!(!app.picker_models[0].supports_tools);
+        assert_eq!(app.picker_models[1].id, "keep-me");
+        assert!(app.picker_models[1].supports_tools);
+        let painted = screen(&mut app, 100, 24);
+        assert!(painted.contains("plain/text"), "{painted}");
+        assert!(painted.contains("no tools"), "{painted}");
+        assert!(painted.contains("keep-me"), "{painted}");
+    }
+
+    #[test]
+    fn empty_catalog_keeps_the_selected_model_in_the_picker() {
+        let mut app = App::new();
+        app.model_id = "keep-me".to_string();
+        app.mode = Mode::ModelWait;
+        app.apply(ServerMessage::Models {
+            ok: true,
+            message: String::new(),
+            models: Vec::new(),
+            status: crate::protocol::StatusSnapshot::default(),
+        });
+
+        assert_eq!(app.mode, Mode::ModelPicker);
+        assert_eq!(app.picker_models.len(), 1);
+        assert_eq!(app.picker_models[0].id, "keep-me");
+    }
+
+    #[test]
+    fn empty_failure_does_not_wipe_models_already_in_the_picker() {
+        let mut app = App::new();
+        app.model_id = "keep-me".to_string();
+        app.mode = Mode::ModelPicker;
+        app.picker_models = vec![CatalogEntry {
+            id: "vendor/model".to_string(),
+            context_length: Some(1024),
+            prompt_price: None,
+            completion_price: None,
+            supports_tools: true,
+        }];
+        app.apply(ServerMessage::Models {
+            ok: false,
+            message: "OpenRouter HTTP 500: down".to_string(),
+            models: Vec::new(),
+            status: crate::protocol::StatusSnapshot::default(),
+        });
+
+        assert_eq!(app.mode, Mode::ModelPicker);
+        assert_eq!(app.picker_models.len(), 1);
+        assert_eq!(app.picker_models[0].id, "vendor/model");
+        assert!(tool_text(&app).contains("model list failed"));
+    }
+
+    #[test]
     fn selecting_a_model_updates_the_status_speed() {
         let mut app = App::new();
         app.model_id = "old".to_string();
@@ -2718,12 +2852,14 @@ mod tests {
                 context_length: None,
                 prompt_price: None,
                 completion_price: None,
+                supports_tools: true,
             },
             CatalogEntry {
                 id: "google/gemini".to_string(),
                 context_length: Some(128_000),
                 prompt_price: Some("0.1".to_string()),
                 completion_price: Some("0.2".to_string()),
+                supports_tools: true,
             },
         ];
 
@@ -2779,6 +2915,7 @@ mod tests {
             context_length: Some(1_000_000),
             prompt_price: Some("0.000002".to_string()),
             completion_price: Some("0.00001".to_string()),
+            supports_tools: true,
         }];
         let painted = screen(&mut app, 80, 24);
         assert!(painted.contains("ctx 1.00M"), "{painted}");
@@ -2795,6 +2932,7 @@ mod tests {
             context_length: Some(1_000_000),
             prompt_price: Some("0.0000000198".to_string()),
             completion_price: Some("0.000000396".to_string()),
+            supports_tools: true,
         }];
         let painted = screen(&mut app, 80, 24);
         assert!(painted.contains("input $0.0198/M"), "{painted}");
@@ -2810,6 +2948,7 @@ mod tests {
             context_length: None,
             prompt_price: None,
             completion_price: None,
+            supports_tools: true,
         }];
         let painted = screen(&mut app, 80, 24);
         assert!(painted.contains("input n/a"), "{painted}");
@@ -3517,6 +3656,7 @@ mod tests {
                 context_length: Some(128_000),
                 prompt_price: Some("0.1".to_string()),
                 completion_price: Some("0.2".to_string()),
+                supports_tools: true,
             })
             .collect();
 
