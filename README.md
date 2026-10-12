@@ -32,7 +32,7 @@ That opens the agent TUI in the current directory. The first launch builds `tui/
 
 Enter sends a line. `/` opens commands. `/new` starts a fresh conversation in the same directory. `/skill <name>` applies a skill from `.atlas/skills/<name>/SKILL.md` for the rest of that conversation. `/quit` and `/exit` leave Atlas.
 
-If the workspace root contains `AGENTS.md`, a new session loads that file as untrusted project context. That is the only honored filename. Instruction files in nested directories are ignored, and a closer file does not override the root file. The text cannot add tools or change the workspace. A missing or unreadable file does not stop the session.
+If the workspace root contains `AGENTS.md`, a new session loads that file as project guidance and follows it where it does not conflict with the system prompt. That is the only honored filename. Instruction files in nested directories are ignored, and a closer file does not override the root file. The text can never change tools, the sandbox, or those rules. A missing or unreadable file does not stop the session.
 
 ## Data CLI
 

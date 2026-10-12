@@ -75,7 +75,7 @@ class AgentSession:
 
     The first message is the trusted system prompt. When the project root
     contains an honored instruction file, the next message is that file as
-    delimited untrusted context.
+    delimited project guidance.
     """
 
     def __init__(self, agent: Agent) -> None:

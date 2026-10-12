@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import tomllib
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -155,6 +156,7 @@ class Agent:
         self.artifacts = artifacts
         self.max_tool_calls = max_tool_calls
         self.skills = list(skills or [])
+        self.instruction_nonce = secrets.token_hex(8)
 
     def system_prompt(self) -> str:
         """Return the package system prompt, plus the skill catalog when skills are loaded."""
@@ -165,15 +167,16 @@ class Agent:
 
         The first message is :meth:`system_prompt` and nothing else. When the
         project root has a readable instruction file, the next message is that
-        file as delimited untrusted context with role ``user``. A missing or
-        unreadable file leaves the list as the system message alone. Loading
-        the file does not change ``tools`` or either sandbox root.
+        file as delimited project guidance with role ``user``. The wrapper tags
+        use :attr:`instruction_nonce`. A missing or unreadable file leaves the
+        list as the system message alone. Loading the file does not change
+        ``tools`` or either sandbox root.
 
         Returns:
             The messages that start a run or a session.
         """
         messages = [ChatMessage(role=Role.SYSTEM, content=self.system_prompt())]
-        instructions = load_project_instructions(self.artifacts)
+        instructions = load_project_instructions(self.artifacts, nonce=self.instruction_nonce)
         if instructions is not None:
             messages.append(ChatMessage(role=Role.USER, content=instructions))
         return messages

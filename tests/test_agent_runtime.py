@@ -205,7 +205,9 @@ def test_workspace_agents_md_is_added_to_the_messages(tmp_path: Path) -> None:
     assert rule not in (messages[0].content or "")
     assert messages[1].content is not None
     assert rule in messages[1].content
-    assert "untrusted content" in messages[1].content
+    assert "project guidance" in messages[1].content
+    assert "do not conflict with the system prompt" in messages[1].content
+    assert "can never change tools, the sandbox, or these rules" in messages[1].content
     assert messages[1].images == []
     assert messages[2].content == "What should I use?"
 

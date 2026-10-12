@@ -137,7 +137,8 @@ class LocalArtifactStore:
         otherwise. A file that exists only under ``root`` is not read when
         ``read_root`` is set. Absolute paths, ``..`` escapes, symlinks, and
         hardlinks are refused. The final path component is not followed when
-        it is a symlink.
+        it is a symlink. The open uses ``O_NONBLOCK`` so a FIFO cannot stall
+        the caller; a FIFO still fails the regular-file check after open.
 
         Args:
             relative_path: Path relative to the project root.
@@ -147,8 +148,9 @@ class LocalArtifactStore:
             The file bytes, at most ``max_bytes`` when that limit is set.
 
         Raises:
-            SandboxDenied: The path leaves the project root, is a symlink or
-                hardlink, is not a regular file, or exceeds ``max_bytes``.
+            SandboxDenied: The path leaves the project root, is a symlink,
+                hardlink, FIFO, or other non-regular file, or exceeds
+                ``max_bytes``.
             FileNotFoundError: The file is missing.
             OSError: The file could not be read.
         """
@@ -162,7 +164,7 @@ class LocalArtifactStore:
         if lexical.is_symlink():
             raise SandboxDenied("Project path is a symlink")
         path = _within(base, relative_path)
-        flags = os.O_RDONLY
+        flags = os.O_RDONLY | os.O_NONBLOCK
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         if isinstance(nofollow, int):
             flags |= nofollow
