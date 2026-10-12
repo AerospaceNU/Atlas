@@ -10,6 +10,7 @@ from datetime import date
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
@@ -31,7 +32,7 @@ from atlas.cli.download import (
 from atlas.cli.progress import ProgressReporter, pick_reporter
 from atlas.compile.aggregate import aggregate
 from atlas.compile.product import SceneCatalog
-from atlas.data.base import BBox, DataPullClient, PullRequest, Scene
+from atlas.data.base import BBox, DataPullClient, Polygon, PullRequest, Scene
 from atlas.data.registry import sources
 from atlas.data.sources.fldas import (
     MISSING_TOKEN_MESSAGE,
@@ -48,6 +49,8 @@ from atlas.data.sources.fldas import (
 _EXAMPLE = (
     "atlas data sentinel2 optical --date 2024-07-01:2024-07-07 "
     "--coords -71.12,42.32,-71.02,42.40\n"
+    "  atlas data sentinel2 optical --date 2024-07-01:2024-07-07 "
+    "--polygon -71.12,42.32;-71.02,42.32;-71.02,42.40;-71.12,42.40\n"
     "  atlas data fldas landsurface --date 2020-01-01:2020-01-31 "
     "--coords -71.2,42.2,-70.9,42.5 --out .atlas/data/fldas"
 )
@@ -90,6 +93,13 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     data.add_argument(
         "--coords",
         help="Bounding box as west,south,east,north (west can be negative: --coords -71.12,42.32,-71.02,42.40)",
+    )
+    data.add_argument(
+        "--polygon",
+        help=(
+            "AOI ring as lon,lat pairs separated by semicolons, or a GeoJSON Polygon. "
+            "An open ring is closed. Without --coords the search box is the ring envelope."
+        ),
     )
     data.add_argument(
         "--out",
@@ -189,20 +199,28 @@ def run_data(
             Console(stderr=True, highlight=False).print(str(exc), style="red")
             return 2
         return 0
-    if not args.date or not args.coords:
-        print("data pull requires --date START:END and --coords W,S,E,N", file=sys.stderr)
+    polygon_text = getattr(args, "polygon", None)
+    if not args.date or not (args.coords or polygon_text):
+        print(
+            "data pull requires --date START:END and --coords W,S,E,N or --polygon",
+            file=sys.stderr,
+        )
         return 2
     try:
         names = resolve_sources(args.satellite, args.kind)
         start, end = parse_date_range(args.date)
-        request = PullRequest(
-            start_date=start,
-            end_date=end,
-            bbox=parse_coords(args.coords),
-            min_cloud_cover=args.min_cloud_cover,
-            max_cloud_cover=args.max_cloud_cover,
-            limit=args.limit,
-        )
+        polygon = parse_polygon(polygon_text) if polygon_text else None
+        request_body: dict[str, object] = {
+            "start_date": start,
+            "end_date": end,
+            "min_cloud_cover": args.min_cloud_cover,
+            "max_cloud_cover": args.max_cloud_cover,
+            "limit": args.limit,
+            "polygon": polygon,
+        }
+        if args.coords:
+            request_body["bbox"] = parse_coords(args.coords)
+        request = PullRequest.model_validate(request_body)
     except (CatalogError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -302,6 +320,63 @@ def parse_coords(text: str) -> BBox:
         raise ValueError("coords must be west,south,east,north")
     west, south, east, north = (float(item) for item in parts)
     return BBox(west=west, south=south, east=east, north=north)
+
+
+def parse_polygon(text: str) -> Polygon:
+    """Parse a polygon AOI.
+
+    A GeoJSON Polygon (or a Feature whose geometry is one), a JSON ring of
+    ``[lon, lat]`` positions, or ``lon,lat`` pairs separated by semicolons.
+    An open ring is closed.
+
+    Args:
+        text: The ``--polygon`` value.
+
+    Returns:
+        The exterior ring.
+
+    Raises:
+        ValueError: If the text is not a usable polygon.
+    """
+    raw = text.strip()
+    if not raw:
+        raise ValueError("polygon is empty")
+    if raw.startswith("{") or raw.startswith("["):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("polygon JSON is invalid") from exc
+        if isinstance(payload, dict) and payload.get("type") == "Feature":
+            payload = payload.get("geometry")
+        try:
+            if isinstance(payload, dict):
+                return Polygon.from_geojson(payload)
+            if isinstance(payload, list):
+                return Polygon(ring=payload)
+        except ValidationError as exc:
+            raise ValueError(_polygon_error(exc)) from exc
+        raise ValueError("polygon JSON must be a Polygon or a ring")
+    parts = [item.strip() for item in raw.split(";") if item.strip()]
+    ring: list[tuple[float, float]] = []
+    for part in parts:
+        bits = [item.strip() for item in part.split(",")]
+        if len(bits) != 2:
+            raise ValueError("polygon pairs must be lon,lat separated by semicolons")
+        try:
+            ring.append((float(bits[0]), float(bits[1])))
+        except ValueError as exc:
+            raise ValueError("polygon pairs must be lon,lat separated by semicolons") from exc
+    if len(ring) >= 1 and (len(ring) == 1 or ring[0] != ring[-1]):
+        ring.append(ring[0])
+    try:
+        return Polygon(ring=ring)
+    except ValidationError as exc:
+        raise ValueError(_polygon_error(exc)) from exc
+
+
+def _polygon_error(exc: ValidationError) -> str:
+    messages = [error["msg"].removeprefix("Value error, ") for error in exc.errors()]
+    return "; ".join(messages) if messages else "polygon is invalid"
 
 
 async def execute_pull(
@@ -479,18 +554,35 @@ async def _extract_table(
     )
 
 
+def _catalog_bbox_note(request: PullRequest) -> str:
+    if request.polygon is None:
+        return "Every catalog was searched with this bounding box."
+    return (
+        "Catalogs that only accept a bounding box were searched with this box. "
+        "The polygon is the area of interest. Scenes from every source are filtered "
+        "to it by footprint bounding-box overlap; point scenes must fall inside the ring. "
+        "A scene stores that box, not the full footprint outline."
+    )
+
+
 def _write_manifest(
     out_dir: Path,
     catalog: SceneCatalog,
     report: DownloadReport,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    request = catalog.request
+    bbox = request.bbox.as_list()
     payload = {
-        "request": catalog.request.model_dump(mode="json"),
+        "request": request.model_dump(mode="json"),
+        "polygon": None if request.polygon is None else request.polygon.as_geojson(),
+        "catalog_bbox": bbox,
+        "catalog_bbox_note": _catalog_bbox_note(request),
         "sources": [
             {
                 "source": src.source,
                 "collection": src.collection,
+                "bbox": bbox,
                 "error": src.error,
                 "n_scenes": len(src.scenes),
                 "scene_ids": [scene.id for scene in src.scenes],
