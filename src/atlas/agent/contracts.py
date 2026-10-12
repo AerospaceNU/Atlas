@@ -87,9 +87,10 @@ class ModelCall(BaseModel):
 class CatalogModel(BaseModel):
     """One row from the OpenRouter models catalog.
 
-    ``name`` and ``description`` are display text with control characters and
-    ANSI sequences removed. ``supports_tools`` is true when the provider lists
-    ``tools`` in ``supported_parameters``.
+    ``name`` and ``description`` are display text with control characters,
+    ANSI sequences, and bidi overrides removed. An id that contains those
+    characters is not stored. ``supports_tools`` is true when the provider
+    lists ``tools`` in ``supported_parameters``.
     """
 
     id: str

@@ -707,6 +707,42 @@ def test_parse_strips_control_characters_and_ansi_from_name_and_description() ->
     assert models[0].supports_tools is True
 
 
+def test_parse_rejects_ids_with_control_or_bidi_characters() -> None:
+    models = parse_model_catalog(
+        {
+            "data": [
+                {
+                    "id": "ven\x00dor/model",
+                    "name": "Should drop",
+                    "supported_parameters": ["tools"],
+                },
+                {
+                    "id": "ok/model\x1b[31m",
+                    "name": "Ansi id",
+                    "supported_parameters": ["tools"],
+                },
+                {
+                    "id": "spoof\u202e/model",
+                    "name": "Bidi id",
+                    "supported_parameters": ["tools"],
+                },
+                {
+                    "id": "  vendor/model  ",
+                    "name": " Hello\u202eWorld\u202c ",
+                    "description": "a\u202b b\u2066c\u200f",
+                    "supported_parameters": ["temperature"],
+                },
+            ]
+        }
+    )
+
+    assert [model.id for model in models] == ["vendor/model"]
+    assert models[0].name == "HelloWorld"
+    assert models[0].description == "a bc"
+    assert "\u202e" not in (models[0].name or "")
+    assert models[0].supports_tools is False
+
+
 def test_catalog_cache_skips_a_second_fetch_until_it_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -765,7 +801,11 @@ def test_live_openrouter_model_list() -> None:
         assert model.id
         if model.name is not None:
             assert "\x1b" not in model.name
+            assert "\u202e" not in model.name
             assert all(ord(char) >= 32 for char in model.name)
         if model.description is not None:
             assert "\x1b" not in model.description
+            assert "\u202e" not in model.description
             assert all(ord(char) >= 32 for char in model.description)
+        assert "\u202e" not in model.id
+        assert all(ord(char) >= 32 and not 0x7F <= ord(char) <= 0x9F for char in model.id)

@@ -35,6 +35,7 @@ _ANSI_ESCAPE = re.compile(
     r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]"
 )
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_BIDI_CHARS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 MISSING_KEY_MESSAGE = (
     "OPENROUTER_API_KEY is not set. Set it in the environment, the repo .env, "
@@ -609,8 +610,10 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
     """Parse an OpenRouter ``/models`` payload.
 
     Rows without an id are skipped. Missing context length or pricing stays unset.
-    Names and descriptions lose control characters and ANSI sequences.
-    ``supports_tools`` records whether ``supported_parameters`` lists ``tools``.
+    Names and descriptions lose control characters, ANSI sequences, and bidi
+    overrides. An id that contains a control character or a bidi override is
+    rejected rather than rewritten. ``supports_tools`` records whether
+    ``supported_parameters`` lists ``tools``.
     """
     if not isinstance(payload, dict):
         raise ValueError("model catalog must be an object")
@@ -621,7 +624,7 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
     for item in data:
         if not isinstance(item, dict):
             continue
-        model_id = _sanitize_display(item.get("id"))
+        model_id = _model_id(item.get("id"))
         if model_id is None:
             continue
         pricing = item.get("pricing")
@@ -650,12 +653,27 @@ def _lists_tools(value: object) -> bool:
     return any(isinstance(item, str) and item == "tools" for item in value)
 
 
+def _model_id(value: object) -> str | None:
+    """Return a model id, or None when the row should be skipped.
+
+    Surrounding whitespace is ignored. A control character or a bidi override
+    rejects the row so the id is never rewritten into a different model.
+    """
+    if not isinstance(value, str):
+        return None
+    if _CONTROL_CHARS.search(value) or _BIDI_CHARS.search(value):
+        return None
+    text = value.strip()
+    return text or None
+
+
 def _sanitize_display(value: object) -> str | None:
-    """Remove ANSI sequences and control characters from provider text."""
+    """Remove ANSI sequences, control characters, and bidi overrides from text."""
     if not isinstance(value, str):
         return None
     text = _ANSI_ESCAPE.sub("", value)
-    text = _CONTROL_CHARS.sub("", text).strip()
+    text = _CONTROL_CHARS.sub("", text)
+    text = _BIDI_CHARS.sub("", text).strip()
     return text or None
 
 
