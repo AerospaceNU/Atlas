@@ -11,6 +11,7 @@ The tool loop over one local artifact directory.
 | `artifacts` | The workspace sandbox (`LocalArtifactStore`) and image metadata. Paths stay relative to the store root. |
 | `contracts` | Tool and model types, the tool registry, and discovery of tool classes. |
 | `runtime` | The bounded agent loop: call a tool, record the step, stop at the call budget. |
+| `system_prompt` | The package system prompt (`system_prompt.md`). A workspace file cannot replace it. The text is cached for the life of the process, so an edit applies on the next start. |
 | `session` | A multi-turn conversation on top of that loop, plus the `python -m atlas.agent` entry. |
 | `skills` | Load Agent Skills from the workspace read root and activate one with `use_skill`. `.atlas/skills-drafts` is not loaded. Home skills stay off unless `ATLAS_HOME_SKILLS=1` or `home_skills = true` in `~/.atlas/config.toml`. |
 | `analysis_skill` | Save a finished analysis as a draft under `.atlas/skills-drafts/`. `/enable-skill` shows the description and body hash before moving it into `.atlas/skills`. |
@@ -29,7 +30,7 @@ The `atlas` command.
 | `__init__` | Argument routing. No args opens the TUI; `atlas data` and a bare satellite name stay on search. |
 | `catalog` | Source names, kind aliases, and the catalog listing. |
 | `data` | Search: pick sources, run a pull, print scenes. |
-| `download` | Fetch scene assets (previews and thumbnails are refused). |
+| `download` | Fetch scene assets (previews and thumbnails are refused). Geographic, Web Mercator, and WGS84 UTM COGs are windowed to the request box. |
 | `progress` | Per-source search progress for the data command. |
 | `tui` | Find or build the Rust `atlas-tui` binary and replace this process with it. |
 
@@ -40,7 +41,7 @@ Agent-agnostic consolidation. Same path for interactive use and batch jobs.
 | Module | What it holds |
 |---|---|
 | `pipeline` | `consolidate`: search, select, optionally render mosaics. |
-| `aggregate` | Fan a request out across sources. One source's error does not abort the rest. |
+| `aggregate` | Fan a request out across sources. One source's error does not abort the rest. A rate-limited source (HTTP 429) is retried while the others continue. Each source has a time budget. Recorded HTTP errors are the status and reason only. |
 | `select` | Metadata filters: cloud, id dedup, clearest-then-newest, a cheap coverage estimate. |
 | `mosaic` | Planetary Computer mosaic render, written as `<source>.png`. |
 | `product` | Result types: per-source scenes, the catalog, and a rendered mosaic. |
@@ -51,7 +52,8 @@ STAC and related search clients. `search` is the only required method, and it is
 
 | Module | What it holds |
 |---|---|
-| `base` | Shared models: bbox, scene, pull request/result, and the client interface. |
+| `base` | Shared models: bbox, polygon AOI, scene, pull request/result, and the client interface. |
+| `cog` | Read a COG window with HTTP range requests instead of the whole granule. BigTIFF and LZW are later work. |
 | `registry` | Stable source names and `sources()` / `all_sources()`. |
 | `stac` | Generic STAC API client. |
 | `planetary_computer` | Microsoft Planetary Computer search and asset signing. |

@@ -6,13 +6,15 @@ from collections.abc import Sequence
 
 from atlas.cli.catalog import is_known_target
 from atlas.cli.data import add_data_parser, run_data
+from atlas.cli.indices import add_indices_parser, run_indices
 
-_ROOT = frozenset({"data", "-h", "--help"})
+_ROOT = frozenset({"data", "indices", "-h", "--help"})
 _TUI_FLAGS = frozenset({"--workspace", "--repo"})
 _HELP = """examples:
   atlas                          open the agent TUI
   atlas data                     list satellites
   atlas sentinel2 optical ...    search one collection
+  atlas indices --red red.npy --nir nir.npy --out indices
 """
 
 
@@ -37,15 +39,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     tokens = _attach_negative_option_values(_inject_data_command(tokens))
     parser = argparse.ArgumentParser(
         prog="atlas",
-        description="Open the agent TUI, or search satellite data.",
+        description="Open the agent TUI, search satellite data, or compute spectral indices.",
         epilog=_HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="group")
     add_data_parser(sub)
+    add_indices_parser(sub)
     args = parser.parse_args(tokens)
     if getattr(args, "_atlas_cmd", None) == "data":
         return run_data(args)
+    if getattr(args, "_atlas_cmd", None) == "indices":
+        return run_indices(args)
     parser.print_help()
     return 0
 
@@ -61,12 +66,16 @@ def _is_tui_invocation(tokens: list[str]) -> bool:
 _VALUE_FLAGS = frozenset(
     {
         "--coords",
+        "--polygon",
         "--date",
         "--out",
         "--limit",
         "--min-cloud-cover",
         "--max-cloud-cover",
         "--asset",
+        "--nodata",
+        "--scale",
+        "--offset",
     }
 )
 

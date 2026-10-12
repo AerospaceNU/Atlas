@@ -51,6 +51,7 @@ pub enum ServerMessage {
     KeySet {
         scope: String,
         saved: bool,
+        warning: String,
     },
     Listing {
         scope: String,
@@ -148,6 +149,10 @@ pub struct StatusSnapshot {
     pub recent: Vec<String>,
 }
 
+fn default_supports_tools() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CatalogEntry {
     pub id: String,
@@ -157,6 +162,10 @@ pub struct CatalogEntry {
     pub prompt_price: Option<String>,
     #[serde(default)]
     pub completion_price: Option<String>,
+    /// False when the provider did not list ``tools``. Missing on older
+    /// payloads, which are treated as tool-capable.
+    #[serde(default = "default_supports_tools")]
+    pub supports_tools: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -243,6 +252,8 @@ enum RawMessage {
         scope: String,
         #[serde(default)]
         saved: bool,
+        #[serde(default)]
+        warning: String,
     },
     #[serde(rename = "listing")]
     Listing {
@@ -426,7 +437,15 @@ impl From<RawMessage> for ServerMessage {
                 context_length,
                 status,
             },
-            RawMessage::Key { scope, saved } => ServerMessage::KeySet { scope, saved },
+            RawMessage::Key {
+                scope,
+                saved,
+                warning,
+            } => ServerMessage::KeySet {
+                scope,
+                saved,
+                warning,
+            },
             RawMessage::Listing { scope, kind, names } => {
                 ServerMessage::Listing { scope, kind, names }
             }
@@ -703,6 +722,19 @@ mod tests {
                 assert!(!ok);
                 assert!(message.contains("500"));
                 assert!(models.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tool_support_and_defaults_missing_flag_to_true() {
+        let line = r#"{"type":"models","ok":true,"models":[{"id":"plain/text","supports_tools":false},{"id":"vendor/model","supports_tools":true},{"id":"legacy/model"}]}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::Models { models, .. }) => {
+                assert!(!models[0].supports_tools);
+                assert!(models[1].supports_tools);
+                assert!(models[2].supports_tools);
             }
             other => panic!("unexpected: {other:?}"),
         }

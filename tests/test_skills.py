@@ -22,13 +22,14 @@ from atlas.agent.contracts import (
     ToolRegistry,
     default_registry,
 )
-from atlas.agent.runtime import _SYSTEM_PROMPT, Agent, load_home_skills_enabled
+from atlas.agent.runtime import Agent, load_home_skills_enabled
 from atlas.agent.session import AgentSession, main
 from atlas.agent.skills import (
     load_skills,
     register_skill_tool,
     render_system_prompt,
 )
+from atlas.agent.system_prompt import load_system_prompt
 
 
 class ScriptedModel:
@@ -379,7 +380,7 @@ def test_symlinked_skill_directory_is_skipped(tmp_path: Path) -> None:
 def test_missing_directories_load_nothing(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path / "artifacts", read_root=tmp_path / "missing")
     assert load_skills(store) == []
-    assert render_system_prompt(_SYSTEM_PROMPT, []) == _SYSTEM_PROMPT
+    assert render_system_prompt(load_system_prompt(), []) == load_system_prompt()
 
 
 def test_catalog_lists_names_and_descriptions_without_the_body_or_host_path(
@@ -391,9 +392,9 @@ def test_catalog_lists_names_and_descriptions_without_the_body_or_host_path(
     )
     skills = load_skills(_store(workspace))
 
-    prompt = render_system_prompt(_SYSTEM_PROMPT, skills)
+    prompt = render_system_prompt(load_system_prompt(), skills)
 
-    assert prompt.startswith(_SYSTEM_PROMPT)
+    assert prompt.startswith(load_system_prompt())
     assert "<name>coast</name>" in prompt
     assert "<description>Read coastal notes.</description>" in prompt
     assert "Say the coast is clear." not in prompt

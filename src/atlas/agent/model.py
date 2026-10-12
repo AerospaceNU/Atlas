@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Self
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -13,16 +17,27 @@ from atlas.agent.contracts import (
     CallTiming,
     CatalogModel,
     ChatMessage,
+    ModelImage,
     ModelResponse,
     Role,
     TokenUsage,
     ToolCall,
     ToolDefinition,
 )
+from atlas.agent.images import apply_image_budget
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 _ERROR_BODY_LIMIT = 180
+_CATALOG_PAGE_LIMIT = 20
+_CATALOG_TIME_LIMIT = 15.0
+_CATALOG_CACHE_SECONDS = 30.0
+_OPENROUTER_HOST = "openrouter.ai"
+_ANSI_ESCAPE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]"
+)
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_BIDI_CHARS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 MISSING_KEY_MESSAGE = (
     "OPENROUTER_API_KEY is not set. Set it in the environment, the repo .env, "
@@ -64,7 +79,7 @@ class OpenRouterModel:
     def __init__(self, config: ModelConfig, client: httpx.Client | None = None) -> None:
         self.config = config
         self.history: list[ChatMessage] = []
-        self._client = client or httpx.Client(timeout=config.timeout)
+        self._client = client or httpx.Client(timeout=config.timeout, follow_redirects=False)
         self._owns_client = client is None
 
     def __call__(self, prompt: str) -> str:
@@ -81,7 +96,12 @@ class OpenRouterModel:
         return content
 
     def complete(self, messages: list[ChatMessage], tools: list[ToolDefinition]) -> ModelResponse:
-        """Call OpenRouter using its OpenAI-compatible native tool-calling format."""
+        """Call OpenRouter using its OpenAI-compatible native tool-calling format.
+
+        Older image attachments are removed until the newest ones fit in the
+        request budget. Those bytes are not sent again on a later call.
+        """
+        apply_image_budget(messages)
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": [_serialize_message(message) for message in messages],
@@ -117,7 +137,7 @@ class OpenRouterModel:
         parsed.timing = timing
         return parsed
 
-    def list_models(self) -> list[CatalogModel]:
+    def list_models(self) -> CatalogFetch:
         """Fetch the live OpenRouter model catalog with this client's key."""
         return fetch_model_catalog(self._client, self.config.api_key)
 
@@ -411,17 +431,170 @@ def _merge_tool_call(acc: _StreamAcc, call: dict[str, Any], fallback: int) -> No
         slot.arguments = json.dumps(arguments)
 
 
-def fetch_model_catalog(client: Any, api_key: str) -> list[CatalogModel]:
-    """GET the OpenRouter models endpoint and parse id, context length, and price."""
+@dataclass
+class CatalogFetch:
+    """Models read from the OpenRouter catalog, plus a later-page error if any.
+
+    ``models`` keeps every page that succeeded. ``error`` is set when a later
+    page fails or the total time cap is reached, and stays empty when the walk
+    finishes cleanly. The selected model is not changed here.
+    """
+
+    models: list[CatalogModel]
+    error: str | None = None
+
+
+@dataclass
+class _CatalogCacheEntry:
+    key_id: str
+    stored_at: float
+    models: list[CatalogModel]
+
+
+_catalog_cache: _CatalogCacheEntry | None = None
+_catalog_cache_lock = threading.Lock()
+
+
+def clear_model_catalog_cache() -> None:
+    """Drop the short-lived catalog cache. Tests use this between cases."""
+    global _catalog_cache
+    with _catalog_cache_lock:
+        _catalog_cache = None
+
+
+def peek_model_catalog(api_key: str) -> list[CatalogModel] | None:
+    """Return a cached catalog for ``api_key`` when it is still fresh."""
+    if not api_key.strip():
+        return None
+    return _read_catalog_cache(api_key)
+
+
+def fetch_model_catalog(client: Any, api_key: str) -> CatalogFetch:
+    """GET the OpenRouter models endpoint and parse id, context length, and price.
+
+    The first request omits ``offset`` and ``limit`` so OpenRouter returns the
+    full list. When a page includes ``links.next``, later pages are followed
+    only while the URL stays on ``https://openrouter.ai``. Redirects are not
+    followed. A repeated URL, the page cap, or the total time cap ends the
+    walk. A failure after the first page keeps the rows already parsed and
+    reports the error. Duplicate ids keep one row, and a row that does not
+    list ``tools`` stays in the list with ``supports_tools`` false. A fresh
+    result is cached briefly.
+    """
     if not api_key.strip():
         raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
-    started = time.perf_counter()
-    resp = client.get(
-        OPENROUTER_MODELS_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    payload, _timing = _interpret_response(resp, started)
-    return parse_model_catalog(payload)
+    cached = _read_catalog_cache(api_key)
+    if cached is not None:
+        return CatalogFetch(models=cached)
+    started = _catalog_now()
+    deadline = started + _CATALOG_TIME_LIMIT
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url: str | None = OPENROUTER_MODELS_URL
+    seen: set[str] = set()
+    models: list[CatalogModel] = []
+    pages = 0
+    error: str | None = None
+    while url is not None and url not in seen and pages < _CATALOG_PAGE_LIMIT:
+        remaining = deadline - _catalog_now()
+        if remaining <= 0:
+            error = "model catalog timed out"
+            break
+        seen.add(url)
+        pages += 1
+        try:
+            resp = client.get(
+                url,
+                headers=headers,
+                follow_redirects=False,
+                timeout=remaining,
+            )
+            payload, _timing = _interpret_response(resp, started)
+            page = parse_model_catalog(payload)
+        except Exception as exc:
+            if models:
+                error = _catalog_error_text(exc)
+                break
+            raise
+        models.extend(page)
+        url = _next_catalog_page(payload, url)
+    fetched = CatalogFetch(models=_dedupe_models(models), error=error)
+    if error is None:
+        _write_catalog_cache(api_key, fetched.models)
+    return fetched
+
+
+def _catalog_now() -> float:
+    return time.perf_counter()
+
+
+def _catalog_error_text(exc: Exception) -> str:
+    if isinstance(exc, OpenRouterHTTPError | MissingOpenRouterKey):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"[:300]
+
+
+def _key_id(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode()).hexdigest()
+
+
+def _read_catalog_cache(api_key: str) -> list[CatalogModel] | None:
+    with _catalog_cache_lock:
+        entry = _catalog_cache
+        if entry is None or entry.key_id != _key_id(api_key):
+            return None
+        if _catalog_now() - entry.stored_at >= _CATALOG_CACHE_SECONDS:
+            return None
+        return list(entry.models)
+
+
+def _write_catalog_cache(api_key: str, models: list[CatalogModel]) -> None:
+    global _catalog_cache
+    with _catalog_cache_lock:
+        _catalog_cache = _CatalogCacheEntry(
+            key_id=_key_id(api_key),
+            stored_at=_catalog_now(),
+            models=list(models),
+        )
+
+
+def _dedupe_models(models: list[CatalogModel]) -> list[CatalogModel]:
+    """Keep one row per id, including rows that cannot call tools.
+
+    The first row wins. A later copy replaces it only when that copy lists
+    ``tools`` and the kept row does not, so the flag records tool support.
+    """
+    order: list[str] = []
+    kept: dict[str, CatalogModel] = {}
+    for model in models:
+        current = kept.get(model.id)
+        if current is None:
+            order.append(model.id)
+            kept[model.id] = model
+            continue
+        if model.supports_tools and not current.supports_tools:
+            kept[model.id] = model
+    return [kept[model_id] for model_id in order]
+
+
+def _next_catalog_page(payload: dict[str, Any], current: str) -> str | None:
+    """Return the next OpenRouter catalog URL, or None when the walk should stop."""
+    links = payload.get("links")
+    if not isinstance(links, dict):
+        return None
+    raw = links.get("next")
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    joined = urljoin(current, text)
+    parsed = urlparse(joined)
+    host = parsed.hostname
+    if parsed.scheme != "https" or host is None or host.casefold() != _OPENROUTER_HOST:
+        return None
+    if parsed.port not in (None, 443):
+        return None
+    return joined
 
 
 def parse_usage(raw: object) -> TokenUsage:
@@ -444,6 +617,10 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
     """Parse an OpenRouter ``/models`` payload.
 
     Rows without an id are skipped. Missing context length or pricing stays unset.
+    Names and descriptions lose control characters, ANSI sequences, and bidi
+    overrides. An id that contains a control character or a bidi override is
+    rejected rather than rewritten. ``supports_tools`` records whether
+    ``supported_parameters`` lists ``tools``.
     """
     if not isinstance(payload, dict):
         raise ValueError("model catalog must be an object")
@@ -454,8 +631,8 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
     for item in data:
         if not isinstance(item, dict):
             continue
-        model_id = item.get("id")
-        if not isinstance(model_id, str) or not model_id.strip():
+        model_id = _model_id(item.get("id"))
+        if model_id is None:
             continue
         pricing = item.get("pricing")
         prompt_price = None
@@ -465,13 +642,46 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
             completion_price = _as_price(pricing.get("completion"))
         models.append(
             CatalogModel(
-                id=model_id.strip(),
+                id=model_id,
+                name=_sanitize_display(item.get("name")),
+                description=_sanitize_display(item.get("description")),
                 context_length=_as_optional_int(item.get("context_length")),
                 prompt_price=prompt_price,
                 completion_price=completion_price,
+                supports_tools=_lists_tools(item.get("supported_parameters")),
             )
         )
     return models
+
+
+def _lists_tools(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    return any(isinstance(item, str) and item == "tools" for item in value)
+
+
+def _model_id(value: object) -> str | None:
+    """Return a model id, or None when the row should be skipped.
+
+    Surrounding whitespace is ignored. A control character or a bidi override
+    rejects the row so the id is never rewritten into a different model.
+    """
+    if not isinstance(value, str):
+        return None
+    if _CONTROL_CHARS.search(value) or _BIDI_CHARS.search(value):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _sanitize_display(value: object) -> str | None:
+    """Remove ANSI sequences, control characters, and bidi overrides from text."""
+    if not isinstance(value, str):
+        return None
+    text = _ANSI_ESCAPE.sub("", value)
+    text = _CONTROL_CHARS.sub("", text)
+    text = _BIDI_CHARS.sub("", text).strip()
+    return text or None
 
 
 def filter_model_catalog(models: Sequence[CatalogModel], query: str) -> list[CatalogModel]:
@@ -539,7 +749,11 @@ def _short_error_body(resp: Any) -> str:
 
 def _serialize_message(message: ChatMessage) -> dict[str, Any]:
     data: dict[str, Any] = {"role": message.role.value}
-    if message.content is not None:
+    # Tool results stay text. Image bytes travel on a following user message.
+    images = [] if message.role is Role.TOOL else message.images
+    if images:
+        data["content"] = _content_with_images(message.content, images)
+    elif message.content is not None:
         data["content"] = message.content
     if message.tool_call_id is not None:
         data["tool_call_id"] = message.tool_call_id
@@ -557,6 +771,28 @@ def _serialize_message(message: ChatMessage) -> dict[str, Any]:
     if message.reasoning_details:
         data["reasoning_details"] = message.reasoning_details
     return data
+
+
+def _content_with_images(content: str | None, images: list[ModelImage]) -> list[dict[str, Any]]:
+    """Turn text plus local image artifacts into OpenRouter vision parts.
+
+    Each image is a data URL. A short text part names the artifact path so
+    the model can refer to the file the bytes came from.
+    """
+    parts: list[dict[str, Any]] = []
+    if content is not None:
+        parts.append({"type": "text", "text": content})
+    for image in images:
+        parts.append({"type": "text", "text": f"Image artifact: {image.path}"})
+        parts.append(_image_part(image))
+    return parts
+
+
+def _image_part(image: ModelImage) -> dict[str, Any]:
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{image.media_type};base64,{image.data}"},
+    }
 
 
 def _optional_text(value: object) -> str | None:

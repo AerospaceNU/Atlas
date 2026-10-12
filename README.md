@@ -34,7 +34,7 @@ Enter sends a line. `/` opens commands. `/new` starts a fresh conversation in th
 
 ## Data CLI
 
-`atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`.
+`atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`. A polygon AOI is `--polygon` as `lon,lat` pairs separated by semicolons, or a GeoJSON Polygon. Without `--coords`, the search box is that ring's envelope. A ring that winds around a pole is rejected: the boundary does not close inside one 360-degree window, so the interior is not a box or a STAC polygon. Rings longer than 4096 vertices are rejected so the caller can simplify them first. The written manifest stores the polygon and the box sent to catalogs that only accept a bounding box. Scenes from every source are then kept only when they meet the ring: a point must lie inside it, and every other scene is kept when its footprint bounding box meets the ring, because a scene record stores that box rather than the full footprint outline.
 
 ```bash
 atlas data                         # catalog
@@ -44,13 +44,17 @@ atlas data sentinel2 optical \
   --date 2024-07-01:2024-07-07 \
   --coords -71.12,42.32,-71.02,42.40
 
+atlas data sentinel2 optical \
+  --date 2024-07-01:2024-07-07 \
+  --polygon -71.12,42.32;-71.02,42.32;-71.02,42.40;-71.12,42.40
+
 atlas data fldas landsurface \
   --date 2023-01-01:2024-12-31 \
   --coords -71.2,42.2,-70.9,42.5 \
   --out .atlas/data/fldas
 ```
 
-Scene pulls download native assets under `.atlas/data` and write `manifest.json`. `--search-only` skips the download. `--limit` caps scenes per source (default 100).
+Scene pulls download native assets under `.atlas/data` and write `manifest.json`. A geographic, Web Mercator, or WGS84 UTM Cloud Optimized GeoTIFF is read as the window overlapping `--coords`, using HTTP range requests, instead of downloading the whole granule. A server that ignores Range fails that scene and does not fall back to a full download. BigTIFF and LZW compression are later work. `--search-only` skips the download. `--limit` caps scenes per source (default 100).
 
 `fldas landsurface` writes `.atlas/data/fldas/fldas.csv`: one row per 0.1° cell per month (January 1982 through the latest published month). Set `EARTHDATA_TOKEN` in `.env` and approve **Hyrax in the cloud** and **NASA GESDISC DATA ARCHIVE**. See `.env.example`.
 
