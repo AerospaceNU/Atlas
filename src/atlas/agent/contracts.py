@@ -121,6 +121,10 @@ class CatalogModel(BaseModel):
     context_length: int | None = None
     prompt_price: str | None = None
     completion_price: str | None = None
+    # OpenRouter ``pricing.input_cache_read``, dollars per cached token.
+    # Unset when the row has no cache-read rate. Estimates then price cached
+    # tokens at ``prompt_price``, because prompt tokens already include them.
+    cache_read_price: str | None = None
     supports_tools: bool = False
 
 

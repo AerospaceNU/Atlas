@@ -27,8 +27,12 @@ class SessionTotals(BaseModel):
     reasoning_tokens: int = 0
     cost: Decimal | None = None
     # False once any call used tokens but had neither a provider cost nor
-    # catalog prices. The status line then says ``spend unknown``.
+    # catalog prices. The status line then says ``spend unknown``. A session
+    # with no token-using calls stays known and renders ``$0``.
     spend_known: bool = True
+    # True when any of the running total came from catalog prices rather
+    # than a provider-reported cost. The status line then prefixes ``~``.
+    estimated: bool = False
     context_used: int = 0
     context_limit: int | None = None
     last_http_status: int | None = None
@@ -85,29 +89,50 @@ def catalog_spend(
     completion_tokens: int,
     prompt_price: str | None,
     completion_price: str | None,
+    *,
+    cached_tokens: int = 0,
+    cache_read_price: str | None = None,
 ) -> Decimal | None:
     """Price one call from catalog per-token rates.
 
-    ``prompt_price`` and ``completion_price`` are the OpenRouter catalog
-    strings (dollars per token). The product is :class:`~decimal.Decimal`
-    times the token counts. A missing, negative, or non-decimal rate leaves
-    the call unpriced. Cached tokens stay inside ``prompt_tokens``; the
-    catalog has no separate cache rate.
+    ``prompt_price`` and ``completion_price`` are dollars per token. The
+    product is :class:`~decimal.Decimal` times the token counts. A missing,
+    negative, or non-decimal prompt or completion rate leaves the call
+    unpriced.
+
+    Cached tokens use ``cache_read_price`` when the catalog row has one
+    (OpenRouter ``pricing.input_cache_read``). The remainder of
+    ``prompt_tokens`` stays at the prompt rate. When the catalog has no
+    cache-read price, cached tokens are priced at the prompt rate, because
+    ``prompt_tokens`` already includes them.
     """
     prompt = _price_decimal(prompt_price)
     completion = _price_decimal(completion_price)
     if prompt is None or completion is None:
         return None
-    return (prompt * prompt_tokens) + (completion * completion_tokens)
+    cache = _price_decimal(cache_read_price)
+    if cache is None:
+        # No cache-read price on this catalog row. Cached tokens are priced
+        # at the prompt rate.
+        return (prompt * prompt_tokens) + (completion * completion_tokens)
+    cached = cached_tokens if cached_tokens > 0 else 0
+    uncached = prompt_tokens - cached
+    if uncached < 0:
+        uncached = 0
+    return (prompt * uncached) + (cache * cached) + (completion * completion_tokens)
 
 
 def reported_spend(totals: SessionTotals) -> float | None:
-    """Dollars to publish, or None when the session total is incomplete."""
+    """Dollars to publish, or None when the session total is incomplete.
+
+    A fresh session with no token-using calls reports ``0``. That is a known
+    zero, not an unknown provider cost.
+    """
     if not totals.spend_known:
         return None
     amount = _decimal_cost(totals.cost)
     if amount is None:
-        return None
+        return 0.0
     return float(amount)
 
 
@@ -117,14 +142,17 @@ def apply_call(
     *,
     prompt_price: str | None = None,
     completion_price: str | None = None,
+    cache_read_price: str | None = None,
 ) -> SessionTotals:
     """Fold one completion into ``totals`` and return the same object.
 
     A provider ``cost`` is added as reported. When that field is missing and
-    the call used tokens, the catalog per-token prices are applied. If those
-    rates are missing too, the session spend becomes unknown instead of
-    ``$0``. Output speed is the latest call that reported time to first
-    token; a later call without that instant does not replace it.
+    the call used tokens, the catalog per-token prices are applied and
+    ``estimated`` is set so the status line can prefix ``~``. If those rates
+    are missing too, the session spend becomes unknown. A session that has
+    not used tokens stays at ``$0``. Output speed is the latest call that
+    reported time to first token; a later call without that instant does not
+    replace it.
     """
     usage = call.usage
     totals.prompt_tokens += usage.prompt_tokens
@@ -132,7 +160,7 @@ def apply_call(
     totals.total_tokens += usage.total_tokens
     totals.cached_tokens += usage.cached_tokens
     totals.reasoning_tokens += usage.reasoning_tokens
-    _note_spend(totals, usage, prompt_price, completion_price)
+    _note_spend(totals, usage, prompt_price, completion_price, cache_read_price)
     if usage.prompt_tokens > 0:
         totals.context_used = usage.prompt_tokens
     timing = call.timing
@@ -188,9 +216,11 @@ def format_tui_status(totals: SessionTotals) -> str:
     Prompt and completion counts are written beside the total once either is
     non-zero. Cached and reasoning counts are added only when they are
     non-zero. An empty session leaves those words off so the first frame
-    matches the TUI default line. Spend is ``unknown`` until a provider cost
-    or catalog price accounts for every call. The speed is the latest call,
-    labeled ``last``, and is ``n/a`` until one is measured from the first token.
+    matches the TUI default line. A session with no token-using calls shows
+    ``spend $0``. An unpriced call shows ``spend unknown``. A catalog
+    estimate shows ``spend ~$...`` so it is not mistaken for a provider
+    cost. The speed is the latest call, labeled ``last``, and is ``n/a``
+    until one is measured from the first token.
     """
     limit = "unknown" if totals.context_limit is None else format_token_count(totals.context_limit)
     model = totals.model or "unset"
@@ -258,6 +288,7 @@ def _note_spend(
     usage: TokenUsage,
     prompt_price: str | None,
     completion_price: str | None,
+    cache_read_price: str | None,
 ) -> None:
     if usage.cost is not None:
         _add_spend(totals, Decimal(str(usage.cost)))
@@ -270,12 +301,15 @@ def _note_spend(
         usage.completion_tokens,
         prompt_price,
         completion_price,
+        cached_tokens=usage.cached_tokens,
+        cache_read_price=cache_read_price,
     )
     # A total with no prompt or completion split cannot be priced from the
     # two catalog rates, so a zero product would still be a guess.
     if estimate is None or (usage.prompt_tokens == 0 and usage.completion_tokens == 0):
         totals.spend_known = False
         return
+    totals.estimated = True
     _add_spend(totals, estimate)
 
 
@@ -317,8 +351,11 @@ def _spend_label(totals: SessionTotals) -> str:
         return "unknown"
     amount = _decimal_cost(totals.cost)
     if amount is None:
-        return "unknown"
-    return _format_spend(amount)
+        return "$0"
+    text = _format_spend(amount)
+    if totals.estimated:
+        return f"~{text}"
+    return text
 
 
 def _speed_label(speed: float | None) -> str:

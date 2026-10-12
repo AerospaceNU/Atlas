@@ -475,7 +475,11 @@ def test_fetch_model_catalog_reads_id_context_and_price() -> None:
                         {
                             "id": "google/gemini-3.8-flash",
                             "context_length": 128000,
-                            "pricing": {"prompt": "0.1", "completion": "0.4"},
+                            "pricing": {
+                                "prompt": "0.1",
+                                "completion": "0.4",
+                                "input_cache_read": "0.02",
+                            },
                             "supported_parameters": ["tools"],
                         },
                         {"id": "local/no-meta", "supported_parameters": ["tools"]},
@@ -496,6 +500,8 @@ def test_fetch_model_catalog_reads_id_context_and_price() -> None:
     assert models[0].context_length == 128000
     assert models[0].prompt_price == "0.1"
     assert models[0].completion_price == "0.4"
+    assert models[0].cache_read_price == "0.02"
+    assert models[1].cache_read_price is None
     assert models[1].id == "local/no-meta"
     assert models[1].context_length is None
     assert models[1].prompt_price is None

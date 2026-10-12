@@ -159,7 +159,10 @@ def test_start_fresh_keeps_model_and_zeroes_totals(tmp_path: Path) -> None:
     assert ready["total_tokens"] == 0
     assert ready["prompt_tokens"] == 0
     assert ready["completion_tokens"] == 0
-    assert ready["spend"] is None
+    assert ready["spend"] == 0
+    assert ready["estimated"] is False
+    assert "spend $0" in ready["status_line"]
+    assert "spend unknown" not in ready["status_line"]
     assert ready["tokens_per_second"] is None
     assert ready["recent"] == []
     assert ready["model"] == "keep/model"
@@ -1005,6 +1008,7 @@ def test_models_command_returns_the_live_catalog_without_changing_the_model(
             "context_length": 128000,
             "prompt_price": "0.1",
             "completion_price": "0.4",
+            "cache_read_price": None,
             "supports_tools": True,
         },
         {
@@ -1014,6 +1018,7 @@ def test_models_command_returns_the_live_catalog_without_changing_the_model(
             "context_length": None,
             "prompt_price": None,
             "completion_price": None,
+            "cache_read_price": None,
             "supports_tools": True,
         },
     ]
@@ -1396,7 +1401,9 @@ def test_omitted_cost_uses_catalog_prices_and_token_details(tmp_path: Path) -> N
     assert done["cached_tokens"] == 800
     assert done["reasoning_tokens"] == 40
     assert done["spend"] == pytest.approx(0.003)
-    assert "spend $0.003" in done["status_line"]
+    assert done["estimated"] is True
+    assert "spend ~$0.003" in done["status_line"]
+    assert "spend $0.003" not in done["status_line"]
     assert "spend unknown" not in done["status_line"]
     assert "cached 800" in done["status_line"]
     assert "reasoning 40" in done["status_line"]

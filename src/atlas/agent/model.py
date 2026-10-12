@@ -679,9 +679,11 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
         pricing = item.get("pricing")
         prompt_price = None
         completion_price = None
+        cache_read_price = None
         if isinstance(pricing, dict):
             prompt_price = _as_price(pricing.get("prompt"))
             completion_price = _as_price(pricing.get("completion"))
+            cache_read_price = _as_price(pricing.get("input_cache_read"))
         models.append(
             CatalogModel(
                 id=model_id,
@@ -690,6 +692,7 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
                 context_length=_as_optional_int(item.get("context_length")),
                 prompt_price=prompt_price,
                 completion_price=completion_price,
+                cache_read_price=cache_read_price,
                 supports_tools=_lists_tools(item.get("supported_parameters")),
             )
         )

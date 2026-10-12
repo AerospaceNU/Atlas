@@ -56,8 +56,9 @@ def test_status_line_does_not_invent_a_context_window() -> None:
     assert "128000" not in text
     assert "prompt" not in text
     assert "completion" not in text
-    assert "spend unknown" in text
-    assert "spend $0" not in text
+    assert "spend $0" in text
+    assert "spend unknown" not in text
+    assert "spend ~" not in text
     assert "last n/a tok/s" in text
     assert "0.0 tok/s" not in text
     assert "http" not in text
@@ -108,9 +109,23 @@ def test_output_speed_is_the_last_call_after_the_first_token() -> None:
     assert totals.tokens_per_second == 10.0
 
 
-def test_unknown_cost_is_not_rendered_as_zero() -> None:
-    text = format_tui_status(SessionTotals(prompt_tokens=3, completion_tokens=1, total_tokens=4))
+def test_fresh_session_spend_is_zero() -> None:
+    text = format_tui_status(SessionTotals())
 
+    assert "spend $0" in text
+    assert "spend unknown" not in text
+    assert "spend ~" not in text
+
+
+def test_unknown_cost_is_not_rendered_as_zero() -> None:
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(usage=TokenUsage(prompt_tokens=3, completion_tokens=1, total_tokens=4)),
+    )
+    text = format_tui_status(totals)
+
+    assert totals.estimated is False
     assert "spend unknown" in text
     assert "spend $0" not in text
 
@@ -133,7 +148,9 @@ def test_missing_provider_cost_uses_catalog_prices() -> None:
 
     assert totals.cost == Decimal("0.5")
     assert totals.spend_known is True
-    assert "spend $0.5" in format_tui_status(totals)
+    assert totals.estimated is True
+    assert "spend ~$0.5" in format_tui_status(totals)
+    assert "spend $0.5" not in format_tui_status(totals)
 
     priced = SessionTotals()
     apply_call(
@@ -150,7 +167,75 @@ def test_missing_provider_cost_uses_catalog_prices() -> None:
         completion_price="0.2",
     )
     assert priced.cost == Decimal("0.02")
-    assert "spend $0.02" in format_tui_status(priced)
+    assert priced.estimated is False
+    text = format_tui_status(priced)
+    assert "spend $0.02" in text
+    assert "spend ~" not in text
+
+
+def test_catalog_estimate_renders_with_a_tilde() -> None:
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+        ),
+        prompt_price="0.004",
+        completion_price="0.0003",
+    )
+
+    assert totals.estimated is True
+    assert totals.cost == Decimal("0.0123")
+    text = format_tui_status(totals)
+    assert "spend ~$0.0123" in text
+    assert "spend $0.0123" not in text
+
+
+def test_cache_read_price_is_used_when_the_catalog_has_one() -> None:
+    # 10 prompt tokens include 6 cached. Uncached 4 * 0.002 = 0.008,
+    # cached 6 * 0.0005 = 0.003, completion 4 * 0.01 = 0.04.
+    priced = catalog_spend(
+        10,
+        4,
+        "0.002",
+        "0.01",
+        cached_tokens=6,
+        cache_read_price="0.0005",
+    )
+    assert priced == Decimal("0.051")
+
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(
+                prompt_tokens=10,
+                completion_tokens=4,
+                total_tokens=14,
+                cached_tokens=6,
+            ),
+        ),
+        prompt_price="0.002",
+        completion_price="0.01",
+        cache_read_price="0.0005",
+    )
+    assert totals.estimated is True
+    assert totals.cost == Decimal("0.051")
+    assert "spend ~$0.051" in format_tui_status(totals)
+
+
+def test_cached_tokens_use_the_prompt_rate_without_a_cache_price() -> None:
+    # No cache-read price: all 10 prompt tokens, including the 6 cached,
+    # are charged at the prompt rate. 10 * 0.002 + 4 * 0.01 = 0.06.
+    fallback = catalog_spend(
+        10,
+        4,
+        "0.002",
+        "0.01",
+        cached_tokens=6,
+        cache_read_price=None,
+    )
+    assert fallback == Decimal("0.06")
 
 
 def test_explicit_zero_cost_stays_zero() -> None:

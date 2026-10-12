@@ -258,13 +258,14 @@ class AgentSession:
             raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
 
     def _note(self, run: AgentRun) -> None:
-        prompt_price, completion_price = _catalog_prices(self)
+        prompt_price, completion_price, cache_read_price = _catalog_prices(self)
         for call in run.calls:
             apply_call(
                 self.totals,
                 call,
                 prompt_price=prompt_price,
                 completion_price=completion_price,
+                cache_read_price=cache_read_price,
             )
 
     def save_finished_skill(
@@ -1255,16 +1256,20 @@ def _key_set(session: AgentSession) -> bool:
     return bool(session.active_key and session.active_key.strip())
 
 
-def _catalog_prices(session: AgentSession) -> tuple[str | None, str | None]:
-    """Return the active model's per-token catalog prices, when both exist."""
+def _catalog_prices(session: AgentSession) -> tuple[str | None, str | None, str | None]:
+    """Return prompt, completion, and cache-read prices for the active model.
+
+    Any rate the catalog row does not carry is None. A missing cache-read
+    price means cached tokens are priced at the prompt rate.
+    """
     model_id = session.totals.model or session.model_id
     if not model_id:
-        return None, None
+        return None, None, None
     with session._catalog_lock:
         chosen = next((item for item in session.catalog if item.id == model_id), None)
     if chosen is None:
-        return None, None
-    return chosen.prompt_price, chosen.completion_price
+        return None, None, None
+    return chosen.prompt_price, chosen.completion_price, chosen.cache_read_price
 
 
 def _apply_known_context_limit(session: AgentSession) -> None:
@@ -1297,6 +1302,7 @@ def _status_fields(session: AgentSession) -> dict[str, Any]:
         "cached_tokens": totals.cached_tokens,
         "reasoning_tokens": totals.reasoning_tokens,
         "spend": reported_spend(totals),
+        "estimated": totals.estimated,
         "tokens_per_second": totals.tokens_per_second,
         "http_status": totals.last_http_status,
         "elapsed_seconds": totals.last_elapsed_seconds,
