@@ -886,6 +886,9 @@ class Asset(BaseModel):
     media_type: str | None = None
     title: str | None = None
     roles: list[str] = Field(default_factory=list)
+    # First ``raster:bands`` entry. None when the item does not publish one.
+    scale: float | None = None
+    offset: float | None = None
 
     @field_validator("href")
     @classmethod
@@ -893,6 +896,15 @@ class Asset(BaseModel):
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("href must be an absolute http(s) URL")
+        return value
+
+    @field_validator("scale", "offset")
+    @classmethod
+    def scale_and_offset_must_be_finite(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        if not math.isfinite(value):
+            raise ValueError("scale and offset must be finite")
         return value
 
     @classmethod

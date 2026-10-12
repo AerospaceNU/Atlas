@@ -77,7 +77,7 @@ def test_names_resolve_even_when_other_assets_carry_wavelengths() -> None:
         "red": _band(common_name="red"),
         "nir08": _band(common_name="nir08"),
     }
-    assert resolve_bands(assets) == {"red": "red", "nir": "nir08"}
+    assert resolve_bands(assets) == {"red": "red", "green": "green", "nir": "nir08"}
 
 
 def test_wavelength_wins_before_names_are_consulted() -> None:
@@ -99,6 +99,35 @@ def test_assets_without_band_metadata_are_ignored() -> None:
 def test_rededge_is_outside_the_red_tolerance() -> None:
     assert abs(0.7039 - BANDS["red"].target) > BANDS["red"].tolerance
     assert resolve_bands({"B05": _band(0.7039)}) == {}
+
+
+def test_earth_search_keys_resolve_red_green_nir_and_swir22() -> None:
+    # Earth Search names B08 `nir` (0.842) and B8A `nir08` (0.865). Wavelength
+    # keeps the narrow band. `visual` is multi-band and must not take `red`.
+    visual = {
+        "href": "https://example.com/tci.tif",
+        "eo:bands": [
+            {"common_name": "red", "center_wavelength": 0.665},
+            {"common_name": "green", "center_wavelength": 0.56},
+            {"common_name": "blue", "center_wavelength": 0.49},
+        ],
+    }
+    assets = {
+        "blue": _band(0.49, "blue"),
+        "green": _band(0.56, "green"),
+        "red": _band(0.665, "red"),
+        "nir": _band(0.842, "nir"),
+        "nir08": _band(0.865, "nir08"),
+        "swir16": _band(1.61, "swir16"),
+        "swir22": _band(2.19, "swir22"),
+        "visual": visual,
+    }
+    assert resolve_bands(assets) == {
+        "red": "red",
+        "green": "green",
+        "nir": "nir08",
+        "swir22": "swir22",
+    }
 
 
 def test_unmatched_names_are_absent_rather_than_none() -> None:

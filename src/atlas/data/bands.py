@@ -26,11 +26,15 @@ class Candidate(NamedTuple):
 # Catalogs disagree about common_name -- S30 tags its broad 0.835 band "nir",
 # L30 its narrow 0.86 band -- so match on wavelength and keep names a fallback.
 # Each tolerance is bounded by real bands, so widening one changes the winner:
-#   red  admits L30 B04 at 0.650 (0.015), rejects S2 B05 at 0.7039 (0.039)
-#   nir  admits S30 B08 at 0.8351 (0.030), rejects S30 B05 at 0.7039 (0.161)
+#   red    admits L30 B04 at 0.650 (0.015), rejects S2 B05 at 0.7039 (0.039)
+#   green  admits S2 B03 at 0.560, rejects S2 blue at 0.490 (0.070)
+#   nir    admits S30 B08 at 0.8351 (0.030), rejects S30 B05 at 0.7039 (0.161)
+#   swir22 admits S2 B12 at 2.190, rejects S2 B11 at 1.610 (0.580)
 BANDS: Final[Mapping[str, BandSpec]] = {
     "red": BandSpec(0.665, 0.03, frozenset({"red"})),
+    "green": BandSpec(0.560, 0.03, frozenset({"green"})),
     "nir": BandSpec(0.865, 0.05, frozenset({"nir", "nir08"})),
+    "swir22": BandSpec(2.190, 0.15, frozenset({"swir22"})),
 }
 
 

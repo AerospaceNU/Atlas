@@ -409,6 +409,24 @@ def _call_from_object(
     return _CursorCall("POST", url, dict(body))
 
 
+def _raster_calibration(raw: object) -> tuple[float | None, float | None]:
+    """Return scale and offset from the first ``raster:bands`` entry."""
+    if not isinstance(raw, list) or not raw:
+        return None, None
+    entry = raw[0]
+    if not isinstance(entry, dict):
+        return None, None
+    return _finite_float(entry.get("scale")), _finite_float(entry.get("offset"))
+
+
+def _finite_float(raw: object) -> float | None:
+    """Return a finite float, or None for anything else."""
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) else None
+
+
 def item_to_scene(
     feature: dict[str, Any],
     *,
@@ -441,11 +459,14 @@ def item_to_scene(
             if not isinstance(spec, dict) or not isinstance(spec.get("href"), str):
                 continue
             roles = spec.get("roles")
+            scale, offset = _raster_calibration(spec.get("raster:bands"))
             asset = Asset.try_new(
                 href=_http_href(spec["href"]),
                 media_type=spec.get("type") if isinstance(spec.get("type"), str) else None,
                 title=spec.get("title") if isinstance(spec.get("title"), str) else None,
                 roles=list(roles) if isinstance(roles, list) else [],
+                scale=scale,
+                offset=offset,
             )
             if asset is not None:
                 assets[str(name)] = asset
