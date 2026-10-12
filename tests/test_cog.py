@@ -104,6 +104,7 @@ def build_cog(
     dimensions: tuple[int, int] | None = None,
     tile_blobs: list[bytes] | None = None,
     place_tiles_at: int | None = None,
+    nodata: str | None = None,
 ) -> BuiltCog:
     """Build a classic tiled GeoTIFF the production reader does not share code with."""
     if dimensions is None:
@@ -164,6 +165,9 @@ def build_cog(
     ]
     if epsg is not None:
         fields.append(_field(34735, 3, [1, 1, 0, 1, key, 0, 1, epsg], endian))
+    if nodata is not None:
+        raw_nodata = nodata.encode("ascii") + b"\x00"
+        fields.append(_Field(42113, 2, len(raw_nodata), raw_nodata, inline=len(raw_nodata) <= 4))
     fields.sort(key=lambda item: item.tag)
     ifd_at = 8 + pad
     ifd_size = 2 + len(fields) * 12 + 4
@@ -911,6 +915,42 @@ def test_manifest_records_bytes_read_and_granule_size(tmp_path: Path) -> None:
         }
     ]
     assert source["windows"][0]["bytes_read"] < source["windows"][0]["granule_size"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nodata", [None, "0", "-9999"])
+async def test_gdal_nodata_is_carried_through_the_window(nodata: str | None) -> None:
+    built = build_cog(
+        _grid(4, 4),
+        tile=2,
+        origin_x=0.0,
+        origin_y=4.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        nodata=nodata,
+    )
+    async with httpx.AsyncClient(transport=_RangeLog(built.blob).transport()) as http:
+        read = await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=0.0,
+            south=2.0,
+            east=2.0,
+            north=4.0,
+        )
+    assert read.nodata == nodata
+    encoded = encode_cog(read)
+    async with httpx.AsyncClient(transport=_RangeLog(encoded).transport()) as http:
+        again = await read_cog_window(
+            http,
+            "https://example.com/window.tif",
+            west=read.origin_x,
+            south=read.origin_y - read.pixel_size_y * read.array.shape[1],
+            east=read.origin_x + read.pixel_size_x * read.array.shape[2],
+            north=read.origin_y,
+        )
+    assert again.nodata == nodata
+    assert np.array_equal(again.array, read.array)
 
 
 def test_encode_rejects_an_empty_window() -> None:

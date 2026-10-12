@@ -32,6 +32,7 @@ _USER_DEFINED_EPSG: Final[int] = 32767
 
 _TYPE_SIZE: Final[dict[int, int]] = {
     1: 1,  # BYTE
+    2: 1,  # ASCII
     3: 2,  # SHORT
     4: 4,  # LONG
     12: 8,  # DOUBLE
@@ -52,6 +53,7 @@ _TAG_SAMPLE_FORMAT: Final[int] = 339
 _TAG_PIXEL_SCALE: Final[int] = 33550
 _TAG_TIEPOINT: Final[int] = 33922
 _TAG_GEOKEYS: Final[int] = 34735
+_TAG_NODATA: Final[int] = 42113
 _GEO_GEOGRAPHIC: Final[int] = 2048
 _GEO_PROJECTED: Final[int] = 3072
 _COMPRESS_NONE: Final[int] = 1
@@ -103,6 +105,7 @@ class CogRead:
     row_off: int
     bytes_fetched: int
     granule_size: int | None = None
+    nodata: str | None = None
 
 
 @dataclass
@@ -123,6 +126,7 @@ class _Image:
     pixel_size_x: float
     pixel_size_y: float
     epsg: int | None
+    nodata: str | None
 
 
 class _RangeReader:
@@ -272,6 +276,7 @@ class CogFile:
             row_off=row0,
             bytes_fetched=self._reader.bytes_fetched,
             granule_size=self._reader.granule_size,
+            nodata=image.nodata,
         )
 
 
@@ -419,11 +424,15 @@ def encode_cog(read: CogRead) -> bytes:
     scale = struct.pack(endian + "3d", read.pixel_size_x, read.pixel_size_y, 0.0)
     tie = struct.pack(endian + "6d", 0.0, 0.0, 0.0, read.origin_x, read.origin_y, 0.0)
     geokeys = _geokey_bytes(read.epsg, endian)
+    nodata_bytes = _nodata_bytes(read.nodata)
     payloads: list[bytes] = [scale, tie]
     if geokeys is not None:
         payloads.append(geokeys)
-    # Width through tiepoint is 13 tags; the GeoKey directory is the 14th.
-    n_entries = 14 if geokeys is not None else 13
+    nodata_inline = nodata_bytes is not None and len(nodata_bytes) <= 4
+    if nodata_bytes is not None and not nodata_inline:
+        payloads.append(nodata_bytes)
+    # Width through tiepoint, plus an optional GeoKey directory and GDAL_NODATA.
+    n_entries = 13 + int(geokeys is not None) + int(nodata_bytes is not None)
     ifd_size = 2 + n_entries * 12 + 4
     cursor = 8 + ifd_size
     payload_offsets = []
@@ -451,6 +460,12 @@ def encode_cog(read: CogRead) -> bytes:
         fields.append(
             (_TAG_GEOKEYS, 3, len(geokeys) // 2, struct.pack(endian + "I", payload_offsets[2]))
         )
+    if nodata_bytes is not None:
+        if nodata_inline:
+            nodata_value = nodata_bytes + bytes(4 - len(nodata_bytes))
+        else:
+            nodata_value = struct.pack(endian + "I", payload_offsets[-1])
+        fields.append((_TAG_NODATA, 2, len(nodata_bytes), nodata_value))
     fields.sort(key=lambda item: item[0])
     out = bytearray(struct.pack(endian + "HHI", 0x4949, 42, 8))
     out += struct.pack(endian + "H", len(fields))
@@ -462,6 +477,15 @@ def encode_cog(read: CogRead) -> bytes:
         out += payload
     out += tile
     return bytes(out)
+
+
+def _nodata_bytes(nodata: str | None) -> bytes | None:
+    if nodata is None:
+        return None
+    try:
+        return nodata.encode("ascii") + b"\x00"
+    except UnicodeEncodeError as exc:
+        raise CogError("nodata must be ASCII") from exc
 
 
 def _geokey_bytes(epsg: int | None, endian: str) -> bytes | None:
@@ -652,6 +676,7 @@ async def _image_from_entries(
     epsg = None
     if _TAG_GEOKEYS in entries:
         epsg = _epsg_from_geokeys(await _entry_ints(reader, endian, entries[_TAG_GEOKEYS]))
+    nodata = await _nodata_text(reader, endian, entries.get(_TAG_NODATA))
     return _Image(
         endian=endian,
         width=width,
@@ -669,7 +694,32 @@ async def _image_from_entries(
         pixel_size_x=pixel_size_x,
         pixel_size_y=pixel_size_y,
         epsg=epsg,
+        nodata=nodata,
     )
+
+
+async def _nodata_text(
+    reader: _RangeReader,
+    endian: str,
+    entry: tuple[int, int, bytes] | None,
+) -> str | None:
+    """Read GDAL_NODATA. An empty or non-ASCII tag leaves the window without one."""
+    if entry is None:
+        return None
+    type_code, count, inline = entry
+    if type_code != 2:
+        return None
+    try:
+        raw = await _entry_bytes(reader, endian, type_code, count, inline)
+    except CogLimitError:
+        raise
+    except CogError:
+        return None
+    try:
+        text = raw.split(b"\x00", 1)[0].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return text or None
 
 
 def _epsg_from_geokeys(values: list[int]) -> int | None:
