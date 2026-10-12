@@ -15,6 +15,7 @@ from atlas.data.base import (
     Scene,
     SceneKind,
 )
+from atlas.data.credentials import EARTHDATA_CREDENTIALS, raise_for_missing_credential
 
 CMR_SEARCH_URL = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
 
@@ -73,6 +74,8 @@ class MODISClient(DataPullClient):
             params["cloud_cover"] = f"{low:g},{high:g}"
 
         resp = await self._client.get(CMR_SEARCH_URL, params=params)
+        # A refused search with no token names EARTHDATA_TOKEN and omits any value.
+        raise_for_missing_credential(resp, EARTHDATA_CREDENTIALS)
         resp.raise_for_status()
         payload = resp.json()
         if not isinstance(payload, dict):

@@ -296,7 +296,11 @@ async def aggregate(
     ``asyncio.timeout``. Other sources keep running during that wait and if
     the budget runs out. Any other error is recorded on the first failure.
     An HTTP failure is stored as its status and reason phrase, with no
-    request URL or query string.
+    request URL or query string. A 401 or 403 from Earthdata or CDSE while
+    the credential is unset, and a FIRMS search with no map key, is stored
+    as the missing variable instead of that provider status. The variables
+    are ``EARTHDATA_TOKEN``, ``FIRMS_MAP_KEY``, and the CDSE pair
+    ``CDSE_USERNAME`` and ``CDSE_PASSWORD``. The value is not included.
 
     ``page_cursors`` resumes a pull. A source whose cursor is a string is
     searched from that cursor. A source present in the map with no cursor is

@@ -40,6 +40,7 @@ from atlas.agent.runtime import Agent
 from atlas.agent.session import AgentSession, serve
 from atlas.cli.data import run_data
 from atlas.data.base import Asset, BBox, PullRequest, Scene, SceneKind
+from atlas.data.credentials import MissingCredentialError
 from atlas.data.firms import FirmsClient
 from atlas.data.sources import fldas as fldas_module
 from atlas.data.sources.fldas import MISSING_TOKEN_MESSAGE, FldasAuthError, FldasClient
@@ -369,7 +370,7 @@ async def test_firms_uses_the_session_key_and_keeps_the_missing_key_error(
     bind_session_credentials({})
     monkeypatch.delenv(FIRMS_MAP_KEY, raising=False)
     explicit = FirmsClient(map_key="", client=transport)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="FIRMS_MAP_KEY is not set") as excinfo:
+    with pytest.raises(MissingCredentialError, match="FIRMS_MAP_KEY is not set") as excinfo:
         await explicit.search(_pull())
     assert str(excinfo.value) == "FIRMS_MAP_KEY is not set"
     assert _TOKENS[FIRMS_MAP_KEY] not in str(excinfo.value)

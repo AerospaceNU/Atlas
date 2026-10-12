@@ -20,6 +20,7 @@ from atlas.data.base import (
     Scene,
     SceneKind,
 )
+from atlas.data.credentials import raise_for_missing_credential
 
 _CLOUD_QUERY_KINDS = frozenset({SceneKind.optical, SceneKind.browse})
 
@@ -30,6 +31,8 @@ class StacApiClient(DataPullClient):
     include_datetime: ClassVar[bool] = True
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = None
+    # Unset variables named here replace a 401 or 403 with MissingCredentialError.
+    required_credentials: ClassVar[tuple[str, ...]] = ()
 
     def __init__(
         self,
@@ -60,6 +63,7 @@ class StacApiClient(DataPullClient):
 
     async def search(self, request: PullRequest) -> PullResult:
         resp = await self._client.post(self.search_url, json=self._search_body(request))
+        self._raise_for_credentials(resp)
         resp.raise_for_status()
         return self._result_from_payload(request, resp.json())
 
@@ -83,14 +87,22 @@ class StacApiClient(DataPullClient):
         Raises:
             ValueError: The cursor is on another host, carries a signed query,
                 or is not a usable next link. The message does not include the URL.
+            MissingCredentialError: The provider returned 401 or 403 and a
+                variable in ``required_credentials`` is unset. The message
+                names that variable and does not include a value.
         """
         call = _cursor_request(page_cursor, self.search_url, request, self._search_body)
         if call.method == "GET":
             resp = await self._client.get(call.url)
         else:
             resp = await self._client.post(call.url, json=call.body)
+        self._raise_for_credentials(resp)
         resp.raise_for_status()
         return self._result_from_payload(request, resp.json())
+
+    def _raise_for_credentials(self, response: object) -> None:
+        """Raise a named credential error, or leave the provider status alone."""
+        raise_for_missing_credential(response, self.required_credentials)
 
     def _search_body(self, request: PullRequest, *, token: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {

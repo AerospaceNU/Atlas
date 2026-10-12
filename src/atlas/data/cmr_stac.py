@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 from atlas.data.base import SceneKind
+from atlas.data.credentials import EARTHDATA_CREDENTIALS
 from atlas.data.stac import StacApiClient
 
 LPCLOUD_SEARCH = "https://cmr.earthdata.nasa.gov/stac/LPCLOUD/search"
@@ -10,11 +11,25 @@ NSIDC_SEARCH = "https://cmr.earthdata.nasa.gov/stac/NSIDC_CPRD/search"
 
 
 class CmrLpcloudClient(StacApiClient):
+    """NASA CMR STAC on LPCLOUD.
+
+    A 401 or 403 while ``EARTHDATA_TOKEN`` is unset is a source error that
+    names that variable. The value is not included.
+    """
+
     search_url: ClassVar[str] = LPCLOUD_SEARCH
+    required_credentials: ClassVar[tuple[str, ...]] = EARTHDATA_CREDENTIALS
 
 
 class CmrNsidcClient(StacApiClient):
+    """NASA CMR STAC on NSIDC_CPRD.
+
+    A 401 or 403 while ``EARTHDATA_TOKEN`` is unset is a source error that
+    names that variable. The value is not included.
+    """
+
     search_url: ClassVar[str] = NSIDC_SEARCH
+    required_credentials: ClassVar[tuple[str, ...]] = EARTHDATA_CREDENTIALS
 
 
 class GediL2AClient(CmrLpcloudClient):

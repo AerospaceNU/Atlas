@@ -18,6 +18,11 @@ from atlas.data.base import (
     Scene,
     SceneKind,
 )
+from atlas.data.credentials import (
+    FIRMS_CREDENTIALS,
+    MissingCredentialError,
+    raise_for_missing_credential,
+)
 
 FIRMS_AREA_URL = (
     "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{bbox}/{days}/{date}"
@@ -29,8 +34,11 @@ class FirmsClient(DataPullClient):
     """Map FIRMS hotspot rows to point scenes. Requires ``FIRMS_MAP_KEY``.
 
     An explicit ``map_key`` wins. Otherwise the session value wins over the
-    environment, which wins over ``~/.atlas/keys``. A missing key still
-    raises ``ValueError`` with ``FIRMS_MAP_KEY is not set``.
+    environment, which wins over ``~/.atlas/keys``. A missing key raises
+    ``MissingCredentialError`` with ``FIRMS_MAP_KEY is not set``. That
+    message is the source error. It names the variable and does not include
+    a value. A blank key is missing. A 401 or 403 with a key still present
+    stays a provider error, with the key scrubbed from the URL.
 
     The key is percent-encoded as one URL path segment. httpx errors are
     re-raised without that URL, and the httpx logger stays at WARNING so an
@@ -59,9 +67,9 @@ class FirmsClient(DataPullClient):
     ) -> None:
         quiet_http_client_logs()
         if map_key is not None:
-            self._map_key = map_key
+            self._map_key = map_key.strip()
         else:
-            self._map_key = resolve_credential(FIRMS_MAP_KEY) or ""
+            self._map_key = (resolve_credential(FIRMS_MAP_KEY) or "").strip()
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._owns_client = client is None
 
@@ -83,11 +91,13 @@ class FirmsClient(DataPullClient):
         """Request each side of a dateline AOI and merge the hotspot rows.
 
         Raises:
-            ValueError: ``FIRMS_MAP_KEY`` is unset, the box cannot be cut at
-                180°, or FIRMS returns an error document instead of CSV.
+            MissingCredentialError: ``FIRMS_MAP_KEY`` is unset. The message
+                names that variable and does not include a value.
+            ValueError: The box cannot be cut at 180°, or FIRMS returns an
+                error document instead of CSV.
         """
         if not self._map_key:
-            raise ValueError("FIRMS_MAP_KEY is not set")
+            raise MissingCredentialError(FIRMS_MAP_KEY)
         parts = request.bbox.antimeridian_parts()
         scenes: list[Scene] = []
         seen: set[str] = set()
@@ -111,6 +121,11 @@ class FirmsClient(DataPullClient):
                     date=start.isoformat(),
                 )
                 resp = await self._get(url)
+                raise_for_missing_credential(
+                    resp,
+                    FIRMS_CREDENTIALS,
+                    satisfied=FIRMS_CREDENTIALS if self._map_key else (),
+                )
                 if resp.status_code == 400:
                     # NRT rejects "today" / future dates depending on FIRMS' calendar.
                     continue
