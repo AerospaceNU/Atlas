@@ -72,7 +72,7 @@ STAC and related search clients. `search` is the only required method, and it is
 | `digitalearth` | Digital Earth Australia and Africa Sentinel-2. |
 | `inpe` | CBERS-4 and Amazonia-1. |
 | `maxar_opendata` | Maxar Open Data. |
-| `firms` | NASA FIRMS active-fire detections. A dateline box is two area requests. |
+| `firms` | NASA FIRMS active-fire detections. `FIRMS_MAP_KEY` comes from the session, the environment, or `~/.atlas/keys`. A dateline box is two area requests. |
 | `gibs` | NASA GIBS browse imagery (true color, night lights, flood, snow, thermal). A dateline box is two WMS GetMap requests. |
 | `goes`, `himawari` | Geostationary imagery. GOES picks a satellite per side of a dateline box. Himawari lists the full-disk slot once when either side meets the disk. |
 

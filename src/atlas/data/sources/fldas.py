@@ -16,6 +16,7 @@ from urllib.parse import quote
 import httpx
 from dotenv import load_dotenv
 
+from atlas.agent.layout import EARTHDATA_TOKEN, resolve_credential
 from atlas.data.base import (
     Asset,
     BBox,
@@ -237,7 +238,10 @@ class FldasClient(DataPullClient):
     reads one hyper-slab per granule for every requested variable and cell
     together, so the 0.1° global NetCDF is never downloaded. The OPeNDAP axes
     are read once per extract and every granule reuses them, so nothing depends
-    on hardcoded axis direction or endpoints.
+    on hardcoded axis direction or endpoints. An explicit token wins. Otherwise
+    the session value wins over the environment, which wins over
+    ``~/.atlas/keys``. A missing token still raises ``FldasAuthError`` with
+    ``MISSING_TOKEN_MESSAGE``.
     """
 
     short_name: ClassVar[str] = SHORT_NAME
@@ -261,7 +265,7 @@ class FldasClient(DataPullClient):
             timeout=timeout, follow_redirects=True, trust_env=True
         )
         self._owns_client = client is None
-        self._token = token or os.environ.get("EARTHDATA_TOKEN") or None
+        self._token = token or resolve_credential(EARTHDATA_TOKEN) or None
         self._username = username or os.environ.get("EARTHDATA_USERNAME") or None
         self._password = password or os.environ.get("EARTHDATA_PASSWORD") or None
         self.table_path = table_path
