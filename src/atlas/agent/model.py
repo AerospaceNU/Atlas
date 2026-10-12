@@ -469,8 +469,9 @@ def fetch_model_catalog(client: Any, api_key: str) -> CatalogFetch:
     only while the URL stays on ``https://openrouter.ai``. Redirects are not
     followed. A repeated URL, the page cap, or the total time cap ends the
     walk. A failure after the first page keeps the rows already parsed and
-    reports the error. Rows that do not list ``tools`` are omitted, and
-    duplicate ids keep the first row. A fresh result is cached briefly.
+    reports the error. Duplicate ids keep one row, and a row that does not
+    list ``tools`` stays in the list with ``supports_tools`` false. A fresh
+    result is cached briefly.
     """
     if not api_key.strip():
         raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
@@ -508,7 +509,7 @@ def fetch_model_catalog(client: Any, api_key: str) -> CatalogFetch:
             raise
         models.extend(page)
         url = _next_catalog_page(payload, url)
-    fetched = CatalogFetch(models=_dedupe_tool_models(models), error=error)
+    fetched = CatalogFetch(models=_dedupe_models(models), error=error)
     if error is None:
         _write_catalog_cache(api_key, fetched.models)
     return fetched
@@ -548,16 +549,23 @@ def _write_catalog_cache(api_key: str, models: list[CatalogModel]) -> None:
         )
 
 
-def _dedupe_tool_models(models: list[CatalogModel]) -> list[CatalogModel]:
-    """Keep the first tool-capable row for each id."""
-    seen: set[str] = set()
-    kept: list[CatalogModel] = []
+def _dedupe_models(models: list[CatalogModel]) -> list[CatalogModel]:
+    """Keep one row per id, including rows that cannot call tools.
+
+    The first row wins. A later copy replaces it only when that copy lists
+    ``tools`` and the kept row does not, so the flag records tool support.
+    """
+    order: list[str] = []
+    kept: dict[str, CatalogModel] = {}
     for model in models:
-        if not model.supports_tools or model.id in seen:
+        current = kept.get(model.id)
+        if current is None:
+            order.append(model.id)
+            kept[model.id] = model
             continue
-        seen.add(model.id)
-        kept.append(model)
-    return kept
+        if model.supports_tools and not current.supports_tools:
+            kept[model.id] = model
+    return [kept[model_id] for model_id in order]
 
 
 def _next_catalog_page(payload: dict[str, Any], current: str) -> str | None:

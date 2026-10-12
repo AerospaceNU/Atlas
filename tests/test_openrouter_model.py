@@ -592,7 +592,7 @@ def test_later_page_with_a_bad_payload_keeps_earlier_rows() -> None:
     assert "missing data" in fetched.error
 
 
-def test_catalog_dedupes_ids_and_drops_models_without_tools() -> None:
+def test_catalog_dedupes_ids_and_marks_models_without_tools() -> None:
     first = OPENROUTER_MODELS_URL
     second = "https://openrouter.ai/api/v1/models?offset=1"
     client = _CatalogPages(
@@ -648,10 +648,11 @@ def test_catalog_dedupes_ids_and_drops_models_without_tools() -> None:
     fetched = fetch_model_catalog(client, "catalog-key")
 
     assert fetched.error is None
-    assert [(model.id, model.context_length) for model in fetched.models] == [
-        ("alpha/one", 10),
-        ("beta/two", None),
-        ("gamma/chat", 50),
+    assert [(model.id, model.context_length, model.supports_tools) for model in fetched.models] == [
+        ("alpha/one", 10, True),
+        ("plain/text", None, False),
+        ("gamma/chat", 50, True),
+        ("beta/two", None, True),
     ]
 
 
@@ -760,7 +761,7 @@ def test_live_openrouter_model_list() -> None:
     ids = [model.id for model in fetched.models]
     assert len(ids) == len(set(ids))
     for model in fetched.models:
-        assert model.supports_tools is True
+        assert isinstance(model.supports_tools, bool)
         assert model.id
         if model.name is not None:
             assert "\x1b" not in model.name

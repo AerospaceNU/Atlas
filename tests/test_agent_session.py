@@ -998,7 +998,16 @@ def test_models_command_returns_the_live_catalog_without_changing_the_model(
             "prompt_price": "0.1",
             "completion_price": "0.4",
             "supports_tools": True,
-        }
+        },
+        {
+            "id": "keep-me",
+            "name": None,
+            "description": None,
+            "context_length": None,
+            "prompt_price": None,
+            "completion_price": None,
+            "supports_tools": True,
+        },
     ]
     assert session.totals.context_limit == 111
     assert "catalog-key" not in json.dumps(events)
@@ -1051,13 +1060,64 @@ def test_later_page_failure_keeps_rows_in_the_session(tmp_path: Path) -> None:
 
     assert client.urls == [first, second]
     assert session.model_id == "keep-me"
-    assert [item.id for item in session.catalog] == ["alpha/one"]
+    assert [item.id for item in session.catalog] == ["alpha/one", "keep-me"]
     assert session.catalog[0].name == "Alpha!"
     catalog = events[1]
     assert catalog["ok"] is False
     assert "500" in catalog["message"]
     assert catalog["models"][0]["id"] == "alpha/one"
     assert catalog["models"][0]["name"] == "Alpha!"
+    assert catalog["models"][1]["id"] == "keep-me"
+    assert "catalog-key" not in json.dumps(events)
+
+
+def test_session_catalog_marks_non_tool_models_and_keeps_the_selected_one(
+    tmp_path: Path,
+) -> None:
+    class Client:
+        def get(self, url: str, **kwargs: Any) -> _HeaderResponse:
+            assert url == OPENROUTER_MODELS_URL
+            assert kwargs["follow_redirects"] is False
+            return _HeaderResponse(
+                {
+                    "data": [
+                        {
+                            "id": "plain/text",
+                            "name": "Plain",
+                            "supported_parameters": ["temperature"],
+                        },
+                        {"id": "other/model", "supported_parameters": ["tools"]},
+                    ]
+                },
+                status_code=200,
+                elapsed_seconds=0.1,
+            )
+
+        def close(self) -> None:
+            return None
+
+    model = OpenRouterModel(ModelConfig(model="keep-me", api_key="catalog-key"), Client())
+    session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
+    session.model_id = "keep-me"
+    session.totals.model = "keep-me"
+    session.catalog = [
+        CatalogModel(id="keep-me", name="Current", context_length=111, supports_tools=True)
+    ]
+    session.fetch_models = model.list_models
+
+    events = _run_protocol(['{"type":"models"}'], session)
+
+    assert session.model_id == "keep-me"
+    rows = events[1]["models"]
+    assert [(row["id"], row["supports_tools"]) for row in rows] == [
+        ("plain/text", False),
+        ("other/model", True),
+        ("keep-me", True),
+    ]
+    assert rows[0]["name"] == "Plain"
+    assert rows[2]["name"] == "Current"
+    assert rows[2]["context_length"] == 111
+    assert [item.id for item in session.catalog] == ["plain/text", "other/model", "keep-me"]
     assert "catalog-key" not in json.dumps(events)
 
 

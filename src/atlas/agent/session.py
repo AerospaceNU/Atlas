@@ -621,14 +621,35 @@ def _coerce_catalog(value: CatalogFetch | list[CatalogModel]) -> CatalogFetch:
     return CatalogFetch(models=list(value))
 
 
+def _include_selected_model(
+    session: AgentSession, models: list[CatalogModel]
+) -> list[CatalogModel]:
+    """Keep the active model in the list when a fetch does not return it.
+
+    A short or empty catalog would otherwise leave the picker with nothing to
+    select. A row already stored for that id keeps its context and tool flag.
+    """
+    selected = session.model_id.strip()
+    if not selected or any(model.id == selected for model in models):
+        return list(models)
+    previous = next((model for model in session.catalog if model.id == selected), None)
+    kept = list(models)
+    if previous is not None:
+        kept.append(previous)
+    else:
+        kept.append(CatalogModel(id=selected, supports_tools=True))
+    return kept
+
+
 def _publish_catalog(session: AgentSession, stdout: IO[str], fetched: CatalogFetch) -> None:
-    session.catalog = fetched.models
+    models = _include_selected_model(session, fetched.models)
+    session.catalog = models
     _apply_known_context_limit(session)
     payload: dict[str, Any] = {
         "type": "models",
         "ok": fetched.error is None,
         "message": fetched.error or "",
-        "models": [model.model_dump() for model in fetched.models],
+        "models": [model.model_dump() for model in models],
     }
     payload.update(_status_fields(session))
     _write_line(stdout, payload, session.secrets)
