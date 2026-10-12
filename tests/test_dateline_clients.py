@@ -96,6 +96,11 @@ def _wms_box(href: str) -> tuple[float, float, float, float]:
     return south, west, north, east
 
 
+def _wms_pixels(href: str) -> tuple[int, int]:
+    query = parse_qs(urlparse(href).query)
+    return int(query["WIDTH"][0]), int(query["HEIGHT"][0])
+
+
 def _firms_box(url: str) -> tuple[float, float, float, float]:
     segment = urlparse(url).path.split("/")[6]
     west, south, east, north = (float(item) for item in segment.split(","))
@@ -103,11 +108,17 @@ def _firms_box(url: str) -> tuple[float, float, float, float]:
 
 
 def _hotspot(lon: float) -> str:
-    return (
+    return _hotspots(lon)
+
+
+def _hotspots(*lons: float) -> str:
+    lines = [
         "latitude,longitude,bright_ti4,scan,track,acq_date,acq_time,"
-        "satellite,instrument,confidence,version,bright_ti5,frp,daynight\n"
-        f"-17.0,{lon},330.1,0.4,0.4,2024-07-01,1342,N,VIIRS,n,2.0NRT,290.1,4.2,D\n"
-    )
+        "satellite,instrument,confidence,version,bright_ti5,frp,daynight"
+    ]
+    for lon in lons:
+        lines.append(f"-17.0,{lon},330.1,0.4,0.4,2024-07-01,1342,N,VIIRS,n,2.0NRT,290.1,4.2,D")
+    return "\n".join(lines) + "\n"
 
 
 class FirmsFake(FakeAsyncClient):
@@ -150,6 +161,34 @@ async def test_gibs_dateline_aoi_is_two_wms_requests() -> None:
     assert all(scene.bbox.west <= scene.bbox.east for scene in result.scenes)
     assert [scene.properties["antimeridian_part"] for scene in result.scenes] == ["east", "west"]
     assert all(scene.footprint_is_request for scene in result.scenes)
+    # Each half is 2° by 2°, so the scaled width stays the square image size.
+    assert [_wms_pixels(scene.assets["rendered_preview"].href) for scene in result.scenes] == [
+        (512, 512),
+        (512, 512),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gibs_dateline_halves_scale_width_to_longitude_span() -> None:
+    # 10° on the east side of 180 and 2° on the west; the latitude span is 2°.
+    uneven = BBox(west=170.0, south=-18.0, east=-178.0, north=-16.0)
+    async with GibsModisTrueColorClient(
+        client=cast(httpx.AsyncClient, FakeAsyncClient())
+    ) as client:
+        result = await client.search(_request(uneven, limit=1))
+    pixels = [_wms_pixels(scene.assets["rendered_preview"].href) for scene in result.scenes]
+    assert pixels == [(2560, 512), (512, 512)]
+
+
+@pytest.mark.asyncio
+async def test_gibs_non_dateline_preview_stays_square() -> None:
+    boston = BBox(west=-71.12, south=42.32, east=-71.02, north=42.40)
+    async with GibsModisTrueColorClient(
+        client=cast(httpx.AsyncClient, FakeAsyncClient())
+    ) as client:
+        result = await client.search(_request(boston, limit=1))
+    assert len(result.scenes) == 1
+    assert _wms_pixels(result.scenes[0].assets["rendered_preview"].href) == (512, 512)
 
 
 @pytest.mark.asyncio
@@ -212,6 +251,49 @@ async def test_firms_unpublished_day_is_still_skipped() -> None:
         result = await client.search(_request(DATELINE))
     assert result.scenes == []
     assert len(fake.calls) == 2
+
+
+class _RowPerRequest(FakeAsyncClient):
+    """One new hotspot for every area request, so an extra chunk is visible."""
+
+    async def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.calls.append(url)
+        return FakeResponse(text=_hotspot(170.0 + len(self.calls)))
+
+
+class _ThreeRows(FakeAsyncClient):
+    async def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.calls.append(url)
+        return FakeResponse(text=_hotspots(179.0, 178.5, 178.0))
+
+
+@pytest.mark.asyncio
+async def test_firms_limit_stops_before_later_date_chunks() -> None:
+    # 1 June through 1 July is four FIRMS chunks of at most 10 days.
+    window = PullRequest(
+        start_date=date(2024, 6, 1),
+        end_date=date(2024, 7, 1),
+        bbox=BBox(west=-71.12, south=42.32, east=-71.02, north=42.40),
+        limit=1,
+    )
+    fake = _RowPerRequest()
+    async with FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, fake)) as client:
+        result = await client.search(window)
+    assert len(result.scenes) == 1
+    assert len(fake.calls) == 1
+    assert fake.calls[0].endswith("/10/2024-07-01")
+
+    two = _RowPerRequest()
+    async with FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, two)) as client:
+        result = await client.search(window.model_copy(update={"limit": 2}))
+    assert len(result.scenes) == 2
+    assert len(two.calls) == 2
+
+    crowded = _ThreeRows()
+    async with FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, crowded)) as client:
+        result = await client.search(window)
+    assert len(result.scenes) == 1
+    assert len(crowded.calls) == 1
 
 
 def _goes_listing() -> dict[str, str]:

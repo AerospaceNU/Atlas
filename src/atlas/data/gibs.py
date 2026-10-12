@@ -26,7 +26,11 @@ class GibsClient(DataPullClient):
     side of ±180°. WMS 1.3 with EPSG:4326 requires west <= east. One BBOX with
     west greater than east is rejected by GIBS or drawn the long way around
     the globe, which is an empty or wrapped image of the wrong hemisphere.
-    ``limit`` caps days, and both sides of a selected day are kept together.
+    Each map is ``image_size`` pixels tall. A dateline half's width is that
+    height times the half's longitude span divided by the latitude span, so
+    a narrow side is not stretched into a square. A box that does not cross
+    180° stays square. ``limit`` caps days, and both sides of a selected day
+    are kept together.
     """
 
     layer: ClassVar[str] = ""
@@ -87,6 +91,7 @@ class GibsClient(DataPullClient):
                 }
                 if side is not None:
                     properties["antimeridian_part"] = side
+                width, height = _preview_size(part, self.image_size, scale_width=split)
                 scene = Scene.try_new(
                     id=scene_id,
                     collection=self.layer,
@@ -100,7 +105,7 @@ class GibsClient(DataPullClient):
                     instrument=self.instrument_name,
                     assets={
                         "rendered_preview": Asset(
-                            href=_wms_url(self.layer, day, part, self.image_size),
+                            href=_wms_url(self.layer, day, part, width, height),
                             media_type="image/png",
                             title=self.layer,
                             roles=["overview", "visual"],
@@ -110,7 +115,7 @@ class GibsClient(DataPullClient):
                 )
                 if scene is None:
                     raise ValueError(
-                        "GIBS could not build a dateline preview for "
+                        "GIBS could not build a preview for "
                         f"{day.isoformat()} west={part.west} east={part.east}"
                     )
                 scenes.append(scene)
@@ -190,7 +195,22 @@ def _dateline_side(part: BBox) -> str:
     return "west"
 
 
-def _wms_url(layer: str, day: date, bbox: BBox, size: int) -> str:
+def _preview_size(bbox: BBox, size: int, *, scale_width: bool) -> tuple[int, int]:
+    """Pixel width and height for one GetMap.
+
+    Height is ``size``. When ``scale_width`` is set, width uses the same
+    degrees per pixel as that height, so a dateline half keeps its longitude
+    span instead of being drawn as a square.
+    """
+    if not scale_width:
+        return size, size
+    lat_span = bbox.north - bbox.south
+    if lat_span <= 0:
+        return size, size
+    return max(1, round(size * bbox.lon_span / lat_span)), size
+
+
+def _wms_url(layer: str, day: date, bbox: BBox, width: int, height: int) -> str:
     if bbox.west > bbox.east:
         raise ValueError(
             f"GIBS WMS BBOX requires west <= east; got west={bbox.west} east={bbox.east}"
@@ -204,8 +224,8 @@ def _wms_url(layer: str, day: date, bbox: BBox, size: int) -> str:
         "TIME": day.isoformat(),
         "CRS": "EPSG:4326",
         "BBOX": f"{bbox.south},{bbox.west},{bbox.north},{bbox.east}",
-        "WIDTH": str(size),
-        "HEIGHT": str(size),
+        "WIDTH": str(width),
+        "HEIGHT": str(height),
         "FORMAT": "image/png",
         "TRANSPARENT": "TRUE",
     }

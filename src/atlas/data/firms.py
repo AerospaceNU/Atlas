@@ -82,9 +82,13 @@ class FirmsClient(DataPullClient):
         if start_date > end_date:
             return PullResult(request=request, scenes=[])
         for part in parts:
+            if _at_limit(len(scenes), request.limit):
+                break
             bbox = _area_param(part)
             for start, days in _chunk_days(start_date, end_date):
-                if request.limit is not None and len(scenes) >= request.limit:
+                # The row loop's break does not leave this loop. A later chunk
+                # would send another area request and append more hotspots.
+                if _at_limit(len(scenes), request.limit):
                     break
                 url = FIRMS_AREA_URL.format(
                     key=self._map_key,
@@ -98,6 +102,7 @@ class FirmsClient(DataPullClient):
                     # NRT rejects "today" / future dates depending on FIRMS' calendar.
                     continue
                 resp.raise_for_status()
+                filled = False
                 for scene in _rows_to_scenes(
                     resp.text,
                     source=self.source,
@@ -110,10 +115,11 @@ class FirmsClient(DataPullClient):
                         continue
                     seen.add(scene.id)
                     scenes.append(scene)
-                    if request.limit is not None and len(scenes) >= request.limit:
+                    if _at_limit(len(scenes), request.limit):
+                        filled = True
                         break
-            if request.limit is not None and len(scenes) >= request.limit:
-                break
+                if filled:
+                    break
         return PullResult(request=request, scenes=scenes)
 
 
@@ -143,6 +149,10 @@ class FirmsLandsatClient(FirmsClient):
     platform_name: ClassVar[str] = "Landsat"
     instrument_name: ClassVar[str] = "OLI"
     nominal_gsd_m: ClassVar[float | None] = 30.0
+
+
+def _at_limit(count: int, limit: int | None) -> bool:
+    return limit is not None and count >= limit
 
 
 def _area_param(bbox: BBox) -> str:
