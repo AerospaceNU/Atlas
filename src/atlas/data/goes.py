@@ -32,6 +32,13 @@ class GoesClient(DataPullClient):
     """Pick GOES-East or West from the AOI longitude; list ABI MCMIP NetCDFs.
 
     Scene footprints are the whole CONUS or full-disk sector, not the AOI.
+
+    A box that crosses the antimeridian is cut at ±180° before the satellite
+    is chosen. The midpoint of the uncut box is not a point inside the AOI, so
+    it selects a disk that misses the Pacific and the search returns no
+    scenes. Each side is listed only when it meets that side's disk. An HTTP
+    failure while listing is raised, so the source is an error rather than an
+    empty catalog.
     """
 
     satellite: ClassVar[str] = "goes"
@@ -61,33 +68,78 @@ class GoesClient(DataPullClient):
         await self.aclose()
 
     async def search(self, request: PullRequest) -> PullResult:
-        bucket = _bucket_for_bbox(request.bbox)
-        product = _product_for_bbox(request.bbox)
-        if not _footprint(bucket, product).intersects(request.bbox):
+        targets = _list_targets(request.bbox)
+        if not targets:
             return PullResult(request=request, scenes=[])
         hours = set(_hours_in_range(request.start_date, request.end_date))
-        days = sorted({(year, doy) for year, doy, _ in hours})
-        scenes: dict[str, Scene] = {}
-        for year, doy in reversed(days):
-            if request.limit is not None and len(scenes) >= request.limit:
-                break
-            for key in await list_keys(self._client, bucket, f"{product}/{year}/{doy:03d}/"):
-                scene = _key_to_scene(bucket, key, product)
-                # Keep finished hours only.
-                if scene is not None and _hour_key(scene.datetime) in hours:
-                    scenes.setdefault(scene.id, scene)
-        newest = sorted(scenes.values(), key=lambda s: s.datetime)
+        merged: dict[str, Scene] = {}
+        for bucket, product in targets:
+            for scene in await _search_product(self._client, request, bucket, product, hours):
+                merged.setdefault(scene.id, scene)
+        newest = sorted(merged.values(), key=lambda s: s.datetime)
         if request.limit is not None:
             newest = newest[-request.limit :]
         return PullResult(request=request, scenes=newest)
 
 
+def _list_targets(bbox: BBox) -> list[tuple[str, str]]:
+    """Bucket and product for each side of ``bbox`` that meets a GOES disk.
+
+    A wrapping box is cut first. Sides that miss both disks are skipped, which
+    is an empty result for an AOI outside GOES coverage, not an error.
+    """
+    targets: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for part in bbox.antimeridian_parts():
+        bucket = _bucket_for_bbox(part)
+        product = _product_for_bbox(part)
+        if not _footprint(bucket, product).intersects(part):
+            continue
+        pair = (bucket, product)
+        if pair not in seen:
+            seen.add(pair)
+            targets.append(pair)
+    return targets
+
+
+async def _search_product(
+    client: httpx.AsyncClient,
+    request: PullRequest,
+    bucket: str,
+    product: str,
+    hours: set[tuple[int, int, int]],
+) -> list[Scene]:
+    days = sorted({(year, doy) for year, doy, _hour in hours})
+    scenes: dict[str, Scene] = {}
+    for year, doy in reversed(days):
+        if request.limit is not None and len(scenes) >= request.limit:
+            break
+        for key in await list_keys(client, bucket, f"{product}/{year}/{doy:03d}/"):
+            scene = _key_to_scene(bucket, key, product)
+            # Keep finished hours only.
+            if scene is not None and _hour_key(scene.datetime) in hours:
+                scenes.setdefault(scene.id, scene)
+    newest = sorted(scenes.values(), key=lambda s: s.datetime)
+    if request.limit is not None:
+        newest = newest[-request.limit :]
+    return newest
+
+
+def _require_unwrapped(bbox: BBox) -> None:
+    if bbox.west > bbox.east:
+        raise ValueError(
+            f"GOES disk selection needs a non-wrapping box; got west={bbox.west} east={bbox.east}"
+        )
+
+
 def _bucket_for_bbox(bbox: BBox) -> str:
+    _require_unwrapped(bbox)
     lon = (bbox.west + bbox.east) / 2
     return GOES_EAST_BUCKET if lon >= -105.0 else GOES_WEST_BUCKET
 
 
 def _product_for_bbox(bbox: BBox) -> str:
+    _require_unwrapped(bbox)
     inside = (
         bbox.west >= _CONUS.west
         and bbox.east <= _CONUS.east
