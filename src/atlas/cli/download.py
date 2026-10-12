@@ -166,8 +166,10 @@ async def download_assets(
 ) -> DownloadReport:
     """GET one native-resolution asset per scene, streamed to disk.
 
-    Existing non-empty files are skipped. Browse assets are not downloaded.
-    A failed GET records ``failed`` and does not abort the rest.
+    Existing non-empty files are skipped, except a GeoTIFF read as a window.
+    That read is checked again: an empty window fails the scene and does not
+    keep an older chip as this request's file. Browse assets are not
+    downloaded. A failed GET records ``failed`` and does not abort the rest.
 
     When ``bbox`` is set, a geographic, Web Mercator, or WGS84 UTM Cloud
     Optimized GeoTIFF is stored as the overlapping window. Those requests
@@ -198,6 +200,7 @@ async def download_assets(
 
     async def one(scene: Scene) -> None:
         path: Path | None = None
+        stale: Path | None = None
         bytes_read: int | None = None
         granule_size: int | None = None
         try:
@@ -216,16 +219,21 @@ async def download_assets(
             dest_dir = out / scene.source
             dest_dir.mkdir(parents=True, exist_ok=True)
             planned = dest_dir / scene_filename(scene.id, key, asset_suffix(asset))
-            if planned.is_file() and planned.stat().st_size > 0:
-                await record(
-                    DownloadOutcome(
-                        source=scene.source,
-                        scene_id=scene.id,
-                        status="skipped",
-                        path=planned,
+            window = bbox is not None and _is_geotiff_asset(asset)
+            if _nonempty_file(planned):
+                if not window:
+                    await record(
+                        DownloadOutcome(
+                            source=scene.source,
+                            scene_id=scene.id,
+                            status="skipped",
+                            path=planned,
+                        )
                     )
-                )
-                return
+                    return
+                # The chip on disk may be an earlier window. A miss must not
+                # report that file as the result of this request.
+                stale = planned
             async with sem:
                 href = await _signed_href(clients.get(scene.source), asset.href)
                 windowed = await _windowed_cog(http, href, asset, bbox)
@@ -233,6 +241,9 @@ async def download_assets(
                     payload, bytes_read, granule_size = windowed
                     path = dest_dir / scene_filename(scene.id, key, ".tif")
                     path.write_bytes(payload)
+                    if stale is not None and stale != path:
+                        _unlink_file(stale)
+                    stale = None
                 else:
                     async with http.stream("GET", href, follow_redirects=True) as response:
                         response.raise_for_status()
@@ -241,7 +252,24 @@ async def download_assets(
                         with path.open("wb") as handle:
                             async for chunk in response.aiter_bytes():
                                 handle.write(chunk)
-        except (CogMissError, CogRangeError, CogLimitError) as exc:
+                    if stale is not None and stale != path:
+                        _unlink_file(stale)
+                    stale = None
+        except CogMissError as exc:
+            _unlink_file(stale)
+            _unlink_file(path)
+            await record(
+                DownloadOutcome(
+                    source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
+                )
+            )
+            return
+        except (CogRangeError, CogLimitError) as exc:
+            # A server that will not serve the window is the same class of
+            # failure as an empty window: the older chip is not this request.
+            if isinstance(exc, CogRangeError):
+                _unlink_file(stale)
+            _unlink_file(path)
             await record(
                 DownloadOutcome(
                     source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
@@ -256,8 +284,8 @@ async def download_assets(
             )
             return
         except (httpx.HTTPError, OSError, TypeError) as exc:
-            if path is not None:
-                path.unlink(missing_ok=True)
+            _unlink_file(path)
+            _unlink_file(stale)
             await record(
                 DownloadOutcome(
                     source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
@@ -265,6 +293,7 @@ async def download_assets(
             )
             return
         if path is None:
+            _unlink_file(stale)
             await record(
                 DownloadOutcome(
                     source=scene.source,
@@ -287,6 +316,21 @@ async def download_assets(
 
     await asyncio.gather(*(one(scene) for scene in scenes))
     return report
+
+
+def _nonempty_file(path: Path) -> bool:
+    """True when ``path`` is a file with bytes, without following a symlink."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    return path.stat().st_size > 0
+
+
+def _unlink_file(path: Path | None) -> None:
+    """Remove one product file. A symlink is unlinked, not followed."""
+    if path is None:
+        return
+    if path.is_symlink() or path.is_file():
+        path.unlink()
 
 
 def _is_geotiff_asset(asset: Asset) -> bool:

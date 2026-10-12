@@ -36,6 +36,7 @@ from atlas.data.base import BBox, DataPullClient, Polygon, PullRequest, Scene
 from atlas.data.registry import sources
 from atlas.data.sources.fldas import (
     MISSING_TOKEN_MESSAGE,
+    FldasAuthError,
     FldasClient,
     FldasError,
     FldasRequestError,
@@ -56,6 +57,7 @@ _EXAMPLE = (
 )
 _EXTRACT_HINT = "FLDAS table extraction runs alone; pass only the fldas source"
 _TABLE_NAME = "fldas.csv"
+_EMPTY_WINDOW = "requested window is empty"
 
 
 def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -470,6 +472,14 @@ async def execute_pull(
                     report.outcomes.append(outcome)
                     table_failed = table_failed or outcome.status != "saved"
                     table_usage = table_usage or usage_error
+        _record_empty_windows(
+            catalog,
+            report,
+            live_clients,
+            out_dir,
+            search_only=search_only,
+            table_path=table_path,
+        )
         for src in catalog.sources:
             reporter.source_done(src.source)
         _write_manifest(out_dir, catalog, report)
@@ -522,6 +532,8 @@ async def _extract_table(
         )
         table.write_csv(path)
     except FldasRequestError as exc:
+        if "grid-cell" in str(exc):
+            _discard_file(path)
         return (
             DownloadOutcome(
                 source=source,
@@ -531,7 +543,28 @@ async def _extract_table(
             ),
             True,
         )
-    except (FldasError, httpx.HTTPError, OSError, ValueError) as exc:
+    except FldasAuthError as exc:
+        return (
+            DownloadOutcome(
+                source=source,
+                scene_id=f"{source}-table",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            ),
+            False,
+        )
+    except (FldasError, httpx.HTTPError, OSError) as exc:
+        _discard_file(path)
+        return (
+            DownloadOutcome(
+                source=source,
+                scene_id=f"{source}-table",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            ),
+            False,
+        )
+    except ValueError as exc:
         return (
             DownloadOutcome(
                 source=source,
@@ -554,6 +587,67 @@ async def _extract_table(
         ),
         False,
     )
+
+
+def _record_empty_windows(
+    catalog: SceneCatalog,
+    report: DownloadReport,
+    clients: Mapping[str, DataPullClient],
+    out_dir: Path,
+    *,
+    search_only: bool,
+    table_path: Path | None,
+) -> None:
+    """Record an empty date window and drop a product it did not write.
+
+    A source that has not published the window, or whose search failed, must
+    not leave the previous CSV or chip as the result of this pull. Search-only
+    records the failure and leaves files alone. FLDAS pulls record the failure
+    from the extract itself.
+
+    The source object keeps the fields already written on main. A page cursor
+    can be added beside them without a new manifest shape.
+    """
+    for src in catalog.sources:
+        client = clients.get(src.source)
+        fldas = isinstance(client, FldasClient)
+        if src.error is not None:
+            if not search_only:
+                if fldas:
+                    _discard_file(table_path or (out_dir / _TABLE_NAME))
+                else:
+                    _discard_source_files(out_dir, src.source)
+            continue
+        if src.scenes:
+            continue
+        if not search_only and fldas:
+            continue
+        report.outcomes.append(
+            DownloadOutcome(
+                source=src.source,
+                scene_id=f"{src.source}-window",
+                status="failed",
+                error=_EMPTY_WINDOW,
+            )
+        )
+        if not search_only:
+            _discard_source_files(out_dir, src.source)
+
+
+def _discard_file(path: Path) -> None:
+    """Remove one previous product file. A symlink is unlinked, not followed."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+
+
+def _discard_source_files(out_dir: Path, source: str) -> None:
+    """Remove chip files written for ``source`` by an earlier pull."""
+    directory = out_dir / source
+    if directory.is_symlink() or not directory.is_dir():
+        return
+    for child in directory.iterdir():
+        if child.is_symlink() or child.is_file():
+            child.unlink()
 
 
 def _catalog_bbox_note(request: PullRequest) -> str:

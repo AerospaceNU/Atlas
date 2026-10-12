@@ -704,6 +704,71 @@ async def test_download_of_unknown_crs_fetches_the_whole_asset(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_empty_window_does_not_reuse_an_older_chip(tmp_path: Path) -> None:
+    built = _geographic()
+    log = _RangeLog(built.blob)
+    dest = tmp_path / "sentinel2" / "chip_visual.tif"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"yesterday")
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=1.0, south=1.0, east=2.0, north=2.0),
+        )
+    assert report.outcomes[0].status == "failed"
+    assert report.outcomes[0].path is None
+    assert "does not overlap" in (report.outcomes[0].error or "")
+    assert report.saved_paths() == {}
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_window_with_pixels_replaces_an_older_chip(tmp_path: Path) -> None:
+    built = _geographic()
+    log = _RangeLog(built.blob)
+    dest = tmp_path / "sentinel2" / "chip_visual.tif"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"yesterday")
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=-9.5, south=8.5, east=-9.0, north=9.0),
+        )
+    assert report.outcomes[0].status == "saved"
+    saved = dest.read_bytes()
+    assert saved != b"yesterday"
+    assert len(saved) < len(built.blob)
+    assert report.saved_paths()["sentinel2"] == [dest]
+
+
+@pytest.mark.asyncio
+async def test_ignored_range_does_not_keep_an_older_chip(tmp_path: Path) -> None:
+    built = _geographic()
+    log = _RangeLog(built.blob, honor_range=False, allow_full=True)
+    dest = tmp_path / "sentinel2" / "chip_visual.tif"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"yesterday")
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=-9.5, south=8.5, east=-9.0, north=9.0),
+        )
+    assert report.outcomes[0].status == "failed"
+    assert "whole object" in (report.outcomes[0].error or "")
+    assert not dest.exists()
+    assert log.body_reads == 0
+
+
+@pytest.mark.asyncio
 async def test_download_miss_does_not_fetch_the_granule(tmp_path: Path) -> None:
     built = _geographic()
     log = _RangeLog(built.blob)
