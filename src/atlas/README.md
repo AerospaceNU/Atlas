@@ -65,7 +65,7 @@ STAC and related search clients. `search` is the only required method, and it is
 | `hls_landsat`, `hls_sentinel` | Harmonized Landsat–Sentinel. |
 | `naip` | NAIP aerial imagery. |
 | `cop_dem` | Copernicus DEM (30 m and 90 m). |
-| `earth_search` | Element84 Earth Search (Sentinel-1 GRD). |
+| `earth_search` | Element84 Earth Search (Sentinel-1 GRD, Sentinel-2 L2A). |
 | `usgs` | USGS Landsat Collection 2. |
 | `cdse` | Copernicus Data Space: Sentinel-3, Sentinel-5P, burnt area. |
 | `cmr_stac` | NASA CMR STAC: GEDI, ICESat-2, SMAP, VIIRS. |

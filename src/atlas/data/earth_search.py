@@ -19,3 +19,12 @@ class EarthSearchSentinel1GrdClient(EarthSearchClient):
     satellite: ClassVar[str] = "sentinel1"
     scene_kind: ClassVar[SceneKind] = SceneKind.sar
     nominal_gsd_m: ClassVar[float | None] = 10.0
+
+
+class EarthSearchSentinel2L2aClient(EarthSearchClient):
+    """Sentinel-2 L2A on AWS Open Data (not the Planetary Computer collection)."""
+
+    default_collection: ClassVar[str] = "sentinel-2-l2a"
+    satellite: ClassVar[str] = "sentinel2"
+    scene_kind: ClassVar[SceneKind] = SceneKind.optical
+    nominal_gsd_m: ClassVar[float | None] = 10.0
