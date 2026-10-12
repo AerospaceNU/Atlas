@@ -35,10 +35,11 @@ class FirmsClient(DataPullClient):
 
     An explicit ``map_key`` wins. Otherwise the session value wins over the
     environment, which wins over ``~/.atlas/keys``. A missing key raises
-    ``MissingCredentialError`` with ``FIRMS_MAP_KEY is not set``. That
-    message is the source error. It names the variable and does not include
-    a value. A blank key is missing. A 401 or 403 with a key still present
-    stays a provider error, with the key scrubbed from the URL.
+    ``MissingCredentialError``. The message names ``FIRMS_MAP_KEY``, says to
+    set it with ``/key firms`` or the env var, and does not include a value.
+    A blank key is missing. A 401 or 403 with a key still present says that
+    variable was rejected and includes the status, not the value. The key is
+    scrubbed from any HTTP error URL.
 
     The key is percent-encoded as one URL path segment. httpx errors are
     re-raised without that URL, and the httpx logger stays at WARNING so an
@@ -92,7 +93,10 @@ class FirmsClient(DataPullClient):
 
         Raises:
             MissingCredentialError: ``FIRMS_MAP_KEY`` is unset. The message
-                names that variable and does not include a value.
+                names that variable, says how to set it, and does not include
+                a value.
+            CredentialRejectedError: FIRMS returned 401 or 403 and the map
+                key is present. The message names the variable and the status.
             ValueError: The box cannot be cut at 180°, or FIRMS returns an
                 error document instead of CSV.
         """

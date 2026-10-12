@@ -14,7 +14,10 @@ class CmrLpcloudClient(StacApiClient):
     """NASA CMR STAC on LPCLOUD.
 
     A 401 or 403 while ``EARTHDATA_TOKEN`` is unset is a source error that
-    names that variable. The value is not included.
+    names that variable and says to set it with ``/key earthdata`` or the
+    env var. The same status with a token present names the rejection and
+    the status. The value is not included. The check runs after the
+    response, not before the request.
     """
 
     search_url: ClassVar[str] = LPCLOUD_SEARCH
@@ -25,7 +28,10 @@ class CmrNsidcClient(StacApiClient):
     """NASA CMR STAC on NSIDC_CPRD.
 
     A 401 or 403 while ``EARTHDATA_TOKEN`` is unset is a source error that
-    names that variable. The value is not included.
+    names that variable and says to set it with ``/key earthdata`` or the
+    env var. The same status with a token present names the rejection and
+    the status. The value is not included. The check runs after the
+    response, not before the request.
     """
 
     search_url: ClassVar[str] = NSIDC_SEARCH

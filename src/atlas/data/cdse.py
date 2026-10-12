@@ -16,7 +16,10 @@ class CdseStacClient(StacApiClient):
 
     Search is public when the catalog allows it. A 401 or 403 while
     ``CDSE_USERNAME`` or ``CDSE_PASSWORD`` is unset is a source error that
-    names each missing variable. The value is not included.
+    names each missing variable and says to set the env var. The same status
+    with both values present names the rejection and the status. The value
+    is not included. CDSE has no ``/key`` command. The check runs after the
+    response, not before the request.
     """
 
     search_url: ClassVar[str] = CDSE_SEARCH_URL

@@ -288,9 +288,10 @@ class FldasClient(DataPullClient):
     async def search(self, request: PullRequest) -> PullResult:
         """Search CMR for FLDAS granules (metadata only, no credentials).
 
-        A 401 or 403 while no token was resolved names ``EARTHDATA_TOKEN``.
-        The value is not included. A token that is present leaves the provider
-        status unchanged.
+        A 401 or 403 while no token was resolved names ``EARTHDATA_TOKEN``
+        and says to set it with ``/key earthdata`` or the env var. A token
+        that is present names the rejection and the status. The value is
+        not included. The check runs after the response, not before the request.
         """
         reject_wrapping_bbox(request.bbox)
         params: dict[str, Any] = {

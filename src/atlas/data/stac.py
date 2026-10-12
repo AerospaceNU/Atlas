@@ -89,7 +89,11 @@ class StacApiClient(DataPullClient):
                 or is not a usable next link. The message does not include the URL.
             MissingCredentialError: The provider returned 401 or 403 and a
                 variable in ``required_credentials`` is unset. The message
-                names that variable and does not include a value.
+                names that variable, says how to set it, and does not include
+                a value.
+            CredentialRejectedError: The provider returned 401 or 403 and
+                every required variable is set. The message names the
+                variable and the status, not the value.
         """
         call = _cursor_request(page_cursor, self.search_url, request, self._search_body)
         if call.method == "GET":
@@ -101,7 +105,11 @@ class StacApiClient(DataPullClient):
         return self._result_from_payload(request, resp.json())
 
     def _raise_for_credentials(self, response: object) -> None:
-        """Raise a named credential error, or leave the provider status alone."""
+        """Raise a named credential error for a 401 or 403.
+
+        An unset variable is missing. A variable that is set was rejected.
+        Any other status is left for the caller. The value is not included.
+        """
         raise_for_missing_credential(response, self.required_credentials)
 
     def _search_body(self, request: PullRequest, *, token: str | None = None) -> dict[str, Any]:

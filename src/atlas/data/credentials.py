@@ -28,13 +28,28 @@ class MissingCredentialError(RuntimeError):
     """A source cannot search because a credential variable is unset.
 
     ``names`` lists the missing variables. The message names those variables
-    and does not include a value. Aggregate records this as the source error.
+    and says how to set them. It does not include a value. Aggregate records
+    this as the source error.
     """
 
     def __init__(self, *names: str) -> None:
         cleaned = tuple(name for name in names if _VARIABLE_NAME.fullmatch(name))
         self.names = cleaned
         super().__init__(_missing_message(cleaned))
+
+
+class CredentialRejectedError(RuntimeError):
+    """A provider returned 401 or 403 while the credential was present.
+
+    ``names`` lists the variables that were sent or already held. The message
+    names those variables and the HTTP status. It does not include a value.
+    """
+
+    def __init__(self, status: int, *names: str) -> None:
+        cleaned = tuple(name for name in names if _VARIABLE_NAME.fullmatch(name))
+        self.names = cleaned
+        self.status_code = status
+        super().__init__(_rejected_message(status, cleaned))
 
 
 def credential_is_set(name: str) -> bool:
@@ -56,12 +71,13 @@ def raise_for_missing_credential(
     *,
     satisfied: Collection[str] = (),
 ) -> None:
-    """Turn an auth rejection into :class:`MissingCredentialError` when unset.
+    """Turn an auth rejection into a named credential error.
 
     Status 401 and 403 are the provider failures that do not name a variable.
-    When every name in ``names`` is set, or listed in ``satisfied`` because
-    the client was given an explicit value, the provider status is left for
-    the caller. Any other status is left unchanged.
+    A name that is unset, and not listed in ``satisfied``, becomes
+    :class:`MissingCredentialError`. When every name is set, or listed in
+    ``satisfied`` because the client was given an explicit value, the error
+    is :class:`CredentialRejectedError`. Any other status is left unchanged.
 
     Args:
         response: Search response. Only ``status_code`` is read.
@@ -71,7 +87,11 @@ def raise_for_missing_credential(
 
     Raises:
         MissingCredentialError: The provider refused the search and at least
-            one required variable is absent. The message names it.
+            one required variable is absent. The message names it and says
+            how to set it.
+        CredentialRejectedError: The provider refused the search and every
+            required variable is present. The message names it and the status.
+            The value is not included.
     """
     if not names:
         return
@@ -82,16 +102,53 @@ def raise_for_missing_credential(
     missing = tuple(name for name in names if name not in held and not credential_is_set(name))
     if missing:
         raise MissingCredentialError(*missing)
+    raise CredentialRejectedError(status, *names)
+
+
+# ``/key`` stores these two. CDSE has no slash command, so its hint is the env var.
+_KEY_COMMAND = {
+    EARTHDATA_TOKEN: "earthdata",
+    FIRMS_MAP_KEY: "firms",
+}
 
 
 def _missing_message(names: tuple[str, ...]) -> str:
     """Return the source-error text for ``names``.
 
-    One variable reads ``NAME is not set``. The CDSE pair, and any other
-    list of two or more, names every missing variable. No value is included.
+    One variable reads ``NAME is not set`` plus how to set it. Earthdata and
+    FIRMS name ``/key`` and the env var. CDSE, and any other name, names the
+    env var only. Two or more variables are joined the same way. No value is
+    included.
     """
     if not names:
         return "credential is not set"
+    hint = _set_hint(names)
     if len(names) == 1:
-        return f"{names[0]} is not set"
-    return f"{' and '.join(names)} are not set"
+        return f"{names[0]} is not set; {hint}"
+    return f"{' and '.join(names)} are not set; {hint}"
+
+
+def _set_hint(names: tuple[str, ...]) -> str:
+    """Return the clause that says how to set ``names``."""
+    commands = tuple(_KEY_COMMAND[name] for name in names if name in _KEY_COMMAND)
+    if len(commands) == len(names):
+        if len(names) == 1:
+            return f"set it with /key {commands[0]} or the env var"
+        listed = " or ".join(f"/key {command}" for command in commands)
+        return f"set them with {listed} or the env vars"
+    if len(names) == 1:
+        return "set the env var"
+    return "set the env vars"
+
+
+def _rejected_message(status: int, names: tuple[str, ...]) -> str:
+    """Return the source-error text for a present credential the provider refused.
+
+    One variable reads ``NAME was rejected (HTTP status)``. Two or more use
+    ``were``. No value is included.
+    """
+    if not names:
+        return f"credential was rejected (HTTP {status})"
+    if len(names) == 1:
+        return f"{names[0]} was rejected (HTTP {status})"
+    return f"{' and '.join(names)} were rejected (HTTP {status})"
