@@ -13,12 +13,14 @@ from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied, record_deni
 from atlas.agent.contracts import (
     ChatMessage,
     ModelCall,
+    ModelImage,
     Role,
     ToolCall,
     ToolCapableModel,
     ToolRegistry,
     ToolResult,
 )
+from atlas.agent.images import ingest_image, ingest_images, is_model_image
 from atlas.agent.metrics import observe_model_call, tokens_per_second
 from atlas.agent.skills import (
     Skill,
@@ -157,11 +159,18 @@ class Agent:
         """Return the package system prompt, plus the skill catalog when skills are loaded."""
         return render_system_prompt(load_system_prompt(), self.skills)
 
-    def run(self, request: str) -> AgentRun:
-        """Answer ``request``, making bounded, registry-approved tool calls."""
+    def run(self, request: str, *, images: Sequence[str] = ()) -> AgentRun:
+        """Answer ``request``, making bounded, registry-approved tool calls.
+
+        ``images`` are paths in the write sandbox or the project workspace.
+        Each one is read through the store and sent with the user message.
+        """
+        user = ChatMessage(role=Role.USER, content=request)
+        if images:
+            user.images = ingest_images(self.artifacts, list(images))
         messages = [
             ChatMessage(role=Role.SYSTEM, content=self.system_prompt()),
-            ChatMessage(role=Role.USER, content=request),
+            user,
         ]
         return self.advance(messages)
 
@@ -221,6 +230,8 @@ class Agent:
             if not response.tool_calls:
                 return AgentRun(response=response.content or "", steps=steps, calls=calls)
             hit_limit = False
+            attached: list[ModelImage] = []
+            image_errors: list[str] = []
             for call in response.tool_calls:
                 emit("tool_calling", call.name)
                 if executed < self.max_tool_calls:
@@ -230,6 +241,10 @@ class Agent:
                 else:
                     hit_limit = True
                     step = AgentStep(call=call, error="tool call limit reached", error_kind="limit")
+                images, errors = _ingest_tool_images(step, self.artifacts)
+                if errors and step.error is None:
+                    step.error = "\n".join(errors)
+                    step.error_kind = "tool_failure"
                 steps.append(step)
                 messages.append(
                     ChatMessage(
@@ -238,8 +253,18 @@ class Agent:
                         content=_tool_message(step),
                     )
                 )
+                attached.extend(images)
+                image_errors.extend(errors)
                 if on_step is not None:
                     on_step(step)
+            if attached or image_errors:
+                messages.append(
+                    ChatMessage(
+                        role=Role.USER,
+                        content="\n".join(image_errors) if image_errors else None,
+                        images=attached,
+                    )
+                )
             if executed >= self.max_tool_calls or hit_limit:
                 return AgentRun(
                     response=_STOPPED_RESPONSE,
@@ -280,3 +305,25 @@ def _tool_message(step: AgentStep) -> str:
     if step.result is not None:
         return step.result.model_dump_json()
     return json.dumps({"error": step.error, "error_kind": step.error_kind})
+
+
+def _ingest_tool_images(
+    step: AgentStep, store: LocalArtifactStore
+) -> tuple[list[ModelImage], list[str]]:
+    """Read image artifacts for a following user message.
+
+    An over-cap, unreadable, or decompression-bomb image is an error string.
+    Other artifacts are left as the tool's text result.
+    """
+    if step.result is None:
+        return [], []
+    images: list[ModelImage] = []
+    errors: list[str] = []
+    for path in step.result.artifacts:
+        if not is_model_image(path):
+            continue
+        try:
+            images.append(ingest_image(store, path))
+        except (OSError, ValueError) as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+    return images, errors
