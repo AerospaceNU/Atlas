@@ -266,10 +266,19 @@ class _CountingStream(httpx.AsyncByteStream):
 
 
 class _RangeLog:
-    def __init__(self, blob: bytes, *, honor_range: bool = True, allow_full: bool = False) -> None:
+    def __init__(
+        self,
+        blob: bytes,
+        *,
+        honor_range: bool = True,
+        allow_full: bool = False,
+        fail_first: int = 0,
+    ) -> None:
         self.blob = blob
         self.honor_range = honor_range
         self.allow_full = allow_full
+        self.fail_first = fail_first
+        self.failures = 0
         self.calls: list[tuple[int, int] | None] = []
         self.body_reads = 0
 
@@ -286,6 +295,10 @@ class _RangeLog:
         start_s, end_s = header.removeprefix("bytes=").split("-", 1)
         start, end = int(start_s), int(end_s)
         self.calls.append((start, end))
+        if self.fail_first > 0:
+            self.fail_first -= 1
+            self.failures += 1
+            return httpx.Response(503, content=b"busy")
         if not self.honor_range:
             return httpx.Response(200, stream=_CountingStream(self, self.blob))
         if start < 0 or end < start or end >= len(self.blob):
@@ -915,6 +928,52 @@ def test_manifest_records_bytes_read_and_granule_size(tmp_path: Path) -> None:
         }
     ]
     assert source["windows"][0]["bytes_read"] < source["windows"][0]["granule_size"]
+
+
+@pytest.mark.asyncio
+async def test_adjacent_tile_ranges_are_fetched_together() -> None:
+    pixels = _grid(8, 8)
+    built = build_cog(
+        pixels,
+        tile=2,
+        origin_x=-10.0,
+        origin_y=10.0,
+        pixel_size_x=0.25,
+        pixel_size_y=0.25,
+    )
+    log = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        read = await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-10.0,
+            south=9.5,
+            east=-9.0,
+            north=10.0,
+        )
+    tile_calls = [call for call in log.range_calls() if _tiles_touched([call], built.tile_spans)]
+    assert tile_calls
+    assert len(tile_calls) == 1
+    assert _tiles_touched(tile_calls, built.tile_spans) == {0, 1}
+    assert np.array_equal(read.array, pixels[:, 0:2, 0:4])
+
+
+@pytest.mark.asyncio
+async def test_transient_range_status_is_retried() -> None:
+    built = _geographic()
+    log = _RangeLog(built.blob, fail_first=1)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        read = await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-9.5,
+            south=8.5,
+            east=-9.0,
+            north=9.0,
+        )
+    assert log.failures == 1
+    assert np.array_equal(read.array, np.array([[[42, 43], [52, 53]]], dtype=np.uint8))
+    assert _tiles_touched(log.range_calls(), built.tile_spans) == {9}
 
 
 @pytest.mark.asyncio

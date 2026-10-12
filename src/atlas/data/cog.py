@@ -8,6 +8,7 @@ substituted for it.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import struct
 import zlib
@@ -59,6 +60,8 @@ _GEO_PROJECTED: Final[int] = 3072
 _COMPRESS_NONE: Final[int] = 1
 _COMPRESS_DEFLATE: Final[frozenset[int]] = frozenset({8, 32946})
 _MAX_RANGE_BYTES: Final[int] = 8 * 1024 * 1024
+_RANGE_ATTEMPTS: Final[int] = 3
+_RETRY_STATUS: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
 _MAX_IFD_ENTRIES: Final[int] = 128
 _MAX_TILES: Final[int] = 8192
 _MAX_WINDOW_PIXELS: Final[int] = 16_000_000
@@ -148,10 +151,22 @@ class _RangeReader:
         expected = end - start + 1
         if expected > _MAX_RANGE_BYTES:
             raise CogRangeError("requested range exceeds the byte limit")
-        data = await self._stream_range(start, end, expected)
+        data = await self._fetch_with_retries(start, end, expected)
         self._spans.append((start, end, data))
         self.bytes_fetched += len(data)
         return data
+
+    async def _fetch_with_retries(self, start: int, end: int, expected: int) -> bytes:
+        """Retry transport failures and a few server statuses, not a refused range."""
+        attempt = 0
+        while True:
+            try:
+                return await self._stream_range(start, end, expected)
+            except httpx.HTTPError:
+                attempt += 1
+                if attempt >= _RANGE_ATTEMPTS:
+                    raise
+                await asyncio.sleep(0.05 * attempt)
 
     async def _stream_range(self, start: int, end: int, expected: int) -> bytes:
         """Read one range, and do not buffer a body the server did not slice.
@@ -172,8 +187,9 @@ class _RangeReader:
                 )
             if status == 416:
                 raise CogRangeError("server rejected the byte range")
-            if status != 206:
+            if status in _RETRY_STATUS:
                 response.raise_for_status()
+            if status != 206:
                 raise CogRangeError(f"unexpected status {status} for a range request")
             self._note_granule_size(response.headers.get("content-range"))
             chunks = bytearray()
@@ -261,6 +277,17 @@ class CogFile:
             (image.samples, row1 - row0, col1 - col0),
             dtype=out_dtype,
         )
+        spans: list[tuple[int, int]] = []
+        for ty in range(ty0, ty1 + 1):
+            for tx in range(tx0, tx1 + 1):
+                index = ty * tiles_x + tx
+                offset = image.tile_offsets[index]
+                count = image.tile_counts[index]
+                if count < 1 or offset < 0:
+                    raise CogError("tile offset is empty")
+                spans.append((offset, offset + count - 1))
+        for start, end in _coalesce(spans, _MAX_RANGE_BYTES):
+            await self._reader.read(start, end)
         for ty in range(ty0, ty1 + 1):
             for tx in range(tx0, tx1 + 1):
                 index = ty * tiles_x + tx
@@ -833,6 +860,21 @@ def _snap(value: float) -> float:
     if abs(value - nearest) <= 1e-8:
         return float(nearest)
     return value
+
+
+def _coalesce(spans: list[tuple[int, int]], limit: int) -> list[tuple[int, int]]:
+    """Merge ranges that touch and still fit in one limited request."""
+    if not spans:
+        return []
+    ordered = sorted(spans)
+    merged: list[tuple[int, int]] = [ordered[0]]
+    for start, end in ordered[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + 1 and end - prev_start + 1 <= limit:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 async def _copy_tile(
