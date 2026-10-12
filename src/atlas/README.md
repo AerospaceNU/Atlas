@@ -71,7 +71,7 @@ STAC and related search clients. `search` is the only required method, and it is
 | `digitalearth` | Digital Earth Australia and Africa Sentinel-2. |
 | `inpe` | CBERS-4 and Amazonia-1. |
 | `maxar_opendata` | Maxar Open Data. |
-| `firms` | NASA FIRMS active-fire detections. |
+| `firms` | NASA FIRMS active-fire detections. `FIRMS_MAP_KEY` comes from the session, the environment, or `~/.atlas/keys`. |
 | `gibs` | NASA GIBS browse imagery (true color, night lights, flood, snow, thermal). |
 | `goes`, `himawari` | Geostationary imagery. |
 

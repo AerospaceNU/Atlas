@@ -9,8 +9,10 @@ Project root (the workspace):
 User root (the home directory):
 
 - ``keys/`` — API keys, never written into the project tree. The directory
-  is mode ``0700`` and the OpenRouter key file is mode ``0600``. Neither is
-  read or written through a symlink.
+  is mode ``0700`` and each key file is mode ``0600``. Neither is read or
+  written through a symlink. ``OPENROUTER_API_KEY``, ``EARTHDATA_TOKEN``, and
+  ``FIRMS_MAP_KEY`` can be saved here for the user. A session value stays in
+  memory and wins over the environment, which wins over the file.
 - ``weights/`` — user-level weights (existing ``~/.atlas/weights``)
 - ``defaults/`` — user defaults
 
@@ -31,7 +33,18 @@ _PROJECT_DIRS = ("sessions", "artifacts", "data")
 _USER_DIRS = ("keys", "weights", "defaults")
 _LIST_KINDS = frozenset({"sessions", "artifacts"})
 _REMOVE_KINDS = frozenset({"sessions", "artifacts", "keys", "weights"})
-_KEY_FILE = "openrouter_api_key"
+OPENROUTER_API_KEY = "OPENROUTER_API_KEY"
+EARTHDATA_TOKEN = "EARTHDATA_TOKEN"
+FIRMS_MAP_KEY = "FIRMS_MAP_KEY"
+KEY_VARIABLES = frozenset({OPENROUTER_API_KEY, EARTHDATA_TOKEN, FIRMS_MAP_KEY})
+_KEY_FILES = {
+    OPENROUTER_API_KEY: "openrouter_api_key",
+    EARTHDATA_TOKEN: "earthdata_token",
+    FIRMS_MAP_KEY: "firms_map_key",
+}
+# The live session's credential map. ``serve`` binds the session dict here and
+# unbinds it when the loop ends, so a session value dies with that process.
+_active_session_keys: dict[str, str] = {}
 
 Kind = Literal["sessions", "artifacts", "keys", "weights"]
 
@@ -40,8 +53,49 @@ class AtlasPathError(ValueError):
     """A layout path left the chosen ``.atlas`` root or skipped confirmation."""
 
 
-class OpenRouterKeyWarning(UserWarning):
+class CredentialKeyWarning(UserWarning):
+    """A stored credential was kept, but its file mode looks wrong."""
+
+
+class OpenRouterKeyWarning(CredentialKeyWarning):
     """The OpenRouter key was kept, but its shape or file mode looks wrong."""
+
+
+def bind_session_credentials(store: dict[str, str]) -> None:
+    """Point credential lookup at the live session map.
+
+    ``store`` is the session object. Later writes to that dict are visible
+    to data clients in this process. The map is not copied to disk.
+    """
+    global _active_session_keys
+    _active_session_keys = store
+
+
+def unbind_session_credentials() -> None:
+    """Drop the live session map so later lookups no longer see it."""
+    global _active_session_keys
+    _active_session_keys = {}
+
+
+def session_credential(name: str) -> str | None:
+    """Return the bound session value for ``name``, or None when it is blank."""
+    value = _active_session_keys.get(name)
+    if value is None or not value.strip():
+        return None
+    return value.strip()
+
+
+def key_filename(name: str) -> str:
+    """Return the user-key filename for an allowed variable name.
+
+    Raises:
+        ValueError: if ``name`` is not one of the stored variables. The
+        message does not echo ``name``, which may be a pasted secret.
+    """
+    try:
+        return _KEY_FILES[name]
+    except KeyError:
+        raise ValueError("unknown key variable") from None
 
 
 def project_atlas_root(workspace: Path) -> Path:
@@ -116,16 +170,20 @@ def remove_entry(atlas_root: Path, kind: str, name: str, *, confirm: bool) -> No
     _delete(target)
 
 
-def read_user_key(home: Path | None = None) -> str | None:
-    """Return the user OpenRouter key, or None when the file is absent.
+def read_user_key(home: Path | None = None, *, name: str = OPENROUTER_API_KEY) -> str | None:
+    """Return the user key for ``name``, or None when the file is absent.
 
     The file is opened with ``O_NOFOLLOW`` where the OS provides it. A
     symlink, or a keys directory that resolves outside the user ``.atlas``
     root, is ignored. On POSIX, a file that is readable by group or others
-    produces :class:`OpenRouterKeyWarning`. Windows does not report those
+    produces a warning that names ``name``. Windows does not report those
     Unix bits, so the warning is skipped there.
+
+    Raises:
+        ValueError: if ``name`` is not a stored variable. The message does
+        not echo ``name``.
     """
-    path = user_key_path(home)
+    path = user_key_path(home, name=name)
     keys = path.parent
     if keys.is_symlink() or path.is_symlink() or not _is_inside(keys.parent, keys):
         return None
@@ -139,11 +197,18 @@ def read_user_key(home: Path | None = None) -> str | None:
     try:
         info = os.fstat(fd)
         if os.name == "posix" and info.st_mode & 0o077:
-            warnings.warn(
-                "OpenRouter key file permissions are too loose",
-                OpenRouterKeyWarning,
-                stacklevel=2,
-            )
+            if name == OPENROUTER_API_KEY:
+                warnings.warn(
+                    "OpenRouter key file permissions are too loose",
+                    OpenRouterKeyWarning,
+                    stacklevel=2,
+                )
+            else:
+                warnings.warn(
+                    f"{name} file permissions are too loose",
+                    CredentialKeyWarning,
+                    stacklevel=2,
+                )
         chunks: list[bytes] = []
         while True:
             block = os.read(fd, 4096)
@@ -156,6 +221,21 @@ def read_user_key(home: Path | None = None) -> str | None:
     if not text or "\n" in text or "\r" in text:
         return None
     return text
+
+
+def prepare_credential(key: str, *, name: str) -> str:
+    """Strip ``key`` for ``name`` and reject an empty value or a newline.
+
+    Raises:
+        ValueError: if ``name`` is unknown, or the value is empty or contains
+        a newline or carriage return. The message names ``name`` and does not
+        include the value.
+    """
+    key_filename(name)
+    cleaned = key.strip()
+    if not cleaned or "\n" in cleaned or "\r" in cleaned:
+        raise ValueError(f"{name} is empty or contains a newline")
+    return cleaned
 
 
 def prepare_openrouter_key(key: str, *, warn: bool = True) -> tuple[str, str]:
@@ -177,40 +257,52 @@ def prepare_openrouter_key(key: str, *, warn: bool = True) -> tuple[str, str]:
     return cleaned, warning
 
 
-def write_user_key(key: str, home: Path | None = None) -> Path:
-    """Persist a user OpenRouter key under ``~/.atlas/keys`` and return the path.
+def write_user_key(key: str, home: Path | None = None, *, name: str = OPENROUTER_API_KEY) -> Path:
+    """Persist a user key under ``~/.atlas/keys`` and return the path.
 
     ``home`` is the directory that contains ``.atlas``, not the project
-    workspace. The keys directory is mode ``0700``. The file is replaced
-    atomically: a temporary file is created with ``O_EXCL`` and mode
-    ``0600``, fsynced, then renamed into place. The keys directory is fsynced
-    after that rename so the new directory entry itself is durable. An
-    existing file is chmodded to ``0600`` before that rename and is never
-    opened with ``O_TRUNC``.
+    workspace. ``name`` selects the file. The keys directory is mode
+    ``0700``. The file is replaced atomically: a temporary file is created
+    with ``O_EXCL`` and mode ``0600``, fsynced, then renamed into place. The
+    keys directory is fsynced after that rename so the new directory entry
+    itself is durable. An existing file is chmodded to ``0600`` before that
+    rename and is never opened with ``O_TRUNC``.
 
     A symlink at the key path or the keys directory is refused, and so is a
-    keys directory that resolves outside the user root.
+    keys directory that resolves outside the user root. The project tree is
+    not written.
 
     On Windows the Unix modes are not enforced. ``chmod`` is still called,
     but the file ACL decides who can read the key, and symlinks are rejected
     with ``is_symlink`` because ``O_NOFOLLOW`` is not available. Windows also
     has no directory ``fsync``, so that durability step is skipped.
+
+    Raises:
+        ValueError: if ``name`` is unknown or ``key`` is empty or contains a
+        newline. The message names the variable and does not include the value.
     """
-    cleaned, _warning = prepare_openrouter_key(key)
+    if name == OPENROUTER_API_KEY:
+        cleaned, _warning = prepare_openrouter_key(key)
+    else:
+        cleaned = prepare_credential(key, name=name)
     root = ensure_user_layout(home)
     keys = _require_keys_dir(root)
-    path = keys / _KEY_FILE
+    path = keys / key_filename(name)
     _atomic_write_private(keys, path, cleaned + "\n")
     return path
 
 
-def delete_user_key(home: Path | None = None) -> bool:
-    """Remove the user OpenRouter key file.
+def delete_user_key(home: Path | None = None, *, name: str = OPENROUTER_API_KEY) -> bool:
+    """Remove the user key file for ``name``.
 
     Returns true when a file was removed. A missing file returns false. A
     symlink is refused and left in place.
+
+    Raises:
+        ValueError: if ``name`` is not a stored variable.
+        AtlasPathError: if the path is a symlink or escapes the user root.
     """
-    path = user_key_path(home)
+    path = user_key_path(home, name=name)
     keys = path.parent
     if keys.is_symlink() or path.is_symlink():
         raise AtlasPathError("refusing to follow a key symlink")
@@ -222,9 +314,42 @@ def delete_user_key(home: Path | None = None) -> bool:
     return True
 
 
-def user_key_path(home: Path | None = None) -> Path:
-    """Path of the user OpenRouter key file."""
-    return user_atlas_root(home) / "keys" / _KEY_FILE
+def user_key_path(home: Path | None = None, *, name: str = OPENROUTER_API_KEY) -> Path:
+    """Path of the user key file for ``name``.
+
+    Raises:
+        ValueError: if ``name`` is not a stored variable.
+    """
+    return user_atlas_root(home) / "keys" / key_filename(name)
+
+
+def resolve_credential(
+    name: str,
+    *,
+    session_key: str | None = None,
+    env_key: str | None = None,
+    home: Path | None = None,
+) -> str | None:
+    """Choose the credential for ``name``.
+
+    A non-empty session value wins over the environment, which wins over the
+    user file. When ``session_key`` is omitted, the bound session map is
+    used. When ``env_key`` is omitted, ``os.environ`` is used. Missing
+    everywhere returns None.
+
+    Raises:
+        ValueError: if ``name`` is not a stored variable.
+    """
+    key_filename(name)
+    if session_key is None:
+        session_key = session_credential(name)
+    if session_key is not None and session_key.strip():
+        return session_key.strip()
+    if env_key is None:
+        env_key = os.environ.get(name)
+    if env_key is not None and env_key.strip():
+        return env_key.strip()
+    return read_user_key(home, name=name)
 
 
 def resolve_openrouter_key(

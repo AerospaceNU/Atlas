@@ -50,7 +50,9 @@ def _request(bbox: BBox = BOSTON, *, limit: int = 1) -> PullRequest:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_earthdata_env(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_earthdata_env(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Keep offline tests off a developer's real .env so credentials never leak in."""
     if request.node.get_closest_marker("evals") is not None:
         return
@@ -58,6 +60,9 @@ def _isolate_earthdata_env(request: pytest.FixtureRequest, monkeypatch: pytest.M
     monkeypatch.delenv("EARTHDATA_USERNAME", raising=False)
     monkeypatch.delenv("EARTHDATA_PASSWORD", raising=False)
     monkeypatch.setattr(fldas_module, "load_dotenv", lambda *a, **k: False)
+    home = tmp_path / "no-saved-earthdata-key"
+    home.mkdir()
+    monkeypatch.setattr("atlas.agent.layout.Path.home", lambda: home)
 
 
 def _granule_item(*, granule_ur: str | None = None) -> dict[str, Any]:

@@ -160,7 +160,7 @@ enum Mode {
     Compose,
     ModelWait,
     ModelPicker,
-    Key { scope: String },
+    Key { scope: String, name: String },
 }
 
 struct App {
@@ -532,16 +532,28 @@ impl App {
                 scope,
                 saved,
                 warning,
+                name,
             } => {
                 self.mode = Mode::Compose;
                 self.input.clear();
                 let note = if scope == "deleted" {
-                    "OpenRouter key deleted. OPENROUTER_API_KEY in the environment \
-                     will still be used on the next launch."
-                        .to_string()
+                    if name.is_empty() {
+                        "OpenRouter key deleted. OPENROUTER_API_KEY in the environment \
+                         will still be used on the next launch."
+                            .to_string()
+                    } else {
+                        format!(
+                            "{name} key deleted. {name} in the environment \
+                             will still be used on the next launch."
+                        )
+                    }
                 } else {
                     let label = if saved { "saved" } else { "not saved" };
-                    format!("{scope} key {label}")
+                    if name.is_empty() {
+                        format!("{scope} key {label}")
+                    } else {
+                        format!("{name} {scope} key {label}")
+                    }
                 };
                 let warning_already_shown = note.contains(warning.as_str());
                 self.transcript.push(tool_note(note));
@@ -870,8 +882,8 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
     let mode = app.mode.clone();
     match mode {
         Mode::ModelPicker => handle_picker_key(app, child, key)?,
-        Mode::Key { scope } => {
-            handle_secret_key(app, child, key, &scope)?;
+        Mode::Key { scope, name } => {
+            handle_secret_key(app, child, key, &scope, &name)?;
         }
         Mode::ModelWait => {}
         Mode::Compose => {
@@ -1341,6 +1353,7 @@ fn handle_secret_key(
     child: &mut ChildProcess,
     key: KeyEvent,
     scope: &str,
+    name: &str,
 ) -> Result<()> {
     match key.code {
         KeyCode::Backspace => {
@@ -1352,11 +1365,15 @@ fn handle_secret_key(
         KeyCode::Enter => {
             if !app.input.is_empty() {
                 let secret = std::mem::take(&mut app.input);
-                child.send(serde_json::json!({
+                let mut payload = serde_json::json!({
                     "type": "set_key",
                     "scope": scope,
                     "key": secret
-                }))?;
+                });
+                if !name.is_empty() {
+                    payload["name"] = serde_json::Value::String(name.to_string());
+                }
+                child.send(payload)?;
                 // The secret is not copied into the transcript.
             }
         }
@@ -1413,25 +1430,7 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
                 .push(tool_note(format!("fetching models{suffix}")));
             Some(serde_json::json!({"type": "models"}))
         }
-        "/key" => {
-            let scope = parts.next().unwrap_or("");
-            if scope == "delete" && parts.next().is_none() {
-                Some(serde_json::json!({"type": "delete_key"}))
-            } else if scope == "session" || scope == "user" {
-                app.mode = Mode::Key {
-                    scope: scope.to_string(),
-                };
-                app.transcript.push(tool_note(format!(
-                    "Enter the OpenRouter key for this {scope}. It stays hidden."
-                )));
-                None
-            } else {
-                app.transcript.push(tool_note(
-                    "usage: /key session | /key user | /key delete",
-                ));
-                None
-            }
-        }
+        "/key" => key_command(app, &mut parts),
         "/sessions" => Some(serde_json::json!({
             "type": "list",
             "scope": app.scope_root,
@@ -1513,6 +1512,64 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
     }
 }
 
+const KEY_USAGE: &str = "usage: /key session | /key user | /key delete | \
+/key earthdata session | /key earthdata user | /key earthdata delete | \
+/key firms session | /key firms user | /key firms delete";
+
+fn credential_variable(token: &str) -> Option<&'static str> {
+    match token {
+        "earthdata" => Some("EARTHDATA_TOKEN"),
+        "firms" => Some("FIRMS_MAP_KEY"),
+        _ => None,
+    }
+}
+
+/// `/key` for OpenRouter, Earthdata, or FIRMS. The secret is not sent here.
+fn key_command(
+    app: &mut App,
+    parts: &mut std::str::SplitWhitespace<'_>,
+) -> Option<serde_json::Value> {
+    let first = parts.next().unwrap_or("");
+    let second = parts.next();
+    if parts.next().is_some() {
+        app.transcript.push(tool_note(KEY_USAGE));
+        return None;
+    }
+    if matches!(first, "session" | "user") && second.is_none() {
+        app.mode = Mode::Key {
+            scope: first.to_string(),
+            name: String::new(),
+        };
+        app.transcript.push(tool_note(format!(
+            "Enter the OpenRouter key for this {first}. It stays hidden."
+        )));
+        return None;
+    }
+    if first == "delete" && second.is_none() {
+        return Some(serde_json::json!({"type": "delete_key"}));
+    }
+    if let Some(variable) = credential_variable(first) {
+        match second {
+            Some("delete") => {
+                return Some(serde_json::json!({"type": "delete_key", "name": variable}));
+            }
+            Some(scope @ ("session" | "user")) => {
+                app.mode = Mode::Key {
+                    scope: scope.to_string(),
+                    name: variable.to_string(),
+                };
+                app.transcript.push(tool_note(format!(
+                    "Enter the {variable} for this {scope}. It stays hidden."
+                )));
+                return None;
+            }
+            _ => {}
+        }
+    }
+    app.transcript.push(tool_note(KEY_USAGE));
+    None
+}
+
 const PICKER_PAGE: usize = 8;
 /// Slash commands stay on one page so a new command is not clipped off `/`.
 const MENU_PAGE: usize = 12;
@@ -1554,7 +1611,7 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
         },
         MenuItem {
             token: "/key",
-            description: "Set an OpenRouter key",
+            description: "Set an API key",
         },
         MenuItem {
             token: "/skill",
@@ -1585,21 +1642,6 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
             description: "Enable a saved skill draft",
         },
     ];
-    const KEY_ARGS: [MenuItem; 3] = [
-        MenuItem {
-            token: "session",
-            description: "Key for this session",
-        },
-        MenuItem {
-            token: "user",
-            description: "Saved for this user",
-        },
-        MenuItem {
-            token: "delete",
-            description: "Delete the saved key",
-        },
-    ];
-
     if !text.starts_with('/') {
         return Vec::new();
     }
@@ -1617,19 +1659,71 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
     }
     // Once a fixed set is exhausted and free text follows, show nothing.
     if !rest.is_empty() && text.ends_with(char::is_whitespace) {
+        if command == "/key" && key_scope_menu(&rest) {
+            return key_scope_items();
+        }
         return Vec::new();
     }
 
     match command {
         "/model" => Vec::new(),
         "/sessions" | "/artifacts" | "/save-skill" | "/enable-skill" => Vec::new(),
-        "/key" => {
-            if rest.len() > 1 {
-                Vec::new()
-            } else {
-                filter_args(&KEY_ARGS, rest.first().copied().unwrap_or(""))
-            }
-        }
+        "/key" => key_menu(&rest),
+        _ => Vec::new(),
+    }
+}
+
+const KEY_SCOPES: [MenuItem; 3] = [
+    MenuItem {
+        token: "session",
+        description: "Key for this session",
+    },
+    MenuItem {
+        token: "user",
+        description: "Saved for this user",
+    },
+    MenuItem {
+        token: "delete",
+        description: "Delete the saved key",
+    },
+];
+
+const KEY_NAMES: [MenuItem; 5] = [
+    MenuItem {
+        token: "session",
+        description: "OpenRouter key for this session",
+    },
+    MenuItem {
+        token: "user",
+        description: "OpenRouter key saved for this user",
+    },
+    MenuItem {
+        token: "delete",
+        description: "Delete the saved OpenRouter key",
+    },
+    MenuItem {
+        token: "earthdata",
+        description: "Earthdata token",
+    },
+    MenuItem {
+        token: "firms",
+        description: "FIRMS map key",
+    },
+];
+
+fn key_scope_items() -> Vec<MenuItem> {
+    KEY_SCOPES.to_vec()
+}
+
+fn key_scope_menu(rest: &[&str]) -> bool {
+    matches!(rest, ["earthdata"] | ["firms"])
+}
+
+fn key_menu(rest: &[&str]) -> Vec<MenuItem> {
+    match rest {
+        [] => KEY_NAMES.to_vec(),
+        [query] => filter_args(&KEY_NAMES, query),
+        [name, query] if key_scope_menu(&[*name]) => filter_args(&KEY_SCOPES, query),
         _ => Vec::new(),
     }
 }
@@ -1760,7 +1854,11 @@ fn is_finished_command(text: &str) -> bool {
             None => false,
         },
         "/model" => text.starts_with("/model"),
-        "/key" => matches!(words.next(), Some("session") | Some("user") | Some("delete")),
+        "/key" => match (words.next(), words.next(), words.next()) {
+            (Some("session" | "user" | "delete"), None, _) => true,
+            (Some("earthdata" | "firms"), Some("session" | "user" | "delete"), None) => true,
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -3517,6 +3615,64 @@ mod tests {
     }
 
     #[test]
+    fn earthdata_session_prompts_without_sending_the_secret() {
+        let mut app = App::new();
+        assert!(slash_outcome(&mut app, "/key earthdata session").is_none());
+        assert!(matches!(
+            app.mode,
+            Mode::Key { ref scope, ref name } if scope == "session" && name == "EARTHDATA_TOKEN"
+        ));
+        let text = tool_text(&app);
+        assert!(text.contains("EARTHDATA_TOKEN"), "{text}");
+        assert!(text.contains("stays hidden"), "{text}");
+        assert!(!text.contains("secret-token"), "{text}");
+    }
+
+    #[test]
+    fn firms_delete_names_the_variable() {
+        let mut app = App::new();
+        let payload = slash_outcome(&mut app, "/key firms delete").expect("delete request");
+        assert_eq!(payload["type"], "delete_key");
+        assert_eq!(payload["name"], "FIRMS_MAP_KEY");
+        assert!(slash_outcome(&mut app, "/key firms delete extra").is_none());
+        let text = tool_text(&app);
+        assert!(!text.contains("map-key-value"), "{text}");
+    }
+
+    #[test]
+    fn earthdata_menu_offers_a_scope_after_the_name() {
+        let tokens: Vec<&str> = menu_options("/key earthdata ")
+            .iter()
+            .map(|item| item.token)
+            .collect();
+        assert_eq!(tokens, vec!["session", "user", "delete"]);
+        assert_eq!(
+            menu_action("/key earthdata s", 0, true),
+            MenuAction::Run("/key earthdata session".to_string())
+        );
+    }
+
+    #[test]
+    fn named_key_delete_names_the_variable_in_the_note() {
+        let mut app = App::new();
+        app.apply(ServerMessage::KeySet {
+            scope: "deleted".to_string(),
+            saved: false,
+            warning: "FIRMS_MAP_KEY in the environment will still be used on the next launch"
+                .to_string(),
+            name: "FIRMS_MAP_KEY".to_string(),
+        });
+        let text = tool_text(&app);
+        assert!(text.contains("FIRMS_MAP_KEY key deleted"), "{text}");
+        assert!(
+            text.contains(
+                "FIRMS_MAP_KEY in the environment will still be used on the next launch"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn key_delete_says_the_environment_key_returns_next_launch() {
         let mut app = App::new();
         app.apply(ServerMessage::KeySet {
@@ -3524,6 +3680,7 @@ mod tests {
             saved: false,
             warning: "OPENROUTER_API_KEY in the environment will still be used on the next launch"
                 .to_string(),
+            name: String::new(),
         });
         let text = tool_text(&app);
         assert!(

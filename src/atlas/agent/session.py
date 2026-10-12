@@ -31,15 +31,21 @@ from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
 from atlas.agent.images import ingest_images
 from atlas.agent.layout import (
+    KEY_VARIABLES,
+    OPENROUTER_API_KEY,
     AtlasPathError,
+    bind_session_credentials,
     delete_user_key,
     ensure_project_layout,
     ensure_user_layout,
     list_entries,
+    prepare_credential,
     prepare_openrouter_key,
     project_atlas_root,
+    read_user_key,
     remove_entry,
     resolve_openrouter_key,
+    unbind_session_credentials,
     user_atlas_root,
     write_user_key,
 )
@@ -80,6 +86,7 @@ class AgentSession:
         ]
         self.stopped_for_limit = False
         self.session_key: str | None = None
+        self.credential_keys: dict[str, str] = {}
         self.home: Path | None = None
         self.workspace: Path | None = None
         self.requires_api_key = False
@@ -405,6 +412,15 @@ def serve(
     """
     if redact and redact not in session.secrets:
         session.secrets.append(redact)
+    bind_session_credentials(session.credential_keys)
+    try:
+        return _serve_bound(session, stdin, stdout)
+    finally:
+        unbind_session_credentials()
+
+
+def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
+    """Read the protocol after the session credential map is bound."""
     _write_line(stdout, _ready_event(session), session.secrets)
     for line in stdin:
         stripped = line.strip()
@@ -446,7 +462,7 @@ def serve(
             _handle_set_key(session, stdout, message)
             continue
         if kind == "delete_key":
-            _handle_delete_key(session, stdout)
+            _handle_delete_key(session, stdout, message)
             continue
         if kind == "list":
             _handle_list(session, stdout, message)
@@ -717,7 +733,33 @@ def _handle_select_model(session: AgentSession, stdout: IO[str], message: dict[s
     _write_line(stdout, payload, session.secrets)
 
 
+_KEY_NAME_ERROR = "set_key name must be OPENROUTER_API_KEY, EARTHDATA_TOKEN, or FIRMS_MAP_KEY"
+
+
+def _credential_name(message: dict[str, Any]) -> str:
+    """Return the key variable named by ``message``, defaulting to OpenRouter.
+
+    Raises:
+        ValueError: if ``name`` is present and not an allowed variable. The
+        message does not echo the supplied name.
+    """
+    if "name" not in message or message.get("name") is None:
+        return OPENROUTER_API_KEY
+    name = message.get("name")
+    if not isinstance(name, str) or name not in KEY_VARIABLES:
+        raise ValueError(_KEY_NAME_ERROR)
+    return name
+
+
 def _handle_set_key(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
+    try:
+        name = _credential_name(message)
+    except ValueError:
+        _write_line(stdout, {"type": "error", "message": _KEY_NAME_ERROR}, session.secrets)
+        return
+    if name != OPENROUTER_API_KEY:
+        _handle_set_named_key(session, stdout, message, name)
+        return
     scope = message.get("scope")
     key = message.get("key")
     if scope not in {"session", "user"} or not isinstance(key, str) or not key.strip():
@@ -759,12 +801,72 @@ def _handle_set_key(session: AgentSession, stdout: IO[str], message: dict[str, A
     _write_line(stdout, payload, session.secrets)
 
 
-def _handle_delete_key(session: AgentSession, stdout: IO[str]) -> None:
+def _handle_set_named_key(
+    session: AgentSession, stdout: IO[str], message: dict[str, Any], name: str
+) -> None:
+    """Store ``EARTHDATA_TOKEN`` or ``FIRMS_MAP_KEY`` for the session or the user.
+
+    The value is never written into the reply. A session value stays in
+    ``session.credential_keys``. A user value is the private file under
+    ``~/.atlas/keys``. The session value is left in place when a user value
+    is saved.
+    """
+    scope = message.get("scope")
+    key = message.get("key")
+    if scope not in {"session", "user"} or not isinstance(key, str) or not key.strip():
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"{name} needs scope session or user and a key"},
+            session.secrets,
+        )
+        return
+    try:
+        cleaned = prepare_credential(key, name=name)
+    except ValueError:
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"{name} is empty or contains a newline"},
+            session.secrets,
+        )
+        return
+    _remember_secret(session, cleaned)
+    try:
+        if scope == "user":
+            write_user_key(cleaned, session.home, name=name)
+        else:
+            session.credential_keys[name] = cleaned
+    except Exception as exc:
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"Could not save {name}: {type(exc).__name__}"},
+            session.secrets,
+        )
+        return
+    _write_line(
+        stdout,
+        {"type": "key", "scope": scope, "saved": True, "name": name},
+        session.secrets,
+    )
+
+
+def _handle_delete_key(
+    session: AgentSession, stdout: IO[str], message: dict[str, Any] | None = None
+) -> None:
     """Remove the saved user key and stop using any key in this process.
 
-    The reply warns that ``OPENROUTER_API_KEY`` in the environment is still
-    used on the next launch.
+    The reply warns that the environment variable is still used on the next
+    launch. ``EARTHDATA_TOKEN`` and ``FIRMS_MAP_KEY`` name that variable.
+    OpenRouter keeps its existing reply. The value is not printed.
     """
+    payload = message or {}
+    try:
+        name = _credential_name(payload)
+    except ValueError:
+        _write_line(stdout, {"type": "error", "message": _KEY_NAME_ERROR}, session.secrets)
+        return
+    if name != OPENROUTER_API_KEY:
+        _handle_delete_named_key(session, stdout, name)
+        return
     try:
         delete_user_key(session.home)
     except Exception as exc:
@@ -785,6 +887,45 @@ def _handle_delete_key(session: AgentSession, stdout: IO[str]) -> None:
             "warning": (
                 "OPENROUTER_API_KEY in the environment will still be used on the next launch"
             ),
+        },
+        session.secrets,
+    )
+
+
+def _handle_delete_named_key(session: AgentSession, stdout: IO[str], name: str) -> None:
+    """Remove the saved user file and the in-memory session value for ``name``.
+
+    The value is remembered for redaction and is not written into the reply.
+    The environment variable is left set; the reply says the next launch
+    still reads it.
+    """
+    current = session.credential_keys.get(name)
+    if current:
+        _remember_secret(session, current)
+    try:
+        stored = read_user_key(session.home, name=name)
+    except ValueError:
+        stored = None
+    if stored:
+        _remember_secret(session, stored)
+    try:
+        delete_user_key(session.home, name=name)
+    except Exception as exc:
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"Could not delete {name}: {type(exc).__name__}"},
+            session.secrets,
+        )
+        return
+    session.credential_keys.pop(name, None)
+    _write_line(
+        stdout,
+        {
+            "type": "key",
+            "scope": "deleted",
+            "saved": False,
+            "name": name,
+            "warning": (f"{name} in the environment will still be used on the next launch"),
         },
         session.secrets,
     )

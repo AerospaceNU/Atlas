@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date
@@ -14,6 +13,7 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
+from atlas.agent.layout import EARTHDATA_TOKEN, resolve_credential
 from atlas.cli.catalog import (
     CatalogError,
     only_kind,
@@ -275,7 +275,7 @@ def run_data(
         fldas_only
         and not args.search_only
         and clients is None
-        and not (os.environ.get("EARTHDATA_TOKEN") or "").strip()
+        and not (resolve_credential(EARTHDATA_TOKEN) or "").strip()
     ):
         print(MISSING_TOKEN_MESSAGE, file=sys.stderr)
         return 1

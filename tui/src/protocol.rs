@@ -52,6 +52,7 @@ pub enum ServerMessage {
         scope: String,
         saved: bool,
         warning: String,
+        name: String,
     },
     Listing {
         scope: String,
@@ -254,6 +255,8 @@ enum RawMessage {
         saved: bool,
         #[serde(default)]
         warning: String,
+        #[serde(default)]
+        name: String,
     },
     #[serde(rename = "listing")]
     Listing {
@@ -441,10 +444,12 @@ impl From<RawMessage> for ServerMessage {
                 scope,
                 saved,
                 warning,
+                name,
             } => ServerMessage::KeySet {
                 scope,
                 saved,
                 warning,
+                name,
             },
             RawMessage::Listing { scope, kind, names } => {
                 ServerMessage::Listing { scope, kind, names }

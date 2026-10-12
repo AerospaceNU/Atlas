@@ -44,6 +44,7 @@ Edit `.env`:
 
 - `OPENROUTER_API_KEY` — required to run the agent. Create a key at https://openrouter.ai/keys
 - `FIRMS_MAP_KEY` — optional; required only for FIRMS fire sources. Free key from https://firms.modaps.eosdis.nasa.gov/api/map_key/
+- `EARTHDATA_TOKEN` and `FIRMS_MAP_KEY` can also be saved with `/key earthdata` and `/key firms` (`session`, `user`, or `delete`). A session value stays in memory. A user value is stored under `~/.atlas/keys` and is not written into this checkout. The session value wins, and the value is not printed.
 
 Put `atlas` on `PATH`, pointed at this checkout:
 

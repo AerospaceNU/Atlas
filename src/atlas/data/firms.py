@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import csv
 import io
-import os
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, ClassVar, Self
 
 import httpx
 
+from atlas.agent.layout import FIRMS_MAP_KEY, resolve_credential
 from atlas.data.base import (
     BBox,
     DataPullClient,
@@ -25,7 +25,12 @@ _MAX_SPAN_DAYS = 10
 
 
 class FirmsClient(DataPullClient):
-    """Map FIRMS hotspot rows to point scenes. Requires ``FIRMS_MAP_KEY``."""
+    """Map FIRMS hotspot rows to point scenes. Requires ``FIRMS_MAP_KEY``.
+
+    An explicit ``map_key`` wins. Otherwise the session value wins over the
+    environment, which wins over ``~/.atlas/keys``. A missing key still
+    raises ``ValueError`` with ``FIRMS_MAP_KEY is not set``.
+    """
 
     source: ClassVar[str] = "VIIRS_SNPP_NRT"
     platform_name: ClassVar[str] = "Suomi-NPP"
@@ -41,7 +46,10 @@ class FirmsClient(DataPullClient):
         client: httpx.AsyncClient | None = None,
         timeout: float = 60.0,
     ) -> None:
-        self._map_key = map_key if map_key is not None else os.environ.get("FIRMS_MAP_KEY", "")
+        if map_key is not None:
+            self._map_key = map_key
+        else:
+            self._map_key = resolve_credential(FIRMS_MAP_KEY) or ""
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._owns_client = client is None
 
