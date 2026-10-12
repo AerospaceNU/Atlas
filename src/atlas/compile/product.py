@@ -14,6 +14,10 @@ class SourceScenes(BaseModel):
     error: str | None = None  # populated if this source's search failed
     # Next STAC page for this source. None means the search has no further page.
     next_cursor: str | None = None
+    # Item-search URL. Empty when the client does not search a STAC API.
+    search_url: str = ""
+    # The resume cursor was rejected and must not be copied back from the manifest.
+    cursor_rejected: bool = False
 
 
 class SceneCatalog(BaseModel):

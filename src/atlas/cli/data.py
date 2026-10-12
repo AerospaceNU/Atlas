@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -46,6 +47,7 @@ from atlas.data.sources.fldas import (
     resolve_variables,
     split_variables,
 )
+from atlas.data.stac import encode_page_cursor
 
 _EXAMPLE = (
     "atlas data sentinel2 optical --date 2024-07-01:2024-07-07 "
@@ -433,6 +435,11 @@ async def execute_pull(
         http if http is not None else httpx.AsyncClient(timeout=300.0, follow_redirects=True)
     )
     try:
+        if prior_manifest is not None:
+            mismatch = _resume_mismatch(prior_manifest, live_clients)
+            if mismatch is not None:
+                print(mismatch, file=sys.stderr)
+                return 2
         for name in live_clients:
             reporter.source_start(name)
         catalog = await aggregate(
@@ -646,11 +653,7 @@ def _page_cursors(payload: Mapping[str, Any]) -> dict[str, str | None]:
         name = item.get("source")
         if not isinstance(name, str) or not name:
             continue
-        cursor = item.get("next_cursor")
-        if isinstance(cursor, str) and cursor.strip():
-            cursors[name] = cursor.strip()
-        else:
-            cursors[name] = None
+        cursors[name] = _wire_cursor(item.get("next_cursor"))
     return cursors
 
 
@@ -671,8 +674,10 @@ def _write_manifest(
                 "source": src.source,
                 "collection": src.collection,
                 "bbox": bbox,
-                "next_cursor": src.next_cursor,
+                "search_url": src.search_url,
+                "next_cursor": _manifest_cursor(src.next_cursor),
                 "error": src.error,
+                "_cursor_rejected": src.cursor_rejected,
                 "n_scenes": len(src.scenes),
                 "scene_ids": [scene.id for scene in src.scenes],
                 "saved": [
@@ -711,7 +716,7 @@ def _write_manifest(
         "catalog_bbox_note": _catalog_bbox_note(request),
         "sources": sources_payload,
     }
-    (out_dir / "manifest.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _write_json_atomic(out_dir / "manifest.json", json.dumps(payload, indent=2) + "\n")
 
 
 def _prior_sources(prior: Mapping[str, Any] | None) -> dict[str, Mapping[str, Any]]:
@@ -727,12 +732,101 @@ def _prior_sources(prior: Mapping[str, Any] | None) -> dict[str, Mapping[str, An
     return found
 
 
+def _resume_mismatch(prior: Mapping[str, Any], clients: Mapping[str, DataPullClient]) -> str | None:
+    """Return why this resume cannot use ``prior``, or None when it can.
+
+    The cursor is only valid for the sources, collections, and search
+    endpoints that produced it.
+    """
+    recorded = _prior_sources(prior)
+    if set(clients) != set(recorded):
+        return "resume sources do not match the pull manifest"
+    for name in sorted(clients):
+        row = recorded[name]
+        client = clients[name]
+        collection = getattr(client, "collection", "")
+        if not isinstance(collection, str):
+            collection = ""
+        if row.get("collection") != collection:
+            return f"resume collection for {name} does not match the pull manifest"
+        search_url = getattr(client, "search_url", "")
+        if not isinstance(search_url, str):
+            search_url = ""
+        stored_url = row.get("search_url")
+        if not isinstance(stored_url, str):
+            stored_url = ""
+        if stored_url != search_url:
+            return f"resume search endpoint for {name} does not match the pull manifest"
+    return None
+
+
+def _manifest_cursor(value: object) -> str | dict[str, Any] | None:
+    """Return the cursor as stored in ``manifest.json``.
+
+    A JSON cursor is an object. A legacy token or URL stays a string.
+    """
+    if isinstance(value, dict):
+        text = encode_page_cursor(value)
+        if not text:
+            return None
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+            if isinstance(parsed, dict):
+                return _manifest_cursor(parsed)
+        return text
+    return None
+
+
+def _wire_cursor(value: object) -> str | None:
+    """Return the cursor string ``search_from_cursor`` accepts."""
+    if isinstance(value, dict):
+        text = encode_page_cursor(value)
+        return text or None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _cursor_present(value: object) -> bool:
+    return _wire_cursor(value) is not None
+
+
+def _write_json_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via a temp file, fsync, and ``os.replace``.
+
+    A failed replace leaves the previous file in place and removes the temp file.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        raise
+
+
 def _merge_source(current: dict[str, Any], prior: Mapping[str, Any] | None) -> dict[str, Any]:
     """Append this page to the previous source record.
 
     A failed resume keeps the previous scenes, windows, and cursor so the
-    next resume can try the same page again.
+    next resume can try the same page again. A rejected cursor is cleared
+    instead of being copied back.
     """
+    rejected = bool(current.pop("_cursor_rejected", False))
     if prior is None:
         return current
     if current.get("error"):
@@ -743,12 +837,10 @@ def _merge_source(current: dict[str, Any], prior: Mapping[str, Any] | None) -> d
         kept["skipped"] = _extend_str(prior.get("skipped"), [])
         kept["failed"] = _merge_failed(prior.get("failed"), [])
         kept["windows"] = _merge_windows(prior.get("windows"), [])
-        cursor = current.get("next_cursor")
-        if not isinstance(cursor, str) or not cursor.strip():
-            previous = prior.get("next_cursor")
-            kept["next_cursor"] = (
-                previous.strip() if isinstance(previous, str) and previous.strip() else None
-            )
+        if rejected:
+            kept["next_cursor"] = None
+        elif not _cursor_present(current.get("next_cursor")):
+            kept["next_cursor"] = _manifest_cursor(prior.get("next_cursor"))
         return kept
     scene_ids = _extend_str(prior.get("scene_ids"), current.get("scene_ids"))
     merged = dict(current)
