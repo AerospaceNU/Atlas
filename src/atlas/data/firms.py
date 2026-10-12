@@ -4,10 +4,11 @@ import csv
 import io
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, ClassVar, Self
+from urllib.parse import quote
 
 import httpx
 
-from atlas.agent.layout import FIRMS_MAP_KEY, resolve_credential
+from atlas.agent.layout import FIRMS_MAP_KEY, quiet_http_client_logs, resolve_credential
 from atlas.data.base import (
     BBox,
     DataPullClient,
@@ -30,6 +31,10 @@ class FirmsClient(DataPullClient):
     An explicit ``map_key`` wins. Otherwise the session value wins over the
     environment, which wins over ``~/.atlas/keys``. A missing key still
     raises ``ValueError`` with ``FIRMS_MAP_KEY is not set``.
+
+    The key is percent-encoded as one URL path segment. httpx errors are
+    re-raised without that URL, and the httpx logger stays at WARNING so an
+    INFO request line cannot print the key.
     """
 
     source: ClassVar[str] = "VIIRS_SNPP_NRT"
@@ -46,6 +51,7 @@ class FirmsClient(DataPullClient):
         client: httpx.AsyncClient | None = None,
         timeout: float = 60.0,
     ) -> None:
+        quiet_http_client_logs()
         if map_key is not None:
             self._map_key = map_key
         else:
@@ -79,17 +85,17 @@ class FirmsClient(DataPullClient):
             if request.limit is not None and len(scenes) >= request.limit:
                 break
             url = FIRMS_AREA_URL.format(
-                key=self._map_key,
+                key=quote(self._map_key, safe=""),
                 source=self.source,
                 bbox=bbox,
                 days=days,
                 date=start.isoformat(),
             )
-            resp = await self._client.get(url)
+            resp = await self._get(url)
             if resp.status_code == 400:
                 # NRT rejects "today" / future dates depending on FIRMS' calendar.
                 continue
-            resp.raise_for_status()
+            self._raise_for_status(resp)
             for scene in _rows_to_scenes(
                 resp.text,
                 source=self.source,
@@ -102,6 +108,54 @@ class FirmsClient(DataPullClient):
                 if request.limit is not None and len(scenes) >= request.limit:
                     break
         return PullResult(request=request, scenes=scenes)
+
+    async def _get(self, url: str) -> httpx.Response:
+        """GET ``url`` and re-raise httpx failures without the map key."""
+        try:
+            return await self._client.get(url)
+        except httpx.HTTPError as exc:
+            raise _scrubbed_http_error(exc, self._map_key) from None
+
+    def _raise_for_status(self, response: httpx.Response) -> None:
+        """Raise a status error whose message and URL omit the map key."""
+        try:
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise _scrubbed_http_error(exc, self._map_key) from None
+
+
+def _scrub_secret(text: str, key: str) -> str:
+    """Replace ``key`` and its percent-encoded form with ``***``."""
+    if not key:
+        return text
+    encoded = quote(key, safe="")
+    scrubbed = text.replace(encoded, "***")
+    if encoded != key:
+        scrubbed = scrubbed.replace(key, "***")
+    return scrubbed
+
+
+def _scrubbed_request(request: httpx.Request, key: str) -> httpx.Request:
+    """Return a request whose URL no longer contains ``key``."""
+    return httpx.Request(request.method, _scrub_secret(str(request.url), key))
+
+
+def _scrubbed_http_error(exc: httpx.HTTPError, key: str) -> httpx.HTTPError:
+    """Rebuild ``exc`` so its message and request URL omit ``key``.
+
+    The new error is not chained to ``exc``. A traceback of the rebuilt error
+    does not include the original message, which carries the FIRMS URL.
+    """
+    message = _scrub_secret(str(exc), key)
+    original = getattr(exc, "_request", None)
+    request = _scrubbed_request(original, key) if isinstance(original, httpx.Request) else None
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_request = request if request is not None else _scrubbed_request(exc.request, key)
+        response = httpx.Response(exc.response.status_code, request=status_request)
+        return httpx.HTTPStatusError(message, request=status_request, response=response)
+    if isinstance(exc, httpx.RequestError):
+        return type(exc)(message, request=request)
+    return httpx.HTTPError(message)
 
 
 class FirmsViirsNoaa20Client(FirmsClient):

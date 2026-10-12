@@ -23,7 +23,9 @@ Keys and weights are deleted only when that kind is named.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import shutil
 import warnings
 from pathlib import Path
@@ -45,6 +47,19 @@ _KEY_FILES = {
 # The live session's credential map. ``serve`` binds the session dict here and
 # unbinds it when the loop ends, so a session value dies with that process.
 _active_session_keys: dict[str, str] = {}
+# The live session's redaction list. Resolved env and file values are appended
+# here so a later protocol line can hide them. Unbound outside a session.
+_active_secrets: list[str] | None = None
+# FIRMS area tutorial map key ``abcdef1234567890abcdef1234567890``.
+# https://firms.modaps.eosdis.nasa.gov/api/area/
+_FIRMS_MAP_KEY_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+# Earthdata Login user tokens are JWTs (three base64url segments).
+# https://urs.earthdata.nasa.gov/documentation/for_users/user_token
+_JWT_SEGMENT = r"[A-Za-z0-9_-]+={0,2}"
+_EARTHDATA_TOKEN_RE = re.compile(rf"^{_JWT_SEGMENT}\.{_JWT_SEGMENT}\.{_JWT_SEGMENT}$")
+# httpx logs the full request URL at INFO. FIRMS puts MAP_KEY in that path.
+_FIRMS_PATH_KEY = re.compile(r"(https://firms\.modaps\.eosdis\.nasa\.gov/api/area/csv/)[^/\s\"']+")
+_HTTPX_LOGGER = "httpx"
 
 Kind = Literal["sessions", "artifacts", "keys", "weights"]
 
@@ -75,6 +90,52 @@ def unbind_session_credentials() -> None:
     """Drop the live session map so later lookups no longer see it."""
     global _active_session_keys
     _active_session_keys = {}
+
+
+def bind_session_secrets(secrets: list[str]) -> None:
+    """Point credential redaction at the live session secret list.
+
+    ``secrets`` is the session object. Resolved credentials are appended to
+    it. The list is not copied to disk.
+    """
+    global _active_secrets
+    _active_secrets = secrets
+
+
+def unbind_session_secrets() -> None:
+    """Drop the live secret list so later resolves are not remembered."""
+    global _active_secrets
+    _active_secrets = None
+
+
+def remember_secret(value: str) -> None:
+    """Append ``value`` to the bound session secret list.
+
+    No list is bound outside a session, and then this does nothing. Blank
+    values are ignored. A value already in the list is left where it is.
+    """
+    secrets = _active_secrets
+    if secrets is None:
+        return
+    cleaned = value.strip()
+    if cleaned and cleaned not in secrets:
+        secrets.append(cleaned)
+
+
+def quiet_http_client_logs() -> None:
+    """Keep the httpx logger at WARNING and redact FIRMS map keys.
+
+    httpx writes the request URL at INFO. A FIRMS area URL carries
+    ``FIRMS_MAP_KEY`` in the path, so that line is a credential leak. The
+    logger is raised to WARNING when it is unset or more verbose. A filter
+    still redacts a FIRMS path key, and any bound session secret, if a record
+    is emitted anyway.
+    """
+    logger = logging.getLogger(_HTTPX_LOGGER)
+    if logger.level == logging.NOTSET or logger.level < logging.WARNING:
+        logger.setLevel(logging.WARNING)
+    if not any(isinstance(item, _HttpxRedactionFilter) for item in logger.filters):
+        logger.addFilter(_HttpxRedactionFilter())
 
 
 def session_credential(name: str) -> str | None:
@@ -224,17 +285,25 @@ def read_user_key(home: Path | None = None, *, name: str = OPENROUTER_API_KEY) -
 
 
 def prepare_credential(key: str, *, name: str) -> str:
-    """Strip ``key`` for ``name`` and reject an empty value or a newline.
+    """Strip ``key`` for ``name`` and reject an empty, broken, or mistyped value.
+
+    ``FIRMS_MAP_KEY`` must be 32 hexadecimal characters, the shape of a FIRMS
+    area API map key. ``EARTHDATA_TOKEN`` must be a JWT of three base64url
+    segments, the shape of an Earthdata Login user token.
 
     Raises:
-        ValueError: if ``name`` is unknown, or the value is empty or contains
-        a newline or carriage return. The message names ``name`` and does not
-        include the value.
+        ValueError: if ``name`` is unknown, or the value is empty, contains a
+        newline or carriage return, or does not match that variable. The
+        message names ``name`` and does not include the value.
     """
     key_filename(name)
     cleaned = key.strip()
     if not cleaned or "\n" in cleaned or "\r" in cleaned:
         raise ValueError(f"{name} is empty or contains a newline")
+    if name == FIRMS_MAP_KEY and _FIRMS_MAP_KEY_RE.fullmatch(cleaned) is None:
+        raise ValueError(f"{name} must be 32 hexadecimal characters")
+    if name == EARTHDATA_TOKEN and _EARTHDATA_TOKEN_RE.fullmatch(cleaned) is None:
+        raise ValueError(f"{name} must be a JWT of three base64url segments")
     return cleaned
 
 
@@ -278,8 +347,9 @@ def write_user_key(key: str, home: Path | None = None, *, name: str = OPENROUTER
     has no directory ``fsync``, so that durability step is skipped.
 
     Raises:
-        ValueError: if ``name`` is unknown or ``key`` is empty or contains a
-        newline. The message names the variable and does not include the value.
+        ValueError: if ``name`` is unknown, or ``key`` is empty, contains a
+        newline, or does not match that variable. The message names the
+        variable and does not include the value.
     """
     if name == OPENROUTER_API_KEY:
         cleaned, _warning = prepare_openrouter_key(key)
@@ -344,12 +414,12 @@ def resolve_credential(
     if session_key is None:
         session_key = session_credential(name)
     if session_key is not None and session_key.strip():
-        return session_key.strip()
+        return _remember_resolved(session_key.strip())
     if env_key is None:
         env_key = os.environ.get(name)
     if env_key is not None and env_key.strip():
-        return env_key.strip()
-    return read_user_key(home, name=name)
+        return _remember_resolved(env_key.strip())
+    return _remember_resolved(read_user_key(home, name=name))
 
 
 def resolve_openrouter_key(
@@ -364,10 +434,41 @@ def resolve_openrouter_key(
     The environment wins over the user file. Missing everywhere returns None.
     """
     if session_key is not None and session_key.strip():
-        return session_key.strip()
+        return _remember_resolved(session_key.strip())
     if env_key is not None and env_key.strip():
-        return env_key.strip()
-    return read_user_key(home)
+        return _remember_resolved(env_key.strip())
+    return _remember_resolved(read_user_key(home))
+
+
+def _remember_resolved(value: str | None) -> str | None:
+    """Remember a resolved credential and return it unchanged."""
+    if value:
+        remember_secret(value)
+    return value
+
+
+class _HttpxRedactionFilter(logging.Filter):
+    """Drop FIRMS map keys and bound session secrets from httpx log lines."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        rendered = record.getMessage()
+        redacted = _redact_http_log(rendered)
+        if redacted != rendered:
+            record.msg = redacted
+            record.args = None
+        return True
+
+
+def _redact_http_log(message: str) -> str:
+    """Replace a FIRMS path key and any bound session secret."""
+    redacted = _FIRMS_PATH_KEY.sub(r"\1***", message)
+    secrets = _active_secrets
+    if secrets is None:
+        return redacted
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "***")
+    return redacted
 
 
 def _tighten_keys_dir(root: Path) -> None:

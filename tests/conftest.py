@@ -14,8 +14,10 @@ def _clear_openrouter_catalog_cache() -> None:
 @pytest.fixture(autouse=True)
 def _clear_session_credentials():
     """Drop a previous test's in-memory Earthdata or FIRMS session key."""
-    from atlas.agent.layout import unbind_session_credentials
+    from atlas.agent.layout import unbind_session_credentials, unbind_session_secrets
 
     unbind_session_credentials()
+    unbind_session_secrets()
     yield
     unbind_session_credentials()
+    unbind_session_secrets()

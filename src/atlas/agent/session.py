@@ -31,10 +31,13 @@ from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
 from atlas.agent.images import ingest_images
 from atlas.agent.layout import (
+    EARTHDATA_TOKEN,
+    FIRMS_MAP_KEY,
     KEY_VARIABLES,
     OPENROUTER_API_KEY,
     AtlasPathError,
     bind_session_credentials,
+    bind_session_secrets,
     delete_user_key,
     ensure_project_layout,
     ensure_user_layout,
@@ -42,10 +45,13 @@ from atlas.agent.layout import (
     prepare_credential,
     prepare_openrouter_key,
     project_atlas_root,
+    quiet_http_client_logs,
     read_user_key,
     remove_entry,
+    resolve_credential,
     resolve_openrouter_key,
     unbind_session_credentials,
+    unbind_session_secrets,
     user_atlas_root,
     write_user_key,
 )
@@ -413,10 +419,14 @@ def serve(
     if redact and redact not in session.secrets:
         session.secrets.append(redact)
     bind_session_credentials(session.credential_keys)
+    bind_session_secrets(session.secrets)
+    quiet_http_client_logs()
     try:
+        _remember_resolved_credentials(session)
         return _serve_bound(session, stdin, stdout)
     finally:
         unbind_session_credentials()
+        unbind_session_secrets()
 
 
 def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
@@ -822,10 +832,10 @@ def _handle_set_named_key(
         return
     try:
         cleaned = prepare_credential(key, name=name)
-    except ValueError:
+    except ValueError as exc:
         _write_line(
             stdout,
-            {"type": "error", "message": f"{name} is empty or contains a newline"},
+            {"type": "error", "message": str(exc)},
             session.secrets,
         )
         return
@@ -1116,6 +1126,26 @@ def _add_enabled_skill(session: AgentSession, name: str, scope: str) -> str:
             content=session.agent.system_prompt(),
         )
     return "The skill catalog was reloaded."
+
+
+def _remember_resolved_credentials(session: AgentSession) -> None:
+    """Remember env and file credentials before any tool result is written.
+
+    In-session ``set_key`` already records the value it stores. A key that
+    arrived from the environment or ``~/.atlas/keys`` is resolved here, and
+    ``resolve_credential`` appends it to the bound secret list.
+    """
+    home = session.home
+    for name in (EARTHDATA_TOKEN, FIRMS_MAP_KEY):
+        try:
+            resolve_credential(name, home=home)
+        except ValueError:
+            continue
+    resolve_openrouter_key(
+        session_key=session.session_key,
+        env_key=os.environ.get(OPENROUTER_API_KEY),
+        home=home,
+    )
 
 
 def _remember_secret(session: AgentSession, key: str) -> None:
