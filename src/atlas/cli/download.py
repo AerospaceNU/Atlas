@@ -13,6 +13,7 @@ import httpx
 from atlas.data.base import Asset, BBox, DataPullClient, Scene
 from atlas.data.cog import (
     CogError,
+    CogLimitError,
     CogMissError,
     CogRangeError,
     encode_cog,
@@ -240,7 +241,7 @@ async def download_assets(
                         with path.open("wb") as handle:
                             async for chunk in response.aiter_bytes():
                                 handle.write(chunk)
-        except (CogMissError, CogRangeError) as exc:
+        except (CogMissError, CogRangeError, CogLimitError) as exc:
             await record(
                 DownloadOutcome(
                     source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
@@ -324,7 +325,7 @@ async def _windowed_cog(
             return None
         west, south, east, north = bounds
         read = await cog.read_window(west=west, south=south, east=east, north=north)
-    except (CogMissError, CogRangeError):
+    except (CogMissError, CogRangeError, CogLimitError):
         raise
     except (CogError, httpx.HTTPError):
         return None

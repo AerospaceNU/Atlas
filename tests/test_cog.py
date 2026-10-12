@@ -23,12 +23,14 @@ from atlas.cli.download import download_assets
 from atlas.data.base import Asset, BBox, DataPullClient, PullRequest, PullResult, Scene, SceneKind
 from atlas.data.cog import (
     CogError,
+    CogLimitError,
     CogMissError,
     CogRangeError,
     CogRead,
     CogUnsupportedError,
     encode_cog,
     model_bounds,
+    open_cog,
     read_cog_window,
 )
 
@@ -99,27 +101,39 @@ def build_cog(
     trailer: int = 0,
     pad: int = 0,
     declared_tile_bytes: int | None = None,
+    dimensions: tuple[int, int] | None = None,
+    tile_blobs: list[bytes] | None = None,
+    place_tiles_at: int | None = None,
 ) -> BuiltCog:
     """Build a classic tiled GeoTIFF the production reader does not share code with."""
-    bands, height, width = (int(pixels.shape[0]), int(pixels.shape[1]), int(pixels.shape[2]))
+    if dimensions is None:
+        bands, height, width = (int(pixels.shape[0]), int(pixels.shape[1]), int(pixels.shape[2]))
+    else:
+        height, width = dimensions
+        bands = int(pixels.shape[0])
     dtype = np.dtype(f"{endian}u{pixels.dtype.itemsize}")
-    source = np.asarray(pixels, dtype=dtype)
     tiles_x = math.ceil(width / tile)
     tiles_y = math.ceil(height / tile)
-    stored: list[bytes] = []
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            block = np.zeros((tile, tile, bands), dtype=dtype)
-            row0, col0 = ty * tile, tx * tile
-            row1, col1 = min(row0 + tile, height), min(col0 + tile, width)
-            block[: row1 - row0, : col1 - col0, :] = np.moveaxis(
-                source[:, row0:row1, col0:col1], 0, -1
-            )
-            if predictor:
-                for col in range(block.shape[1] - 1, 0, -1):
-                    block[:, col, :] -= block[:, col - 1, :]
-            raw = np.ascontiguousarray(block).tobytes()
-            stored.append(zlib.compress(raw) if compression == "deflate" else raw)
+    if tile_blobs is not None:
+        stored = list(tile_blobs)
+    elif dimensions is not None:
+        stored = [b"\x00"] * (tiles_x * tiles_y)
+    else:
+        source = np.asarray(pixels, dtype=dtype)
+        stored = []
+        for ty in range(tiles_y):
+            for tx in range(tiles_x):
+                block = np.zeros((tile, tile, bands), dtype=dtype)
+                row0, col0 = ty * tile, tx * tile
+                row1, col1 = min(row0 + tile, height), min(col0 + tile, width)
+                block[: row1 - row0, : col1 - col0, :] = np.moveaxis(
+                    source[:, row0:row1, col0:col1], 0, -1
+                )
+                if predictor:
+                    for col in range(block.shape[1] - 1, 0, -1):
+                        block[:, col, :] -= block[:, col - 1, :]
+                raw = np.ascontiguousarray(block).tobytes()
+                stored.append(zlib.compress(raw) if compression == "deflate" else raw)
 
     ntiles = len(stored)
     key = 2048 if epsg in {4326, 4269, 4258, 4267} else 3072
@@ -161,10 +175,18 @@ def build_cog(
         cursor += len(field.data)
     spans: list[tuple[int, int]] = []
     offsets: list[int] = []
-    for blob in stored:
-        offsets.append(cursor)
-        spans.append((cursor, cursor + len(blob) - 1))
-        cursor += len(blob)
+    if place_tiles_at is None:
+        for blob in stored:
+            offsets.append(cursor)
+            spans.append((cursor, cursor + len(blob) - 1))
+            cursor += len(blob)
+    else:
+        tile_cursor = place_tiles_at
+        for blob in stored:
+            length = declared_tile_bytes if declared_tile_bytes is not None else max(len(blob), 1)
+            offsets.append(tile_cursor)
+            spans.append((tile_cursor, tile_cursor + length - 1))
+            tile_cursor += length
     offset_field = next(field for field in fields if field.tag == 324)
     offset_field.data = _pack_values(endian, 4, offsets)
     count_field = next(field for field in fields if field.tag == 325)
@@ -184,8 +206,9 @@ def build_cog(
     for field in fields:
         if not field.inline:
             out += field.data
-    for blob in stored:
-        out += blob
+    if place_tiles_at is None:
+        for blob in stored:
+            out += blob
     out += bytes(trailer)
     return BuiltCog(
         blob=bytes(out),
@@ -704,6 +727,119 @@ async def test_range_above_the_byte_limit_is_not_requested() -> None:
                 north=4.0,
             )
     assert all(end - start + 1 <= 8 * 1024 * 1024 for start, end in log.range_calls())
+
+
+def _short_ifd(entries: list[tuple[int, int, int]]) -> bytes:
+    """Classic little-endian IFD of inline integer fields. ``entries`` are tag, type, value."""
+    body = struct.pack("<H", len(entries))
+    for tag, type_code, value in sorted(entries):
+        body += struct.pack("<HHI", tag, type_code, 1)
+        if type_code == 3:
+            body += struct.pack("<H", value) + b"\x00\x00"
+        else:
+            body += struct.pack("<I", value)
+    body += struct.pack("<I", 0)
+    return struct.pack("<HHI", 0x4949, 42, 8) + body
+
+
+@pytest.mark.asyncio
+async def test_ifd_entry_cap_stops_before_the_directory() -> None:
+    blob = struct.pack("<HHIH", 0x4949, 42, 8, 200)
+    log = _RangeLog(blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogLimitError, match="200 entries"):
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=0.0,
+                south=0.0,
+                east=1.0,
+                north=1.0,
+            )
+    assert log.range_calls() == [(0, 7), (8, 9)]
+
+
+@pytest.mark.asyncio
+async def test_tile_count_cap_stops_before_the_offset_table() -> None:
+    blob = _short_ifd(
+        [
+            (256, 4, 100_000),
+            (257, 4, 100_000),
+            (258, 3, 8),
+            (322, 4, 1),
+            (323, 4, 1),
+        ]
+    )
+    log = _RangeLog(blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogLimitError, match="too many tiles"):
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=0.0,
+                south=0.0,
+                east=1.0,
+                north=1.0,
+            )
+    assert all(end < len(blob) for _, end in log.range_calls())
+
+
+@pytest.mark.asyncio
+async def test_window_pixel_cap_stops_before_tile_payloads() -> None:
+    built = build_cog(
+        np.zeros((1, 1, 1), dtype=np.uint8),
+        tile=1000,
+        origin_x=0.0,
+        origin_y=5000.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        dimensions=(5000, 5000),
+        place_tiles_at=1_000_000,
+    )
+    log = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        opened = await open_cog(http, "https://example.com/granule.tif")
+        assert opened.epsg == 4326
+        with pytest.raises(CogLimitError, match="too many pixels"):
+            await opened.read_window(west=0.0, south=0.0, east=5000.0, north=5000.0)
+    assert all(start < 1_000_000 for start, _ in log.range_calls())
+
+
+@pytest.mark.asyncio
+async def test_deflate_bomb_is_rejected(tmp_path: Path) -> None:
+    bomb = zlib.compress(b"\x00" * 200_000)
+    built = build_cog(
+        np.zeros((1, 2, 2), dtype=np.uint8),
+        tile=2,
+        origin_x=0.0,
+        origin_y=2.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        compression="deflate",
+        tile_blobs=[bomb],
+    )
+    log = _RangeLog(built.blob, allow_full=True)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogLimitError, match="exceeded its dimensions"):
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=0.0,
+                south=0.0,
+                east=2.0,
+                north=2.0,
+            )
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=0.0, south=0.0, east=2.0, north=2.0),
+        )
+    assert report.outcomes[0].status == "failed"
+    assert "exceeded its dimensions" in (report.outcomes[0].error or "")
+    assert None not in log.calls
+    assert list(tmp_path.rglob("*.tif")) == []
 
 
 def test_run_data_passes_the_aoi_into_the_cog_read(tmp_path: Path) -> None:

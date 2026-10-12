@@ -57,6 +57,10 @@ _GEO_PROJECTED: Final[int] = 3072
 _COMPRESS_NONE: Final[int] = 1
 _COMPRESS_DEFLATE: Final[frozenset[int]] = frozenset({8, 32946})
 _MAX_RANGE_BYTES: Final[int] = 8 * 1024 * 1024
+_MAX_IFD_ENTRIES: Final[int] = 128
+_MAX_TILES: Final[int] = 8192
+_MAX_WINDOW_PIXELS: Final[int] = 16_000_000
+_MAX_FIELD_BYTES: Final[int] = 1024 * 1024
 _MISS: Final[str] = "AOI does not overlap the COG"
 
 
@@ -74,6 +78,10 @@ class CogUnsupportedError(CogError):
 
 class CogRangeError(CogError):
     """The server did not return the requested byte range."""
+
+
+class CogLimitError(CogError):
+    """A COG would exceed a read limit, so the whole granule is not fetched."""
 
 
 @dataclass(frozen=True)
@@ -223,6 +231,7 @@ class CogFile:
 
         Raises:
             CogMissError: The box does not cover any pixel.
+            CogLimitError: The window has too many pixels.
             CogError: A tile could not be decoded.
             CogRangeError: The server did not honor Range.
         """
@@ -234,6 +243,10 @@ class CogFile:
             east=east,
             north=north,
         )
+        rows = row1 - row0
+        cols = col1 - col0
+        if cols > _MAX_WINDOW_PIXELS or rows > _MAX_WINDOW_PIXELS // cols:
+            raise CogLimitError("window has too many pixels")
         tiles_x = math.ceil(image.width / image.tile_width)
         tx0 = col0 // image.tile_width
         tx1 = (col1 - 1) // image.tile_width
@@ -563,8 +576,8 @@ async def _parse_image(reader: _RangeReader) -> _Image:
     ifd_at = struct.unpack_from(endian + "I", header, 4)[0]
     count_raw = await reader.read(ifd_at, ifd_at + 1)
     count = struct.unpack(endian + "H", count_raw)[0]
-    if count < 1 or count > 4096:
-        raise CogUnsupportedError("TIFF IFD is not a COG header")
+    if count < 1 or count > _MAX_IFD_ENTRIES:
+        raise CogLimitError(f"TIFF IFD has {count} entries")
     ifd_end = ifd_at + 2 + count * 12 + 4 - 1
     ifd = await reader.read(ifd_at, ifd_end)
     entries: dict[int, tuple[int, int, bytes]] = {}
@@ -618,6 +631,8 @@ async def _image_from_entries(
         raise CogUnsupportedError("TIFF dimensions are empty")
     tiles_x = math.ceil(width / tile_width)
     tiles_y = math.ceil(height / tile_height)
+    if tiles_x > _MAX_TILES or tiles_y > _MAX_TILES or tiles_x > _MAX_TILES // tiles_y:
+        raise CogLimitError("too many tiles")
     offsets = await _entry_ints(reader, endian, entries[_TAG_TILE_OFFSETS])
     counts = await _entry_ints(reader, endian, entries[_TAG_TILE_COUNTS])
     if len(offsets) != tiles_x * tiles_y or len(counts) != len(offsets):
@@ -722,6 +737,8 @@ async def _entry_bytes(
     size_of = _TYPE_SIZE.get(type_code)
     if size_of is None or count < 1:
         raise CogUnsupportedError(f"TIFF type {type_code} is not supported")
+    if count > _MAX_FIELD_BYTES // size_of:
+        raise CogLimitError("TIFF field is too large")
     size = size_of * count
     if size <= 4:
         return inline[:size]
@@ -803,15 +820,9 @@ async def _copy_tile(
 
 
 def _decode_tile(payload: bytes, image: _Image) -> NDArray[np.generic]:
-    if image.compression == _COMPRESS_NONE:
-        raw = payload
-    else:
-        try:
-            raw = zlib.decompress(payload)
-        except zlib.error as exc:
-            raise CogError("deflate tile could not be decoded") from exc
     itemsize = image.bits // 8
     expected = image.tile_width * image.tile_height * image.samples * itemsize
+    raw = payload if image.compression == _COMPRESS_NONE else _inflate_bounded(payload, expected)
     if len(raw) < expected:
         raise CogError("tile expanded to fewer bytes than its dimensions")
     dtype = np.dtype(f"{image.endian}u{itemsize}")
@@ -823,3 +834,17 @@ def _decode_tile(payload: bytes, image: _Image) -> NDArray[np.generic]:
         for col in range(1, image.tile_width):
             cube[:, col, :] += cube[:, col - 1, :]
     return cube
+
+
+def _inflate_bounded(payload: bytes, expected: int) -> bytes:
+    """Inflate one tile and stop once the output passes its dimensions."""
+    decoder = zlib.decompressobj()
+    try:
+        raw = decoder.decompress(payload, expected + 1)
+        if len(raw) != expected or not decoder.eof or decoder.unconsumed_tail:
+            raise CogLimitError("deflate tile exceeded its dimensions")
+        if decoder.flush():
+            raise CogLimitError("deflate tile exceeded its dimensions")
+    except zlib.error as exc:
+        raise CogError("deflate tile could not be decoded") from exc
+    return raw
