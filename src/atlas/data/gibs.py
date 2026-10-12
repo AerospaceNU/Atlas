@@ -8,6 +8,7 @@ import httpx
 
 from atlas.data.base import (
     Asset,
+    BBox,
     DataPullClient,
     PullRequest,
     PullResult,
@@ -19,6 +20,15 @@ GIBS_WMS = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
 
 
 class GibsClient(DataPullClient):
+    """NASA GIBS WMS browse scenes, one GetMap per day.
+
+    A box that crosses the antimeridian is two GetMap requests, one on each
+    side of ±180°. WMS 1.3 with EPSG:4326 requires west <= east. One BBOX with
+    west greater than east is rejected by GIBS or drawn the long way around
+    the globe, which is an empty or wrapped image of the wrong hemisphere.
+    ``limit`` caps days, and both sides of a selected day are kept together.
+    """
+
     layer: ClassVar[str] = ""
     platform_name: ClassVar[str] = "GIBS"
     instrument_name: ClassVar[str | None] = None
@@ -51,39 +61,58 @@ class GibsClient(DataPullClient):
         await self.aclose()
 
     async def search(self, request: PullRequest) -> PullResult:
-        """Build one WMS preview per day without checking that the layer has data.
+        """Build one WMS preview per day and per side of the antimeridian.
 
         No HTTP request is made, so a day with no imagery still gets a scene (it
         renders blank). Scenes are marked ``synthetic`` and never count toward
-        coverage.
+        coverage. A dateline box that cannot be cut into a west-before-east
+        BBOX raises, so the source fails instead of publishing a wrapped URL.
         """
+        parts = request.bbox.antimeridian_parts()
+        split = request.bbox.west > request.bbox.east
         days = _dates_inclusive(request.start_date, request.end_date)[: request.limit]
         scenes: list[Scene] = []
         for day in days:
             start = datetime(day.year, day.month, day.day, tzinfo=UTC)
             end = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=UTC)
-            scene = Scene.try_new(
-                id=f"{self.layer}:{day.isoformat()}",
-                collection=self.layer,
-                kind=self.scene_kind,
-                datetime=start,
-                start_datetime=start,
-                end_datetime=end,
-                bbox=request.bbox,
-                footprint_is_request=True,
-                platform=self.platform_name,
-                instrument=self.instrument_name,
-                assets={
-                    "rendered_preview": Asset(
-                        href=_wms_url(self.layer, day, request, self.image_size),
-                        media_type="image/png",
-                        title=self.layer,
-                        roles=["overview", "visual"],
+            for part in parts:
+                side = _dateline_side(part) if split else None
+                scene_id = f"{self.layer}:{day.isoformat()}"
+                if side is not None:
+                    scene_id = f"{scene_id}:{side}"
+                properties: dict[str, str | bool] = {
+                    "layer": self.layer,
+                    "time": day.isoformat(),
+                    "synthetic": True,
+                }
+                if side is not None:
+                    properties["antimeridian_part"] = side
+                scene = Scene.try_new(
+                    id=scene_id,
+                    collection=self.layer,
+                    kind=self.scene_kind,
+                    datetime=start,
+                    start_datetime=start,
+                    end_datetime=end,
+                    bbox=part,
+                    footprint_is_request=True,
+                    platform=self.platform_name,
+                    instrument=self.instrument_name,
+                    assets={
+                        "rendered_preview": Asset(
+                            href=_wms_url(self.layer, day, part, self.image_size),
+                            media_type="image/png",
+                            title=self.layer,
+                            roles=["overview", "visual"],
+                        )
+                    },
+                    properties=properties,
+                )
+                if scene is None:
+                    raise ValueError(
+                        "GIBS could not build a dateline preview for "
+                        f"{day.isoformat()} west={part.west} east={part.east}"
                     )
-                },
-                properties={"layer": self.layer, "time": day.isoformat(), "synthetic": True},
-            )
-            if scene is not None:
                 scenes.append(scene)
         return PullResult(request=request, scenes=scenes)
 
@@ -154,8 +183,18 @@ def _dates_inclusive(start: date, end: date) -> list[date]:
     return days
 
 
-def _wms_url(layer: str, day: date, request: PullRequest, size: int) -> str:
-    bbox = request.bbox
+def _dateline_side(part: BBox) -> str:
+    """``east`` for the side that ends at 180°, ``west`` for the side from -180°."""
+    if part.east == 180.0:
+        return "east"
+    return "west"
+
+
+def _wms_url(layer: str, day: date, bbox: BBox, size: int) -> str:
+    if bbox.west > bbox.east:
+        raise ValueError(
+            f"GIBS WMS BBOX requires west <= east; got west={bbox.west} east={bbox.east}"
+        )
     # WMS 1.3.0 + EPSG:4326 uses lat,lon axis order.
     params = {
         "SERVICE": "WMS",

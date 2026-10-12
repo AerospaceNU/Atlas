@@ -25,7 +25,14 @@ _MAX_SPAN_DAYS = 10
 
 
 class FirmsClient(DataPullClient):
-    """Map FIRMS hotspot rows to point scenes. Requires ``FIRMS_MAP_KEY``."""
+    """Map FIRMS hotspot rows to point scenes. Requires ``FIRMS_MAP_KEY``.
+
+    The area API takes ``west,south,east,north`` and requires west <= east.
+    A dateline AOI is two area requests, one on each side of ±180°, and the
+    rows are merged. An error document is raised so a rejected box is a source
+    error rather than an empty scene list. HTTP 400 is still skipped: NRT uses
+    it when the requested day is not published yet.
+    """
 
     source: ClassVar[str] = "VIIRS_SNPP_NRT"
     platform_name: ClassVar[str] = "Suomi-NPP"
@@ -60,39 +67,53 @@ class FirmsClient(DataPullClient):
         await self.aclose()
 
     async def search(self, request: PullRequest) -> PullResult:
+        """Request each side of a dateline AOI and merge the hotspot rows.
+
+        Raises:
+            ValueError: ``FIRMS_MAP_KEY`` is unset, the box cannot be cut at
+                180°, or FIRMS returns an error document instead of CSV.
+        """
         if not self._map_key:
             raise ValueError("FIRMS_MAP_KEY is not set")
-        bbox = f"{request.bbox.west},{request.bbox.south},{request.bbox.east},{request.bbox.north}"
+        parts = request.bbox.antimeridian_parts()
         scenes: list[Scene] = []
+        seen: set[str] = set()
         start_date, end_date = _nrt_window(request.start_date, request.end_date)
         if start_date > end_date:
             return PullResult(request=request, scenes=[])
-        for start, days in _chunk_days(start_date, end_date):
-            if request.limit is not None and len(scenes) >= request.limit:
-                break
-            url = FIRMS_AREA_URL.format(
-                key=self._map_key,
-                source=self.source,
-                bbox=bbox,
-                days=days,
-                date=start.isoformat(),
-            )
-            resp = await self._client.get(url)
-            if resp.status_code == 400:
-                # NRT rejects "today" / future dates depending on FIRMS' calendar.
-                continue
-            resp.raise_for_status()
-            for scene in _rows_to_scenes(
-                resp.text,
-                source=self.source,
-                platform=self.platform_name,
-                instrument=self.instrument_name,
-                kind=self.scene_kind,
-                gsd_m=self.nominal_gsd_m,
-            ):
-                scenes.append(scene)
+        for part in parts:
+            bbox = _area_param(part)
+            for start, days in _chunk_days(start_date, end_date):
                 if request.limit is not None and len(scenes) >= request.limit:
                     break
+                url = FIRMS_AREA_URL.format(
+                    key=self._map_key,
+                    source=self.source,
+                    bbox=bbox,
+                    days=days,
+                    date=start.isoformat(),
+                )
+                resp = await self._client.get(url)
+                if resp.status_code == 400:
+                    # NRT rejects "today" / future dates depending on FIRMS' calendar.
+                    continue
+                resp.raise_for_status()
+                for scene in _rows_to_scenes(
+                    resp.text,
+                    source=self.source,
+                    platform=self.platform_name,
+                    instrument=self.instrument_name,
+                    kind=self.scene_kind,
+                    gsd_m=self.nominal_gsd_m,
+                ):
+                    if scene.id in seen:
+                        continue
+                    seen.add(scene.id)
+                    scenes.append(scene)
+                    if request.limit is not None and len(scenes) >= request.limit:
+                        break
+            if request.limit is not None and len(scenes) >= request.limit:
+                break
         return PullResult(request=request, scenes=scenes)
 
 
@@ -124,6 +145,13 @@ class FirmsLandsatClient(FirmsClient):
     nominal_gsd_m: ClassVar[float | None] = 30.0
 
 
+def _area_param(bbox: BBox) -> str:
+    """FIRMS area path segment. West must not pass east."""
+    if bbox.west > bbox.east:
+        raise ValueError(f"FIRMS area expects west <= east; got west={bbox.west} east={bbox.east}")
+    return f"{bbox.west},{bbox.south},{bbox.east},{bbox.north}"
+
+
 def _nrt_window(start: date, end: date, *, today_utc: date | None = None) -> tuple[date, date]:
     """Clamp NRT queries so the end date is not FIRMS' un-published 'today'."""
     latest = (today_utc or datetime.now(UTC).date()) - timedelta(days=1)
@@ -151,8 +179,11 @@ def _rows_to_scenes(
     gsd_m: float | None,
 ) -> list[Scene]:
     body = text.strip()
-    if not body or body.lower().startswith("invalid") or "<html" in body.lower():
+    if not body:
         return []
+    lowered = body.lower()
+    if lowered.startswith("invalid") or "<html" in lowered:
+        raise ValueError("FIRMS returned an error document instead of hotspot CSV")
     reader = csv.DictReader(io.StringIO(body))
     scenes: list[Scene] = []
     for row in reader:
