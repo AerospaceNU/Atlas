@@ -35,6 +35,8 @@ class DownloadOutcome:
     status: str
     path: Path | None = None
     error: str | None = None
+    bytes_read: int | None = None
+    granule_size: int | None = None
 
 
 @dataclass
@@ -188,6 +190,8 @@ async def download_assets(
 
     async def one(scene: Scene) -> None:
         path: Path | None = None
+        bytes_read: int | None = None
+        granule_size: int | None = None
         try:
             picked = pick_asset(scene, asset_name)
             if picked is None:
@@ -218,8 +222,9 @@ async def download_assets(
                 href = await _signed_href(clients.get(scene.source), asset.href)
                 windowed = await _windowed_cog(http, href, asset, bbox)
                 if windowed is not None:
+                    payload, bytes_read, granule_size = windowed
                     path = dest_dir / scene_filename(scene.id, key, ".tif")
-                    path.write_bytes(windowed)
+                    path.write_bytes(payload)
                 else:
                     async with http.stream("GET", href, follow_redirects=True) as response:
                         response.raise_for_status()
@@ -262,7 +267,14 @@ async def download_assets(
             )
             return
         await record(
-            DownloadOutcome(source=scene.source, scene_id=scene.id, status="saved", path=path)
+            DownloadOutcome(
+                source=scene.source,
+                scene_id=scene.id,
+                status="saved",
+                path=path,
+                bytes_read=bytes_read,
+                granule_size=granule_size,
+            )
         )
 
     await asyncio.gather(*(one(scene) for scene in scenes))
@@ -281,11 +293,12 @@ async def _windowed_cog(
     href: str,
     asset: Asset,
     bbox: BBox | None,
-) -> bytes | None:
-    """Return a GeoTIFF of the AOI, or None when the whole asset should be fetched.
+) -> tuple[bytes, int, int | None] | None:
+    """Return the AOI GeoTIFF, bytes read, and granule size.
 
-    A miss is not a fallback: the AOI is outside the raster, and downloading
-    the granule would not contain it.
+    None means the whole asset should be fetched. A miss is not a fallback:
+    the AOI is outside the raster, and downloading the granule would not
+    contain it. ``granule_size`` is the object size from Content-Range.
     """
     if bbox is None or not _is_geotiff_asset(asset):
         return None
@@ -308,7 +321,7 @@ async def _windowed_cog(
         raise
     except (CogError, httpx.HTTPError):
         return None
-    return encode_cog(read)
+    return encode_cog(read), read.bytes_fetched, read.granule_size
 
 
 async def _signed_href(client: DataPullClient | None, href: str) -> str:

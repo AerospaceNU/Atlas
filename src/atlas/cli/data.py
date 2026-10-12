@@ -511,6 +511,15 @@ def _write_manifest(
                     for item in report.for_source(src.source)
                     if item.status in {"failed", "no_asset"}
                 ],
+                "windows": [
+                    {
+                        "id": item.scene_id,
+                        "bytes_read": item.bytes_read,
+                        "granule_size": item.granule_size,
+                    }
+                    for item in report.for_source(src.source)
+                    if item.bytes_read is not None and item.granule_size is not None
+                ],
             }
             for src in catalog.sources
         ],

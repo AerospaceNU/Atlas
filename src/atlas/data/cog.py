@@ -93,6 +93,7 @@ class CogRead:
     col_off: int
     row_off: int
     bytes_fetched: int
+    granule_size: int | None = None
 
 
 @dataclass
@@ -123,6 +124,7 @@ class _RangeReader:
         self._href = href
         self._spans: list[tuple[int, int, bytes]] = []
         self.bytes_fetched = 0
+        self.granule_size: int | None = None
 
     async def read(self, start: int, end: int) -> bytes:
         if end < start or start < 0:
@@ -146,9 +148,17 @@ class _RangeReader:
         expected = end - start + 1
         if len(data) != expected:
             raise CogRangeError("range response was not the requested length")
+        self._note_granule_size(response.headers.get("content-range"))
         self._spans.append((start, end, data))
         self.bytes_fetched += len(data)
         return data
+
+    def _note_granule_size(self, content_range: str | None) -> None:
+        if self.granule_size is not None or content_range is None:
+            return
+        _, _, total = content_range.partition("/")
+        if total.strip().isdigit():
+            self.granule_size = int(total.strip())
 
     def _cached(self, start: int, end: int) -> bytes | None:
         for span_start, span_end, data in self._spans:
@@ -226,6 +236,7 @@ class CogFile:
             col_off=col0,
             row_off=row0,
             bytes_fetched=self._reader.bytes_fetched,
+            granule_size=self._reader.granule_size,
         )
 
 

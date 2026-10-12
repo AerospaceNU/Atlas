@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import math
 import struct
 import zlib
@@ -676,6 +677,45 @@ def test_run_data_passes_the_aoi_into_the_cog_read(tmp_path: Path) -> None:
     saved = next(tmp_path.rglob("*.tif")).read_bytes()
     assert len(saved) < len(built.blob)
     assert _tiles_touched(log.range_calls(), built.tile_spans) == {9}
+
+
+def test_manifest_records_bytes_read_and_granule_size(tmp_path: Path) -> None:
+    built = _geographic()
+    log = _RangeLog(built.blob)
+    scene = _scene("https://example.com/granule.tif")
+    args = argparse.Namespace(
+        list_catalog=False,
+        satellite="sentinel2",
+        kind="optical",
+        date="2024-07-01:2024-07-07",
+        coords="-9.5,8.5,-9.0,9.0",
+        out=tmp_path,
+        limit=10,
+        min_cloud_cover=None,
+        max_cloud_cover=None,
+        concurrency=2,
+        search_only=False,
+        asset=None,
+        table=None,
+        variables=None,
+        points=None,
+    )
+    http = httpx.AsyncClient(transport=log.transport())
+    try:
+        assert run_data(args, clients={"sentinel2": _Pull([scene])}, http=http) == 0
+    finally:
+        asyncio.run(http.aclose())
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    source = manifest["sources"][0]
+    assert source["saved"] == ["sentinel2/chip_visual.tif"]
+    assert source["windows"] == [
+        {
+            "id": "chip",
+            "bytes_read": sum(end - start + 1 for start, end in log.range_calls()),
+            "granule_size": len(built.blob),
+        }
+    ]
+    assert source["windows"][0]["bytes_read"] < source["windows"][0]["granule_size"]
 
 
 def test_encode_rejects_an_empty_window() -> None:
