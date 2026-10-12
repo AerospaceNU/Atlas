@@ -929,7 +929,6 @@ def test_manifest_is_replaced_after_fsync(tmp_path: Path, monkeypatch: pytest.Mo
         if str(path).endswith(".tmp"):
             assert flags & os.O_CREAT
             assert flags & os.O_EXCL
-            assert flags & os.O_WRONLY
         if dir_fd is None:
             return real_open(path, flags, mode)
         return real_open(path, flags, mode, dir_fd=dir_fd)
@@ -944,13 +943,33 @@ def test_manifest_is_replaced_after_fsync(tmp_path: Path, monkeypatch: pytest.Mo
     assert written["sources"][0]["next_cursor"] == "page-2"
 
 
-def test_manifest_temp_file_is_created_exclusively(tmp_path: Path) -> None:
-    tmp = tmp_path / f".manifest.json.{os.getpid()}.tmp"
-    tmp.write_text("keep-me", encoding="utf-8")
-    with pytest.raises(FileExistsError):
-        _write_manifest(tmp_path, _sample_catalog("page-2"), DownloadReport())
-    assert tmp.read_text(encoding="utf-8") == "keep-me"
-    assert not (tmp_path / "manifest.json").exists()
+def test_data_help_warns_that_signed_pages_stay_unfetched(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = argparse.ArgumentParser(prog="atlas")
+    sub = parser.add_subparsers(dest="group")
+    add_data_parser(sub)
+    with pytest.raises(SystemExit) as caught:
+        parser.parse_args(["data", "--help"])
+    assert caught.value.code == 0
+    text = capsys.readouterr().out
+    assert "signed" in text
+    assert "unfetched" in text
+    assert "warning" in text
+    assert "exits 0" in text
+    assert "exit status stays 0" in text
+
+
+def test_stale_manifest_temp_files_are_removed(tmp_path: Path) -> None:
+    stale = tmp_path / f".manifest.json.{os.getpid()}.tmp"
+    stale.write_text("leftover", encoding="utf-8")
+    other = tmp_path / "notes.tmp"
+    other.write_text("keep", encoding="utf-8")
+    _write_manifest(tmp_path, _sample_catalog("page-2"), DownloadReport())
+    assert not stale.exists()
+    assert other.read_text(encoding="utf-8") == "keep"
+    assert (tmp_path / "manifest.json").is_file()
+    assert list(tmp_path.glob(".manifest.json.*.tmp")) == []
 
 
 def test_signed_get_without_a_body_stays_unavailable_on_resume(
@@ -990,7 +1009,7 @@ def test_signed_get_without_a_body_stays_unavailable_on_resume(
         assert resumed["next_cursor_unavailable"] == "signed"
         assert resumed["note"] == note
         err = capsys.readouterr().err
-        assert f"sentinel2: {note}" in err
+        assert f"warning: sentinel2: {note}" in err
         assert "secret-value" not in err
         assert "://" not in resumed["note"]
     finally:

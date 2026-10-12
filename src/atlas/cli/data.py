@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import sys
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 from pathlib import Path
@@ -69,7 +70,9 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         description=(
             "List discovered satellites, or search a satellite and download native assets. "
             "A geographic, Web Mercator, or WGS84 UTM COG is read as the window "
-            "overlapping --coords. fldas landsurface writes a CSV training table."
+            "overlapping --coords. fldas landsurface writes a CSV training table. "
+            "A signed STAC next link is not stored, so later pages can stay unfetched. "
+            "That pull prints a warning and still exits 0."
         ),
         epilog=f"example:\n  {_EXAMPLE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -140,7 +143,8 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         action="store_true",
         help=(
             "Continue from next-page cursors in the output manifest "
-            "instead of requesting page one again"
+            "instead of requesting page one again. A signed next link leaves "
+            "later pages unfetched and prints a warning; the exit status stays 0."
         ),
     )
     data.add_argument(
@@ -444,7 +448,10 @@ async def execute_pull(
         if unavailable:
             for name in sorted(unavailable):
                 if name in live_clients:
-                    print(f"{name}: {_unavailable_note(unavailable[name])}", file=sys.stderr)
+                    print(
+                        _unavailable_warning(name, unavailable[name]),
+                        file=sys.stderr,
+                    )
         for name in live_clients:
             reporter.source_start(name)
         catalog = await aggregate(
@@ -817,6 +824,11 @@ def _unavailable_note(reason: str) -> str:
     return "The next page cursor is unavailable. Later pages were not fetched."
 
 
+def _unavailable_warning(name: str, reason: str) -> str:
+    """Return the stderr warning for pages left unfetched. The pull still exits 0."""
+    return f"warning: {name}: {_unavailable_note(reason)}"
+
+
 def _unavailable_cursors(payload: Mapping[str, Any]) -> dict[str, str]:
     """Return sources whose next page exists but was not stored."""
     found: dict[str, str] = {}
@@ -844,29 +856,43 @@ def _fsync_directory(directory: Path) -> None:
         os.close(fd)
 
 
+def _sweep_manifest_temps(directory: Path) -> None:
+    """Remove leftover manifest temp files from an earlier crash.
+
+    The name is random, so a reused process id cannot collide with one of
+    these. A temp still present at the next write is stale.
+    """
+    if not directory.is_dir():
+        return
+    for leftover in directory.glob(".manifest.json.*.tmp"):
+        if leftover.is_dir() and not leftover.is_symlink():
+            continue
+        with contextlib.suppress(OSError):
+            leftover.unlink()
+
+
 def _write_json_atomic(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` via an exclusive temp file, fsync, and ``os.replace``.
 
-    The directory is fsynced after the replace. A failed replace leaves the
-    previous file in place and removes the temp file this write created.
+    The temp name is random. Stale ``.manifest.json.*.tmp`` files in the same
+    directory are removed first. The directory is fsynced after the replace.
+    A failed replace leaves the previous file in place and removes the temp
+    file this write created.
     """
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd: int | None = None
-    created = False
+    directory = path.parent
+    _sweep_manifest_temps(directory)
+    fd, name = tempfile.mkstemp(dir=directory, prefix=".manifest.json.", suffix=".tmp")
+    tmp = Path(name)
     try:
-        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        created = True
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = None
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
-        _fsync_directory(path.parent)
+        _fsync_directory(directory)
     except Exception:
-        if fd is not None:
-            os.close(fd)
-        if created and tmp.exists():
+        if tmp.exists():
             with contextlib.suppress(OSError):
                 tmp.unlink()
         raise
@@ -986,7 +1012,7 @@ def _print_run_summary(
         if src.error:
             failure_lines.append(f"{src.source}: search {src.error}")
         elif src.next_cursor_unavailable:
-            failure_lines.append(f"{src.source}: {_unavailable_note(src.next_cursor_unavailable)}")
+            failure_lines.append(_unavailable_warning(src.source, src.next_cursor_unavailable))
         for item in items:
             if item.error:
                 failure_lines.append(f"{src.source} {item.scene_id}: {item.error}")
