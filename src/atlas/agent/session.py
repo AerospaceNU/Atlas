@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
@@ -28,11 +29,14 @@ from atlas.agent.analysis_skill import (
 )
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
+from atlas.agent.images import ingest_images
 from atlas.agent.layout import (
     AtlasPathError,
+    delete_user_key,
     ensure_project_layout,
     ensure_user_layout,
     list_entries,
+    prepare_openrouter_key,
     project_atlas_root,
     remove_entry,
     resolve_openrouter_key,
@@ -41,11 +45,14 @@ from atlas.agent.layout import (
 )
 from atlas.agent.metrics import SessionTotals, apply_call, apply_http_error, format_tui_status
 from atlas.agent.model import (
+    _CATALOG_TIME_LIMIT,
     MISSING_KEY_MESSAGE,
+    CatalogFetch,
     MissingOpenRouterKey,
     ModelConfig,
     OpenRouterHTTPError,
     OpenRouterModel,
+    peek_model_catalog,
 )
 from atlas.agent.runtime import (
     Agent,
@@ -60,6 +67,7 @@ from atlas.agent.skill_author import normalize_skill_name
 from atlas.agent.skills import Skill, load_skills, register_skill_tool
 
 _REDACTED = "***"
+_STDOUT_LOCK = threading.Lock()
 
 
 class AgentSession:
@@ -81,13 +89,18 @@ class AgentSession:
         self.catalog: list[CatalogModel] = []
         self.active_skills: list[str] = []
         self.totals = SessionTotals()
-        self.fetch_models: Callable[[], list[CatalogModel]] | None = None
+        self.fetch_models: Callable[[], CatalogFetch | list[CatalogModel]] | None = None
+        self._catalog_thread: threading.Thread | None = None
+        self._catalog_inflight = False
+        self._catalog_lock = threading.Lock()
         config = getattr(agent.model, "config", None)
         if config is not None:
             self.model_id = str(getattr(config, "model", "") or "")
             self.totals.model = self.model_id
             key = str(getattr(config, "api_key", "") or "").strip()
             self.active_key = key or None
+            if key:
+                self.secrets.append(key)
         self.skill_catalog_note = ""
         self._skill_previews: dict[tuple[str, str], str] = {}
         self._analysis_turns: list[AnalysisTurn] = []
@@ -100,14 +113,22 @@ class AgentSession:
         self,
         request: str,
         *,
+        images: Sequence[str] = (),
         on_step: Callable[[AgentStep], None] | None = None,
         on_phase: Callable[[str, str | None], None] | None = None,
         on_thought: Callable[[str, float | None], None] | None = None,
     ) -> AgentRun:
-        """Append the user message and advance the shared history one turn."""
+        """Append the user message and advance the shared history one turn.
+
+        ``images`` are paths in the write sandbox or the project workspace.
+        A path the sandbox rejects is not appended.
+        """
         self._require_key()
+        message = ChatMessage(role=Role.USER, content=request)
+        if images:
+            message.images = ingest_images(self.agent.artifacts, list(images))
         self._begin_analysis(request)
-        self.messages.append(ChatMessage(role=Role.USER, content=request))
+        self.messages.append(message)
         run = self.agent.advance(
             self.messages, on_step=on_step, on_phase=on_phase, on_thought=on_thought
         )
@@ -336,8 +357,9 @@ class AgentSession:
 
 def _write_line(stdout: IO[str], payload: dict[str, Any], secrets: list[str]) -> None:
     text = json.dumps(_redact_value(payload, secrets), ensure_ascii=False)
-    stdout.write(text + "\n")
-    stdout.flush()
+    with _STDOUT_LOCK:
+        stdout.write(text + "\n")
+        stdout.flush()
 
 
 def _redact_value(value: Any, secrets: list[str]) -> Any:
@@ -400,6 +422,7 @@ def serve(
             continue
         kind = message.get("type")
         if kind == "quit":
+            _join_catalog_fetch(session)
             return 0
         if kind == "user":
             _handle_user(session, stdout, message)
@@ -422,6 +445,9 @@ def serve(
         if kind == "set_key":
             _handle_set_key(session, stdout, message)
             continue
+        if kind == "delete_key":
+            _handle_delete_key(session, stdout)
+            continue
         if kind == "list":
             _handle_list(session, stdout, message)
             continue
@@ -439,6 +465,7 @@ def serve(
             {"type": "error", "message": f"Unknown message type: {kind!r}"},
             session.secrets,
         )
+    _join_catalog_fetch(session)
     return 0
 
 
@@ -544,8 +571,12 @@ def _handle_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any
 
 
 def _handle_models(session: AgentSession, stdout: IO[str]) -> None:
-    """Fetch the catalog. A failure leaves the selected model id unchanged."""
-    previous = session.model_id
+    """Start a catalog fetch. A failure leaves the selected model id unchanged.
+
+    A fresh cache hit is written immediately. Otherwise paging runs on a
+    background thread so the session loop can keep reading. The thread is
+    joined when the loop ends.
+    """
     fetcher = session.fetch_models
     if fetcher is None:
         _write_line(
@@ -559,26 +590,96 @@ def _handle_models(session: AgentSession, stdout: IO[str]) -> None:
             session.secrets,
         )
         return
+    key = _catalog_api_key(session)
+    cached = peek_model_catalog(key) if key else None
+    if cached is not None:
+        _publish_catalog(session, stdout, CatalogFetch(models=cached))
+        return
+    if session._catalog_inflight:
+        return
+    session._catalog_inflight = True
+    thread = threading.Thread(
+        target=_catalog_worker,
+        args=(session, stdout),
+        daemon=True,
+        name="atlas-model-catalog",
+    )
+    session._catalog_thread = thread
+    thread.start()
+
+
+def _catalog_worker(session: AgentSession, stdout: IO[str]) -> None:
     try:
-        catalog = fetcher()
+        fetcher = session.fetch_models
+        if fetcher is None:
+            fetched = CatalogFetch(models=[], error="model catalog is unavailable")
+        else:
+            fetched = _coerce_catalog(fetcher())
+        _publish_catalog(session, stdout, fetched)
     except Exception as exc:
-        session.model_id = previous
         _write_line(
             stdout,
             {"type": "models", "ok": False, "message": _public_error(exc), "models": []},
             session.secrets,
         )
-        return
-    session.catalog = catalog
+    finally:
+        session._catalog_inflight = False
+
+
+def _join_catalog_fetch(session: AgentSession) -> None:
+    thread = session._catalog_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=_CATALOG_TIME_LIMIT + 5)
+
+
+def _coerce_catalog(value: CatalogFetch | list[CatalogModel]) -> CatalogFetch:
+    if isinstance(value, CatalogFetch):
+        return value
+    return CatalogFetch(models=list(value))
+
+
+def _include_selected_model(
+    session: AgentSession, models: list[CatalogModel]
+) -> list[CatalogModel]:
+    """Keep the active model in the list when a fetch does not return it.
+
+    A short or empty catalog would otherwise leave the picker with nothing to
+    select. A row already stored for that id keeps its context and tool flag.
+    """
+    selected = session.model_id.strip()
+    if not selected or any(model.id == selected for model in models):
+        return list(models)
+    previous = next((model for model in session.catalog if model.id == selected), None)
+    kept = list(models)
+    if previous is not None:
+        kept.append(previous)
+    else:
+        kept.append(CatalogModel(id=selected, supports_tools=True))
+    return kept
+
+
+def _publish_catalog(session: AgentSession, stdout: IO[str], fetched: CatalogFetch) -> None:
+    with session._catalog_lock:
+        models = _include_selected_model(session, fetched.models)
+        session.catalog = models
     _apply_known_context_limit(session)
     payload: dict[str, Any] = {
         "type": "models",
-        "ok": True,
-        "message": "",
-        "models": [model.model_dump() for model in catalog],
+        "ok": fetched.error is None,
+        "message": fetched.error or "",
+        "models": [model.model_dump() for model in models],
     }
     payload.update(_status_fields(session))
     _write_line(stdout, payload, session.secrets)
+
+
+def _catalog_api_key(session: AgentSession) -> str:
+    config = getattr(session.agent.model, "config", None)
+    if config is not None:
+        key = str(getattr(config, "api_key", "") or "").strip()
+        if key:
+            return key
+    return (session.active_key or "").strip()
 
 
 def _handle_select_model(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
@@ -592,7 +693,10 @@ def _handle_select_model(session: AgentSession, stdout: IO[str], message: dict[s
             session.secrets,
         )
         return
-    chosen = next((item for item in session.catalog if item.id == model_id), None)
+    with session._catalog_lock:
+        chosen = next((item for item in session.catalog if item.id == model_id), None)
+        if chosen is not None:
+            chosen = chosen.model_copy()
     if chosen is None:
         session.model_id = previous
         session.totals.context_limit = previous_limit
@@ -623,9 +727,17 @@ def _handle_set_key(session: AgentSession, stdout: IO[str], message: dict[str, A
             session.secrets,
         )
         return
-    cleaned = key.strip()
-    if cleaned not in session.secrets:
-        session.secrets.append(cleaned)
+    try:
+        # User scope warns inside write_user_key. Session scope warns here.
+        cleaned, warning = prepare_openrouter_key(key, warn=scope != "user")
+    except ValueError:
+        _write_line(
+            stdout,
+            {"type": "error", "message": "set_key rejected a key that contains a newline"},
+            session.secrets,
+        )
+        return
+    _remember_secret(session, cleaned)
     try:
         if scope == "user":
             write_user_key(cleaned, session.home)
@@ -641,7 +753,41 @@ def _handle_set_key(session: AgentSession, stdout: IO[str], message: dict[str, A
             session.secrets,
         )
         return
-    _write_line(stdout, {"type": "key", "scope": scope, "saved": True}, session.secrets)
+    payload: dict[str, Any] = {"type": "key", "scope": scope, "saved": True}
+    if warning:
+        payload["warning"] = warning
+    _write_line(stdout, payload, session.secrets)
+
+
+def _handle_delete_key(session: AgentSession, stdout: IO[str]) -> None:
+    """Remove the saved user key and stop using any key in this process.
+
+    The reply warns that ``OPENROUTER_API_KEY`` in the environment is still
+    used on the next launch.
+    """
+    try:
+        delete_user_key(session.home)
+    except Exception as exc:
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"Could not delete the key: {type(exc).__name__}"},
+            session.secrets,
+        )
+        return
+    session.session_key = None
+    _clear_installed_key(session)
+    _write_line(
+        stdout,
+        {
+            "type": "key",
+            "scope": "deleted",
+            "saved": False,
+            "warning": (
+                "OPENROUTER_API_KEY in the environment will still be used on the next launch"
+            ),
+        },
+        session.secrets,
+    )
 
 
 def _handle_list(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
@@ -831,11 +977,24 @@ def _add_enabled_skill(session: AgentSession, name: str, scope: str) -> str:
     return "The skill catalog was reloaded."
 
 
+def _remember_secret(session: AgentSession, key: str) -> None:
+    if key and key not in session.secrets:
+        session.secrets.append(key)
+
+
 def _install_key(session: AgentSession, key: str) -> None:
+    _remember_secret(session, key)
     session.active_key = key
     config = getattr(session.agent.model, "config", None)
     if config is not None:
         config.api_key = key
+
+
+def _clear_installed_key(session: AgentSession) -> None:
+    session.active_key = None
+    config = getattr(session.agent.model, "config", None)
+    if config is not None:
+        config.api_key = ""
 
 
 def _atlas_root(session: AgentSession, scope: object) -> Path:
@@ -918,9 +1077,11 @@ def _apply_known_context_limit(session: AgentSession) -> None:
     model_id = session.totals.model or session.model_id
     if not model_id:
         return
-    chosen = next((item for item in session.catalog if item.id == model_id), None)
-    if chosen is not None and chosen.context_length is not None:
-        session.totals.context_limit = chosen.context_length
+    with session._catalog_lock:
+        chosen = next((item for item in session.catalog if item.id == model_id), None)
+        context_length = chosen.context_length if chosen is not None else None
+    if context_length is not None:
+        session.totals.context_limit = context_length
 
 
 def _status_fields(session: AgentSession) -> dict[str, Any]:

@@ -34,7 +34,7 @@ Enter sends a line. `/` opens commands. `/new` starts a fresh conversation in th
 
 ## Data CLI
 
-`atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`.
+`atlas data` lists sources and pulls them. A date window is `START:END`. A box is `west,south,east,north`. A polygon AOI is `--polygon` as `lon,lat` pairs separated by semicolons, or a GeoJSON Polygon. Without `--coords`, the search box is that ring's envelope. A ring that winds around a pole is rejected: the boundary does not close inside one 360-degree window, so the interior is not a box or a STAC polygon. Rings longer than 4096 vertices are rejected so the caller can simplify them first. The written manifest stores the polygon and the box sent to catalogs that only accept a bounding box. Scenes from every source are then kept only when they meet the ring: a point must lie inside it, and every other scene is kept when its footprint bounding box meets the ring, because a scene record stores that box rather than the full footprint outline.
 
 ```bash
 atlas data                         # catalog
@@ -43,6 +43,10 @@ atlas data sentinel2               # kinds for one satellite
 atlas data sentinel2 optical \
   --date 2024-07-01:2024-07-07 \
   --coords -71.12,42.32,-71.02,42.40
+
+atlas data sentinel2 optical \
+  --date 2024-07-01:2024-07-07 \
+  --polygon -71.12,42.32;-71.02,42.32;-71.02,42.40;-71.12,42.40
 
 atlas data fldas landsurface \
   --date 2023-01-01:2024-12-31 \
