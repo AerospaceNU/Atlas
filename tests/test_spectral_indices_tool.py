@@ -143,6 +143,25 @@ def test_tool_preset_matches_compute_indices(tmp_path: Path) -> None:
     )
 
 
+def test_tool_refuses_to_overwrite_unless_asked(tmp_path: Path) -> None:
+    _save(tmp_path, "red.npy", [0.1])
+    _save(tmp_path, "nir.npy", [0.5])
+    store = LocalArtifactStore(tmp_path)
+    tool = SpectralIndicesTool()
+    first = tool.run({"red": "red.npy", "nir": "nir.npy", "out": "indices"}, store)
+    assert first.artifacts == ["indices/ndvi.npy"]
+    with pytest.raises(FileExistsError, match="overwrite"):
+        tool.run({"red": "red.npy", "nir": "nir.npy", "out": "indices"}, store)
+    _save(tmp_path, "nir.npy", [0.9])
+    second = tool.run(
+        {"red": "red.npy", "nir": "nir.npy", "out": "indices", "overwrite": True},
+        store,
+    )
+    assert second.artifacts == ["indices/ndvi.npy"]
+    written = np.load(tmp_path / "indices" / "ndvi.npy")
+    assert written[0] == pytest.approx((0.9 - 0.1) / (0.9 + 0.1))
+
+
 def test_tool_rejects_a_path_outside_the_workspace(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     with pytest.raises(SandboxDenied):

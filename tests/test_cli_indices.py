@@ -233,6 +233,25 @@ def test_cli_presets_match_compute_indices(tmp_path: Path) -> None:
     assert mixed == 2
 
 
+def test_cli_refuses_to_overwrite_unless_asked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    red = tmp_path / "red.npy"
+    nir = tmp_path / "nir.npy"
+    _save(red, [0.1])
+    _save(nir, [0.4])
+    out = tmp_path / "out"
+    args = ["indices", "--red", str(red), "--nir", str(nir), "--out", str(out)]
+    assert main(args) == 0
+    capsys.readouterr()
+    assert main(args) == 2
+    assert "overwrite" in capsys.readouterr().err
+    _save(nir, [0.8])
+    assert main([*args, "--overwrite"]) == 0
+    written = np.load(out / "ndvi.npy")
+    assert written[0] == pytest.approx((0.8 - 0.1) / (0.8 + 0.1))
+
+
 def test_cli_rejects_nan_nodata(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     red = tmp_path / "red.npy"
     nir = tmp_path / "nir.npy"

@@ -59,6 +59,10 @@ class SpectralIndicesInput(BaseModel):
             "scale 2.75e-5 and offset -0.2."
         ),
     )
+    overwrite: bool = Field(
+        default=False,
+        description="Replace index .npy files that already exist. Refused otherwise.",
+    )
     preset: Literal["s2-l2a", "landsat-c2"] | None = Field(
         default=None,
         description=(
@@ -109,10 +113,19 @@ class SpectralIndicesTool(Tool):
         )
         if not result:
             raise ValueError("red and NIR are required before an index can be computed")
+        planned: list[tuple[str, str]] = []
+        for name in result:
+            relative = f"{request.out.rstrip('/')}/{name}.npy"
+            path = store.resolve(relative)
+            if path.exists() and not request.overwrite:
+                raise FileExistsError(
+                    f"refusing to overwrite {relative}; pass overwrite to replace it"
+                )
+            planned.append((name, relative))
         artifacts: list[str] = []
         lines: list[str] = []
-        for name, array in result.items():
-            relative = f"{request.out.rstrip('/')}/{name}.npy"
+        for name, relative in planned:
+            array = result[name]
             path = store.resolve(relative)
             path.parent.mkdir(parents=True, exist_ok=True)
             np.save(path, array)

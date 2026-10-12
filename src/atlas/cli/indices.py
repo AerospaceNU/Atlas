@@ -39,6 +39,11 @@ def add_indices_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser])
     parser.add_argument("--swir22", type=Path, default=None, help="SWIR2.2 band .npy (NBR)")
     parser.add_argument("--out", required=True, type=Path, help="Directory for index .npy files")
     parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace index files that already exist",
+    )
+    parser.add_argument(
         "--nodata",
         action="append",
         default=None,
@@ -105,9 +110,20 @@ def run_indices(args: argparse.Namespace) -> int:
         )
         return 2
     out = Path(args.out)
+    paths = {name: out / f"{name}.npy" for name in result}
+    if not args.overwrite:
+        existing = [path for path in paths.values() if path.exists()]
+        if existing:
+            print(
+                "refusing to overwrite "
+                + ", ".join(str(path) for path in existing)
+                + "; pass --overwrite to replace them",
+                file=sys.stderr,
+            )
+            return 2
     out.mkdir(parents=True, exist_ok=True)
     for name, array in result.items():
-        path = out / f"{name}.npy"
+        path = paths[name]
         np.save(path, array)
         print(f"{name} {path}")
     return 0
