@@ -20,6 +20,7 @@ from atlas.data.base import (
     Scene,
     SceneKind,
 )
+from atlas.data.credentials import raise_for_missing_credential
 
 _CLOUD_QUERY_KINDS = frozenset({SceneKind.optical, SceneKind.browse})
 
@@ -30,6 +31,8 @@ class StacApiClient(DataPullClient):
     include_datetime: ClassVar[bool] = True
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = None
+    # Unset variables named here replace a 401 or 403 with MissingCredentialError.
+    required_credentials: ClassVar[tuple[str, ...]] = ()
 
     def __init__(
         self,
@@ -60,6 +63,7 @@ class StacApiClient(DataPullClient):
 
     async def search(self, request: PullRequest) -> PullResult:
         resp = await self._client.post(self.search_url, json=self._search_body(request))
+        self._raise_for_credentials(resp)
         resp.raise_for_status()
         return self._result_from_payload(request, resp.json())
 
@@ -83,14 +87,30 @@ class StacApiClient(DataPullClient):
         Raises:
             ValueError: The cursor is on another host, carries a signed query,
                 or is not a usable next link. The message does not include the URL.
+            MissingCredentialError: The provider returned 401 or 403 and a
+                variable in ``required_credentials`` is unset. The message
+                names that variable, says how to set it, and does not include
+                a value.
+            CredentialRejectedError: The provider returned 401 or 403 and
+                every required variable is set. The message names the
+                variable and the status, not the value.
         """
         call = _cursor_request(page_cursor, self.search_url, request, self._search_body)
         if call.method == "GET":
             resp = await self._client.get(call.url)
         else:
             resp = await self._client.post(call.url, json=call.body)
+        self._raise_for_credentials(resp)
         resp.raise_for_status()
         return self._result_from_payload(request, resp.json())
+
+    def _raise_for_credentials(self, response: object) -> None:
+        """Raise a named credential error for a 401 or 403.
+
+        An unset variable is missing. A variable that is set was rejected.
+        Any other status is left for the caller. The value is not included.
+        """
+        raise_for_missing_credential(response, self.required_credentials)
 
     def _search_body(self, request: PullRequest, *, token: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -409,6 +429,24 @@ def _call_from_object(
     return _CursorCall("POST", url, dict(body))
 
 
+def _raster_calibration(raw: object) -> tuple[float | None, float | None]:
+    """Return scale and offset from the first ``raster:bands`` entry."""
+    if not isinstance(raw, list) or not raw:
+        return None, None
+    entry = raw[0]
+    if not isinstance(entry, dict):
+        return None, None
+    return _finite_float(entry.get("scale")), _finite_float(entry.get("offset"))
+
+
+def _finite_float(raw: object) -> float | None:
+    """Return a finite float, or None for anything else."""
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) else None
+
+
 def item_to_scene(
     feature: dict[str, Any],
     *,
@@ -441,11 +479,14 @@ def item_to_scene(
             if not isinstance(spec, dict) or not isinstance(spec.get("href"), str):
                 continue
             roles = spec.get("roles")
+            scale, offset = _raster_calibration(spec.get("raster:bands"))
             asset = Asset.try_new(
                 href=_http_href(spec["href"]),
                 media_type=spec.get("type") if isinstance(spec.get("type"), str) else None,
                 title=spec.get("title") if isinstance(spec.get("title"), str) else None,
                 roles=list(roles) if isinstance(roles, list) else [],
+                scale=scale,
+                offset=offset,
             )
             if asset is not None:
                 assets[str(name)] = asset

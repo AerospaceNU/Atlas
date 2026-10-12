@@ -15,6 +15,7 @@ from atlas.data import goes
 from atlas.data.base import BBox, GeometryKind, PullRequest, SceneKind
 from atlas.data.cdse import CdseSentinel3OlciClient
 from atlas.data.cop_dem import CopDemGlo30Client
+from atlas.data.credentials import MissingCredentialError
 from atlas.data.earth_search import EarthSearchSentinel1GrdClient
 from atlas.data.firms import FirmsClient
 from atlas.data.gibs import GibsModisTrueColorClient
@@ -243,7 +244,7 @@ async def test_firms_parses_csv_and_requires_key() -> None:
         "42.35,-71.08,330.1,0.4,0.4,2024-07-01,1342,N,VIIRS,n,2.0NRT,290.1,4.2,D\n"
     )
     fake = FakeAsyncClient(text=csv_body)
-    with pytest.raises(ValueError, match="FIRMS_MAP_KEY"):
+    with pytest.raises(MissingCredentialError, match="FIRMS_MAP_KEY"):
         await FirmsClient(map_key="", client=cast(httpx.AsyncClient, fake)).search(_request())
 
     async with FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, fake)) as client:

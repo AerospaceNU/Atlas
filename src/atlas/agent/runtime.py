@@ -23,6 +23,7 @@ from atlas.agent.contracts import (
 )
 from atlas.agent.images import ingest_image, ingest_images, is_model_image
 from atlas.agent.instructions import load_project_instructions
+from atlas.agent.layout import project_agent_config_path, project_atlas_root
 from atlas.agent.metrics import observe_model_call, output_tokens_per_second
 from atlas.agent.skills import (
     Skill,
@@ -66,7 +67,7 @@ def _load_agent_config(root: Path) -> dict[str, object]:
 
     Malformed TOML raises ``ValueError`` (``tomllib.TOMLDecodeError``).
     """
-    config_path = root / ".atlas" / "agent.toml"
+    config_path = project_agent_config_path(root)
     if not config_path.is_file():
         return {}
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -95,8 +96,8 @@ def ensure_agent_config(root: Path) -> Path:
 
     An existing file is left unchanged, including a file that omits a key.
     """
-    config_dir = root / ".atlas"
-    config_path = config_dir / "agent.toml"
+    config_dir = project_atlas_root(root)
+    config_path = project_agent_config_path(root)
     if config_path.is_file():
         return config_path
     config_dir.mkdir(parents=True, exist_ok=True)

@@ -40,6 +40,7 @@ from atlas.agent.runtime import Agent
 from atlas.agent.session import AgentSession, serve
 from atlas.cli.data import run_data
 from atlas.data.base import Asset, BBox, PullRequest, Scene, SceneKind
+from atlas.data.credentials import CredentialRejectedError, MissingCredentialError
 from atlas.data.firms import FirmsClient
 from atlas.data.sources import fldas as fldas_module
 from atlas.data.sources.fldas import MISSING_TOKEN_MESSAGE, FldasAuthError, FldasClient
@@ -369,9 +370,9 @@ async def test_firms_uses_the_session_key_and_keeps_the_missing_key_error(
     bind_session_credentials({})
     monkeypatch.delenv(FIRMS_MAP_KEY, raising=False)
     explicit = FirmsClient(map_key="", client=transport)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="FIRMS_MAP_KEY is not set") as excinfo:
+    with pytest.raises(MissingCredentialError, match="FIRMS_MAP_KEY is not set") as excinfo:
         await explicit.search(_pull())
-    assert str(excinfo.value) == "FIRMS_MAP_KEY is not set"
+    assert str(excinfo.value) == ("FIRMS_MAP_KEY is not set; set it with /key firms or the env var")
     assert _TOKENS[FIRMS_MAP_KEY] not in str(excinfo.value)
 
     from_file = FirmsClient()
@@ -513,7 +514,7 @@ def test_a_firms_http_error_in_a_tool_result_does_not_expose_the_key(
     assert key not in tool_text
 
     captured = ""
-    error: httpx.HTTPStatusError | None = None
+    error: CredentialRejectedError | None = None
 
     def handler(request: httpx.Request) -> httpx.Response:
         del request
@@ -528,14 +529,40 @@ def test_a_firms_http_error_in_a_tool_result_does_not_expose_the_key(
     with caplog.at_level(logging.DEBUG):
         try:
             asyncio.run(logged())
-        except httpx.HTTPStatusError as exc:
+        except CredentialRejectedError as exc:
             error = exc
             captured = traceback.format_exc()
     assert error is not None
     assert key not in str(error)
-    assert key not in str(error.request.url)
+    assert "FIRMS_MAP_KEY was rejected (HTTP 403)" in str(error)
     assert key not in captured
-    assert "HTTPStatusError" in captured
+    assert "CredentialRejectedError" in captured
+    assert key not in caplog.text
+
+    status_error: httpx.HTTPStatusError | None = None
+    status_trace = ""
+
+    def handler_500(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500)
+
+    async def logged_500() -> None:
+        transport = httpx.MockTransport(handler_500)
+        async with httpx.AsyncClient(transport=transport) as http:
+            client = FirmsClient(map_key=key, client=http)
+            await client.search(_pull())
+
+    with caplog.at_level(logging.DEBUG):
+        try:
+            asyncio.run(logged_500())
+        except httpx.HTTPStatusError as exc:
+            status_error = exc
+            status_trace = traceback.format_exc()
+    assert status_error is not None
+    assert key not in str(status_error)
+    assert key not in str(status_error.request.url)
+    assert key not in status_trace
+    assert "HTTPStatusError" in status_trace
     assert key not in caplog.text
     assert logging.getLogger("httpx").level >= logging.WARNING
 

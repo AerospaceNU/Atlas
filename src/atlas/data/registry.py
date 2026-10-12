@@ -19,7 +19,10 @@ from atlas.data.cmr_stac import (
 )
 from atlas.data.cop_dem import CopDemGlo30Client, CopDemGlo90Client
 from atlas.data.digitalearth import DeAfricaS2Client, DeaS2ArdClient, DeaS2BmArdClient
-from atlas.data.earth_search import EarthSearchSentinel1GrdClient
+from atlas.data.earth_search import (
+    EarthSearchSentinel1GrdClient,
+    EarthSearchSentinel2L2aClient,
+)
 from atlas.data.firms import (
     FirmsClient,
     FirmsLandsatClient,
@@ -98,6 +101,7 @@ SOURCES: dict[str, type[DataPullClient]] = {
     "io_lulc_annual": IoLulcAnnualClient,
     "mrms_qpe_24h": NoaaMrmsQpe24hClient,
     "earthsearch_sentinel1_grd": EarthSearchSentinel1GrdClient,
+    "earthsearch_sentinel2_l2a": EarthSearchSentinel2L2aClient,
     "usgs_landsat_l1": UsgsLandsatC2L1Client,
     "usgs_landsat_l2_sr": UsgsLandsatC2L2SrClient,
     "cdse_sentinel3_olci": CdseSentinel3OlciClient,

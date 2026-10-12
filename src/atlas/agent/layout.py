@@ -1,10 +1,17 @@
 """Project ``.atlas/`` and user ``~/.atlas/`` locations.
 
-Project root (the workspace):
+Project root (the workspace, the current directory):
 
-- ``sessions/`` — one directory per session, no keys
-- ``artifacts/`` — files that belong to a session id
+- ``sessions/<id>/`` — one directory per session. ``meta.json`` records the
+  id and model. No keys.
+- ``artifacts/<id>/`` — files that belong to that session id
 - ``data/`` — pulls from the data CLI (existing ``.atlas/data``)
+- ``skills/`` and ``skills-drafts/`` — vetted skills and drafts that are not
+  loaded until a person enables them
+- ``agent.toml`` — workspace model and tool-call budget
+
+``AGENTS.md`` stays at the workspace root. ``.agents/skills`` stays beside
+``.atlas``, not inside it.
 
 User root (the home directory):
 
@@ -15,6 +22,16 @@ User root (the home directory):
   memory and wins over the environment, which wins over the file.
 - ``weights/`` — user-level weights (existing ``~/.atlas/weights``)
 - ``defaults/`` — user defaults
+- ``skills/``, ``skills-drafts/``, and ``config.toml`` — user skills and the
+  ``home_skills`` flag
+
+``ATLAS_HOME`` replaces this user root. It is the directory that would
+otherwise be ``~/.atlas``, not the parent home. ``ATLAS_HOME_SKILLS`` still
+only turns user skills on; the skills and ``config.toml`` it refers to are
+read from that same root. On Windows the default user root is
+``%USERPROFILE%/.atlas``.
+
+The directory list other tickets should point at is ``docs/atlas-layout.md``.
 
 Removing a session removes its artifacts. Removing entries from the project
 root does not touch the user root. Absolute paths and ``..`` fail closed.
@@ -31,8 +48,23 @@ import warnings
 from pathlib import Path
 from typing import Literal
 
-_PROJECT_DIRS = ("sessions", "artifacts", "data")
-_USER_DIRS = ("keys", "weights", "defaults")
+ATLAS_HOME_ENV = "ATLAS_HOME"
+ATLAS_DIR_NAME = ".atlas"
+AGENTS_DIR_NAME = ".agents"
+SKILLS_DIR_NAME = "skills"
+SKILL_DRAFTS_DIR_NAME = "skills-drafts"
+AGENTS_MD_FILENAME = "AGENTS.md"
+MANIFEST_FILENAME = "manifest.json"
+AGENT_CONFIG_FILENAME = "agent.toml"
+USER_CONFIG_FILENAME = "config.toml"
+AGENTS_SKILLS_RELATIVE = f"{AGENTS_DIR_NAME}/{SKILLS_DIR_NAME}"
+ATLAS_SKILLS_RELATIVE = f"{ATLAS_DIR_NAME}/{SKILLS_DIR_NAME}"
+ATLAS_SKILL_DRAFTS_RELATIVE = f"{ATLAS_DIR_NAME}/{SKILL_DRAFTS_DIR_NAME}"
+SANDBOX_AUDIT_RELATIVE = f"{ATLAS_DIR_NAME}/sandbox_audit.log"
+MANIFEST_TEMP_PREFIX = f".{MANIFEST_FILENAME}."
+MANIFEST_TEMP_SUFFIX = ".tmp"
+MANIFEST_TEMP_GLOB = f".{MANIFEST_FILENAME}.*.tmp"
+
 _LIST_KINDS = frozenset({"sessions", "artifacts"})
 _REMOVE_KINDS = frozenset({"sessions", "artifacts", "keys", "weights"})
 OPENROUTER_API_KEY = "OPENROUTER_API_KEY"
@@ -159,15 +191,157 @@ def key_filename(name: str) -> str:
         raise ValueError("unknown key variable") from None
 
 
+def atlas_home_override() -> Path | None:
+    """Return ``ATLAS_HOME`` when it names the user root, else None.
+
+    The value is the user ``.atlas`` directory itself. ``~`` is expanded. A
+    blank value is treated as unset.
+    """
+    override = os.environ.get(ATLAS_HOME_ENV, "").strip()
+    if not override:
+        return None
+    return Path(override).expanduser()
+
+
 def project_atlas_root(workspace: Path) -> Path:
     """Return the project ``.atlas`` directory (it may not exist yet)."""
-    return workspace / ".atlas"
+    return workspace / ATLAS_DIR_NAME
 
 
 def user_atlas_root(home: Path | None = None) -> Path:
-    """Return the user ``.atlas`` directory for ``home`` or the real home."""
-    base = Path.home() if home is None else home
-    return base / ".atlas"
+    """Return the user ``.atlas`` directory.
+
+    ``ATLAS_HOME`` wins when it is set, including when ``home`` is passed.
+    The variable is that directory, not the parent home. When it is unset,
+    ``home`` is the parent and the result is ``<home>/.atlas``. ``None``
+    uses the process home (``%USERPROFILE%`` on Windows).
+    """
+    override = atlas_home_override()
+    if override is not None:
+        return override
+    base = Path.home() if home is None else Path(home)
+    return base / ATLAS_DIR_NAME
+
+
+def project_sessions_dir(workspace: Path) -> Path:
+    """Return ``<workspace>/.atlas/sessions`` (it may not exist yet)."""
+    return project_atlas_root(workspace) / "sessions"
+
+
+def project_artifacts_dir(workspace: Path) -> Path:
+    """Return ``<workspace>/.atlas/artifacts`` (it may not exist yet)."""
+    return project_atlas_root(workspace) / "artifacts"
+
+
+def project_data_dir(workspace: Path | None = None) -> Path:
+    """Return the project data-pull directory.
+
+    Args:
+        workspace: Project folder. ``None`` uses ``.`` so the result stays the
+            cwd-relative ``.atlas/data`` path the data CLI already defaults to.
+
+    Returns:
+        ``<workspace>/.atlas/data``.
+    """
+    base = Path(".") if workspace is None else workspace
+    return project_atlas_root(base) / "data"
+
+
+def project_session_dir(workspace: Path, session_id: str) -> Path:
+    """Return one session directory under the project ``.atlas`` root."""
+    return project_sessions_dir(workspace) / session_id
+
+
+def project_artifact_dir(workspace: Path, session_id: str) -> Path:
+    """Return one session's artifact directory under the project ``.atlas`` root."""
+    return project_artifacts_dir(workspace) / session_id
+
+
+def project_skills_root(workspace: Path) -> Path:
+    """Return ``<workspace>/.atlas/skills`` without creating it."""
+    return project_atlas_root(workspace) / SKILLS_DIR_NAME
+
+
+def project_skill_drafts_root(workspace: Path) -> Path:
+    """Return ``<workspace>/.atlas/skills-drafts`` without creating it.
+
+    Drafts are not loaded from ``.atlas/skills``. A person promotes one later.
+    """
+    return project_atlas_root(workspace) / SKILL_DRAFTS_DIR_NAME
+
+
+def project_agents_skills_dir(workspace: Path) -> Path:
+    """Return ``<workspace>/.agents/skills`` without creating it.
+
+    This directory sits beside ``.atlas``, not inside it.
+    """
+    return workspace / AGENTS_DIR_NAME / SKILLS_DIR_NAME
+
+
+def project_agent_config_path(workspace: Path) -> Path:
+    """Return ``<workspace>/.atlas/agent.toml`` without creating it."""
+    return project_atlas_root(workspace) / AGENT_CONFIG_FILENAME
+
+
+def project_agents_md(workspace: Path) -> Path:
+    """Return ``<workspace>/AGENTS.md``.
+
+    Project instructions stay at the workspace root. Nested copies are not
+    read.
+    """
+    return workspace / AGENTS_MD_FILENAME
+
+
+def pull_manifest_path(directory: Path) -> Path:
+    """Return the data-pull manifest inside ``directory``."""
+    return directory / MANIFEST_FILENAME
+
+
+def user_skills_root(home: Path | None = None) -> Path:
+    """Return the user skills directory under the user ``.atlas`` root.
+
+    ``ATLAS_HOME`` selects that root the same way :func:`user_atlas_root` does,
+    so ``ATLAS_HOME_SKILLS`` and ``config.toml`` see the same directory.
+    """
+    return user_atlas_root(home) / SKILLS_DIR_NAME
+
+
+def user_skill_drafts_root(home: Path | None = None) -> Path:
+    """Return the user skill drafts directory under the user ``.atlas`` root."""
+    return user_atlas_root(home) / SKILL_DRAFTS_DIR_NAME
+
+
+def user_agents_skills_dir(home: Path | None = None) -> Path:
+    """Return ``<home>/.agents/skills`` without creating it.
+
+    ``ATLAS_HOME`` does not move this directory. It stays under the home
+    parent, beside the user ``.atlas`` root.
+    """
+    base = Path.home() if home is None else Path(home)
+    return base / AGENTS_DIR_NAME / SKILLS_DIR_NAME
+
+
+def user_config_path(home: Path | None = None) -> Path:
+    """Return ``config.toml`` inside the user ``.atlas`` root.
+
+    ``home_skills`` is read from this file when ``ATLAS_HOME_SKILLS`` is unset.
+    """
+    return user_atlas_root(home) / USER_CONFIG_FILENAME
+
+
+def user_keys_dir(home: Path | None = None) -> Path:
+    """Return ``<home>/.atlas/keys`` (it may not exist yet)."""
+    return user_atlas_root(home) / "keys"
+
+
+def user_weights_dir(home: Path | None = None) -> Path:
+    """Return ``<home>/.atlas/weights`` (it may not exist yet)."""
+    return user_atlas_root(home) / "weights"
+
+
+def user_defaults_dir(home: Path | None = None) -> Path:
+    """Return ``<home>/.atlas/defaults`` (it may not exist yet)."""
+    return user_atlas_root(home) / "defaults"
 
 
 def ensure_project_layout(workspace: Path) -> Path:
@@ -176,8 +350,12 @@ def ensure_project_layout(workspace: Path) -> Path:
     Existing files, including ``.atlas/data``, are left in place.
     """
     root = project_atlas_root(workspace)
-    for name in _PROJECT_DIRS:
-        (root / name).mkdir(parents=True, exist_ok=True)
+    for directory in (
+        project_sessions_dir(workspace),
+        project_artifacts_dir(workspace),
+        project_data_dir(workspace),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -189,8 +367,12 @@ def ensure_user_layout(home: Path | None = None) -> Path:
     is requested but not enforced; the directory ACL is the real control.
     """
     root = user_atlas_root(home)
-    for name in _USER_DIRS:
-        (root / name).mkdir(parents=True, exist_ok=True)
+    for directory in (
+        user_keys_dir(home),
+        user_weights_dir(home),
+        user_defaults_dir(home),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
     _tighten_keys_dir(root)
     return root
 
@@ -390,7 +572,7 @@ def user_key_path(home: Path | None = None, *, name: str = OPENROUTER_API_KEY) -
     Raises:
         ValueError: if ``name`` is not a stored variable.
     """
-    return user_atlas_root(home) / "keys" / key_filename(name)
+    return user_keys_dir(home) / key_filename(name)
 
 
 def resolve_credential(

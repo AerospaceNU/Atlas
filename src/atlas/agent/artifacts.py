@@ -10,10 +10,12 @@ from pathlib import Path
 from PIL import Image
 from pydantic import BaseModel
 
+from atlas.agent.layout import SANDBOX_AUDIT_RELATIVE
+
 _IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"})
 
 _AUDIT_LOGGER = logging.getLogger("atlas.sandbox.audit")
-_AUDIT_LOG_PATH = ".atlas/sandbox_audit.log"
+_AUDIT_LOG_PATH = SANDBOX_AUDIT_RELATIVE
 
 
 class SandboxDenied(ValueError):

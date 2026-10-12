@@ -3,8 +3,9 @@
 This is the shared loader and ``use_skill`` activation path. Call
 :func:`load_skills` with the session artifact store. Pass ``home`` only when
 user-home skills are explicitly enabled (``ATLAS_HOME_SKILLS=1`` or
-``home_skills = true`` in ``~/.atlas/config.toml``). The default is workspace
-only. The skill author writes the same ``SKILL.md`` shape: YAML frontmatter,
+``home_skills = true`` in the user ``config.toml``). The default is workspace
+only. ``ATLAS_HOME`` selects that user root, so the flag and the file stay
+on the same directory. The skill author writes the same ``SKILL.md`` shape: YAML frontmatter,
 then markdown. The frontmatter ``name`` must NFKC-normalize to the parent
 directory name, and the directory name is NFKC-normalized before that
 comparison so an NFD folder still matches. A ``description`` is a YAML string.
@@ -20,7 +21,7 @@ is the whole skill directory: a higher directory replaces every file from a
 lower one, and files are not merged across directories.
 
 1. ``<home>/.agents/skills/<name>`` (only when ``home`` is passed)
-2. ``<home>/.atlas/skills/<name>``
+2. ``<user atlas>/skills/<name>`` (``ATLAS_HOME`` or ``<home>/.atlas``)
 3. ``<workspace>/.agents/skills/<name>``
 4. ``<workspace>/.atlas/skills/<name>``
 
@@ -56,7 +57,19 @@ from pydantic import BaseModel, Field, create_model
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolRegistry, ToolResult
-from atlas.agent.layout import project_atlas_root, user_atlas_root
+from atlas.agent.layout import (
+    AGENTS_SKILLS_RELATIVE,
+    ATLAS_SKILLS_RELATIVE,
+    SKILLS_DIR_NAME,
+    atlas_home_override,
+    project_agents_skills_dir,
+    project_artifacts_dir,
+    project_skills_root,
+    user_agents_skills_dir,
+    user_atlas_root,
+    user_config_path,
+    user_skills_root,
+)
 from atlas.agent.skill_author import is_within, normalize_skill_name
 
 _LOGGER = logging.getLogger(__name__)
@@ -64,8 +77,6 @@ _LOGGER = logging.getLogger(__name__)
 _KEY_RE = re.compile(r"^([A-Za-z0-9_-]+):\s*(.*)$")
 _MAX_DESCRIPTION_LENGTH = 1024
 _MAX_LISTED_FILES = 50
-# Lowest precedence first. Later entries replace the whole skill directory.
-_SKILL_ROOTS = (".agents/skills", ".atlas/skills")
 _CONTENT_TAG = "skill_content"
 _UNTRUSTED_BODY_TAG = "untrusted_skill_body"
 _RESOURCE_TAG = "skill_resources"
@@ -123,7 +134,7 @@ def load_skills(store: LocalArtifactStore, *, home: Path | None = None) -> list[
     ``SKILL.md`` from one directory with scripts from another:
 
     1. ``<home>/.agents/skills/<name>``
-    2. ``<home>/.atlas/skills/<name>``
+    2. user atlas ``skills/<name>`` (``ATLAS_HOME`` or ``<home>/.atlas``)
     3. ``<workspace read root>/.agents/skills/<name>``
     4. ``<workspace read root>/.atlas/skills/<name>``
 
@@ -149,18 +160,17 @@ def load_skills(store: LocalArtifactStore, *, home: Path | None = None) -> list[
     """
     artifact_root = _project_artifact_root(store)
     found: dict[str, Skill] = {}
-    for base, label_prefix in _read_bases(store, home):
-        for root in _SKILL_ROOTS:
-            for skill in _scan_base(base, root, label_prefix, artifact_root):
-                previous = found.get(skill.name)
-                if previous is not None:
-                    _LOGGER.warning(
-                        "Skill %s from %s overrides %s",
-                        skill.name,
-                        skill.directory,
-                        previous.directory,
-                    )
-                found[skill.name] = skill
+    for base, directory, relative_root, label_prefix in _skill_bases(store, home):
+        for skill in _scan_base(base, directory, relative_root, label_prefix, artifact_root):
+            previous = found.get(skill.name)
+            if previous is not None:
+                _LOGGER.warning(
+                    "Skill %s from %s overrides %s",
+                    skill.name,
+                    skill.directory,
+                    previous.directory,
+                )
+            found[skill.name] = skill
     return [found[name] for name in sorted(found)]
 
 
@@ -170,8 +180,10 @@ def load_home_skills_enabled(workspace: Path) -> bool:
     Home skills are off by default. A repository ``.atlas/agent.toml`` cannot
     turn them on. ``ATLAS_HOME_SKILLS`` set to ``1``, ``true``, ``yes``, or
     ``on`` enables them. Any other value, including an unrecognized one,
-    forces them off and overrides ``~/.atlas/config.toml``. When the variable
-    is unset, ``home_skills = true`` in that user file enables them.
+    forces them off and overrides the user ``config.toml``. When the variable
+    is unset, ``home_skills = true`` in that file enables them. The file is
+    read from :func:`atlas.agent.layout.user_config_path`, so ``ATLAS_HOME``
+    and this flag use the same user root.
 
     #31 and #32 call ``load_home_skills_enabled(workspace)``.
 
@@ -326,16 +338,40 @@ class UseSkillTool(Tool):
         return ToolResult(text=_render_skill_content(self._by_name[name]))
 
 
-def _read_bases(store: LocalArtifactStore, home: Path | None) -> list[tuple[Path, str]]:
-    """Return ``(base, label prefix)`` from lowest precedence to highest.
+def user_skill_load_parts(home: Path, name: str) -> tuple[Path, str, str]:
+    """Return ``(base, relative_dir, label_prefix)`` for one user skill.
 
-    The session write root is omitted. ``home`` is not created.
+    The logical label stays ``~/.atlas/skills/<name>``. ``ATLAS_HOME`` points
+    ``base`` at that directory. Otherwise ``base`` is the resolved home and
+    the skill lives at ``.atlas/skills/<name>`` under it.
     """
-    bases: list[tuple[Path, str]] = []
+    resolved = Path(home).expanduser().resolve()
+    if atlas_home_override() is not None:
+        return user_atlas_root(), f"{SKILLS_DIR_NAME}/{name}", "~/.atlas/"
+    return resolved, f"{ATLAS_SKILLS_RELATIVE}/{name}", "~/"
+
+
+def _skill_bases(store: LocalArtifactStore, home: Path | None) -> list[tuple[Path, Path, str, str]]:
+    """Return scan rows from lowest precedence to highest.
+
+    Each row is ``(containment base, skills directory, relative root, label
+    prefix)``. The session write root is omitted. ``home`` is not created.
+    User ``.agents/skills`` stays under ``home``. User ``.atlas/skills``
+    follows ``ATLAS_HOME`` when that variable is set.
+    """
+    bases: list[tuple[Path, Path, str, str]] = []
     if home is not None:
-        bases.append((home.resolve(), "~/"))
-    if store.read_root is not None:
-        bases.append((store.read_root, ""))
+        resolved = Path(home).expanduser().resolve()
+        bases.append((resolved, user_agents_skills_dir(resolved), AGENTS_SKILLS_RELATIVE, "~/"))
+        if atlas_home_override() is not None:
+            atlas = user_atlas_root()
+            bases.append((atlas, user_skills_root(), SKILLS_DIR_NAME, "~/.atlas/"))
+        else:
+            bases.append((resolved, user_skills_root(resolved), ATLAS_SKILLS_RELATIVE, "~/"))
+    workspace = store.read_root
+    if workspace is not None:
+        bases.append((workspace, project_agents_skills_dir(workspace), AGENTS_SKILLS_RELATIVE, ""))
+        bases.append((workspace, project_skills_root(workspace), ATLAS_SKILLS_RELATIVE, ""))
     return bases
 
 
@@ -343,7 +379,7 @@ def _project_artifact_root(store: LocalArtifactStore) -> Path | None:
     """Return ``<workspace>/.atlas/artifacts``, or None when there is no workspace."""
     if store.read_root is None:
         return None
-    return project_atlas_root(store.read_root) / "artifacts"
+    return project_artifacts_dir(store.read_root)
 
 
 def _under_project_artifacts(artifact_root: Path | None, path: Path) -> bool:
@@ -373,8 +409,8 @@ def _resolve_contained(base: Path, relative: str) -> Path | None:
 
 
 def _user_config_enables_home_skills() -> bool:
-    """Return whether ``~/.atlas/config.toml`` sets ``home_skills`` to true."""
-    path = user_atlas_root(Path.home()) / "config.toml"
+    """Return whether the user ``config.toml`` sets ``home_skills`` to true."""
+    path = user_config_path()
     if path.is_symlink() or not path.is_file():
         return False
     try:
@@ -390,25 +426,30 @@ def _user_config_enables_home_skills() -> bool:
     return data.get("home_skills") is True
 
 
-def _scan_base(base: Path, root: str, label_prefix: str, artifact_root: Path | None) -> list[Skill]:
+def _scan_base(
+    base: Path,
+    directory: Path,
+    relative_root: str,
+    label_prefix: str,
+    artifact_root: Path | None,
+) -> list[Skill]:
     """Load child skills of one skills directory under one read-only base."""
-    directory = base / root
     if directory.is_symlink() or not directory.is_dir():
         return []
     try:
         resolved = directory.resolve()
         resolved.relative_to(base.resolve())
     except (OSError, ValueError):
-        _LOGGER.warning("Skipping skills directory %s outside its read root", root)
+        _LOGGER.warning("Skipping skills directory %s outside its read root", relative_root)
         return []
     if _under_project_artifacts(artifact_root, resolved):
-        _LOGGER.warning("Skipping skills directory %s under the project artifacts", root)
+        _LOGGER.warning("Skipping skills directory %s under the project artifacts", relative_root)
         return []
     found: dict[str, Skill] = {}
     for child in sorted(directory.iterdir(), key=lambda path: path.name):
         if child.name.startswith(".") or child.is_symlink() or not child.is_dir():
             continue
-        relative_dir = f"{root}/{child.name}"
+        relative_dir = f"{relative_root}/{child.name}"
         skill = _load_skill_dir(base, relative_dir, child.name, label_prefix, artifact_root)
         if skill is None:
             continue

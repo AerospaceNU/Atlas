@@ -13,7 +13,8 @@ The tool loop over one local artifact directory.
 | `runtime` | The bounded agent loop: call a tool, record the step, stop at the call budget. A run starts with the system prompt, then project instructions when the workspace root has `AGENTS.md`. |
 | `instructions` | Load `AGENTS.md` from the workspace root. Nested directories are not searched, and a closer file does not win over the root file. The text is delimited project guidance after the system prompt, not part of it. A missing file is silent. An unreadable or malformed file, including a FIFO, is skipped. Loading it cannot add tools or change the sandbox. |
 | `system_prompt` | The package system prompt (`system_prompt.md`). A workspace file cannot replace it. The text is cached for the life of the process, so an edit applies on the next start. |
-| `session` | A multi-turn conversation on top of that loop, plus the `python -m atlas.agent` entry. |
+| `layout` | Project `.atlas/` and user `~/.atlas/` paths. `ATLAS_HOME` overrides the user root. The directory list is `docs/atlas-layout.md`. |
+| `session` | A multi-turn conversation on top of that loop, plus the `python -m atlas.agent` entry. New sessions and artifacts are created under the project layout. |
 | `skills` | Load Agent Skills from the workspace read root and activate one with `use_skill`. `.atlas/skills-drafts` is not loaded. Home skills stay off unless `ATLAS_HOME_SKILLS=1` or `home_skills = true` in `~/.atlas/config.toml`. |
 | `analysis_skill` | Save a finished analysis as a draft under `.atlas/skills-drafts/`. `/enable-skill` shows the description and body hash before moving it into `.atlas/skills`. |
 | `model` | The OpenRouter chat backend. |
@@ -60,19 +61,19 @@ STAC and related search clients. `search` is the only required method, and it is
 | `planetary_computer` | Microsoft Planetary Computer search and asset signing. |
 | `sentinel1`, `sentinel2`, `landsat8`, `landsat9` | Those collections on Planetary Computer. Landsat 8 and 9 share a collection and are split by platform. |
 | `pc_more` | Extra Planetary Computer collections (ASTER, ALOS, DEM, WorldCover, GOES CMI, MODIS, precipitation). |
-| `modis_base` | Shared NASA CMR client for MODIS granules. |
+| `modis_base` | Shared NASA CMR client for MODIS granules. A 401 or 403 names `EARTHDATA_TOKEN` as missing or rejected and does not print the value. |
 | `modis_active_fire`, `modis_land_cover`, `modis_surface`, `modis_vegetation` | Those MODIS products. |
 | `hls_landsat`, `hls_sentinel` | Harmonized Landsat–Sentinel. |
 | `naip` | NAIP aerial imagery. |
 | `cop_dem` | Copernicus DEM (30 m and 90 m). |
-| `earth_search` | Element84 Earth Search (Sentinel-1 GRD). |
+| `earth_search` | Element84 Earth Search (Sentinel-1 GRD, Sentinel-2 L2A). |
 | `usgs` | USGS Landsat Collection 2. |
-| `cdse` | Copernicus Data Space: Sentinel-3, Sentinel-5P, burnt area. |
-| `cmr_stac` | NASA CMR STAC: GEDI, ICESat-2, SMAP, VIIRS. |
+| `cdse` | Copernicus Data Space: Sentinel-3, Sentinel-5P, burnt area. A 401 or 403 names `CDSE_USERNAME` and `CDSE_PASSWORD` as missing or rejected. CDSE is set with the env var only. The value is not printed. |
+| `cmr_stac` | NASA CMR STAC: GEDI, ICESat-2, SMAP, VIIRS. A 401 or 403 names `EARTHDATA_TOKEN` as missing or rejected and does not print the value. |
 | `digitalearth` | Digital Earth Australia and Africa Sentinel-2. |
 | `inpe` | CBERS-4 and Amazonia-1. |
 | `maxar_opendata` | Maxar Open Data. |
-| `firms` | NASA FIRMS active-fire detections. `FIRMS_MAP_KEY` comes from the session, the environment, or `~/.atlas/keys`. A dateline box is two area requests. |
+| `firms` | NASA FIRMS active-fire detections. `FIRMS_MAP_KEY` comes from the session, the environment, or `~/.atlas/keys`. A missing key names `FIRMS_MAP_KEY` and says to set it with `/key firms` or the env var. A rejected key names the variable and the status. The value is not printed. A dateline box is two area requests. |
 | `gibs` | NASA GIBS browse imagery (true color, night lights, flood, snow, thermal). A dateline box is two WMS GetMap requests. |
 | `goes`, `himawari` | Geostationary imagery. GOES picks a satellite per side of a dateline box. Himawari lists the full-disk slot once when either side meets the disk. |
 
