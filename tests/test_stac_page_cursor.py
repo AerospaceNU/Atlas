@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import stat
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any, ClassVar
@@ -963,6 +964,8 @@ def test_data_help_warns_that_signed_pages_stay_unfetched(
 def test_stale_manifest_temp_files_are_removed(tmp_path: Path) -> None:
     stale = tmp_path / f".manifest.json.{os.getpid()}.tmp"
     stale.write_text("leftover", encoding="utf-8")
+    old = time.time() - (15 * 60) - 1
+    os.utime(stale, (old, old))
     other = tmp_path / "notes.tmp"
     other.write_text("keep", encoding="utf-8")
     _write_manifest(tmp_path, _sample_catalog("page-2"), DownloadReport())
@@ -970,6 +973,24 @@ def test_stale_manifest_temp_files_are_removed(tmp_path: Path) -> None:
     assert other.read_text(encoding="utf-8") == "keep"
     assert (tmp_path / "manifest.json").is_file()
     assert list(tmp_path.glob(".manifest.json.*.tmp")) == []
+
+
+def test_fresh_manifest_temp_survives_a_concurrent_write(tmp_path: Path) -> None:
+    fresh = tmp_path / ".manifest.json.inflight.tmp"
+    fresh.write_text("in-flight", encoding="utf-8")
+    _write_manifest(tmp_path, _sample_catalog("page-2"), DownloadReport())
+    assert fresh.read_text(encoding="utf-8") == "in-flight"
+    assert (tmp_path / "manifest.json").is_file()
+
+
+def test_manifest_mode_honors_the_umask(tmp_path: Path) -> None:
+    previous = os.umask(0o027)
+    try:
+        _write_manifest(tmp_path, _sample_catalog("page-2"), DownloadReport())
+        mode = (tmp_path / "manifest.json").stat().st_mode & 0o777
+    finally:
+        os.umask(previous)
+    assert mode == (0o666 & ~0o027)
 
 
 def test_signed_get_without_a_body_stays_unavailable_on_resume(

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 from pathlib import Path
@@ -856,16 +857,36 @@ def _fsync_directory(directory: Path) -> None:
         os.close(fd)
 
 
-def _sweep_manifest_temps(directory: Path) -> None:
-    """Remove leftover manifest temp files from an earlier crash.
+# A temp newer than this may belong to a pull that is still writing it.
+_MANIFEST_TEMP_MAX_AGE_SECONDS = 15 * 60
 
-    The name is random, so a reused process id cannot collide with one of
-    these. A temp still present at the next write is stale.
+
+def _manifest_file_mode() -> int:
+    """Return ``0o666`` with the process umask cleared."""
+    umask = os.umask(0)
+    try:
+        return 0o666 & ~umask
+    finally:
+        os.umask(umask)
+
+
+def _sweep_manifest_temps(directory: Path) -> None:
+    """Remove manifest temp files left by a crash more than 15 minutes ago.
+
+    A newer ``.manifest.json.*.tmp`` is left alone so a concurrent pull can
+    finish its own replace.
     """
     if not directory.is_dir():
         return
+    now = time.time()
     for leftover in directory.glob(".manifest.json.*.tmp"):
         if leftover.is_dir() and not leftover.is_symlink():
+            continue
+        try:
+            modified = leftover.stat(follow_symlinks=False).st_mtime
+        except OSError:
+            continue
+        if now - modified <= _MANIFEST_TEMP_MAX_AGE_SECONDS:
             continue
         with contextlib.suppress(OSError):
             leftover.unlink()
@@ -874,8 +895,10 @@ def _sweep_manifest_temps(directory: Path) -> None:
 def _write_json_atomic(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` via an exclusive temp file, fsync, and ``os.replace``.
 
-    The temp name is random. Stale ``.manifest.json.*.tmp`` files in the same
-    directory are removed first. The directory is fsynced after the replace.
+    The temp name is random. ``.manifest.json.*.tmp`` files in the same
+    directory that are older than 15 minutes are removed first. The file
+    mode is ``0o666`` with the process umask cleared. The directory is
+    fsynced after the replace.
     A failed replace leaves the previous file in place and removes the temp
     file this write created.
     """
@@ -888,7 +911,7 @@ def _write_json_atomic(path: Path, text: str) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp, 0o644)
+        os.chmod(tmp, _manifest_file_mode())
         os.replace(tmp, path)
         _fsync_directory(directory)
     except Exception:
