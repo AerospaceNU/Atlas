@@ -89,6 +89,7 @@ class AgentSession:
         self.fetch_models: Callable[[], CatalogFetch | list[CatalogModel]] | None = None
         self._catalog_thread: threading.Thread | None = None
         self._catalog_inflight = False
+        self._catalog_lock = threading.Lock()
         config = getattr(agent.model, "config", None)
         if config is not None:
             self.model_id = str(getattr(config, "model", "") or "")
@@ -642,8 +643,9 @@ def _include_selected_model(
 
 
 def _publish_catalog(session: AgentSession, stdout: IO[str], fetched: CatalogFetch) -> None:
-    models = _include_selected_model(session, fetched.models)
-    session.catalog = models
+    with session._catalog_lock:
+        models = _include_selected_model(session, fetched.models)
+        session.catalog = models
     _apply_known_context_limit(session)
     payload: dict[str, Any] = {
         "type": "models",
@@ -675,7 +677,10 @@ def _handle_select_model(session: AgentSession, stdout: IO[str], message: dict[s
             session.secrets,
         )
         return
-    chosen = next((item for item in session.catalog if item.id == model_id), None)
+    with session._catalog_lock:
+        chosen = next((item for item in session.catalog if item.id == model_id), None)
+        if chosen is not None:
+            chosen = chosen.model_copy()
     if chosen is None:
         session.model_id = previous
         session.totals.context_limit = previous_limit
@@ -1001,9 +1006,11 @@ def _apply_known_context_limit(session: AgentSession) -> None:
     model_id = session.totals.model or session.model_id
     if not model_id:
         return
-    chosen = next((item for item in session.catalog if item.id == model_id), None)
-    if chosen is not None and chosen.context_length is not None:
-        session.totals.context_limit = chosen.context_length
+    with session._catalog_lock:
+        chosen = next((item for item in session.catalog if item.id == model_id), None)
+        context_length = chosen.context_length if chosen is not None else None
+    if context_length is not None:
+        session.totals.context_limit = context_length
 
 
 def _status_fields(session: AgentSession) -> dict[str, Any]:

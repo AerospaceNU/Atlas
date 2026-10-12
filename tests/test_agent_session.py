@@ -1121,6 +1121,52 @@ def test_session_catalog_marks_non_tool_models_and_keeps_the_selected_one(
     assert "catalog-key" not in json.dumps(events)
 
 
+class _HeldCatalogLock:
+    """Sets an event before acquiring the real catalog lock."""
+
+    def __init__(self, inner: threading.Lock, waiting: threading.Event) -> None:
+        self._inner = inner
+        self._waiting = waiting
+
+    def __enter__(self) -> _HeldCatalogLock:
+        self._waiting.set()
+        self._inner.acquire()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._inner.release()
+
+
+def test_catalog_publish_waits_for_the_catalog_lock(tmp_path: Path) -> None:
+    session = _session(ScriptedModel([]), tmp_path=tmp_path)
+    session.model_id = "keep-me"
+    inner = session._catalog_lock
+    inner.acquire()
+    waiting = threading.Event()
+    session._catalog_lock = _HeldCatalogLock(inner, waiting)
+    stdout = io.StringIO()
+
+    def publish() -> None:
+        session_module._publish_catalog(
+            session,
+            stdout,
+            session_module.CatalogFetch(
+                models=[CatalogModel(id="plain/text", supports_tools=False)]
+            ),
+        )
+
+    worker = threading.Thread(target=publish)
+    worker.start()
+    assert waiting.wait(timeout=2)
+    assert worker.is_alive()
+    assert session.catalog == []
+    inner.release()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert [item.id for item in session.catalog] == ["plain/text", "keep-me"]
+    assert session.catalog[0].supports_tools is False
+
+
 def test_catalog_paging_does_not_block_the_next_session_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
