@@ -80,6 +80,8 @@ uv run pytest
 
 The TUI reads `OPENROUTER_API_KEY` from the environment or from this repo's `.env`. The first `atlas` launch writes `<workspace>/.atlas/agent.toml` when that file is missing, with `model` set to `deepseek/deepseek-v4.1-flash`. Edit that file to change the model. `ATLAS_MODEL` or `--model` overrides it for one launch.
 
+`/key user` stores a key at `%USERPROFILE%\.atlas\keys\openrouter_api_key`. `/key session` keeps one for this process only, and `/key delete` removes the saved file and stops using a key in this process. `OPENROUTER_API_KEY` in the environment will still be used on the next launch. Atlas asks for directory mode `0700` and file mode `0600`, and it replaces the file by writing a new private file and renaming it into place. On POSIX the keys directory is fsynced after that rename so the new name survives a crash. Windows does not enforce those Unix modes, and it has no directory fsync, so that step is skipped: `chmod` is still attempted, but the file ACL is what actually restricts access. Windows also has no `O_NOFOLLOW`, so a symlink at the key path is rejected by name instead. A key must be a single line. One that does not start with `sk-or-` is kept, and Atlas warns.
+
 ## Troubleshooting
 
 - **`uv` is not recognized** — close PowerShell and open a new window. Confirm `%USERPROFILE%\.local\bin` is on your user `PATH`.
