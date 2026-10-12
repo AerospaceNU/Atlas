@@ -31,7 +31,10 @@ from atlas.cli.download import (
     DownloadOutcome,
     DownloadReport,
     download_assets,
+    inside_output,
     is_forbidden_asset_name,
+    plain_source_name,
+    retire_product,
 )
 from atlas.cli.progress import ProgressReporter, pick_reporter
 from atlas.compile.aggregate import aggregate
@@ -40,6 +43,7 @@ from atlas.data.base import BBox, DataPullClient, Polygon, PullRequest, Scene
 from atlas.data.registry import sources
 from atlas.data.sources.fldas import (
     MISSING_TOKEN_MESSAGE,
+    FldasAuthError,
     FldasClient,
     FldasError,
     FldasRequestError,
@@ -61,6 +65,7 @@ _EXAMPLE = (
 )
 _EXTRACT_HINT = "FLDAS table extraction runs alone; pass only the fldas source"
 _TABLE_NAME = "fldas.csv"
+_EMPTY_WINDOW = "requested window is empty"
 
 
 def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -517,6 +522,14 @@ async def execute_pull(
                     report.outcomes.append(outcome)
                     table_failed = table_failed or outcome.status != "saved"
                     table_usage = table_usage or usage_error
+        _record_empty_windows(
+            catalog,
+            report,
+            live_clients,
+            out_dir,
+            search_only=search_only,
+            prior=prior_manifest,
+        )
         for src in catalog.sources:
             reporter.source_done(src.source)
         _write_manifest(out_dir, catalog, report, prior=prior_manifest)
@@ -569,6 +582,8 @@ async def _extract_table(
         )
         table.write_csv(path)
     except FldasRequestError as exc:
+        if _empty_fldas_window(exc):
+            _retire_inside(out_dir, path)
         return (
             DownloadOutcome(
                 source=source,
@@ -578,7 +593,29 @@ async def _extract_table(
             ),
             True,
         )
-    except (FldasError, httpx.HTTPError, OSError, ValueError) as exc:
+    except FldasAuthError as exc:
+        return (
+            DownloadOutcome(
+                source=source,
+                scene_id=f"{source}-table",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            ),
+            False,
+        )
+    except (FldasError, httpx.HTTPError, OSError) as exc:
+        if _empty_fldas_window(exc):
+            _retire_inside(out_dir, path)
+        return (
+            DownloadOutcome(
+                source=source,
+                scene_id=f"{source}-table",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            ),
+            False,
+        )
+    except ValueError as exc:
         return (
             DownloadOutcome(
                 source=source,
@@ -601,6 +638,129 @@ async def _extract_table(
         ),
         False,
     )
+
+
+def _record_empty_windows(
+    catalog: SceneCatalog,
+    report: DownloadReport,
+    clients: Mapping[str, DataPullClient],
+    out_dir: Path,
+    *,
+    search_only: bool,
+    prior: Mapping[str, Any] | None = None,
+) -> None:
+    """Record an empty date window without presenting an older product.
+
+    Search-only records the failure and leaves files alone. A search that
+    failed, including an outage, rate limit, or timeout, also leaves files
+    alone. A window that really is empty moves aside only the files the
+    previous manifest listed for this source and this request. FLDAS pulls
+    record the failure from the extract itself. A resume keeps the earlier
+    page's files; an empty next page is not an empty date window.
+    """
+    if prior is not None:
+        return
+    for src in catalog.sources:
+        client = clients.get(src.source)
+        fldas = isinstance(client, FldasClient)
+        if src.error is not None or src.scenes:
+            continue
+        if not search_only and fldas:
+            continue
+        report.outcomes.append(
+            DownloadOutcome(
+                source=src.source,
+                scene_id=f"{src.source}-window",
+                status="failed",
+                error=_EMPTY_WINDOW,
+            )
+        )
+        if search_only or not plain_source_name(src.source):
+            continue
+        for product in _products_for_request(out_dir, src.source, catalog.request):
+            retire_product(product)
+
+
+def _empty_fldas_window(exc: BaseException) -> bool:
+    """True when FLDAS found no granules or no grid cell in the window."""
+    text = str(exc)
+    if isinstance(exc, FldasRequestError) and "grid-cell" in text:
+        return True
+    return (
+        isinstance(exc, FldasError)
+        and not isinstance(exc, FldasAuthError)
+        and ("no FLDAS granules" in text)
+    )
+
+
+def _retire_inside(out_dir: Path, path: Path) -> None:
+    """Move one table aside when it resolves inside ``out_dir``."""
+    if inside_output(out_dir, path):
+        retire_product(path)
+
+
+def _products_for_request(out_dir: Path, source: str, request: PullRequest) -> list[Path]:
+    """Return manifest-listed products for this source and this request.
+
+    Files from another date or area, and files the manifest did not list, are
+    not included. A listed path that leaves ``out_dir`` is skipped.
+    """
+    manifest_path = out_dir / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        return []
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict) or not _same_window(payload.get("request"), request):
+        return []
+    products: list[Path] = []
+    sources = payload.get("sources")
+    if not isinstance(sources, list):
+        return []
+    for item in sources:
+        if not isinstance(item, dict) or item.get("source") != source:
+            continue
+        for key in ("saved", "skipped"):
+            listed = item.get(key)
+            if not isinstance(listed, list):
+                continue
+            for rel in listed:
+                candidate = _listed_product(out_dir, source, rel)
+                if candidate is not None:
+                    products.append(candidate)
+    return products
+
+
+def _same_window(previous: object, request: PullRequest) -> bool:
+    """True when a stored request is the same date window and area."""
+    if not isinstance(previous, dict):
+        return False
+    if previous.get("start_date") != request.start_date.isoformat():
+        return False
+    if previous.get("end_date") != request.end_date.isoformat():
+        return False
+    bbox = previous.get("bbox")
+    if not isinstance(bbox, dict):
+        return False
+    current = request.bbox.model_dump(mode="json")
+    if any(bbox.get(key) != current[key] for key in ("west", "south", "east", "north")):
+        return False
+    current_polygon = None if request.polygon is None else request.polygon.model_dump(mode="json")
+    return previous.get("polygon") == current_polygon
+
+
+def _listed_product(out_dir: Path, source: str, rel: object) -> Path | None:
+    """Resolve one manifest path that belongs to ``source`` and stays in ``out_dir``."""
+    if not isinstance(rel, str) or not rel or rel.startswith(("/", "\\")) or "\\" in rel:
+        return None
+    parts = Path(rel).parts
+    if not parts or parts[0] != source or any(part in {".", ".."} for part in parts):
+        return None
+    candidate = out_dir.joinpath(*parts)
+    if not inside_output(out_dir, candidate):
+        return None
+    return candidate
 
 
 def _catalog_bbox_note(request: PullRequest) -> str:
