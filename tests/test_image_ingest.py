@@ -150,6 +150,47 @@ def test_ingest_rejects_an_escape_and_a_hardlink(tmp_path: Path) -> None:
         ingest_image(store, "linked.png")
 
 
+def test_ingest_rejects_a_workspace_escape_and_a_symlink(tmp_path: Path) -> None:
+    write_root = tmp_path / "artifacts"
+    read_root = tmp_path / "project"
+    read_root.mkdir()
+    store = LocalArtifactStore(write_root, read_root=read_root)
+    outside = tmp_path / "secret.png"
+    _save(outside, fmt="PNG")
+    (read_root / "link.png").symlink_to(outside)
+
+    with pytest.raises(SandboxDenied, match="escapes"):
+        ingest_image(store, "../secret.png")
+    with pytest.raises(SandboxDenied, match="escapes"):
+        ingest_image(store, "link.png")
+
+
+def test_decompression_bomb_is_a_recorded_tool_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1)
+    store = LocalArtifactStore(tmp_path)
+    _save(tmp_path / "bomb.png", fmt="PNG")
+    model = ScriptedModel(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="call-1", name="emit_artifacts", arguments={})]),
+            ModelResponse(content="continued"),
+        ]
+    )
+    agent = Agent(model, _registry(["bomb.png"]), store)
+
+    result = agent.run("look")
+
+    assert result.response == "continued"
+    assert result.steps[0].result is not None
+    assert result.steps[0].error_kind == "tool_failure"
+    assert result.steps[0].error is not None
+    assert "decompression bomb" in result.steps[0].error
+    assert model.requests[1][-1].role == Role.USER
+    assert model.requests[1][-1].content is not None
+    assert "decompression bomb" in model.requests[1][-1].content
+
+
 def test_ingest_rejects_missing_unsupported_and_unreadable_files(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     _save(tmp_path / "notes.bmp", fmt="BMP")

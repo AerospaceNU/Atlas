@@ -316,8 +316,8 @@ def _ingest_tool_images(
 ) -> tuple[list[ModelImage], list[str]]:
     """Read image artifacts for a following user message.
 
-    An over-cap or unreadable image is an error string. Other artifacts are
-    left as the tool's text result.
+    An over-cap, unreadable, or decompression-bomb image is an error string.
+    Other artifacts are left as the tool's text result.
     """
     if step.result is None:
         return [], []

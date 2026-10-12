@@ -57,7 +57,8 @@ def ingest_image(store: LocalArtifactStore, relative_path: str) -> ModelImage:
         with a portable path.
 
     Raises:
-        ValueError: Pillow cannot read the file, or its format is unsupported.
+        ValueError: Pillow cannot read the file, its format is unsupported, or
+            Pillow rejects it as a decompression bomb.
         FileNotFoundError: The path is not a file in either root.
         SandboxDenied: The path escapes a root, is a hardlink, exceeds
             ``MAX_SOURCE_BYTES``, or cannot be downscaled under ``MAX_IMAGE_BYTES``.
@@ -75,6 +76,8 @@ def ingest_image(store: LocalArtifactStore, relative_path: str) -> ModelImage:
                 raise ValueError(f"Image {relative_path} is not a readable image") from exc
             media_type = _media_type(image.format, relative_path)
             encoded = _within_cap(path, image, image.format or "", relative_path)
+    except Image.DecompressionBombError as exc:
+        raise ValueError(f"Image {relative_path} was rejected as a decompression bomb") from exc
     except (UnidentifiedImageError, OSError, SyntaxError) as exc:
         raise ValueError(f"Image {relative_path} is not a readable image") from exc
     return ModelImage(
