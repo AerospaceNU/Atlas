@@ -30,7 +30,7 @@ The `atlas` command.
 | `__init__` | Argument routing. No args opens the TUI; `atlas data` and a bare satellite name stay on search. |
 | `catalog` | Source names, kind aliases, and the catalog listing. |
 | `data` | Search: pick sources, run a pull, print scenes. |
-| `download` | Fetch scene assets (previews and thumbnails are refused). |
+| `download` | Fetch scene assets (previews and thumbnails are refused). Geographic, Web Mercator, and WGS84 UTM COGs are windowed to the request box. |
 | `progress` | Per-source search progress for the data command. |
 | `tui` | Find or build the Rust `atlas-tui` binary and replace this process with it. |
 
@@ -53,6 +53,7 @@ STAC and related search clients. `search` is the only required method, and it is
 | Module | What it holds |
 |---|---|
 | `base` | Shared models: bbox, polygon AOI, scene, pull request/result, and the client interface. |
+| `cog` | Read a COG window with HTTP range requests instead of the whole granule. BigTIFF and LZW are later work. |
 | `registry` | Stable source names and `sources()` / `all_sources()`. |
 | `stac` | Generic STAC API client. |
 | `planetary_computer` | Microsoft Planetary Computer search and asset signing. |

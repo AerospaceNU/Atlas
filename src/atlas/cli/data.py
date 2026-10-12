@@ -65,7 +65,8 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help="Search and pull registered satellite sources",
         description=(
             "List discovered satellites, or search a satellite and download native assets. "
-            "fldas landsurface writes a CSV training table."
+            "A geographic, Web Mercator, or WGS84 UTM COG is read as the window "
+            "overlapping --coords. fldas landsurface writes a CSV training table."
         ),
         epilog=f"example:\n  {_EXAMPLE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -437,6 +438,7 @@ async def execute_pull(
                     clients=live_clients,
                     concurrency=concurrency,
                     asset_name=asset_name,
+                    bbox=request.bbox,
                     on_progress=lambda name, n_saved, total: reporter.source_pull(
                         name, saved=n_saved, total=total
                     ),
@@ -600,6 +602,15 @@ def _write_manifest(
                     {"id": item.scene_id, "error": item.error}
                     for item in report.for_source(src.source)
                     if item.status in {"failed", "no_asset"}
+                ],
+                "windows": [
+                    {
+                        "id": item.scene_id,
+                        "bytes_read": item.bytes_read,
+                        "granule_size": item.granule_size,
+                    }
+                    for item in report.for_source(src.source)
+                    if item.bytes_read is not None and item.granule_size is not None
                 ],
             }
             for src in catalog.sources

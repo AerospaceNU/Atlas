@@ -10,7 +10,16 @@ from urllib.parse import urlparse
 
 import httpx
 
-from atlas.data.base import Asset, DataPullClient, Scene
+from atlas.data.base import Asset, BBox, DataPullClient, Scene
+from atlas.data.cog import (
+    CogError,
+    CogLimitError,
+    CogMissError,
+    CogRangeError,
+    encode_cog,
+    model_bounds,
+    open_cog,
+)
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
 _BROWSE_KEYS = frozenset({"rendered_preview", "thumbnail", "preview"})
@@ -34,6 +43,8 @@ class DownloadOutcome:
     status: str
     path: Path | None = None
     error: str | None = None
+    bytes_read: int | None = None
+    granule_size: int | None = None
 
 
 @dataclass
@@ -151,11 +162,17 @@ async def download_assets(
     concurrency: int = 8,
     asset_name: str | None = None,
     on_progress: Callable[[str, int, int], None] | None = None,
+    bbox: BBox | None = None,
 ) -> DownloadReport:
     """GET one native-resolution asset per scene, streamed to disk.
 
     Existing non-empty files are skipped. Browse assets are not downloaded.
     A failed GET records ``failed`` and does not abort the rest.
+
+    When ``bbox`` is set, a geographic, Web Mercator, or WGS84 UTM Cloud
+    Optimized GeoTIFF is stored as the overlapping window. Those requests
+    use HTTP Range and do not download the rest of the granule. Any other
+    asset, including a COG in an unsupported CRS, is still fetched whole.
     """
     if asset_name and is_forbidden_asset_name(asset_name):
         raise BrowseAssetError(f"{asset_name!r} is a preview/thumbnail and cannot be downloaded")
@@ -181,6 +198,8 @@ async def download_assets(
 
     async def one(scene: Scene) -> None:
         path: Path | None = None
+        bytes_read: int | None = None
+        granule_size: int | None = None
         try:
             picked = pick_asset(scene, asset_name)
             if picked is None:
@@ -209,13 +228,26 @@ async def download_assets(
                 return
             async with sem:
                 href = await _signed_href(clients.get(scene.source), asset.href)
-                async with http.stream("GET", href, follow_redirects=True) as response:
-                    response.raise_for_status()
-                    suffix = asset_suffix(asset, response.headers.get("content-type"))
-                    path = dest_dir / scene_filename(scene.id, key, suffix)
-                    with path.open("wb") as handle:
-                        async for chunk in response.aiter_bytes():
-                            handle.write(chunk)
+                windowed = await _windowed_cog(http, href, asset, bbox)
+                if windowed is not None:
+                    payload, bytes_read, granule_size = windowed
+                    path = dest_dir / scene_filename(scene.id, key, ".tif")
+                    path.write_bytes(payload)
+                else:
+                    async with http.stream("GET", href, follow_redirects=True) as response:
+                        response.raise_for_status()
+                        suffix = asset_suffix(asset, response.headers.get("content-type"))
+                        path = dest_dir / scene_filename(scene.id, key, suffix)
+                        with path.open("wb") as handle:
+                            async for chunk in response.aiter_bytes():
+                                handle.write(chunk)
+        except (CogMissError, CogRangeError, CogLimitError) as exc:
+            await record(
+                DownloadOutcome(
+                    source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
+                )
+            )
+            return
         except BrowseAssetError as exc:
             await record(
                 DownloadOutcome(
@@ -243,11 +275,61 @@ async def download_assets(
             )
             return
         await record(
-            DownloadOutcome(source=scene.source, scene_id=scene.id, status="saved", path=path)
+            DownloadOutcome(
+                source=scene.source,
+                scene_id=scene.id,
+                status="saved",
+                path=path,
+                bytes_read=bytes_read,
+                granule_size=granule_size,
+            )
         )
 
     await asyncio.gather(*(one(scene) for scene in scenes))
     return report
+
+
+def _is_geotiff_asset(asset: Asset) -> bool:
+    media = (asset.media_type or "").lower()
+    if "geotiff" in media or "tiff" in media:
+        return True
+    return Path(urlparse(asset.href).path).suffix.lower() in {".tif", ".tiff"}
+
+
+async def _windowed_cog(
+    http: httpx.AsyncClient,
+    href: str,
+    asset: Asset,
+    bbox: BBox | None,
+) -> tuple[bytes, int, int | None] | None:
+    """Return the AOI GeoTIFF, bytes read, and granule size.
+
+    None means the whole asset should be fetched. A miss is not a fallback:
+    the AOI is outside the raster, and downloading the granule would not
+    contain it. ``granule_size`` is the object size from Content-Range.
+    """
+    if bbox is None or not _is_geotiff_asset(asset):
+        return None
+    try:
+        cog = await open_cog(http, href)
+        if cog.epsg is None:
+            return None
+        bounds = model_bounds(
+            cog.epsg,
+            west=bbox.west,
+            south=bbox.south,
+            east=bbox.east,
+            north=bbox.north,
+        )
+        if bounds is None:
+            return None
+        west, south, east, north = bounds
+        read = await cog.read_window(west=west, south=south, east=east, north=north)
+    except (CogMissError, CogRangeError, CogLimitError):
+        raise
+    except (CogError, httpx.HTTPError):
+        return None
+    return encode_cog(read), read.bytes_fetched, read.granule_size
 
 
 async def _signed_href(client: DataPullClient | None, href: str) -> str:

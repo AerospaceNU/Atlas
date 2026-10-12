@@ -54,7 +54,7 @@ atlas data fldas landsurface \
   --out .atlas/data/fldas
 ```
 
-Scene pulls download native assets under `.atlas/data` and write `manifest.json`. `--search-only` skips the download. `--limit` caps scenes per source (default 100).
+Scene pulls download native assets under `.atlas/data` and write `manifest.json`. A geographic, Web Mercator, or WGS84 UTM Cloud Optimized GeoTIFF is read as the window overlapping `--coords`, using HTTP range requests, instead of downloading the whole granule. A server that ignores Range fails that scene and does not fall back to a full download. BigTIFF and LZW compression are later work. `--search-only` skips the download. `--limit` caps scenes per source (default 100).
 
 `fldas landsurface` writes `.atlas/data/fldas/fldas.csv`: one row per 0.1° cell per month (January 1982 through the latest published month). Set `EARTHDATA_TOKEN` in `.env` and approve **Hyrax in the cloud** and **NASA GESDISC DATA ARCHIVE**. See `.env.example`.
 

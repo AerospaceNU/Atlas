@@ -774,8 +774,13 @@ def test_mixed_catalog_pull_still_writes_the_fldas_table(tmp_path: Path) -> None
         asyncio.run(http.aclose())
     assert code == 0
     assert (tmp_path / "fldas.csv").exists()
-    saved = list(tmp_path.glob("**/*.tif"))
-    assert saved and saved[0].stat().st_size > 0
+    # A GeoTIFF whose server ignores Range is failed, not fetched a second time.
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    sentinel = next(item for item in manifest["sources"] if item["source"] == "sentinel2")
+    assert sentinel["saved"] == []
+    assert sentinel["failed"][0]["id"] == "s2-1"
+    assert "whole object" in sentinel["failed"][0]["error"]
+    assert list(tmp_path.glob("**/*.tif")) == []
 
 
 def test_cloud_ascii_rows_become_a_yx_array() -> None:
