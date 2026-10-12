@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-from atlas.data.indices import CALIBRATION_PRESETS, compute_indices
+from atlas.data.indices import CALIBRATION_PRESETS, MAX_BAND_BYTES, compute_indices
 
 _DESCRIPTION = (
     "Inputs must be surface reflectance arrays stored as .npy files. "
@@ -21,7 +21,8 @@ _DESCRIPTION = (
     "Presets --preset s2-l2a and --preset landsat-c2 set both. "
     "NDWI is the McFeeters index and is written as ndwi_mcfeeters.npy. "
     "A --nodata fill value, or a boolean --mask where True means nodata, "
-    "makes that pixel NaN."
+    "makes that pixel NaN. "
+    "Each input must be at most 16777216 elements and 64 MiB."
 )
 
 
@@ -133,6 +134,9 @@ def _load_array(path: Path, label: str) -> NDArray[np.generic]:
     """Load one numeric .npy array."""
     if not path.is_file():
         raise OSError(f"{label} file does not exist: {path}")
+    size = path.stat().st_size
+    if size > MAX_BAND_BYTES:
+        raise ValueError(f"{label} is {size} bytes, above the limit of {MAX_BAND_BYTES}")
     try:
         array = np.load(path, allow_pickle=False)
     except (OSError, ValueError) as exc:

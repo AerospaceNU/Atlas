@@ -274,6 +274,28 @@ def test_cli_rejects_nan_nodata(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert "NaN" in capsys.readouterr().err
 
 
+def test_cli_rejects_an_oversized_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    red = tmp_path / "red.npy"
+    nir = tmp_path / "nir.npy"
+    _save(red, [0.1])
+    _save(nir, [0.4])
+    monkeypatch.setattr("atlas.cli.indices.MAX_BAND_BYTES", 1)
+    assert (
+        main(
+            [
+                "indices",
+                "--red",
+                str(red),
+                "--nir",
+                str(nir),
+                "--out",
+                str(tmp_path / "out"),
+            ]
+        )
+        == 2
+    )
+
+
 def test_cli_missing_band_is_usage(tmp_path: Path) -> None:
     assert (
         main(

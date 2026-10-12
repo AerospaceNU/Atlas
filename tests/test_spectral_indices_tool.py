@@ -162,6 +162,17 @@ def test_tool_refuses_to_overwrite_unless_asked(tmp_path: Path) -> None:
     assert written[0] == pytest.approx((0.9 - 0.1) / (0.9 + 0.1))
 
 
+def test_tool_rejects_an_oversized_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _save(tmp_path, "red.npy", [0.1])
+    _save(tmp_path, "nir.npy", [0.4])
+    monkeypatch.setattr("atlas.agent.tools.spectral_indices.MAX_BAND_BYTES", 1)
+    with pytest.raises(ValueError, match="above the limit of 1"):
+        SpectralIndicesTool().run(
+            {"red": "red.npy", "nir": "nir.npy"},
+            LocalArtifactStore(tmp_path),
+        )
+
+
 def test_tool_rejects_a_path_outside_the_workspace(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     with pytest.raises(SandboxDenied):

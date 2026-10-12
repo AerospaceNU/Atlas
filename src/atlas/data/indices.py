@@ -52,6 +52,9 @@ _FORMULAS: Final[tuple[_Formula, ...]] = (
 )
 _GATE: Final[frozenset[str]] = frozenset({"red", "nir"})
 _BAND_ORDER: Final[tuple[str, ...]] = ("nir", "red", "green", "swir22")
+# One band, not a mosaic. 4096x4096, or 64 MiB on disk before it is expanded.
+MAX_BAND_ELEMENTS: Final[int] = 16_777_216
+MAX_BAND_BYTES: Final[int] = 64 * 1024 * 1024
 
 
 def available_indices(band_names: Iterable[str]) -> tuple[str, ...]:
@@ -295,6 +298,7 @@ def _mask_map(
 def _as_bool_mask(name: str, value: object) -> NDArray[np.bool_]:
     """Return a boolean nodata mask."""
     if isinstance(value, np.ndarray) and value.dtype == np.bool_:
+        _reject_oversized(name, value.size)
         return np.array(value, dtype=np.bool_, copy=True)
     raise TypeError(f"{name} mask must be a boolean array")
 
@@ -315,5 +319,12 @@ def _finite_number(label: str, raw: object) -> float:
 def _as_float64(name: str, value: object) -> NDArray[np.float64]:
     """Copy a numeric array to float64 without changing the original."""
     if isinstance(value, np.ndarray) and np.issubdtype(value.dtype, np.number):
+        _reject_oversized(name, value.size)
         return np.array(value, dtype=np.float64, copy=True)
     raise TypeError(f"{name} must be a numeric array")
+
+
+def _reject_oversized(name: str, size: int) -> None:
+    """Raise when an input array is above ``MAX_BAND_ELEMENTS``."""
+    if size > MAX_BAND_ELEMENTS:
+        raise ValueError(f"{name} has {size} elements, above the limit of {MAX_BAND_ELEMENTS}")

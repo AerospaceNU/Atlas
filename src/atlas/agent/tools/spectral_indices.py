@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
-from atlas.data.indices import compute_indices
+from atlas.data.indices import MAX_BAND_BYTES, compute_indices
 
 _LABELS = {
     "ndvi": "NDVI",
@@ -84,7 +84,8 @@ class SpectralIndicesTool(Tool):
         "Sentinel-2 L2A: scale 1e-4 and offset -0.1 (published DN offset -1000). "
         "Landsat Collection 2: scale 2.75e-5 and offset -0.2. Presets s2-l2a and "
         "landsat-c2 set both. A nodata fill value "
-        "or a boolean mask (True = nodata) becomes NaN."
+        "or a boolean mask (True = nodata) becomes NaN. Each input must be at most "
+        "16777216 elements and 64 MiB."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
 
@@ -148,6 +149,9 @@ def _load(store: LocalArtifactStore, relative: str, label: str) -> NDArray[np.ge
     path = store.resolve_read(relative)
     if not path.is_file():
         raise FileNotFoundError(f"{label} file does not exist: {relative}")
+    size = path.stat().st_size
+    if size > MAX_BAND_BYTES:
+        raise ValueError(f"{label} is {size} bytes, above the limit of {MAX_BAND_BYTES}")
     try:
         array = np.load(path, allow_pickle=False)
     except (OSError, ValueError) as exc:

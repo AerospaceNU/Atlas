@@ -7,6 +7,8 @@ import pytest
 
 from atlas.data.indices import (
     CALIBRATION_PRESETS,
+    MAX_BAND_BYTES,
+    MAX_BAND_ELEMENTS,
     available_indices,
     compute_indices,
     normalized_difference,
@@ -382,6 +384,19 @@ def test_scale_and_offset_can_differ_per_band() -> None:
         offset={"nir": -1000 * 1e-4},
     )
     assert result["ndvi"][0] == pytest.approx((0.5 - 0.1) / (0.5 + 0.1))
+
+
+def test_input_arrays_above_the_element_cap_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert MAX_BAND_ELEMENTS == 16_777_216
+    assert MAX_BAND_BYTES == 64 * 1024 * 1024
+    monkeypatch.setattr("atlas.data.indices.MAX_BAND_ELEMENTS", 2)
+    bands = {"red": np.ones(3), "nir": np.ones(3)}
+    with pytest.raises(ValueError, match="above the limit of 2"):
+        compute_indices(bands)
+    monkeypatch.setattr("atlas.data.indices.MAX_BAND_ELEMENTS", 3)
+    assert compute_indices(bands)["ndvi"].shape == (3,)
 
 
 def test_unknown_scale_band_and_non_boolean_mask_raise() -> None:
