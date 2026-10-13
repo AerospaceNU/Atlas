@@ -70,6 +70,11 @@ pub enum ServerMessage {
         location: String,
         active: Vec<String>,
     },
+    Goal {
+        text: String,
+        cleared: bool,
+        message: String,
+    },
     Phase {
         phase: String,
         name: Option<String>,
@@ -295,6 +300,15 @@ enum RawMessage {
         #[serde(default)]
         active: Vec<String>,
     },
+    #[serde(rename = "goal")]
+    Goal {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        cleared: bool,
+        #[serde(default)]
+        message: String,
+    },
     #[serde(rename = "saved_skill")]
     SaveSkill {
         #[serde(default)]
@@ -472,6 +486,15 @@ impl From<RawMessage> for ServerMessage {
                 location,
                 active,
             },
+            RawMessage::Goal {
+                text,
+                cleared,
+                message,
+            } => ServerMessage::Goal {
+                text,
+                cleared,
+                message,
+            },
             RawMessage::Phase { phase, name } => ServerMessage::Phase { phase, name },
             RawMessage::Thought {
                 text,
@@ -605,6 +628,36 @@ mod tests {
             Some(ServerMessage::Thought {
                 tokens_per_second, ..
             }) => assert_eq!(tokens_per_second, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_goal() {
+        let line = r#"{"type":"goal","text":"map the flood","cleared":false,"message":"map the flood"}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::Goal {
+                text,
+                cleared,
+                message,
+            }) => {
+                assert_eq!(text, "map the flood");
+                assert!(!cleared);
+                assert_eq!(message, "map the flood");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let empty = r#"{"type":"goal","text":"","cleared":false,"message":"none is set"}"#;
+        match parse_line(empty).unwrap() {
+            Some(ServerMessage::Goal {
+                text,
+                cleared,
+                message,
+            }) => {
+                assert!(text.is_empty());
+                assert!(!cleared);
+                assert_eq!(message, "none is set");
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

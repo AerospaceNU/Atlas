@@ -90,6 +90,16 @@ from atlas.agent.skills import Skill, load_skills, register_skill_tool
 
 _REDACTED = "***"
 _STDOUT_LOCK = threading.Lock()
+_GOAL_HEADER = "Session goal:\n"
+_NO_GOAL_MESSAGE = "none is set"
+_GOAL_CLEARED_MESSAGE = "goal cleared"
+_GOAL_USAGE = "usage: /goal [text] | /goal clear"
+_PROJECT_INSTRUCTION_PREFIX = "<untrusted_project_instructions"
+
+
+def session_goal_text(goal: str) -> str:
+    """Return the session-context block the model sees for ``goal``."""
+    return f"{_GOAL_HEADER}{goal}"
 
 
 class AgentSession:
@@ -97,7 +107,9 @@ class AgentSession:
 
     The first message is the trusted system prompt. When the project root
     contains an honored instruction file, the next message is that file as
-    delimited project guidance.
+    delimited project guidance. An active session goal, when one is set, is
+    the following message. That goal is session text for later turns. It is
+    not a tool and it does not change either sandbox root.
     """
 
     def __init__(self, agent: Agent) -> None:
@@ -114,6 +126,8 @@ class AgentSession:
         self.model_id = ""
         self.catalog: list[CatalogModel] = []
         self.active_skills: list[str] = []
+        self.goal = ""
+        self._goal_at: int | None = None
         self.totals = SessionTotals()
         self.fetch_models: Callable[[], CatalogFetch | list[CatalogModel]] | None = None
         self._catalog_thread: threading.Thread | None = None
@@ -189,11 +203,14 @@ class AgentSession:
         applied during this conversation leaves with that history. The skill
         catalog on the system prompt stays. Project instructions are loaded
         again from the project root after writes move; they are not copied
-        from the previous transcript. The current model id and context
-        window are kept, and writes move to a new session artifact directory
-        inside the same workspace. Reads keep the previous read root, so this
-        never widens write access to the workspace.
+        from the previous transcript. The session goal is cleared with the
+        conversation. The current model id and context window are kept, and
+        writes move to a new session artifact directory inside the same
+        workspace. Reads keep the previous read root, so this never widens
+        write access to the workspace.
         """
+        self.goal = ""
+        self._goal_at = None
         self.active_skills = []
         self.stopped_for_limit = False
         self.totals = SessionTotals(
@@ -207,6 +224,64 @@ class AgentSession:
             read_root = self.agent.artifacts.read_root
             self.agent.artifacts = LocalArtifactStore(artifact_root, read_root=read_root)
         self.messages = self.agent.opening_messages()
+
+    def set_goal(self, text: str) -> None:
+        """Remember ``text`` as the session goal the model sees on later turns.
+
+        The goal is conversation text placed after the system prompt and any
+        project instructions. It does not register a tool and it does not
+        change either sandbox root.
+        """
+        if not text.strip():
+            raise ValueError("goal text must be a non-empty string")
+        self.goal = text.strip()
+        self._place_goal_message()
+
+    def clear_goal(self) -> None:
+        """Drop the session goal so later turns do not see it."""
+        self.goal = ""
+        index = self._find_goal_message()
+        if index is not None:
+            del self.messages[index]
+        self._goal_at = None
+
+    def _place_goal_message(self) -> None:
+        content = session_goal_text(self.goal)
+        index = self._find_goal_message()
+        message = ChatMessage(role=Role.USER, content=content)
+        if index is None:
+            index = self._context_end()
+            self.messages.insert(index, message)
+        else:
+            self.messages[index] = message
+        self._goal_at = index
+
+    def _find_goal_message(self) -> int | None:
+        index = self._goal_at
+        if index is not None and self._is_goal_at(index):
+            return index
+        for index, message in enumerate(self.messages):
+            if _is_goal_message(message):
+                self._goal_at = index
+                return index
+        self._goal_at = None
+        return None
+
+    def _is_goal_at(self, index: int) -> bool:
+        if index < 0 or index >= len(self.messages):
+            return False
+        return _is_goal_message(self.messages[index])
+
+    def _context_end(self) -> int:
+        """Return the index after the system prompt and project instructions."""
+        if not self.messages or self.messages[0].role != Role.SYSTEM:
+            return 0
+        end = 1
+        if len(self.messages) > 1:
+            content = self.messages[1].content or ""
+            if content.startswith(_PROJECT_INSTRUCTION_PREFIX):
+                end = 2
+        return end
 
     def use_skill(self, name: str, argument: str | None = None) -> Skill:
         """Apply a named skill for later turns in this conversation.
@@ -480,6 +555,9 @@ def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
         if kind == "new":
             _handle_new(session, stdout)
             continue
+        if kind == "goal":
+            _handle_goal(session, stdout, message)
+            continue
         if kind == "skill":
             _handle_skill(session, stdout, message)
             continue
@@ -572,6 +650,57 @@ def _handle_new(session: AgentSession, stdout: IO[str]) -> None:
     """Start a fresh conversation and report the reset status."""
     session.start_fresh()
     _write_line(stdout, _ready_event(session), session.secrets)
+
+
+def _handle_goal(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
+    """Set, clear, or report the session goal without calling the model.
+
+    A payload with neither ``text`` nor ``clear`` reports the current goal.
+    ``clear`` true drops it. ``text`` sets it. Any other combination is
+    refused and leaves the goal unchanged.
+    """
+    has_clear = "clear" in message
+    has_text = "text" in message
+    if not has_clear and not has_text:
+        _write_line(stdout, _goal_event(session, cleared=False), session.secrets)
+        return
+    clear = message.get("clear")
+    text = message.get("text")
+    if has_clear and clear is not True:
+        _reject_goal(session, stdout)
+        return
+    if clear is True:
+        if has_text:
+            _reject_goal(session, stdout)
+            return
+        session.clear_goal()
+        _write_line(stdout, _goal_event(session, cleared=True), session.secrets)
+        return
+    if not isinstance(text, str) or not text.strip():
+        _reject_goal(session, stdout)
+        return
+    session.set_goal(text)
+    _write_line(stdout, _goal_event(session, cleared=False), session.secrets)
+
+
+def _reject_goal(session: AgentSession, stdout: IO[str]) -> None:
+    _write_line(stdout, {"type": "error", "message": _GOAL_USAGE}, session.secrets)
+
+
+def _goal_event(session: AgentSession, *, cleared: bool) -> dict[str, Any]:
+    text = session.goal
+    if cleared:
+        message = _GOAL_CLEARED_MESSAGE
+    elif text:
+        message = text
+    else:
+        message = _NO_GOAL_MESSAGE
+    return {"type": "goal", "text": text, "cleared": cleared, "message": message}
+
+
+def _is_goal_message(message: ChatMessage) -> bool:
+    content = message.content or ""
+    return message.role == Role.USER and content.startswith(_GOAL_HEADER)
 
 
 def _handle_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
