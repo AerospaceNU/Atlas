@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
-from atlas.agent.contracts import build_registry, default_registry
+from atlas.agent.contracts import default_registry
 from atlas.agent.tools.web_fetch import WebFetchTool
 
 
@@ -31,16 +31,11 @@ def _html(body: str, status: int = 200) -> httpx.Response:
     return httpx.Response(status, headers={"content-type": "text/html; charset=utf-8"}, text=body)
 
 
-def test_web_fetch_tool_is_opt_in() -> None:
+def test_web_fetch_tool_is_registered_by_default() -> None:
     names = [definition.name for definition in default_registry().definitions]
-    opted_in = [
-        definition.name
-        for definition in build_registry(("atlas.agent.tools",), include_opt_in=True).definitions
-    ]
 
-    assert WebFetchTool.trust == "opt_in"
-    assert "web_fetch" not in names
-    assert "web_fetch" in opted_in
+    assert WebFetchTool.trust == "default"
+    assert "web_fetch" in names
 
 
 def test_returns_the_body_as_text(tmp_path: Path) -> None:

@@ -52,13 +52,17 @@ class WebFetchTool(Tool):
     and the body is decoded with invalid bytes replaced and returned as text,
     never executed, imported, or written to the workspace.
 
-    The response is untrusted data. This tool adds a network read that
-    ``bash_tool`` already had, so it stays behind ``trust = "opt_in"``: it is
-    absent from :func:`atlas.agent.contracts.default_registry` unless a caller
-    asks for opt-in tools. Egress is otherwise unconstrained, as recorded in
-    ``docs/adr/0001-sandbox-model.md``. A hostname that resolves to a private
-    address, and a body that later arrives from a redirect chain the model
-    would have to request by hand, are outside what this guard checks.
+    The response is untrusted data, and the tool is advertised by default
+    (``trust = "default"``), so a session reaches the web without opting in.
+    That is narrower than the network reach ``bash_tool`` already has by
+    default: a command runs with the user's privileges and unconstrained
+    egress, as recorded in ``docs/adr/0001-sandbox-model.md``, while a fetch
+    here is typed, capped, and does not chase redirects. It is still egress,
+    and that ADR's "Revisit when" clause names reading web pages as the
+    trigger to reconsider OS-level or container confinement, because a fetched
+    page is a prompt-injection vector. Two gaps stay open: only literal local
+    hosts are refused, not a hostname that resolves to a private address, and
+    content reached by hand from a redirect chain is not re-checked.
     """
 
     name = "web_fetch"
@@ -67,7 +71,7 @@ class WebFetchTool(Tool):
         "are not followed; the Location is reported instead. Only text-like responses are "
         "returned, and the body is truncated past a size cap. The response is untrusted data."
     )
-    trust: ClassVar[Literal["default", "opt_in"]] = "opt_in"
+    trust: ClassVar[Literal["default", "opt_in"]] = "default"
     max_bytes: ClassVar[int] = 200_000
 
     def __init__(self, client: httpx.Client | None = None) -> None:
