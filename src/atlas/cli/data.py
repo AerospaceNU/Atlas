@@ -47,9 +47,17 @@ from atlas.cli.download import (
 )
 from atlas.cli.progress import ProgressReporter, pick_reporter
 from atlas.compile.aggregate import aggregate
-from atlas.compile.product import SceneCatalog
+from atlas.compile.product import SceneCatalog, SourceScenes
 from atlas.data.base import BBox, DataPullClient, Polygon, PullRequest, Scene
 from atlas.data.registry import sources
+from atlas.data.scene_identity import (
+    SourceResolution,
+    StoredScene,
+    project_records,
+    reconcile,
+    resolution_lines,
+    stored_scenes,
+)
 from atlas.data.sources.fldas import (
     MISSING_TOKEN_MESSAGE,
     FldasAuthError,
@@ -478,6 +486,11 @@ async def execute_pull(
             page_cursors=page_cursors,
             unavailable_cursors=unavailable,
         )
+        identity = (
+            prior_manifest if prior_manifest is not None else _matching_manifest(out_dir, request)
+        )
+        resolutions = await _resolve_catalog(identity, catalog, live_clients)
+        _inject_replacements(catalog, resolutions)
         report = DownloadReport()
         table_failed = False
         table_usage = False
@@ -538,12 +551,25 @@ async def execute_pull(
             out_dir,
             search_only=search_only,
             prior=prior_manifest,
+            held=_held_sources(resolutions),
         )
         for src in catalog.sources:
             reporter.source_done(src.source)
-        _write_manifest(out_dir, catalog, report, prior=prior_manifest)
+        _write_manifest(
+            out_dir,
+            catalog,
+            report,
+            prior=prior_manifest,
+            identity=identity,
+            resolutions=resolutions,
+        )
         reporter.close()
         _print_run_summary(catalog, report, search_only=search_only)
+        for src in catalog.sources:
+            for line in resolution_lines(
+                src.source, resolutions.get(src.source, SourceResolution.unchecked())
+            ):
+                print(line, file=sys.stderr)
         if catalog.sources and all(src.error for src in catalog.sources):
             return 1
         # Usage and auth failures change the exit code only for a FLDAS-only pull.
@@ -657,6 +683,7 @@ def _record_empty_windows(
     *,
     search_only: bool,
     prior: Mapping[str, Any] | None = None,
+    held: set[str] | None = None,
 ) -> None:
     """Record an empty date window without presenting an older product.
 
@@ -665,14 +692,16 @@ def _record_empty_windows(
     alone. A window that really is empty moves aside only the files the
     previous manifest listed for this source and this request. FLDAS pulls
     record the failure from the extract itself. A resume keeps the earlier
-    page's files; an empty next page is not an empty date window.
+    page's files; an empty next page is not an empty date window. A source
+    whose stored scene could not be matched is not an empty region.
     """
     if prior is not None:
         return
+    kept = held or set()
     for src in catalog.sources:
         client = clients.get(src.source)
         fldas = isinstance(client, FldasClient)
-        if src.error is not None or src.scenes:
+        if src.error is not None or src.scenes or src.source in kept:
             continue
         if not search_only and fldas:
             continue
@@ -846,53 +875,24 @@ def _write_manifest(
     report: DownloadReport,
     *,
     prior: Mapping[str, Any] | None = None,
+    identity: Mapping[str, Any] | None = None,
+    resolutions: Mapping[str, SourceResolution] | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     request = catalog.request
     bbox = request.bbox.as_list()
     prior_sources = _prior_sources(prior)
+    identity_sources = _prior_sources(identity)
+    checks = resolutions or {}
     sources_payload = [
-        _merge_source(
-            {
-                "source": src.source,
-                "collection": src.collection,
-                "bbox": bbox,
-                "search_url": src.search_url,
-                "next_cursor": _manifest_cursor(src.next_cursor),
-                "next_cursor_unavailable": src.next_cursor_unavailable,
-                "note": _unavailable_note(src.next_cursor_unavailable)
-                if src.next_cursor_unavailable
-                else None,
-                "error": src.error,
-                "_cursor_rejected": src.cursor_rejected,
-                "n_scenes": len(src.scenes),
-                "scene_ids": [scene.id for scene in src.scenes],
-                "saved": [
-                    _rel(out_dir, item.path)
-                    for item in report.for_source(src.source)
-                    if item.status == "saved" and item.path is not None
-                ],
-                "skipped": [
-                    _rel(out_dir, item.path)
-                    for item in report.for_source(src.source)
-                    if item.status == "skipped" and item.path is not None
-                ],
-                "failed": [
-                    {"id": item.scene_id, "error": item.error}
-                    for item in report.for_source(src.source)
-                    if item.status in {"failed", "no_asset"}
-                ],
-                "windows": [
-                    {
-                        "id": item.scene_id,
-                        "bytes_read": item.bytes_read,
-                        "granule_size": item.granule_size,
-                    }
-                    for item in report.for_source(src.source)
-                    if item.bytes_read is not None and item.granule_size is not None
-                ],
-            },
-            prior_sources.get(src.source),
+        _source_entry(
+            src,
+            report,
+            out_dir,
+            bbox,
+            prior_row=prior_sources.get(src.source),
+            identity_row=identity_sources.get(src.source),
+            resolution=checks.get(src.source, SourceResolution.unchecked()),
         )
         for src in catalog.sources
     ]
@@ -917,6 +917,261 @@ def _prior_sources(prior: Mapping[str, Any] | None) -> dict[str, Mapping[str, An
         if isinstance(item, dict) and isinstance(item.get("source"), str):
             found[item["source"]] = item
     return found
+
+
+def _matching_manifest(out_dir: Path, request: PullRequest) -> dict[str, Any] | None:
+    """Return an existing manifest for this same search, if one is readable.
+
+    A different date, box, or polygon is left alone. A missing or unreadable
+    file does not fail the pull.
+    """
+    path = pull_manifest_path(out_dir)
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("sources"), list):
+        return None
+    if not _same_pull(payload.get("request"), request):
+        return None
+    return payload
+
+
+def _held_sources(resolutions: Mapping[str, SourceResolution]) -> set[str]:
+    """Sources whose stored scenes are gone and were not uniquely replaced."""
+    return {name for name, item in resolutions.items() if item.unresolved}
+
+
+async def _resolve_catalog(
+    identity: Mapping[str, Any] | None,
+    catalog: SceneCatalog,
+    clients: Mapping[str, DataPullClient],
+) -> dict[str, SourceResolution]:
+    """Check stored ids and look up a reprocessed scene by place and time.
+
+    A source whose search failed is skipped so a later retry still has the
+    stored id. A client that cannot check ids leaves those ids unchanged.
+    """
+    if identity is None:
+        return {}
+    rows = _prior_sources(identity)
+    found: dict[str, SourceResolution] = {}
+    for src in catalog.sources:
+        if src.error is not None:
+            continue
+        stored = stored_scenes(rows.get(src.source))
+        if not stored:
+            continue
+        client = clients.get(src.source)
+        if client is None:
+            continue
+        found[src.source] = await _resolve_source(client, stored, collection=src.collection)
+    return found
+
+
+async def _resolve_source(
+    client: DataPullClient,
+    stored: Sequence[StoredScene],
+    *,
+    collection: str,
+) -> SourceResolution:
+    try:
+        present = await client.resolve_scene_ids([item.id for item in stored])
+    except (OSError, TimeoutError, TypeError, ValueError, httpx.HTTPError):
+        return SourceResolution.unchecked()
+    if present is None:
+        return SourceResolution.unchecked()
+    usable = {scene_id: scene for scene_id, scene in present.items() if isinstance(scene, Scene)}
+    bundles: dict[str, list[Scene]] = {}
+    for item in stored:
+        if item.id in usable or item.observed_at is None or item.footprint is None:
+            bundles[item.id] = []
+            continue
+        try:
+            hits = await client.find_scenes_by_place_time(
+                collection=item.collection or collection,
+                when=item.observed_at,
+                footprint=item.footprint,
+            )
+        except (OSError, TimeoutError, TypeError, ValueError, httpx.HTTPError):
+            return SourceResolution.unchecked()
+        if hits is None:
+            bundles[item.id] = []
+        else:
+            bundles[item.id] = [scene for scene in hits if isinstance(scene, Scene)]
+    return reconcile(stored, usable, bundles, collection=collection)
+
+
+def _inject_replacements(
+    catalog: SceneCatalog,
+    resolutions: Mapping[str, SourceResolution],
+) -> None:
+    """Add a uniquely matched replacement so the region is not left empty."""
+    for src in catalog.sources:
+        resolution = resolutions.get(src.source)
+        if resolution is None or src.error is not None:
+            continue
+        known = {scene.id for scene in src.scenes}
+        for item in resolution.replacements:
+            if item.new_id in known:
+                continue
+            updates: dict[str, str] = {}
+            if item.scene.source != src.source:
+                updates["source"] = src.source
+            if not item.scene.collection and src.collection:
+                updates["collection"] = src.collection
+            scene = item.scene.model_copy(update=updates) if updates else item.scene
+            src.scenes.append(scene)
+            known.add(scene.id)
+
+
+def _source_entry(
+    src: SourceScenes,
+    report: DownloadReport,
+    out_dir: Path,
+    bbox: list[float],
+    *,
+    prior_row: Mapping[str, Any] | None,
+    identity_row: Mapping[str, Any] | None,
+    resolution: SourceResolution,
+) -> dict[str, Any]:
+    merged = _merge_source(
+        {
+            "source": src.source,
+            "collection": src.collection,
+            "bbox": bbox,
+            "search_url": src.search_url,
+            "next_cursor": _manifest_cursor(src.next_cursor),
+            "next_cursor_unavailable": src.next_cursor_unavailable,
+            "note": _unavailable_note(src.next_cursor_unavailable)
+            if src.next_cursor_unavailable
+            else None,
+            "error": src.error,
+            "_cursor_rejected": src.cursor_rejected,
+            "n_scenes": len(src.scenes),
+            "scene_ids": [scene.id for scene in src.scenes],
+            "saved": [
+                _rel(out_dir, item.path)
+                for item in report.for_source(src.source)
+                if item.status == "saved" and item.path is not None
+            ],
+            "skipped": [
+                _rel(out_dir, item.path)
+                for item in report.for_source(src.source)
+                if item.status == "skipped" and item.path is not None
+            ],
+            "failed": [
+                {"id": item.scene_id, "error": item.error}
+                for item in report.for_source(src.source)
+                if item.status in {"failed", "no_asset"}
+            ],
+            "windows": [
+                {
+                    "id": item.scene_id,
+                    "bytes_read": item.bytes_read,
+                    "granule_size": item.granule_size,
+                }
+                for item in report.for_source(src.source)
+                if item.bytes_read is not None and item.granule_size is not None
+            ],
+        },
+        prior_row,
+    )
+    records = project_records(
+        src.scenes,
+        stored_scenes(identity_row),
+        resolution,
+        collection=src.collection,
+        keep_stored=prior_row is not None,
+    )
+    merged["scenes"] = [record.as_manifest() for record in records]
+    merged["scene_ids"] = [record.id for record in records]
+    merged["n_scenes"] = len(records)
+    merged["replacements"] = _replacement_entries(identity_row, resolution)
+    merged["unresolved_scenes"] = _unresolved_entries(identity_row, resolution)
+    mapping = {item.old_id: item.new_id for item in resolution.replacements}
+    if mapping:
+        merged["windows"] = _rewrite_ids(merged.get("windows"), mapping)
+        merged["failed"] = _rewrite_ids(merged.get("failed"), mapping)
+    return merged
+
+
+def _replacement_entries(
+    row: Mapping[str, Any] | None,
+    resolution: SourceResolution,
+) -> list[dict[str, str]]:
+    carried: list[dict[str, str]] = []
+    seen: set[str] = set()
+    raw = None if row is None else row.get("replacements")
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            old_id = item.get("old_id")
+            new_id = item.get("new_id")
+            if (
+                isinstance(old_id, str)
+                and old_id
+                and isinstance(new_id, str)
+                and new_id
+                and old_id not in seen
+            ):
+                seen.add(old_id)
+                carried.append({"old_id": old_id, "new_id": new_id})
+    if not resolution.checked:
+        return carried
+    replaced = {item.old_id for item in resolution.replacements}
+    fresh = [item for item in carried if item["old_id"] not in replaced]
+    fresh.extend({"old_id": item.old_id, "new_id": item.new_id} for item in resolution.replacements)
+    return fresh
+
+
+def _unresolved_entries(
+    row: Mapping[str, Any] | None,
+    resolution: SourceResolution,
+) -> list[dict[str, Any]]:
+    if resolution.checked:
+        return [
+            {"id": item.scene_id, "reason": item.reason, "candidates": list(item.candidates)}
+            for item in resolution.unresolved
+        ]
+    raw = None if row is None else row.get("unresolved_scenes")
+    if not isinstance(raw, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        scene_id = item.get("id")
+        reason = item.get("reason")
+        if not isinstance(scene_id, str) or not scene_id:
+            continue
+        if reason not in {"no match", "ambiguous"}:
+            continue
+        names = item.get("candidates")
+        candidates = (
+            [name for name in names if isinstance(name, str)] if isinstance(names, list) else []
+        )
+        entries.append({"id": scene_id, "reason": reason, "candidates": candidates})
+    return entries
+
+
+def _rewrite_ids(rows: object, mapping: Mapping[str, str]) -> list[dict[str, Any]]:
+    rewritten: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in _as_dicts(rows):
+        scene_id = item.get("id")
+        if not isinstance(scene_id, str):
+            continue
+        updated = dict(item)
+        updated["id"] = mapping.get(scene_id, scene_id)
+        if updated["id"] in seen:
+            continue
+        seen.add(updated["id"])
+        rewritten.append(updated)
+    return rewritten
 
 
 def _resume_mismatch(prior: Mapping[str, Any], clients: Mapping[str, DataPullClient]) -> str | None:

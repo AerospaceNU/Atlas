@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, ClassVar, NamedTuple, Self
 from urllib.parse import parse_qsl, urljoin, urlparse
@@ -21,8 +21,11 @@ from atlas.data.base import (
     SceneKind,
 )
 from atlas.data.credentials import raise_for_missing_credential
+from atlas.data.scene_identity import SCENE_DATETIME_TOLERANCE, format_datetime
 
 _CLOUD_QUERY_KINDS = frozenset({SceneKind.optical, SceneKind.browse})
+_ID_BATCH = 50
+_PLACE_TIME_LIMIT = 20
 
 
 class StacApiClient(DataPullClient):
@@ -103,6 +106,101 @@ class StacApiClient(DataPullClient):
         self._raise_for_credentials(resp)
         resp.raise_for_status()
         return self._result_from_payload(request, resp.json())
+
+    async def resolve_scene_ids(self, scene_ids: Sequence[str]) -> Mapping[str, Scene]:
+        """Return items whose ids are still in this collection.
+
+        Args:
+            scene_ids: Ids recorded in the pull manifest.
+
+        Returns:
+            The ids this search still serves. An id absent from the map is gone.
+
+        Raises:
+            MissingCredentialError: The provider returned 401 or 403 and a
+                required variable is unset.
+            CredentialRejectedError: The provider returned 401 or 403 and the
+                required variables are set.
+            httpx.HTTPError: The id search failed.
+            TypeError: The response was not a FeatureCollection.
+        """
+        unique = [scene_id for scene_id in dict.fromkeys(scene_ids) if scene_id]
+        found: dict[str, Scene] = {}
+        for start in range(0, len(unique), _ID_BATCH):
+            batch = unique[start : start + _ID_BATCH]
+            payload = await self._post_search(
+                {"collections": [self.collection], "ids": batch, "limit": len(batch)}
+            )
+            for scene in self._scenes_in(payload):
+                if scene.id in batch:
+                    found[scene.id] = scene
+        return found
+
+    async def find_scenes_by_place_time(
+        self,
+        *,
+        collection: str,
+        when: datetime,
+        footprint: BBox,
+    ) -> list[Scene]:
+        """Search this collection around one acquisition and footprint.
+
+        Args:
+            collection: Collection the stored scene came from.
+            when: Acquisition time of the stored scene.
+            footprint: Footprint box of the stored scene.
+
+        Returns:
+            One page of hits. The caller keeps a scene only when the
+            collection, time tolerance, and footprint overlap all agree.
+
+        Raises:
+            MissingCredentialError: The provider returned 401 or 403 and a
+                required variable is unset.
+            CredentialRejectedError: The provider returned 401 or 403 and the
+                required variables are set.
+            httpx.HTTPError: The search failed.
+            TypeError: The response was not a FeatureCollection.
+        """
+        start = when - SCENE_DATETIME_TOLERANCE
+        end = when + SCENE_DATETIME_TOLERANCE
+        body: dict[str, Any] = {
+            "collections": [collection or self.collection],
+            "bbox": footprint.as_list(),
+            "limit": _PLACE_TIME_LIMIT,
+        }
+        if self.include_datetime:
+            body["datetime"] = f"{format_datetime(start)}/{format_datetime(end)}"
+        payload = await self._post_search(body)
+        return self._scenes_in(payload)
+
+    async def _post_search(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
+        resp = await self._client.post(self.search_url, json=dict(body))
+        self._raise_for_credentials(resp)
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected STAC FeatureCollection, got {type(payload)}")
+        return payload
+
+    def _scenes_in(self, payload: Mapping[str, Any]) -> list[Scene]:
+        scenes: list[Scene] = []
+        features = payload.get("features")
+        if not isinstance(features, list):
+            return scenes
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            scene = item_to_scene(
+                feature,
+                default_platform=self.collection,
+                collection=self.collection,
+                kind=self.scene_kind,
+                gsd_m=self.nominal_gsd_m,
+            )
+            if scene is not None:
+                scenes.append(scene)
+        return scenes
 
     def _raise_for_credentials(self, response: object) -> None:
         """Raise a named credential error for a 401 or 403.

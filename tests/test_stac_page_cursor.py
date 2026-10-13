@@ -121,6 +121,14 @@ class _TokenPages:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
+        probe = _id_probe_features(body)
+        if probe is not None:
+            known = {scene_id for scene_id, _nxt in self.pages.values()}
+            known.add("land-1")
+            features = [_feature(scene_id) for scene_id in probe if scene_id in known]
+            return httpx.Response(
+                200, json={"type": "FeatureCollection", "features": features, "links": []}
+            )
         token = body.get("token") if isinstance(body, dict) else None
         if token is not None and not isinstance(token, str):
             token = None
@@ -144,6 +152,28 @@ def _clients(pages: _TokenPages) -> tuple[httpx.AsyncClient, dict[str, StacApiCl
 
 def _source(manifest: dict[str, Any], name: str) -> dict[str, Any]:
     return next(item for item in manifest["sources"] if item["source"] == name)
+
+
+def _id_probe_features(body: object) -> list[str] | None:
+    """Ids from a scene-identity lookup, which is not a page request."""
+    if not isinstance(body, dict) or not isinstance(body.get("ids"), list):
+        return None
+    return [item for item in body["ids"] if isinstance(item, str)]
+
+
+def _id_probe_response(request: httpx.Request) -> httpx.Response | None:
+    body = json.loads(request.content) if request.content else None
+    wanted = _id_probe_features(body)
+    if wanted is None:
+        return None
+    return httpx.Response(
+        200,
+        json={
+            "type": "FeatureCollection",
+            "features": [_feature(scene_id) for scene_id in wanted],
+            "links": [],
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -423,6 +453,9 @@ def test_rejected_resume_clears_the_cursor(tmp_path: Path) -> None:
     calls: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        probe = _id_probe_response(request)
+        if probe is not None:
+            return probe
         body = json.loads(request.content)
         token = body.get("token")
         calls.append(token if isinstance(token, str) else None)
@@ -1000,6 +1033,9 @@ def test_signed_get_without_a_body_stays_unavailable_on_resume(
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
+        probe = _id_probe_response(request)
+        if probe is not None:
+            return probe
         calls += 1
         return httpx.Response(200, json=_page("scene-a", None, href="?sig=secret-value"))
 

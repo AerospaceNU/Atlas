@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 from datetime import datetime as DateTime
 from enum import StrEnum
@@ -1009,3 +1009,38 @@ class DataPullClient(ABC):
             An empty page that still carries ``page_cursor``.
         """
         return PullResult(request=request, scenes=[], next_cursor=page_cursor)
+
+    async def resolve_scene_ids(self, scene_ids: Sequence[str]) -> Mapping[str, Scene] | None:
+        """Return stored scenes whose ids still exist.
+
+        Args:
+            scene_ids: Ids recorded in the pull manifest.
+
+        Returns:
+            A map of ids the catalog still serves. Missing keys are gone.
+            None means this client cannot check ids, so the caller leaves
+            the stored ids as they are.
+        """
+        del scene_ids
+        return None
+
+    async def find_scenes_by_place_time(
+        self,
+        *,
+        collection: str,
+        when: DateTime,
+        footprint: BBox,
+    ) -> list[Scene] | None:
+        """Return scenes near one acquisition and footprint.
+
+        Args:
+            collection: Collection the stored scene came from.
+            when: Acquisition time of the stored scene.
+            footprint: Footprint box of the stored scene.
+
+        Returns:
+            Catalog hits to filter by collection, time tolerance, and
+            footprint overlap. None means this client cannot search that way.
+        """
+        del collection, when, footprint
+        return None
