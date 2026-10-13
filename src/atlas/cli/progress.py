@@ -30,6 +30,12 @@ class ProgressReporter(Protocol):
     def source_done(self, name: str) -> None:
         """Mark a source fully finished."""
 
+    def suspend(self) -> None:
+        """Release the stream so an estimate and prompt can be printed."""
+
+    def resume(self) -> None:
+        """Restore the live display after the prompt."""
+
     def close(self) -> None:
         """Release any TUI resources."""
 
@@ -54,6 +60,12 @@ class LogReporter:
 
     def source_done(self, name: str) -> None:
         print(f"{name}: done", file=self._stream, flush=True)
+
+    def suspend(self) -> None:
+        return None
+
+    def resume(self) -> None:
+        return None
 
     def close(self) -> None:
         return None
@@ -82,6 +94,7 @@ class RichReporter:
         self._totals: dict[str, int] = {}
         self._pull_label = "downloading"
         self._stopped = False
+        self._suspended = False
         self._progress.start()
 
     def source_start(self, name: str) -> None:
@@ -130,11 +143,27 @@ class RichReporter:
                 description=self._pull_label,
             )
 
+    def suspend(self) -> None:
+        """Stop the live display so the estimate and prompt stay readable."""
+        if self._stopped or self._suspended:
+            return
+        self._progress.stop()
+        self._suspended = True
+
+    def resume(self) -> None:
+        """Start the live display again after the prompt."""
+        if self._stopped or not self._suspended:
+            return
+        self._progress.start()
+        self._suspended = False
+
     def close(self) -> None:
         if self._stopped:
             return
         self._stopped = True
-        self._progress.stop()
+        if not self._suspended:
+            self._progress.stop()
+        self._suspended = False
 
 
 def pick_reporter(*, stream: TextIO) -> ProgressReporter:

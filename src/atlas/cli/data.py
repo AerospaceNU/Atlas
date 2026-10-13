@@ -45,6 +45,7 @@ from atlas.cli.download import (
     plain_source_name,
     retire_product,
 )
+from atlas.cli.estimate import confirm_download, estimate_pull, render_pull_estimate
 from atlas.cli.progress import ProgressReporter, pick_reporter
 from atlas.compile.aggregate import aggregate
 from atlas.compile.product import SceneCatalog
@@ -87,7 +88,12 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
             "A geographic, Web Mercator, or WGS84 UTM COG is read as the window "
             "overlapping --coords. fldas landsurface writes a CSV training table. "
             "A signed STAC next link is not stored, so later pages can stay unfetched. "
-            "That pull prints a warning and still exits 0."
+            "That pull prints a warning and still exits 0. "
+            "A download prints a size estimate from the search. Files already on disk "
+            "or listed in a resume manifest are left out of that estimate. "
+            "The download starts only after confirmation, or when --yes is passed. "
+            "Without a terminal, --yes is required. Remaining quota is included "
+            "when a provider publishes it; otherwise the estimate says quota is not readable."
         ),
         epilog=f"example:\n  {_EXAMPLE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -152,6 +158,14 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         "--search-only",
         action="store_true",
         help="Search and write a manifest; do not download assets",
+    )
+    data.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Start the download without a confirmation prompt. "
+            "Required when stdin is not a terminal."
+        ),
     )
     data.add_argument(
         "--resume",
@@ -340,6 +354,7 @@ def run_data(
             extract_tables=extracting,
             page_cursors=page_cursors,
             prior_manifest=prior_manifest,
+            assume_yes=bool(getattr(args, "yes", False)),
         )
     )
 
@@ -441,11 +456,35 @@ async def execute_pull(
     extract_tables: bool = False,
     page_cursors: Mapping[str, str | None] | None = None,
     prior_manifest: Mapping[str, Any] | None = None,
+    assume_yes: bool = False,
 ) -> int:
     """Fan out search, then extract training tables or download native assets.
 
     A source that derives a table instead of assets (FLDAS) writes its CSV here;
     its failures are recorded so a table that was never written returns 1.
+    After the search, a download prints a size estimate and waits for
+    confirmation unless ``assume_yes`` is set or nothing remains to download.
+    Files already on disk or listed in the resume manifest are left out of
+    the estimate. Search-only does not prompt. A cancelled or refused download
+    writes nothing and still resumes the progress display.
+
+    Args:
+        source_names: Registry names to search.
+        request: Date window and area.
+        out_dir: Directory for assets, tables, and the manifest.
+        search_only: Write the manifest and do not download.
+        concurrency: Maximum parallel asset downloads.
+        asset_name: Band or asset key to download.
+        reporter: Progress display.
+        clients: Pull clients. The registry is used when omitted.
+        http: Client for asset downloads.
+        table_path: Training-table path for an extract source.
+        variables: Extract columns.
+        points: Extract sample points.
+        extract_tables: Run training-table extraction for FLDAS.
+        page_cursors: Per-source resume cursors.
+        prior_manifest: Manifest a resume continues.
+        assume_yes: Start the download without a prompt (``--yes``).
     """
     owns_clients = clients is None
     live_clients = dict(clients) if clients is not None else sources(*source_names)
@@ -478,6 +517,24 @@ async def execute_pull(
             page_cursors=page_cursors,
             unavailable_cursors=unavailable,
         )
+        if not search_only:
+            estimate = estimate_pull(
+                catalog,
+                asset_name=asset_name,
+                unknown_byte_sources=_unknown_byte_sources(live_clients, extract_tables),
+                out_dir=out_dir,
+                prior_manifest=prior_manifest,
+                bbox=request.bbox,
+            )
+            reporter.suspend()
+            try:
+                print(render_pull_estimate(estimate), file=sys.stderr, flush=True)
+                if estimate.scene_count > 0:
+                    blocked = confirm_download(assume_yes=assume_yes)
+                    if blocked is not None:
+                        return blocked
+            finally:
+                reporter.resume()
         report = DownloadReport()
         table_failed = False
         table_usage = False
@@ -563,6 +620,21 @@ async def execute_pull(
             await live_http.aclose()
         if owns_clients:
             await _aclose_all(live_clients)
+
+
+def _unknown_byte_sources(
+    clients: Mapping[str, DataPullClient],
+    extract_tables: bool,
+) -> frozenset[str]:
+    """Return sources whose download size is not a catalog asset size.
+
+    A training-table extract reads a subset of each granule. The asset's
+    ``file:size``, when one exists, is not the table, so the estimate leaves
+    those bytes unknown.
+    """
+    if not extract_tables:
+        return frozenset()
+    return frozenset(name for name, client in clients.items() if isinstance(client, FldasClient))
 
 
 async def _extract_table(

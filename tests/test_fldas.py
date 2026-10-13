@@ -615,6 +615,7 @@ def _pull_args(tmp_path: Path, **overrides: Any) -> Any:
         "max_cloud_cover": None,
         "concurrency": 2,
         "search_only": False,
+        "yes": True,
         "asset": None,
         "table": None,
         "variables": None,
@@ -1112,6 +1113,7 @@ def test_main_writes_a_points_table(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             str(points_file),
             "--variables",
             "Evap_tavg",
+            "--yes",
         ]
     )
     assert code == 0

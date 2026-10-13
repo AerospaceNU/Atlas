@@ -48,6 +48,7 @@ def test_cli_live_download_skips_existing(tmp_path: Path) -> None:
         _COORDS,
         "--limit",
         "1",
+        "--yes",
         "--out",
         str(tmp_path),
     ]
