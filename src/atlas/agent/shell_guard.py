@@ -4,10 +4,11 @@ The text scan refuses obvious paths, ``..``, command substitution, parameter
 expansion, and a few interpreter-eval shapes. It does not see paths an
 interpreter builds at runtime, and on Windows it is the only layer. On Linux
 the child is placed under Landlock (kernel 5.13 or newer). The artifact root
-and ``proposals/`` are masked out of that view with a user namespace, or moved
-outside the workspace when that namespace is unavailable, because a Landlock
-rule cannot exclude a child of a granted directory. If neither is possible the
-shell does not start. On macOS ``sandbox-exec`` is the boundary; if it is
+and ``proposals/`` are masked out of that view with a user namespace, because
+a Landlock rule cannot exclude a child of a granted directory. Hiding a
+directory that already sits inside the workspace requires that namespace. If
+it is unavailable the shell does not start. On macOS ``sandbox-exec`` is the
+boundary; if it is
 missing or cannot be applied, ``bash_tool`` does not run. The network is not
 restricted on any platform.
 """
@@ -88,8 +89,9 @@ _PATH_IN_WORD = re.compile(
 # hide. The script is stdlib-only so the child does not import Atlas before
 # Landlock. Landlock needs Linux 5.13 or newer. The network is not restricted.
 # A path-beneath rule covers every child, so the workspace root is granted
-# only after those paths are masked or renamed to mask_dir + ".hold" outside
-# the workspace. ATLAS_SHELL_NO_USERNS=1 forces the rename path.
+# only after a user-namespace bind mount hides those paths. There is no
+# host-side rename fallback. ATLAS_SHELL_NO_USERNS=1 forces the unavailable
+# path when a directory inside the workspace still has to be hidden.
 _LAUNCHER = r"""
 import ctypes
 import os
@@ -238,75 +240,7 @@ def _libc():
     return libc
 
 
-_PARK_FAIL = "needs user namespaces or an artifact root outside the workspace"
-
-
-def _outside_workspace(workspace, path):
-    root = os.path.realpath(workspace)
-    probe = path
-    while probe and not os.path.exists(probe):
-        parent = os.path.dirname(probe)
-        if parent == probe:
-            break
-        probe = parent
-    try:
-        real = os.path.realpath(probe)
-    except OSError:
-        return False
-    return real != root and not real.startswith(root + os.sep)
-
-
-def _hold_for(mask_dir):
-    parent = os.path.dirname(mask_dir) or os.sep
-    return os.path.join(parent, os.path.basename(mask_dir) + ".hold")
-
-
-def _unpark(excluded, hold):
-    if not hold or not os.path.isdir(hold):
-        return
-    for index, path in enumerate(excluded):
-        src = os.path.join(hold, str(index))
-        if not os.path.lexists(src):
-            continue
-        try:
-            if os.path.lexists(path):
-                displaced = path + ".shell-displaced"
-                suffix = 0
-                while os.path.lexists(displaced):
-                    suffix += 1
-                    displaced = path + ".shell-displaced-" + str(suffix)
-                os.rename(path, displaced)
-            parent = os.path.dirname(path)
-            if parent and not os.path.isdir(parent):
-                os.makedirs(parent, exist_ok=True)
-            os.rename(src, path)
-        except OSError:
-            continue
-
-
-def _park(workspace, excluded, mask_dir):
-    if not mask_dir or not _outside_workspace(workspace, mask_dir):
-        _fail(_PARK_FAIL)
-    hold = _hold_for(mask_dir)
-    if not _outside_workspace(workspace, hold):
-        _fail(_PARK_FAIL)
-    try:
-        os.makedirs(hold, 0o700)
-    except OSError:
-        _fail(_PARK_FAIL)
-    for index, path in enumerate(excluded):
-        if not os.path.lexists(path):
-            continue
-        if os.path.islink(path):
-            _unpark(excluded, hold)
-            _fail(_PARK_FAIL)
-        dest = os.path.join(hold, str(index))
-        try:
-            os.rename(path, dest)
-        except OSError:
-            _unpark(excluded, hold)
-            _fail(_PARK_FAIL)
-    return hold
+_NO_USERNS = "needs user namespaces or an artifact root outside the workspace"
 
 
 def _apply(libc, workspace, tmpdir):
@@ -466,18 +400,18 @@ def _prepare(libc, workspace, command, tmpdir, mask_dir, excluded):
         kind = os.read(notify_r, 1)
         if kind == b"C":
             os.waitpid(pid, 0)
-            return "park"
+            _fail(_NO_USERNS)
         if kind != b"R":
             _reap(pid)
             _fail("Landlock could not be applied")
         if not _write_id_maps(pid):
             _reap(pid)
-            _fail("Landlock could not be applied")
+            _fail(_NO_USERNS)
         os.write(go_w, b"G")
         outcome = os.read(done_r, 1)
         if outcome == b"P":
             os.waitpid(pid, 0)
-            return "park"
+            _fail(_NO_USERNS)
         if outcome != b"K":
             _reap(pid)
             _fail("Landlock could not be applied")
@@ -514,18 +448,12 @@ def _forward(status):
 
 def _run(workspace, command, tmpdir, mask_dir, excluded):
     libc = _libc()
-    force_park = os.environ.get("ATLAS_SHELL_NO_USERNS") == "1"
-    if force_park or not excluded:
-        if excluded:
-            _park(workspace, excluded, mask_dir)
+    if not excluded:
         _confine(libc, workspace, command, tmpdir)
         return
-    status = _prepare(libc, workspace, command, tmpdir, mask_dir, excluded)
-    if status == "park":
-        _park(workspace, excluded, mask_dir)
-        _confine(libc, workspace, command, tmpdir)
-        return
-    _forward(status)
+    if os.environ.get("ATLAS_SHELL_NO_USERNS") == "1":
+        _fail(_NO_USERNS)
+    _forward(_prepare(libc, workspace, command, tmpdir, mask_dir, excluded))
 
 
 def main():
@@ -640,12 +568,17 @@ def shell_excluded_paths(workspace: Path, artifact_root: Path, proposals: Path) 
     A path equal to ``workspace`` is omitted, because masking the workspace
     would hide the tree the shell is allowed to use. A proposal directory
     inside an excluded artifact root is omitted too; masking the artifact root
-    already hides it.
+    already hides it. A path that does not exist yet is omitted: there is
+    nothing to hide, and creating it would require a user namespace for an
+    empty directory. Hiding a directory that does exist requires a user
+    namespace. Without one the shell does not start.
     """
     root = workspace.resolve()
     chosen: list[Path] = []
     for path in (artifact_root.resolve(), proposals.resolve()):
         if _paths_equal(path, root) or not _contains(root, path):
+            continue
+        if not path.is_symlink() and not path.exists():
             continue
         if any(_contains(earlier, path) for earlier in chosen):
             continue
@@ -680,52 +613,6 @@ def cleanup_mount_points(created: Sequence[Path]) -> None:
             path.rmdir()
         except OSError:
             continue
-
-
-def parked_hold_dir(mask_dir: Path) -> Path:
-    """Return the sibling directory that holds trees parked outside the workspace.
-
-    The hold is ``mask_dir`` with ``.hold`` appended to its name. It must not
-    be the mask directory itself: that directory is the bind-mount source, and
-    a numeric child would be confused with a parked tree.
-    """
-    return mask_dir.with_name(mask_dir.name + ".hold")
-
-
-def restore_parked_paths(mask_dir: Path | None, excluded: Sequence[Path]) -> bool:
-    """Move parked trees back next to ``mask_dir``. Return True if none remain.
-
-    A path the command recreated is renamed aside with a ``.shell-displaced``
-    suffix so the parked tree can return to its original path. A failure
-    leaves the hold in place so the parked files are not deleted.
-    """
-    if mask_dir is None:
-        return True
-    hold = parked_hold_dir(mask_dir)
-    if not hold.is_dir():
-        return True
-    leftover = False
-    for index, path in enumerate(excluded):
-        src = hold / str(index)
-        if not src.exists() and not src.is_symlink():
-            continue
-        try:
-            if path.exists() or path.is_symlink():
-                path.rename(_displaced_path(path))
-            path.parent.mkdir(parents=True, exist_ok=True)
-            src.rename(path)
-        except OSError:
-            leftover = True
-    return not leftover
-
-
-def _displaced_path(path: Path) -> Path:
-    candidate = path.with_name(path.name + ".shell-displaced")
-    suffix = 0
-    while candidate.exists() or candidate.is_symlink():
-        suffix += 1
-        candidate = path.with_name(f"{path.name}.shell-displaced-{suffix}")
-    return candidate
 
 
 def sandboxed_shell_argv(

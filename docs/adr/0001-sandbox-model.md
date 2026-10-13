@@ -54,17 +54,18 @@ This is two different guarantees, and they must not be confused:
   Landlock ruleset: the workspace (with execute), read-only `/etc`, a
   private `TMPDIR` inside the workspace, and the toolchain (`/usr`, `/bin`,
   `/lib`, `/lib64`, plus the interpreter prefix). The artifact root and
-  `proposals/` are not in that accessible tree. Landlock cannot exclude a
-  child of a granted directory, so a rule on the workspace root is applied
-  only after those directories are hidden. The usual hide is a private bind
-  mount in a user namespace. If user namespaces or the mount are
-  unavailable, those directories are moved outside the workspace for the
-  command and moved back when it ends, and the root is then granted whole.
-  If they cannot be moved outside the workspace, the shell does not start
-  and the error says it needs user namespaces or an artifact root outside
-  the workspace. Granting the root while they still sit inside it would
-  make them readable. If Landlock cannot be applied, the child exits with
-  a clear message and bash is not started. On macOS, `sandbox-exec` denies
+  `proposals/` are not in that accessible tree when they already exist
+  inside the workspace. Landlock cannot exclude a child of a granted
+  directory, so a rule on the workspace root is applied only after a user
+  namespace bind-mounts those directories out of view. User namespaces are
+  required for that hide. If they are unavailable, or the mount cannot be
+  applied, the shell does not start. The error says the sandbox needs user
+  namespaces or an artifact root outside the workspace. The host does not
+  rename or move those directories. Granting the root while they still sit
+  inside it would make them readable. An artifact root that is already
+  outside the workspace needs no user namespace. If Landlock cannot be
+  applied, the child exits with a clear message and bash is not started.
+  On macOS, `sandbox-exec` denies
   the key directory and file access outside the workspace, aside from the
   toolchain and system read paths. If `sandbox-exec` is missing, cannot be
   launched, or rejects the profile, `bash_tool` raises a sandbox-unavailable
@@ -198,8 +199,9 @@ the workspace is executable, `/etc` is read-only, temp files go to a private
 and executable. The interpreter prefix is included so a virtualenv outside
 the workspace can still start; it is not writable. The artifact root and
 `proposals/` are kept out of that
-tree. When user namespaces are unavailable those directories are moved
-outside the workspace for the command, or the shell does not start. Devices
+tree. User namespaces are required when those directories already sit
+inside the workspace. Without them the shell does not start; nothing is
+renamed on the host. Devices
 a redirect needs (`/dev/null` and the other null devices) are included. On
 macOS the same boundary is a `sandbox-exec` profile. If that program is
 missing, cannot be launched, or rejects the profile, the tool does not run.
@@ -236,8 +238,9 @@ same user who started it.
   the child can open. They do not bound CPU, memory, or disk. On Windows
   there is no OS file boundary; the tool is off unless it is opted in, and
   it warns. A path the text scan misses can still be opened when it stays
-  inside the workspace and is not the masked or parked artifact root or
-  `proposals/`.
+  inside the workspace and is not the masked artifact root or
+  `proposals/`. Without user namespaces, `bash_tool` does not run when
+  either of those directories already exists inside the workspace.
 - **A child that calls `setsid()`** leaves the process group we kill and
   can outlive the call. Only OS-level tracking (cgroups, a job object or a
   container) closes this.
@@ -289,9 +292,9 @@ Offline tests, run in CI:
   is inside the workspace; a drafted tool under `proposals/` is not
   executed, including an interpreter-built path and a copy of that tree;
   a symlink created during the command cannot read or write a host file;
-  without user namespaces a file can still be created at the workspace
-  root, or the shell reports that it needs user namespaces or an artifact
-  root outside the workspace; Landlock denies an interpreter-built path
+  without user namespaces, and with `proposals/` inside the workspace, the
+  shell reports that it needs user namespaces or an artifact root outside
+  the workspace and does not run the command; Landlock denies an interpreter-built path
   outside the workspace; a failed Landlock syscall exits without running
   the command; `$(...)`, backticks, and `$VAR` are rejected; interpreter
   eval flags combined flags, an `env` prefix, and stdin; macOS builds a

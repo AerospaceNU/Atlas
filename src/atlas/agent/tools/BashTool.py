@@ -24,11 +24,9 @@ from atlas.agent.shell_guard import (
     bash_tool_trust,
     cleanup_mount_points,
     guard_shell_command,
-    parked_hold_dir,
     prepare_mount_points,
     refuse_shell_start,
     require_landlock_kernel,
-    restore_parked_paths,
     sandbox_unavailable,
     sandboxed_shell_argv,
     shell_excluded_paths,
@@ -64,10 +62,11 @@ class BashTool(Tool):
     paths before launch. The boundary is the OS sandbox: Landlock on Linux
     5.13 or newer, and ``sandbox-exec`` on macOS. The shell does not start
     when the user key directory or ``ATLAS_HOME`` resolves inside the
-    workspace, or when that sandbox is unavailable. Without user namespaces,
-    the artifact root and ``proposals/`` are moved outside the workspace for
-    the command and moved back afterward. A ``sandbox-exec`` launch or
-    profile failure is a sandbox denial. On Windows the tool is opt-in and
+    workspace, or when that sandbox is unavailable. Hiding an artifact root
+    or ``proposals/`` that already sits inside the workspace requires a user
+    namespace. Without one the shell does not start. A ``sandbox-exec``
+    launch or profile failure is a sandbox denial. On Windows the tool is
+    opt-in and
     warns that there is no OS confinement. The network is not restricted.
     Every call still kills the whole process group. A child that calls
     ``setsid()`` leaves that group. See docs/adr/0001-sandbox-model.md.
@@ -99,7 +98,7 @@ class BashTool(Tool):
         if sys.platform == "linux":
             require_landlock_kernel()
         env = {key: os.environ[key] for key in _INHERITED_ENV_KEYS if key in os.environ}
-        # Tests force the no-namespace fallback. The shell command cannot set
+        # Tests force the no-namespace failure. The shell command cannot set
         # this; the launcher reads it before bash starts.
         if os.environ.get("ATLAS_SHELL_NO_USERNS") == "1":
             env["ATLAS_SHELL_NO_USERNS"] = "1"
@@ -177,7 +176,7 @@ class BashTool(Tool):
                 # return normally, so the group is killed on every exit path.
                 self._kill_process_group(process, pgid)
         finally:
-            self._cleanup_shell_dirs(tmpdir, mask_dir, created, excluded)
+            self._cleanup_shell_dirs(tmpdir, mask_dir, created)
 
         if sys.platform == "darwin":
             ready = f"{SANDBOX_EXEC_READY}\n"
@@ -217,18 +216,11 @@ class BashTool(Tool):
         tmpdir: Path | None,
         mask_dir: Path | None,
         created: list[Path],
-        excluded: list[Path] | tuple[Path, ...],
     ) -> None:
-        # Restore before deleting the hold. A timeout kills the launcher
-        # before it can move parked trees back. The hold is a sibling of the
-        # mask directory, which is only the empty bind-mount source.
-        if mask_dir is not None:
-            restored = restore_parked_paths(mask_dir, excluded)
-            if restored:
-                shutil.rmtree(parked_hold_dir(mask_dir), ignore_errors=True)
-            shutil.rmtree(mask_dir, ignore_errors=True)
         if tmpdir is not None:
             shutil.rmtree(tmpdir, ignore_errors=True)
+        if mask_dir is not None:
+            shutil.rmtree(mask_dir, ignore_errors=True)
         cleanup_mount_points(created)
 
     def _kill_process_group(self, process: subprocess.Popen[str], pgid: int) -> None:

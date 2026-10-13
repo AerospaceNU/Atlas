@@ -310,12 +310,7 @@ def test_linux_landlock_denies_an_interpreter_built_outside_path(tmp_path: Path)
 
 
 @pytest.mark.skipif(not _landlock_available(), reason="Landlock is unavailable")
-@pytest.mark.parametrize("force_park", [False, True])
-def test_linux_runtime_symlink_cannot_read_or_write_outside(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, force_park: bool
-) -> None:
-    if force_park:
-        monkeypatch.setenv("ATLAS_SHELL_NO_USERNS", "1")
+def test_linux_runtime_symlink_cannot_read_or_write_outside(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = tmp_path / "secret.txt"
@@ -361,7 +356,16 @@ def test_linux_cannot_run_proposals_hidden_from_the_text_scan(tmp_path: Path) ->
     )
     store = LocalArtifactStore(artifact, read_root=workspace)
 
-    executed = BashTool().run({"command": "python3 run_draft.py"}, store)
+    def _hidden(command: str, target: LocalArtifactStore) -> str:
+        try:
+            return BashTool().run({"command": command}, target).text
+        except SandboxDenied as exc:
+            # No user namespace: the shell does not start, so the draft cannot run.
+            message = str(exc)
+            assert "needs user namespaces or an artifact root outside the workspace" in message
+            return message
+
+    executed = _hidden("python3 run_draft.py", store)
     # The proposal tree is under the artifact root, which the shell cannot see.
     # A relative proposals path from the workspace does not exist; run the copy
     # from the artifact root by using a store whose workspace is the artifact.
@@ -373,10 +377,10 @@ def test_linux_cannot_run_proposals_hidden_from_the_text_scan(tmp_path: Path) ->
         "print(Path('copied/helper.sh').read_text(encoding='utf-8'))\n",
         encoding="utf-8",
     )
-    copied = BashTool().run({"command": "python3 copy_run.py"}, artifact_store)
+    copied = _hidden("python3 copy_run.py", artifact_store)
 
-    assert "RAN_DRAFT_TOOL" not in executed.text
-    assert "RAN_DRAFT_TOOL" not in copied.text
+    assert "RAN_DRAFT_TOOL" not in executed
+    assert "RAN_DRAFT_TOOL" not in copied
     assert not marker.exists()
     assert (proposals / "helper.py").is_file()
 
@@ -608,8 +612,13 @@ def test_windows_bash_tool_is_opt_in_and_warns(tmp_path: Path) -> None:
     assert "sandbox-exec" not in argv[0]
 
 
+_NO_USERNS = (
+    "Shell sandbox is unavailable: needs user namespaces or an artifact root outside the workspace"
+)
+
+
 @pytest.mark.skipif(not _landlock_available(), reason="Landlock is unavailable")
-def test_linux_without_user_namespaces_can_create_at_the_workspace_root(
+def test_linux_without_user_namespaces_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ATLAS_SHELL_NO_USERNS", "1")
@@ -619,32 +628,19 @@ def test_linux_without_user_namespaces_can_create_at_the_workspace_root(
     proposals.mkdir()
     secret = proposals / "helper.py"
     secret.write_text("SECRET_DRAFT\n", encoding="utf-8")
-    (workspace / "peek.py").write_text(
-        "from pathlib import Path\n"
-        "try:\n"
-        "    print(Path('propo' + 'sals/helper.py').read_text(encoding='utf-8'))\n"
-        "except OSError as exc:\n"
-        "    print(type(exc).__name__)\n",
-        encoding="utf-8",
-    )
     store = LocalArtifactStore(workspace)
 
-    result = BashTool().run(
-        {"command": "echo hi > out.txt && mkdir d && ln -s out.txt linkname && python3 peek.py"},
-        store,
-    )
+    message = _deny("echo hi > out.txt", store)
 
-    assert "exit_code: 0" in result.text
-    assert (workspace / "out.txt").read_text(encoding="utf-8") == "hi\n"
-    assert (workspace / "d").is_dir()
-    assert (workspace / "linkname").is_symlink()
-    assert "SECRET_DRAFT" not in result.text
+    assert message == _NO_USERNS
+    assert "SECRET_DRAFT" not in message
+    assert not (workspace / "out.txt").exists()
     assert secret.read_text(encoding="utf-8") == "SECRET_DRAFT\n"
-    assert not (workspace / "proposals.shell-displaced").exists()
+    assert not list(tmp_path.glob("**/*.hold"))
 
 
 @pytest.mark.skipif(not _landlock_available(), reason="Landlock is unavailable")
-def test_linux_unshare_failure_can_create_at_the_workspace_root(
+def test_linux_unshare_failure_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -661,69 +657,12 @@ def test_linux_unshare_failure_can_create_at_the_workspace_root(
     proposals.mkdir()
     secret = proposals / "helper.py"
     secret.write_text("SECRET_DRAFT\n", encoding="utf-8")
-    (workspace / "peek.py").write_text(
-        "from pathlib import Path\n"
-        "try:\n"
-        "    print(Path('propo' + 'sals/helper.py').read_text(encoding='utf-8'))\n"
-        "except OSError as exc:\n"
-        "    print(type(exc).__name__)\n",
-        encoding="utf-8",
-    )
     store = LocalArtifactStore(workspace)
 
-    result = BashTool().run({"command": "echo hi > out.txt && python3 peek.py"}, store)
+    message = _deny("echo hi > out.txt", store)
 
-    assert "exit_code: 0" in result.text
-    assert (workspace / "out.txt").read_text(encoding="utf-8") == "hi\n"
-    assert "SECRET_DRAFT" not in result.text
-    assert "FileNotFoundError" in result.text
-    assert secret.read_text(encoding="utf-8") == "SECRET_DRAFT\n"
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="the launcher parks on Linux")
-def test_park_inside_the_workspace_fails_closed(tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    proposals = workspace / "proposals"
-    proposals.mkdir()
-    secret = proposals / "helper.py"
-    secret.write_text("SECRET_DRAFT\n", encoding="utf-8")
-    tmpdir = workspace / "tmp"
-    tmpdir.mkdir()
-    mask = workspace / "mask"
-    mask.mkdir()
-    ran = workspace / "out.txt"
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-c",
-            _LAUNCHER,
-            str(workspace),
-            "echo hi > out.txt",
-            str(tmpdir),
-            str(mask),
-            str(proposals),
-        ],
-        cwd=workspace,
-        env={
-            "PATH": os.environ["PATH"],
-            "HOME": os.environ.get("HOME", ""),
-            "ATLAS_SHELL_NO_USERNS": "1",
-        },
-        text=True,
-        capture_output=True,
-        timeout=20,
-        check=False,
-    )
-
-    assert proc.returncode == 126
-    assert (
-        proc.stderr.strip()
-        == "Shell sandbox is unavailable: needs user namespaces or an artifact root outside the workspace"
-    )
-    assert "Traceback" not in proc.stderr
-    assert not ran.exists()
+    assert message == _NO_USERNS
+    assert not (workspace / "out.txt").exists()
     assert secret.read_text(encoding="utf-8") == "SECRET_DRAFT\n"
 
 
