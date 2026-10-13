@@ -47,6 +47,7 @@ def _pull_args(tmp_path: Path, *, search_only: bool = False) -> argparse.Namespa
         max_cloud_cover=None,
         concurrency=2,
         search_only=search_only,
+        yes=True,
         asset=None,
         table=None,
         variables=None,

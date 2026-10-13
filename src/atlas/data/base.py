@@ -889,6 +889,8 @@ class Asset(BaseModel):
     # First ``raster:bands`` entry. None when the item does not publish one.
     scale: float | None = None
     offset: float | None = None
+    # STAC ``file:size`` in bytes. None when the catalog did not report one.
+    size_bytes: int | None = Field(default=None, ge=0)
 
     @field_validator("href")
     @classmethod
@@ -905,6 +907,15 @@ class Asset(BaseModel):
             return None
         if not math.isfinite(value):
             raise ValueError("scale and offset must be finite")
+        return value
+
+    @field_validator("size_bytes", mode="before")
+    @classmethod
+    def size_bytes_must_be_whole(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("size_bytes must be a non-negative integer")
         return value
 
     @classmethod
