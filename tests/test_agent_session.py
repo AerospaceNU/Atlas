@@ -1895,7 +1895,7 @@ def test_clearing_a_goal_removes_it_from_later_turns(tmp_path: Path) -> None:
     assert session.goal == ""
     assert all("map the flood" not in (message.content or "") for message in model.requests[0][0])
     assert all(
-        not (message.content or "").startswith("Session goal:\n") for message in session.messages
+        message.content != session_goal_text("map the flood") for message in session.messages
     )
 
 
@@ -1985,6 +1985,151 @@ def test_goal_protocol_rejects_extra_fields_without_changing_the_goal(tmp_path: 
     assert blank[-1]["type"] == "error"
     assert flag[-1]["type"] == "error"
     assert session.messages[1].content == session_goal_text("map the flood")
+
+
+def test_user_turn_with_goal_wording_survives_set_and_clear(tmp_path: Path) -> None:
+    """A user turn that starts like a goal stays through ``/goal`` set and clear.
+
+    The goal used to be found by matching any user message that started with
+    ``Session goal:``. Setting or clearing the goal then overwrote or deleted
+    that turn. The session now keeps the goal message it inserted.
+    """
+    lookalike = "Session goal:\nkeep this user turn"
+    model = ScriptedModel(
+        [
+            ModelResponse(content="noted"),
+            ModelResponse(content="still here"),
+        ]
+    )
+    session = _session(model, tmp_path=tmp_path)
+    session.turn(lookalike)
+    original = session.messages[1]
+    assert original.content == lookalike
+
+    cleared = _run_protocol(['{"type":"goal","clear":true}'], session)
+    assert cleared[-1]["type"] == "goal"
+    assert cleared[-1]["cleared"] is True
+    assert session.goal == ""
+    assert any(message is original for message in session.messages)
+    assert original.content == lookalike
+
+    set_goal = _run_protocol([json.dumps({"type": "goal", "text": "map the flood"})], session)
+    assert set_goal[-1]["type"] == "goal"
+    assert set_goal[-1]["text"] == "map the flood"
+    assert any(message is original for message in session.messages)
+    assert original.content == lookalike
+    goal_message = next(
+        message
+        for message in session.messages
+        if message.content == session_goal_text("map the flood")
+    )
+    assert goal_message is not original
+
+    replaced = _run_protocol([json.dumps({"type": "goal", "text": "map the coast"})], session)
+    assert replaced[-1]["text"] == "map the coast"
+    assert any(message is goal_message for message in session.messages)
+    assert goal_message.content == session_goal_text("map the coast")
+    assert any(message is original for message in session.messages)
+    assert original.content == lookalike
+    assert session_goal_text("map the flood") not in [
+        message.content for message in session.messages
+    ]
+
+    removed = _run_protocol(['{"type":"goal","clear":true}'], session)
+    assert removed[-1]["cleared"] is True
+    assert session.goal == ""
+    assert all(message is not goal_message for message in session.messages)
+    assert any(message is original for message in session.messages)
+    assert original.content == lookalike
+
+    collision = session_goal_text("map the flood")
+    session.turn(collision)
+    collision_message = next(
+        message for message in session.messages if message.content == collision
+    )
+    session.set_goal("map the flood")
+    assert sum(message.content == collision for message in session.messages) == 2
+    assert any(message is collision_message for message in session.messages)
+    assert collision_message.content == collision
+    session.clear_goal()
+    assert any(message is collision_message for message in session.messages)
+    assert collision_message.content == collision
+    assert sum(message.content == collision for message in session.messages) == 1
+
+
+def test_goal_longer_than_2000_characters_is_rejected(tmp_path: Path) -> None:
+    model = ScriptedModel([])
+    session = _session(model, tmp_path=tmp_path)
+    session.set_goal("keep this")
+    kept = session.messages[1].content
+
+    too_long = "x" * 2001
+    with pytest.raises(ValueError, match="at most 2000 characters"):
+        session.set_goal(too_long)
+    assert session.goal == "keep this"
+    assert session.messages[1].content == kept
+
+    events = _run_protocol([json.dumps({"type": "goal", "text": too_long})], session)
+    assert events[-1] == {
+        "type": "error",
+        "message": "goal text must be at most 2000 characters",
+    }
+    assert session.goal == "keep this"
+    assert session.messages[1].content == kept
+
+    exact = "y" * 2000
+    accepted = _run_protocol([json.dumps({"type": "goal", "text": exact})], session)
+    assert accepted[-1]["type"] == "goal"
+    assert accepted[-1]["text"] == exact
+    assert session.goal == exact
+    assert session.messages[1].content == session_goal_text(exact)
+
+    session.set_goal(f"  {'z' * 2000}  ")
+    assert session.goal == "z" * 2000
+
+
+def test_goal_set_mid_conversation_is_its_own_user_message(tmp_path: Path) -> None:
+    """A goal set after a turn stays a separate user message beside that turn.
+
+    The goal is wrapped in ``<session_goal>`` tags and inserted after the
+    opening context. The earlier user turn is still a user message, so the
+    model sees those two user messages in a row. Atlas does not merge them.
+    """
+    model = ScriptedModel(
+        [
+            ModelResponse(content="first answer"),
+            ModelResponse(content="second answer"),
+        ]
+    )
+    session = _session(model, tmp_path=tmp_path)
+    session.turn("what first?")
+    session.set_goal("map the flood")
+
+    assert [message.role for message in session.messages] == [
+        "system",
+        "user",
+        "user",
+        "assistant",
+    ]
+    assert session.messages[1].content == "<session_goal>\nmap the flood\n</session_goal>"
+    assert session.messages[1].content == session_goal_text("map the flood")
+    assert session.messages[2].content == "what first?"
+    assert session.messages[2].role == "user"
+    assert session.messages[1] is not session.messages[2]
+
+    session.turn("what next?")
+    sent = model.requests[1][0]
+    assert [message.role for message in sent[:5]] == [
+        "system",
+        "user",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert sent[1].content == session_goal_text("map the flood")
+    assert sent[2].content == "what first?"
+    assert sent[3].content == "first answer"
+    assert sent[4].content == "what next?"
 
 
 def _session_from(agent: Agent) -> AgentSession:
