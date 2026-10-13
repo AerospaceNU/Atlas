@@ -12,7 +12,8 @@ from pathlib import Path
 import httpx
 
 from atlas.cli import _attach_negative_option_values
-from atlas.cli.data import add_data_parser, run_data
+from atlas.cli.data import add_data_parser, execute_pull, run_data
+from atlas.cli.download import asset_suffix, output_source_dir, pick_asset, scene_filename
 from atlas.cli.estimate import (
     CONFIRM_PROMPT,
     CONFIRMATION_REQUIRED,
@@ -20,8 +21,10 @@ from atlas.cli.estimate import (
     EXIT_CANCELLED,
     EXIT_REFUSED,
     NO_COVERAGE,
+    QUOTA_NOT_READABLE,
     confirm_download,
     estimate_pull,
+    format_bytes,
     render_pull_estimate,
 )
 from atlas.compile.product import SceneCatalog, SourceScenes
@@ -206,7 +209,9 @@ def test_estimate_uses_catalog_sizes_and_leaves_the_rest_unknown() -> None:
     assert estimate.scene_count == 6
     assert estimate.known_bytes == 1000
     assert estimate.unknown_scenes == 5
-    assert estimate.bytes_text == "1000 (5 unknown)"
+    assert estimate.bytes_text == "1000 bytes (1000 bytes, 5 unknown)"
+    assert estimate.already_present == 0
+    assert estimate.quota_text == QUOTA_NOT_READABLE
     assert estimate.skipped == ()
 
     visual = Scene(
@@ -243,7 +248,7 @@ def test_estimate_uses_catalog_sizes_and_leaves_the_rest_unknown() -> None:
 
     browse = _scene("preview", size=99, key="thumbnail", roles=["thumbnail"])
     browse_estimate = estimate_pull(_catalog(_source("sentinel2", [browse])))
-    assert browse_estimate.bytes_text == "0"
+    assert browse_estimate.bytes_text == "0 bytes (0 bytes)"
     assert browse_estimate.unknown_scenes == 0
 
 
@@ -269,14 +274,16 @@ def test_estimate_reports_skipped_sources_and_does_not_invent_bytes() -> None:
         )
     )
     assert estimate.scene_count == 2
-    assert estimate.bytes_text == "1000 (1 unknown)"
+    assert estimate.bytes_text == "1000 bytes (1000 bytes, 1 unknown)"
     assert [(item.source, item.reason) for item in estimate.skipped] == [
         ("firms", credential),
         ("goes", NO_COVERAGE),
     ]
     text = render_pull_estimate(estimate)
     assert "scenes: 2" in text
-    assert "bytes: 1000 (1 unknown)" in text
+    assert "bytes: 1000 bytes (1000 bytes, 1 unknown)" in text
+    assert "already present: 0" in text
+    assert f"quota: {QUOTA_NOT_READABLE}" in text
     assert f"firms: {credential}" in text
     assert f"goes: {NO_COVERAGE}" in text
 
@@ -307,7 +314,7 @@ def test_pull_prints_the_estimate_before_downloading(tmp_path: Path) -> None:
     code, err, gets = _run(tmp_path, _Stdin(tty=False), "--yes")
     assert code == 0
     assert "scenes: 2" in err
-    assert "bytes: 1000 (1 unknown)" in err
+    assert "bytes: 1000 bytes (1000 bytes, 1 unknown)" in err
     assert "EARTHDATA_TOKEN is not set" in err
     assert f"goes: {NO_COVERAGE}" in err
     assert CONFIRM_PROMPT not in err
@@ -320,7 +327,7 @@ def test_pull_confirm_yes_downloads_and_no_does_not(tmp_path: Path) -> None:
     assert agreed == 0
     assert CONFIRM_PROMPT in yes_err
     assert "scenes: 2" in yes_err
-    assert "bytes: 1000 (1 unknown)" in yes_err
+    assert "bytes: 1000 bytes (1000 bytes, 1 unknown)" in yes_err
     assert len(gets) == 2
     assert list((tmp_path / "yes").rglob("*.bin"))
 
@@ -352,7 +359,7 @@ def test_noninteractive_pull_without_yes_refuses(tmp_path: Path) -> None:
     assert CONFIRMATION_REQUIRED in err
     assert CONFIRM_PROMPT not in err
     assert "scenes: 2" in err
-    assert "bytes: 1000 (1 unknown)" in err
+    assert "bytes: 1000 bytes (1000 bytes, 1 unknown)" in err
     assert gets == []
     assert not (tmp_path / "manifest.json").exists()
     assert list(tmp_path.rglob("*.bin")) == []
@@ -367,3 +374,212 @@ def test_search_only_does_not_prompt_or_download(tmp_path: Path) -> None:
     assert CONFIRM_PROMPT not in err
     assert gets == []
     assert (tmp_path / "manifest.json").is_file()
+
+
+def test_sizes_are_human_readable_and_partly_sized_output_keeps_the_gap() -> None:
+    exact = 700 * 1024 * 1024
+    whole = estimate_pull(_catalog(_source("sentinel2", [_scene("whole", size=exact)])))
+    assert whole.bytes_text == "700 MB (734003200 bytes)"
+    assert format_bytes(exact) == "700 MB (734003200 bytes)"
+    assert format_bytes(1024) == "1 KB (1024 bytes)"
+    assert format_bytes(1536) == "1.5 KB (1536 bytes)"
+
+    partial = estimate_pull(
+        _catalog(_source("sentinel2", [_scene("whole", size=exact), _scene("unsized")]))
+    )
+    assert partial.scene_count == 2
+    assert partial.known_bytes == exact
+    assert partial.unknown_scenes == 1
+    assert partial.bytes_text == "700 MB (734003200 bytes, 1 unknown)"
+    text = render_pull_estimate(partial)
+    assert "bytes: 700 MB (734003200 bytes, 1 unknown)" in text
+    assert "unknown" in partial.bytes_text
+
+
+def test_estimate_excludes_files_on_disk_and_in_the_resume_manifest(tmp_path: Path) -> None:
+    on_disk = _scene("kept", size=1000)
+    resumed = _scene("again", size=2048)
+    fresh = _scene("fresh", size=1024)
+    empty = _scene("empty", size=512)
+    _write_scene(tmp_path, on_disk)
+    _write_scene(tmp_path, empty, content=b"")
+    manifest = {
+        "sources": [
+            {
+                "source": "sentinel2",
+                "saved": ["sentinel2/again_data.bin"],
+                "skipped": ["sentinel2/kept_data.bin"],
+            }
+        ]
+    }
+    estimate = estimate_pull(
+        _catalog(_source("sentinel2", [on_disk, resumed, fresh, empty])),
+        out_dir=tmp_path,
+        prior_manifest=manifest,
+    )
+    assert estimate.already_present == 2
+    assert estimate.scene_count == 2
+    assert estimate.known_bytes == 1024 + 512
+    assert "already present: 2" in render_pull_estimate(estimate)
+    assert estimate.bytes_text == "1.5 KB (1536 bytes)"
+
+
+def test_existing_geotiff_window_stays_in_the_estimate(tmp_path: Path) -> None:
+    scene = Scene(
+        id="chip",
+        source="sentinel2",
+        datetime=_WHEN,
+        bbox=AOI,
+        platform="sentinel-2",
+        assets={
+            "visual": Asset(
+                href="https://example.com/chip.tif",
+                media_type="image/tiff; application=geotiff",
+                roles=["data"],
+                size_bytes=4096,
+            )
+        },
+    )
+    _write_scene(tmp_path, scene)
+    on_disk = estimate_pull(_catalog(_source("sentinel2", [scene])), out_dir=tmp_path)
+    window = estimate_pull(
+        _catalog(_source("sentinel2", [scene])),
+        out_dir=tmp_path,
+        bbox=AOI,
+    )
+    assert on_disk.already_present == 1
+    assert on_disk.scene_count == 0
+    assert window.already_present == 0
+    assert window.known_bytes == 4096
+    assert window.bytes_text == "4 KB (4096 bytes)"
+
+
+def test_cdse_and_earthdata_quota_are_not_invented() -> None:
+    estimate = estimate_pull(
+        _catalog(
+            _source("cdse_sentinel3_olci", [_scene("olci", size=10)]),
+            _source("viirs_vnp09ga", [_scene("viirs", size=10)]),
+            _source("gedi", [_scene("gedi", size=10)]),
+            _source("fldas", [_scene("fldas", size=50)]),
+            _source("modis_surface", [_scene("modis", size=10)]),
+        )
+    )
+    assert estimate.quota_text == "CDSE: not readable; Earthdata: not readable"
+    text = render_pull_estimate(estimate)
+    assert "quota: CDSE: not readable; Earthdata: not readable" in text
+    assert "12" not in estimate.quota_text
+    assert all(item.remaining_bytes is None for item in estimate.quotas)
+
+    sentinel = estimate_pull(_catalog(_source("sentinel2", [_scene("s2", size=10)])))
+    assert sentinel.quota_text == QUOTA_NOT_READABLE
+    assert all(item.remaining_bytes is None for item in sentinel.quotas)
+
+
+def test_existing_file_skips_the_prompt_and_the_download(tmp_path: Path) -> None:
+    scene = _scene("sized", size=1000)
+    _write_scene(tmp_path, scene)
+    stdin = _Stdin(tty=False)
+    code, err, gets = _run(tmp_path, stdin, clients={"sentinel2": _Catalog([scene])})
+    assert code == 0
+    assert stdin.reads == 0
+    assert "already present: 1" in err
+    assert "scenes: 0" in err
+    assert CONFIRM_PROMPT not in err
+    assert CONFIRMATION_REQUIRED not in err
+    assert gets == []
+    assert (tmp_path / "manifest.json").is_file()
+
+
+def test_cli_exits_1_on_cancel_and_2_on_refuse(tmp_path: Path) -> None:
+    assert EXIT_CANCELLED == 1
+    assert EXIT_REFUSED == 2
+    declined, no_err, no_gets = _run(tmp_path / "no", _Stdin("n\n", tty=True))
+    assert declined == 1
+    assert DOWNLOAD_CANCELLED in no_err
+    assert no_gets == []
+    assert not (tmp_path / "no" / "manifest.json").exists()
+
+    refused, err, gets = _run(tmp_path / "pipe", _Stdin(tty=False))
+    assert refused == 2
+    assert CONFIRMATION_REQUIRED in err
+    assert gets == []
+    assert not (tmp_path / "pipe" / "manifest.json").exists()
+
+
+class _Reporter:
+    """Records progress display calls around the estimate prompt."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def source_start(self, name: str) -> None:
+        return None
+
+    def source_search_done(self, name: str, *, scenes: int, error: str | None) -> None:
+        return None
+
+    def source_pull(self, name: str, *, saved: int, total: int, label: str = "downloading") -> None:
+        return None
+
+    def source_done(self, name: str) -> None:
+        return None
+
+    def suspend(self) -> None:
+        self.events.append("suspend")
+
+    def resume(self) -> None:
+        self.events.append("resume")
+
+    def close(self) -> None:
+        self.events.append("close")
+
+
+def test_reporter_resumes_when_the_download_is_refused_or_cancelled(tmp_path: Path) -> None:
+    previous_in, previous_err = sys.stdin, sys.stderr
+    try:
+        sys.stderr = io.StringIO()
+        sys.stdin = _Stdin(tty=False)
+        refused = _Reporter()
+        assert asyncio.run(_pull_until_prompt(tmp_path / "refused", refused)) == 2
+        assert refused.events == ["suspend", "resume", "close"]
+
+        sys.stdin = _Stdin("n\n", tty=True)
+        cancelled = _Reporter()
+        assert asyncio.run(_pull_until_prompt(tmp_path / "cancelled", cancelled)) == 1
+        assert cancelled.events == ["suspend", "resume", "close"]
+    finally:
+        sys.stdin, sys.stderr = previous_in, previous_err
+
+
+async def _pull_until_prompt(out: Path, reporter: _Reporter) -> int:
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_unused_http))
+    try:
+        return await execute_pull(
+            source_names=["sentinel2"],
+            request=_request(),
+            out_dir=out,
+            search_only=False,
+            concurrency=1,
+            asset_name=None,
+            reporter=reporter,
+            clients={"sentinel2": _Catalog([_scene("sized", size=1000)])},
+            http=http,
+        )
+    finally:
+        await http.aclose()
+
+
+def _write_scene(out: Path, scene: Scene, *, content: bytes = b"present") -> Path:
+    picked = pick_asset(scene)
+    assert picked is not None
+    key, asset = picked
+    dest = output_source_dir(out, scene.source)
+    assert dest is not None
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / scene_filename(scene.id, key, asset_suffix(asset))
+    path.write_bytes(content)
+    return path
+
+
+def _unused_http(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"download started: {request.url}")

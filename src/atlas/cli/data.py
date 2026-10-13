@@ -89,8 +89,11 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
             "overlapping --coords. fldas landsurface writes a CSV training table. "
             "A signed STAC next link is not stored, so later pages can stay unfetched. "
             "That pull prints a warning and still exits 0. "
-            "A download prints a size estimate from the search and starts only after "
-            "confirmation, or when --yes is passed. Without a terminal, --yes is required."
+            "A download prints a size estimate from the search. Files already on disk "
+            "or listed in a resume manifest are left out of that estimate. "
+            "The download starts only after confirmation, or when --yes is passed. "
+            "Without a terminal, --yes is required. Remaining quota is included "
+            "when a provider publishes it; otherwise the estimate says quota is not readable."
         ),
         epilog=f"example:\n  {_EXAMPLE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -460,8 +463,10 @@ async def execute_pull(
     A source that derives a table instead of assets (FLDAS) writes its CSV here;
     its failures are recorded so a table that was never written returns 1.
     After the search, a download prints a size estimate and waits for
-    confirmation unless ``assume_yes`` is set. Search-only does not prompt.
-    A cancelled or refused download writes nothing.
+    confirmation unless ``assume_yes`` is set or nothing remains to download.
+    Files already on disk or listed in the resume manifest are left out of
+    the estimate. Search-only does not prompt. A cancelled or refused download
+    writes nothing and still resumes the progress display.
 
     Args:
         source_names: Registry names to search.
@@ -517,14 +522,19 @@ async def execute_pull(
                 catalog,
                 asset_name=asset_name,
                 unknown_byte_sources=_unknown_byte_sources(live_clients, extract_tables),
+                out_dir=out_dir,
+                prior_manifest=prior_manifest,
+                bbox=request.bbox,
             )
             reporter.suspend()
-            print(render_pull_estimate(estimate), file=sys.stderr, flush=True)
-            if any(src.error is None and src.scenes for src in catalog.sources):
-                blocked = confirm_download(assume_yes=assume_yes)
-                if blocked is not None:
-                    return blocked
-            reporter.resume()
+            try:
+                print(render_pull_estimate(estimate), file=sys.stderr, flush=True)
+                if estimate.scene_count > 0:
+                    blocked = confirm_download(assume_yes=assume_yes)
+                    if blocked is not None:
+                        return blocked
+            finally:
+                reporter.resume()
         report = DownloadReport()
         table_failed = False
         table_usage = False
