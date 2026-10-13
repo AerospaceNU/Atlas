@@ -234,7 +234,10 @@ def test_resume_replaces_a_reprocessed_scene_and_reports_it(
     assert record["collection"] == COLLECTION
     assert record["datetime"] == "2024-07-01T15:31:00Z"
     assert record["footprint"] == [0.0, 0.0, 1.0, 1.0]
-    assert "replaced scene old-scene with new-scene" in err
+    assert (
+        "replaced scene old-scene with new-scene "
+        "(no stored grid key; matched by time and footprint)" in err
+    )
     assert "other-collection" not in source["scene_ids"]
     assert "too-late" not in source["scene_ids"]
     assert "elsewhere" not in source["scene_ids"]
@@ -264,7 +267,10 @@ def test_refresh_replaces_a_reprocessed_scene_and_reports_it(
     err = capsys.readouterr().err
     assert source["scene_ids"] == ["new-scene"]
     assert source["replacements"] == [{"old_id": "old-scene", "new_id": "new-scene"}]
-    assert "replaced scene old-scene with new-scene" in err
+    assert (
+        "replaced scene old-scene with new-scene "
+        "(no stored grid key; matched by time and footprint)" in err
+    )
     assert "old-scene" not in source["scene_ids"]
 
 
@@ -374,7 +380,10 @@ def test_neighbour_beside_a_real_reprocess_does_not_make_it_ambiguous(
     assert source["scene_ids"] == ["new-scene"]
     assert source["replacements"] == [{"old_id": "old-scene", "new_id": "new-scene"}]
     assert "neighbour-tile" not in source["scene_ids"]
-    assert "replaced scene old-scene with new-scene" in err
+    assert (
+        "replaced scene old-scene with new-scene "
+        "(no stored grid key; matched by time and footprint)" in err
+    )
     assert "ambiguous" not in err
 
 
@@ -484,6 +493,22 @@ def test_manifest_stores_the_stable_grid_key(tmp_path: Path) -> None:
     assert run_data(_args(tmp_path), clients={"sentinel2": catalog}) == 0
     record = _source(_manifest(tmp_path))["scenes"][0]
     assert record["grid_key"] == {"s2:mgrs_tile": "31TCJ"}
+
+
+def test_stored_grid_key_omits_the_time_and_footprint_note(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    catalog = _Catalog()
+    catalog.pages = [_scene("old-scene", properties={"s2:mgrs_tile": "31TCJ"})]
+    assert run_data(_args(tmp_path), clients={"sentinel2": catalog}) == 0
+    capsys.readouterr()
+    catalog.pages = []
+    catalog.present = {}
+    catalog.candidates = [_scene("new-scene", properties={"s2:mgrs_tile": "31TCJ"})]
+    assert run_data(_args(tmp_path, "--resume"), clients={"sentinel2": catalog}) == 0
+    err = capsys.readouterr().err
+    assert "replaced scene old-scene with new-scene" in err
+    assert "no stored grid key" not in err
 
 
 def test_grid_key_must_match() -> None:

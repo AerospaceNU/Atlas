@@ -8,6 +8,11 @@ Only STAC sources resolve replacements. ``StacApiClient`` confirms which
 stored ids still exist and searches by place and time. Every other source
 returns None from those hooks, and the pull leaves that source's ids
 unchecked.
+
+An old manifest row has no grid key. Matching then uses the time window and
+footprint IoU, and the replacement line says so. ``sat:relative_orbit`` is a
+weak key: many scenes on one pass share it, so a match on that key still
+depends on the time window and the footprint IoU.
 """
 
 from __future__ import annotations
@@ -112,11 +117,20 @@ class SceneRecord:
 
 @dataclass(frozen=True)
 class Replacement:
-    """A stored id that was replaced by exactly one place-and-time match."""
+    """A stored id that was replaced by a place-and-time match.
+
+    Attributes:
+        old_id: Id that no longer resolves.
+        new_id: Id that replaced it.
+        scene: Catalog scene for ``new_id``.
+        missing_grid_key: True when the stored row had no grid key, so the
+            match used the time window and footprint IoU.
+    """
 
     old_id: str
     new_id: str
     scene: Scene
+    missing_grid_key: bool = False
 
 
 @dataclass(frozen=True)
@@ -272,7 +286,14 @@ def reconcile(
         chosen = _choose_match(matches)
         if chosen is not None:
             claimed.add(chosen.id)
-            replacements.append(Replacement(old_id=item.id, new_id=chosen.id, scene=chosen))
+            replacements.append(
+                Replacement(
+                    old_id=item.id,
+                    new_id=chosen.id,
+                    scene=chosen,
+                    missing_grid_key=item.grid_key is None,
+                )
+            )
         elif not matches:
             unresolved.append(Unresolved(item.id, "no match"))
         else:
@@ -344,6 +365,9 @@ def project_records(
 def resolution_lines(source: str, resolution: SourceResolution) -> list[str]:
     """Return the user-facing lines for one source's identity check.
 
+    A replacement of a row that stored no grid key says it matched by time
+    and footprint. A row that stored a grid key does not add that note.
+
     Args:
         source: Registry name.
         resolution: Check result. An unchecked result has nothing to say.
@@ -355,7 +379,12 @@ def resolution_lines(source: str, resolution: SourceResolution) -> list[str]:
         return []
     lines: list[str] = []
     for replacement in resolution.replacements:
-        lines.append(f"{source}: replaced scene {replacement.old_id} with {replacement.new_id}")
+        note = ""
+        if replacement.missing_grid_key:
+            note = " (no stored grid key; matched by time and footprint)"
+        lines.append(
+            f"{source}: replaced scene {replacement.old_id} with {replacement.new_id}{note}"
+        )
     for pending in resolution.unresolved:
         if pending.reason == "ambiguous":
             listed = ", ".join(pending.candidates)
@@ -425,6 +454,13 @@ def _same_scene(matches: Sequence[Scene]) -> bool:
 
 
 def _same_grid(stored: GridKey | None, scene: Scene) -> bool:
+    """True when the candidate may stand in for this stored row.
+
+    An old manifest has no grid key. The candidate is then kept or dropped
+    by the time window and footprint IoU alone, and the replacement line
+    says that. ``sat:relative_orbit`` is a weak key: it only names the
+    pass, so those same checks still have to agree.
+    """
     if stored is None:
         return True
     return grid_key_from_properties(scene.properties) == stored
@@ -451,6 +487,10 @@ def grid_key_from_properties(properties: Mapping[str, Any]) -> GridKey | None:
     ``grid:code``, then ``landsat:wrs_path`` with ``landsat:wrs_row``,
     then ``sat:relative_orbit``. The manifest stores that key, and a
     later lookup requires the same key.
+
+    ``sat:relative_orbit`` is a weak key. Many scenes on one pass share
+    it, so storing it does not by itself identify the tile. The time
+    window and the footprint IoU still have to agree.
 
     Args:
         properties: STAC item properties, or a manifest ``grid_key`` object.
