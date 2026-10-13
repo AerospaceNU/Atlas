@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 from datetime import datetime as DateTime
 from enum import StrEnum
@@ -109,6 +109,46 @@ class BBox(BaseModel):
             for west, east in self._lon_ranges()
             for other_west, other_east in other._lon_ranges()
         )
+
+    def iou(self, other: BBox) -> float:
+        """Return the intersection-over-union of the two boxes.
+
+        The score is the shared area divided by the combined area, in square
+        degrees. Boxes that only touch score 0. A box that crosses 180° is
+        split there before the longitude overlap is measured, so a dateline
+        footprint is not compared as the long way around the globe.
+
+        Args:
+            other: Box to compare with this one.
+
+        Returns:
+            A score from 0 to 1. Identical boxes score 1.
+        """
+        intersection = self._overlap_area(other)
+        if intersection <= 0.0:
+            return 0.0
+        union = self._area() + other._area() - intersection
+        if union <= intersection:
+            return 1.0
+        return intersection / union
+
+    def _area(self) -> float:
+        height = self.north - self.south
+        if height <= 0.0:
+            return 0.0
+        return self.lon_span * height
+
+    def _overlap_area(self, other: BBox) -> float:
+        height = min(self.north, other.north) - max(self.south, other.south)
+        if height <= 0.0:
+            return 0.0
+        width = 0.0
+        for west, east in self._lon_ranges():
+            for other_west, other_east in other._lon_ranges():
+                overlap = min(east, other_east) - max(west, other_west)
+                if overlap > 0.0:
+                    width += overlap
+        return width * height
 
     def _lon_ranges(self) -> list[tuple[float, float]]:
         if self.west > self.east:
@@ -1020,3 +1060,47 @@ class DataPullClient(ABC):
             An empty page that still carries ``page_cursor``.
         """
         return PullResult(request=request, scenes=[], next_cursor=page_cursor)
+
+    async def resolve_scene_ids(self, scene_ids: Sequence[str]) -> Mapping[str, Scene] | None:
+        """Return stored scenes whose ids still exist.
+
+        Only STAC sources resolve replacements. ``StacApiClient`` confirms
+        which ids the collection still serves. Every other source keeps this
+        default and returns None, and the pull leaves that source's ids
+        unchecked: they are not reported missing and they are not replaced.
+
+        Args:
+            scene_ids: Ids recorded in the pull manifest.
+
+        Returns:
+            A map of ids the catalog still serves. Missing keys are gone.
+            None means this client cannot check ids, so the caller leaves
+            the stored ids as they are.
+        """
+        del scene_ids
+        return None
+
+    async def find_scenes_by_place_time(
+        self,
+        *,
+        collection: str,
+        when: DateTime,
+        footprint: BBox,
+    ) -> list[Scene] | None:
+        """Return scenes near one acquisition and footprint.
+
+        Only STAC sources search this way. Other sources return None, and
+        the pull does not invent a replacement for them.
+
+        Args:
+            collection: Collection the stored scene came from.
+            when: Acquisition time of the stored scene.
+            footprint: Footprint box of the stored scene.
+
+        Returns:
+            Catalog hits to filter by collection, time tolerance, footprint
+            IoU, and grid key. None means this client cannot search that way,
+            so the caller leaves the stored ids unchecked.
+        """
+        del collection, when, footprint
+        return None
