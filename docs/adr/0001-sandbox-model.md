@@ -29,21 +29,49 @@ Three models were considered:
 
 ## Decision
 
-We use **option 1, workspace-scoped path and process enforcement**, and
-`bash_tool` stays enabled by default (`trust = "default"`).
+File tools use **option 1, workspace-scoped path enforcement**. `bash_tool`
+uses a filesystem slice of **option 2** where the OS provides one, and stays
+enabled by default on Linux and macOS (`trust = "default"`). On Windows it
+is opt-in and off unless that list is requested.
 
 This is two different guarantees, and they must not be confused:
 
 - **The file tools are confined.** `write_file` and `segment_landcover`
   write only inside the session's artifact folder, and `read_file` and
   `segment_landcover` read only from that folder or the project workspace.
-- **`bash_tool` is not confined.** Only its *starting* directory is
-  checked, and by default it starts in the project workspace. A command
-  runs with the user's full privileges: it can `cd ..`, read `~`, change
-  any file the user can, and use the network. We accept that in exchange
-  for having a general shell available by default. The measures below
-  limit what the process inherits and how long it lives, not what it can
-  reach.
+- **`bash_tool` is confined by the OS sandbox, not by the text scan.** The
+  scan is best-effort. It resolves paths it can see, and it rejects
+  command substitution, parameter expansion, globs, a few `python` / `perl`
+  / `node` eval shapes (`-c` / `-e`, combined short flags, an `env`
+  prefix, and a program read from stdin), and `exec(open(...))`. An
+  interpreter can still build a path the scan never sees. That path is
+  stopped by the sandbox, or the shell does not start. On Windows the scan
+  is the only layer.
+
+  The shell refuses to start when the user key directory or `ATLAS_HOME`
+  resolves inside the workspace. A key denial does not include the path or
+  the file contents. On Linux 5.13 or newer the child is placed in a
+  Landlock ruleset: the workspace (with execute), read-only `/etc`, a
+  private `TMPDIR` inside the workspace, and the toolchain (`/usr`, `/bin`,
+  `/lib`, `/lib64`, plus the interpreter prefix). The artifact root and
+  `proposals/` are not in that accessible tree when they already exist
+  inside the workspace. Landlock cannot exclude a child of a granted
+  directory, so a rule on the workspace root is applied only after a user
+  namespace bind-mounts those directories out of view. User namespaces are
+  required for that hide. If they are unavailable, or the mount cannot be
+  applied, the shell does not start. The error says the sandbox needs user
+  namespaces or an artifact root outside the workspace. The host does not
+  rename or move those directories. Granting the root while they still sit
+  inside it would make them readable. An artifact root that is already
+  outside the workspace needs no user namespace. If Landlock cannot be
+  applied, the child exits with a clear message and bash is not started.
+  On macOS, `sandbox-exec` denies
+  the key directory and file access outside the workspace, aside from the
+  toolchain and system read paths. If `sandbox-exec` is missing, cannot be
+  launched, or rejects the profile, `bash_tool` raises a sandbox-unavailable
+  denial rather than returning a normal command result. The network is
+  unrestricted on every platform. A child that calls `setsid()` still
+  leaves the process group.
 
 ### Two roots
 
@@ -91,10 +119,32 @@ Both fail with a clear error; neither silently truncates.
   root when no workspace is mounted). Any other value goes through
   `resolve_read()`, and an absolute or escaping path raises
   `SandboxDenied`, so it is audited, rather than being returned as plain
-  text.
+  text. The same check refuses a directory that resolves into
+  `~/.atlas/keys` or `<artifact root>/proposals`.
+- **Command paths.** `shell_guard.guard_shell_command()` is a best-effort
+  scan. It resolves paths, redirects, and `cd` targets it can see. `..` and
+  absolute paths that stay inside the workspace are allowed. Ones that
+  leave are refused. Symlinks that already exist are judged after
+  resolution. `~/.atlas/keys` is refused when the scan can see it, and the
+  error text does not include the key. `<artifact root>/proposals` is not a
+  runnable path when the scan can see it, including `python proposals/tool.py`
+  and a working directory inside that folder. Command substitution,
+  parameter expansion, and globs are refused because they can hide a path.
+  `python` / `perl` / `node` eval is refused when the command text shows
+  `-c` or `-e` (including a combined short flag such as `-Ic`), an `env`
+  prefix, or a program taken from stdin (`python3 -`). That check is
+  best-effort and is the only layer on opt-in Windows. A path built inside
+  a script is not visible to this scan. A hardlinked regular file is
+  refused, matching the file tools. Path comparison folds case on macOS and
+  Windows. The OS sandbox is what stops a path the scan misses, including a
+  symlink created while the command is running: creating the link inside
+  the workspace can succeed, and reading or writing through it to a file
+  outside the ruleset is denied.
 - **Environment.** The child receives only `PATH`, `HOME`, `LANG`,
-  `LC_ALL`, `TMPDIR`, `USER` and `SHELL`, so API keys and tokens held by
-  the host process aren't inherited.
+  `LC_ALL`, `USER` and `SHELL`, plus a private `TMPDIR` created inside the
+  workspace for that command. The host `TMPDIR` is not passed through, so
+  API keys and tokens held by the host process aren't inherited and temp
+  files are not written to the host temp directory.
 - **stdin.** The child's stdin is `/dev/null`. The session reads the user's
   protocol messages on its own stdin, and an inherited stdin let a command
   read or swallow them.
@@ -142,12 +192,22 @@ tools can create files where the log lives:
 
 ## Rejected alternatives and why
 
-**OS-level confinement** was rejected for now. It is the only option that
-would actually confine `bash_tool`. The cost is platform-specific code
-(different primitives on macOS and Linux, and CI runners that may not
-support them) and the work of writing a policy that still lets ordinary
-commands run. We chose to keep Bash available by default without this, and
-to record the gap instead of implying it's closed.
+**OS-level confinement of the whole session** was rejected. The shell does
+use a filesystem sandbox. On Linux that is Landlock (kernel 5.13 or newer):
+the workspace is executable, `/etc` is read-only, temp files go to a private
+`TMPDIR` inside the workspace, and the toolchain paths above are readable
+and executable. The interpreter prefix is included so a virtualenv outside
+the workspace can still start; it is not writable. The artifact root and
+`proposals/` are kept out of that
+tree. User namespaces are required when those directories already sit
+inside the workspace. Without them the shell does not start; nothing is
+renamed on the host. Devices
+a redirect needs (`/dev/null` and the other null devices) are included. On
+macOS the same boundary is a `sandbox-exec` profile. If that program is
+missing, cannot be launched, or rejects the profile, the tool does not run.
+Windows has no such confinement, so `bash_tool` is opt-in and warns, and the
+text scan is the only layer. The network is unrestricted. A container
+remains out of scope.
 
 **Container/VM isolation** was rejected for now. It is a much larger
 operational change (image builds, session lifecycle tied to container
@@ -156,10 +216,9 @@ same user who started it.
 
 ## Revisit when
 
-- `bash_tool` is expected to be safe against prompt injection, for example
-  when the agent starts reading untrusted content such as downloaded
-  files, web pages or third-party metadata. Option 2 is then the right
-  fix.
+- `bash_tool` is expected to be safe against prompt injection that uses
+  the network. The network is unrestricted. Landlock and `sandbox-exec`
+  cover host files the text scan cannot see; they do not cover the network.
 - A tool starts executing content not written by us, such as running a
   model-authored script under its own interpreter and dependencies.
 - Atlas serves sessions for anyone other than the person running it
@@ -173,9 +232,15 @@ same user who started it.
   the single path for every file-touching tool. A new tool that builds a
   path without `resolve()` or `resolve_read()` bypasses the sandbox. This
   is a code-review invariant, not something the OS enforces.
-- **`bash_tool` is unconfined** beyond its starting directory, as stated
-  in the decision. There are no filesystem, network, CPU, memory or disk
-  limits on what a command does.
+- **`bash_tool` can still use the network.** Nothing in the Landlock
+  ruleset or the macOS profile blocks it. A child that calls `setsid()`
+  leaves the process group. Landlock and `sandbox-exec` bound the files
+  the child can open. They do not bound CPU, memory, or disk. On Windows
+  there is no OS file boundary; the tool is off unless it is opted in, and
+  it warns. A path the text scan misses can still be opened when it stays
+  inside the workspace and is not the masked artifact root or
+  `proposals/`. Without user namespaces, `bash_tool` does not run when
+  either of those directories already exists inside the workspace.
 - **A child that calls `setsid()`** leaves the process group we kill and
   can outlive the call. Only OS-level tracking (cgroups, a job object or a
   container) closes this.
@@ -220,6 +285,22 @@ Offline tests, run in CI:
   (working directory checks, scrubbed environment, stdin cut off, timeout
   bounds, group kill on timeout and on normal return, output truncation,
   escape stripping and binary output).
+- `tests/test_shell_workspace_guard.py`: the shell's cwd is the workspace;
+  `..` and absolute paths that leave it are denied; a symlink escape is
+  denied; a user-key read is denied and the error does not contain the
+  key; the shell refuses to start when the key directory or `ATLAS_HOME`
+  is inside the workspace; a drafted tool under `proposals/` is not
+  executed, including an interpreter-built path and a copy of that tree;
+  a symlink created during the command cannot read or write a host file;
+  without user namespaces, and with `proposals/` inside the workspace, the
+  shell reports that it needs user namespaces or an artifact root outside
+  the workspace and does not run the command; Landlock denies an interpreter-built path
+  outside the workspace; a failed Landlock syscall exits without running
+  the command; `$(...)`, backticks, and `$VAR` are rejected; interpreter
+  eval flags combined flags, an `env` prefix, and stdin; macOS builds a
+  `sandbox-exec` profile, disables the tool when that program is missing,
+  and treats a launch or profile failure as a sandbox denial; Windows
+  keeps the tool opt-in and off the default list.
 - `tests/test_tool_write_file.py`: oversized writes, byte rather than
   character counting, absolute and `..` paths, and not writing through a
   hardlink.
