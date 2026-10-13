@@ -552,6 +552,19 @@ def _finite_float(raw: object) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _file_size(raw: object) -> int | None:
+    """Return a STAC ``file:size`` in bytes, or None when it is not a count.
+
+    Only a non-negative integer is a reported size. Strings, floats, and
+    booleans are left unknown so a missing or oddly typed field is not guessed.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    if raw < 0:
+        return None
+    return raw
+
+
 def item_to_scene(
     feature: dict[str, Any],
     *,
@@ -592,6 +605,7 @@ def item_to_scene(
                 roles=list(roles) if isinstance(roles, list) else [],
                 scale=scale,
                 offset=offset,
+                size_bytes=_file_size(spec.get("file:size")),
             )
             if asset is not None:
                 assets[str(name)] = asset

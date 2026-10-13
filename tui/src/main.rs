@@ -579,6 +579,11 @@ impl App {
                 self.transcript
                     .push(tool_note(format!("using skill {name}")));
             }
+            ServerMessage::Goal { message, .. } => {
+                if !message.is_empty() {
+                    self.transcript.push(tool_note(message));
+                }
+            }
             ServerMessage::SaveSkill {
                 name,
                 path,
@@ -1416,6 +1421,7 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
                 Some(serde_json::json!({"type": "new"}))
             }
         }
+        "/goal" => goal_command(app, text),
         "/model" => {
             let query = text.trim().trim_start_matches("/model").trim();
             app.picker_filter = query.to_string();
@@ -1516,6 +1522,38 @@ const KEY_USAGE: &str = "usage: /key session | /key user | /key delete | \
 /key earthdata session | /key earthdata user | /key earthdata delete | \
 /key firms session | /key firms user | /key firms delete";
 
+const GOAL_USAGE: &str = "usage: /goal [text] | /goal clear";
+
+/// `/goal`, `/goal clear`, or `/goal` plus the rest of the line.
+///
+/// `/goal clear` followed by another token is rejected and does not change
+/// the goal. The session stores the text; this only builds the request.
+fn goal_command(app: &mut App, text: &str) -> Option<serde_json::Value> {
+    let Some(rest) = goal_argument(text) else {
+        app.transcript.push(tool_note(GOAL_USAGE));
+        return None;
+    };
+    if rest.is_empty() {
+        return Some(serde_json::json!({"type": "goal"}));
+    }
+    if rest == "clear" {
+        return Some(serde_json::json!({"type": "goal", "clear": true}));
+    }
+    Some(serde_json::json!({"type": "goal", "text": rest}))
+}
+
+/// Text after `/goal`, or `None` when `/goal clear` has another token.
+fn goal_argument(text: &str) -> Option<&str> {
+    let rest = text.trim().strip_prefix("/goal")?.trim();
+    if rest.is_empty() || rest == "clear" {
+        return Some(rest);
+    }
+    if rest.split_whitespace().next() == Some("clear") {
+        return None;
+    }
+    Some(rest)
+}
+
 fn credential_variable(token: &str) -> Option<&'static str> {
     match token {
         "earthdata" => Some("EARTHDATA_TOKEN"),
@@ -1596,10 +1634,14 @@ struct MenuItem {
 /// Command or fixed-argument options that match `text`, or an empty list when
 /// the menu should stay hidden (free text after a finished command).
 fn menu_options(text: &str) -> Vec<MenuItem> {
-    const COMMANDS: [MenuItem; 11] = [
+    const COMMANDS: [MenuItem; 12] = [
         MenuItem {
             token: "/new",
             description: "Start a fresh conversation",
+        },
+        MenuItem {
+            token: "/goal",
+            description: "Name what this session is for",
         },
         MenuItem {
             token: "/model",
@@ -1666,7 +1708,7 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
     }
 
     match command {
-        "/model" => Vec::new(),
+        "/model" | "/goal" => Vec::new(),
         "/sessions" | "/artifacts" | "/save-skill" | "/enable-skill" => Vec::new(),
         "/key" => key_menu(&rest),
         _ => Vec::new(),
@@ -1843,6 +1885,7 @@ fn is_finished_command(text: &str) -> bool {
     let mut words = trimmed.split_whitespace();
     let command = words.next().unwrap_or("");
     match command {
+        "/goal" => goal_argument(trimmed).is_some(),
         "/skill" => words.next().is_some(),
         "/save-skill" => words.next().is_some() && words.next().is_none(),
         "/enable-skill" => match words.next() {
@@ -2878,8 +2921,8 @@ mod tests {
         expand_selected, finish_streams, format_context, is_finished_command, menu_action,
         menu_options,
         nudge_scroll, picker_selection, price_per_million, select_tool, select_tool_at,
-        slash_outcome, wrap_text, Activity, App, MenuAction, Mode, Status, StreamText, ToolHit,
-        TranscriptLine,
+        slash_outcome, status_hint, wrap_text, Activity, App, MenuAction, Mode, Status, StreamText,
+        ToolHit, TranscriptLine,
     };
     use crate::logo::logo_size;
     use crate::protocol::{CatalogEntry, ResourcePreview, ServerMessage, StatusSnapshot};
@@ -3224,6 +3267,103 @@ mod tests {
     }
 
     #[test]
+    fn goal_command_sets_the_rest_of_the_line() {
+        let mut app = App::new();
+        let payload = slash_outcome(&mut app, "/goal map  the flood").expect("goal");
+        assert_eq!(payload["type"], "goal");
+        assert_eq!(payload["text"], "map  the flood");
+        assert!(!payload.as_object().unwrap().contains_key("clear"));
+        assert!(tool_text(&app).is_empty());
+        assert!(is_finished_command("/goal map  the flood"));
+        assert!(is_finished_command("/goal"));
+        assert!(is_finished_command("/goal clear"));
+    }
+
+    #[test]
+    fn goal_without_text_asks_for_the_current_goal() {
+        let mut app = App::new();
+        let payload = slash_outcome(&mut app, "/goal").expect("show");
+        assert_eq!(payload, serde_json::json!({"type": "goal"}));
+        let spaced = slash_outcome(&mut app, "/goal   ").expect("blank");
+        assert_eq!(spaced, serde_json::json!({"type": "goal"}));
+    }
+
+    #[test]
+    fn goal_clear_asks_the_session_to_clear() {
+        let mut app = App::new();
+        let payload = slash_outcome(&mut app, "/goal clear").expect("clear");
+        assert_eq!(payload, serde_json::json!({"type": "goal", "clear": true}));
+    }
+
+    #[test]
+    fn goal_clear_with_an_extra_token_shows_usage_and_sends_nothing() {
+        let mut app = App::new();
+        assert!(slash_outcome(&mut app, "/goal clear extra").is_none());
+        assert_eq!(tool_text(&app), "usage: /goal [text] | /goal clear");
+        assert!(!is_finished_command("/goal clear extra"));
+        assert!(slash_outcome(&mut app, "/goal clear the coast").is_none());
+        assert!(tool_text(&app).contains("usage: /goal [text] | /goal clear"));
+    }
+
+    #[test]
+    fn goal_reply_prints_the_current_goal_or_says_none_is_set() {
+        let mut app = App::new();
+        app.apply(ServerMessage::Goal {
+            text: "map the flood".to_string(),
+            cleared: false,
+            message: "map the flood".to_string(),
+        });
+        assert_eq!(tool_text(&app), "map the flood");
+        app.apply(ServerMessage::Goal {
+            text: String::new(),
+            cleared: false,
+            message: "none is set".to_string(),
+        });
+        assert!(tool_text(&app).contains("none is set"));
+        app.apply(ServerMessage::Goal {
+            text: String::new(),
+            cleared: true,
+            message: "goal cleared".to_string(),
+        });
+        assert!(tool_text(&app).contains("goal cleared"));
+    }
+
+    #[test]
+    fn goal_sits_with_the_session_commands() {
+        let tokens: Vec<&str> = menu_options("/").iter().map(|item| item.token).collect();
+        assert_eq!(
+            tokens,
+            vec![
+                "/new",
+                "/goal",
+                "/model",
+                "/copy",
+                "/key",
+                "/skill",
+                "/sessions",
+                "/artifacts",
+                "/quit",
+                "/exit",
+                "/save-skill",
+                "/enable-skill",
+            ]
+        );
+        let filtered: Vec<&str> = menu_options("/g").iter().map(|item| item.token).collect();
+        assert_eq!(filtered, vec!["/goal"]);
+        assert!(menu_options("/goal map the flood").is_empty());
+    }
+
+    #[test]
+    fn command_hint_stays_the_short_list() {
+        let app = App::new();
+        assert_eq!(
+            status_hint(&app),
+            "enter send  /new /model /skill /key /quit"
+        );
+        assert!(!status_hint(&app).contains("/goal"));
+    }
+
+    #[test]
     fn skill_command_sends_the_name_and_argument() {
         let mut app = App::new();
         let payload = slash_outcome(&mut app, "/skill flood-check scene.png").expect("skill");
@@ -3373,6 +3513,7 @@ mod tests {
         let painted = screen(&mut app, 80, 24);
         for name in [
             "/new",
+            "/goal",
             "/model",
             "/copy",
             "/key",

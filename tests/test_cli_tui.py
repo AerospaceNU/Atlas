@@ -1,20 +1,36 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import subprocess
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from atlas.agent.contracts import CallTiming, ModelCall, TokenUsage
+from atlas.agent.artifacts import LocalArtifactStore
+from atlas.agent.contracts import (
+    CallTiming,
+    ChatMessage,
+    ModelCall,
+    ModelResponse,
+    TokenUsage,
+    ToolDefinition,
+    ToolRegistry,
+)
 from atlas.agent.metrics import (
     SessionTotals,
     apply_call,
     catalog_spend,
     format_token_count,
     format_tui_status,
+    output_tokens_per_second,
+    tokens_per_second,
 )
+from atlas.agent.runtime import Agent
+from atlas.agent.session import AgentSession, serve, session_goal_text
 from atlas.cli import main
 from atlas.cli.tui import TuiLaunchError, ensure_tui_binary, launch_tui
 
@@ -107,6 +123,68 @@ def test_output_speed_is_the_last_call_after_the_first_token() -> None:
     )
 
     assert totals.tokens_per_second == 10.0
+
+
+def test_output_rate_uses_a_normal_window_and_drops_a_near_zero_one() -> None:
+    normal = CallTiming(
+        http_status=200,
+        elapsed_seconds=0.5,
+        time_to_first_token_seconds=0.1,
+    )
+    # 4 completion tokens over the 0.4s spent generating them.
+    assert tokens_per_second(4, 0.4) == 10.0
+    assert output_tokens_per_second(4, normal) == 10.0
+
+    # 250 tokens over 1ms is the first chunk and the end of the stream
+    # landing together, which prints as 250000.0 without the floor.
+    sliver = CallTiming(
+        http_status=200,
+        elapsed_seconds=0.501,
+        time_to_first_token_seconds=0.5,
+    )
+    assert tokens_per_second(250, 0.001) is None
+    assert tokens_per_second(4, 0.0) is None
+    assert output_tokens_per_second(250, sliver) is None
+
+
+def test_near_zero_generation_window_keeps_the_previous_rate() -> None:
+    totals = SessionTotals(tokens_per_second=8.0)
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(completion_tokens=250),
+            timing=CallTiming(
+                http_status=200,
+                elapsed_seconds=0.501,
+                time_to_first_token_seconds=0.5,
+            ),
+        ),
+    )
+
+    assert totals.tokens_per_second == 8.0
+    text = format_tui_status(totals)
+    assert "last 8.0 tok/s" in text
+    assert "250000.0" not in text
+
+
+def test_near_zero_generation_window_stays_unset_without_a_previous_rate() -> None:
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(completion_tokens=250),
+            timing=CallTiming(
+                http_status=200,
+                elapsed_seconds=0.501,
+                time_to_first_token_seconds=0.5,
+            ),
+        ),
+    )
+
+    assert totals.tokens_per_second is None
+    text = format_tui_status(totals)
+    assert "last n/a tok/s" in text
+    assert "250000.0" not in text
 
 
 def test_fresh_session_spend_is_zero() -> None:
@@ -421,6 +499,55 @@ def test_missing_cargo_reports_a_clear_error(
 
     assert launch_tui([]) == 1
     assert "cargo was not found" in capsys.readouterr().err
+
+
+def test_goal_slash_results_are_session_text(tmp_path: Path) -> None:
+    """The TUI `/goal` command reports session text and leaves tools alone."""
+    model = _QuietModel()
+    registry = ToolRegistry()
+    session = AgentSession(Agent(model, registry, LocalArtifactStore(tmp_path)))
+    names = [tool.name for tool in session.agent.tools.definitions]
+    root = session.agent.artifacts.root
+    read_root = session.agent.artifacts.read_root
+
+    assert _goal_events(session, ['{"type":"goal"}'])[-1]["message"] == "none is set"
+
+    set_goal = _goal_events(session, ['{"type":"goal","text":"map  the flood"}'])[-1]
+    assert set_goal["message"] == "map  the flood"
+    assert set_goal["text"] == "map  the flood"
+    assert session.messages[1].content == session_goal_text("map  the flood")
+
+    shown = _goal_events(session, ['{"type":"goal"}'])[-1]
+    assert shown["message"] == "map  the flood"
+
+    rejected = _goal_events(session, ['{"type":"goal","clear":true,"text":"other"}'])[-1]
+    assert rejected == {"type": "error", "message": "usage: /goal [text] | /goal clear"}
+    assert session.goal == "map  the flood"
+
+    cleared = _goal_events(session, ['{"type":"goal","clear":true}'])[-1]
+    assert cleared["message"] == "goal cleared"
+    assert session.goal == ""
+    assert [tool.name for tool in session.agent.tools.definitions] == names
+    assert "goal" not in names
+    assert session.agent.artifacts.root == root
+    assert session.agent.artifacts.read_root == read_root
+    assert model.calls == 0
+
+
+def _goal_events(session: AgentSession, lines: list[str]) -> list[dict[str, Any]]:
+    stdout = io.StringIO()
+    code = serve(session, io.StringIO("".join(f"{line}\n" for line in lines)), stdout)
+    assert code == 0
+    return [json.loads(line) for line in stdout.getvalue().splitlines()]
+
+
+class _QuietModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, messages: list[ChatMessage], tools: list[ToolDefinition]) -> ModelResponse:
+        self.calls += 1
+        raise AssertionError((messages, tools))
 
 
 def _fake_repo(tmp_path: Path) -> Path:
