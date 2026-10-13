@@ -3,8 +3,11 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shutil
 import signal
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -12,10 +15,19 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.layout import user_keys_dir
 from atlas.agent.shell_guard import (
+    MACOS_SANDBOX_DISABLED,
+    WINDOWS_BASH_WARNING,
+    bash_tool_trust,
+    cleanup_mount_points,
     guard_shell_command,
+    prepare_mount_points,
+    refuse_shell_start,
+    require_landlock_kernel,
     sandbox_unavailable,
     sandboxed_shell_argv,
+    shell_excluded_paths,
 )
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -44,23 +56,24 @@ class BashTool(Tool):
     """Run a shell command confined to one local artifact workspace.
 
     The working directory is the project workspace when one is mounted, and
-    the artifact root otherwise. Every path the command names is resolved
-    before launch: absolute paths and ``..`` that leave the workspace fail,
-    a symlink is judged by its target, ``~/.atlas/keys`` is refused even when
-    a path only lands there after resolution, and the session ``proposals/``
-    directory is not a runnable path. The child gets a minimal environment,
-    and on Linux Landlock keeps it from opening anything else on the host.
-    Every call still kills the whole process group. A child that calls
-    ``setsid()`` leaves that group. See docs/adr/0001-sandbox-model.md.
+    the artifact root otherwise. A best-effort text scan rejects obvious
+    paths before launch. The boundary is the OS sandbox: Landlock on Linux
+    5.13 or newer, and ``sandbox-exec`` on macOS. The shell does not start
+    when the user key directory or ``ATLAS_HOME`` resolves inside the
+    workspace, or when that sandbox is unavailable. On Windows the tool is
+    opt-in and warns that there is no OS confinement. The network is not
+    restricted. Every call still kills the whole process group. A child that
+    calls ``setsid()`` leaves that group. See docs/adr/0001-sandbox-model.md.
     """
 
     name = "bash_tool"
     description = (
         "Run a shell command inside the workspace. The working directory is the workspace. "
-        "Absolute paths, '..' escapes, the user key directory, and drafted tool paths are denied. "
+        "A best-effort check rejects obvious escapes; Landlock or sandbox-exec is the boundary. "
+        "The network is not restricted. "
         "stdout and stderr are captured, and a non-zero exit is a result rather than an exception."
     )
-    trust: ClassVar[Literal["default", "opt_in"]] = "default"
+    trust: ClassVar[Literal["default", "opt_in"]] = bash_tool_trust()
     input_model = BashInputModel
 
     max_output_chars: ClassVar[int] = 200_000
@@ -73,45 +86,90 @@ class BashTool(Tool):
             return ToolResult(text=f"Working directory not found: {request.working_directory}")
 
         workspace = store.read_root or store.root
+        refuse_shell_start(workspace)
+        if sys.platform == "darwin" and shutil.which("sandbox-exec") is None:
+            raise SandboxDenied(MACOS_SANDBOX_DISABLED)
+        if sys.platform == "linux":
+            require_landlock_kernel()
         env = {key: os.environ[key] for key in _INHERITED_ENV_KEYS if key in os.environ}
         home = Path(env["HOME"]) if "HOME" in env else None
+        proposals = store.root / "proposals"
         guard_shell_command(
             request.command,
             cwd=cwd,
             workspace=workspace,
-            proposals=store.root / "proposals",
+            proposals=proposals,
             home=home,
         )
-
-        process = subprocess.Popen(
-            sandboxed_shell_argv(workspace, request.command),
-            cwd=cwd,
-            env=env,
-            # The session's own stdin carries the user's protocol messages.
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            start_new_session=True,
-        )
-        # start_new_session=True makes the shell the leader of a new process
-        # group whose id is its pid. Captured now because communicate() reaps
-        # the shell, and on macOS os.getpgid() fails once the leader has exited.
-        pgid = process.pid
+        excluded = shell_excluded_paths(workspace, store.root, proposals)
+        created: list[Path] = []
+        tmpdir: Path | None = None
+        mask_dir: Path | None = None
+        if sys.platform == "linux":
+            created = prepare_mount_points(excluded)
+            mask_dir = Path(tempfile.mkdtemp(prefix="atlas-shell-mask-"))
         try:
-            stdout, stderr = process.communicate(timeout=request.timeout)
-        except subprocess.TimeoutExpired:
-            return ToolResult(text=f"Command timed out after {request.timeout}s: {request.command}")
+            tmpdir = Path(tempfile.mkdtemp(prefix=".shell-tmp-", dir=workspace))
+            os.chmod(tmpdir, 0o700)
+        except OSError as exc:
+            if mask_dir is not None:
+                shutil.rmtree(mask_dir, ignore_errors=True)
+            cleanup_mount_points(created)
+            raise SandboxDenied("Shell sandbox is unavailable") from exc
+        env["TMPDIR"] = str(tmpdir)
+        env["TMP"] = str(tmpdir)
+        env["TEMP"] = str(tmpdir)
+        keys: list[Path] = []
+        with contextlib.suppress(RuntimeError):
+            keys.append(user_keys_dir())
+        if "HOME" in os.environ:
+            keys.append(Path(os.environ["HOME"]) / ".atlas" / "keys")
+
+        try:
+            argv = sandboxed_shell_argv(
+                workspace,
+                request.command,
+                tmpdir=tmpdir,
+                mask_dir=mask_dir,
+                excluded=excluded,
+                key_dirs=keys,
+            )
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=env,
+                # The session's own stdin carries the user's protocol messages.
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                start_new_session=True,
+            )
+            # start_new_session=True makes the shell the leader of a new process
+            # group whose id is its pid. Captured now because communicate() reaps
+            # the shell, and on macOS os.getpgid() fails once the leader has exited.
+            pgid = process.pid
+            try:
+                stdout, stderr = process.communicate(timeout=request.timeout)
+            except subprocess.TimeoutExpired:
+                return ToolResult(
+                    text=f"Command timed out after {request.timeout}s: {request.command}"
+                )
+            finally:
+                # A background child that redirects its stdio lets communicate()
+                # return normally, so the group is killed on every exit path.
+                self._kill_process_group(process, pgid)
         finally:
-            # A background child that redirects its stdio lets communicate()
-            # return normally, so the group is killed on every exit path.
-            self._kill_process_group(process, pgid)
+            self._cleanup_shell_dirs(tmpdir, mask_dir, created)
 
         if sandbox_unavailable(process.returncode, stderr):
-            raise SandboxDenied("Shell sandbox is unavailable")
+            detail = (stderr or "").strip() or "Shell sandbox is unavailable"
+            raise SandboxDenied(detail)
 
+        warning = f"{WINDOWS_BASH_WARNING}\n" if sys.platform == "win32" else ""
         output = (
+            f"{warning}"
             f"exit_code: {process.returncode}\n"
             f"stdout:\n{self._sanitize(stdout)}\n"
             f"stderr:\n{self._sanitize(stderr)}"
@@ -130,6 +188,18 @@ class BashTool(Tool):
         if working_directory in ("", "."):
             return store.read_root or store.root
         return store.resolve_read(working_directory)
+
+    def _cleanup_shell_dirs(
+        self,
+        tmpdir: Path | None,
+        mask_dir: Path | None,
+        created: list[Path],
+    ) -> None:
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        if mask_dir is not None:
+            shutil.rmtree(mask_dir, ignore_errors=True)
+        cleanup_mount_points(created)
 
     def _kill_process_group(self, process: subprocess.Popen[str], pgid: int) -> None:
         with contextlib.suppress(ProcessLookupError):
