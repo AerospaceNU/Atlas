@@ -2,11 +2,14 @@
 
 The text scan refuses obvious paths, ``..``, command substitution, parameter
 expansion, and a few interpreter-eval shapes. It does not see paths an
-interpreter builds at runtime. On Linux the child is placed under Landlock
-(kernel 5.13 or newer). The artifact root and ``proposals/`` are masked out of
-that view, because a Landlock rule cannot exclude a child of a granted
-directory. On macOS ``sandbox-exec`` is the boundary; without it ``bash_tool``
-does not run. The network is not restricted on any platform.
+interpreter builds at runtime, and on Windows it is the only layer. On Linux
+the child is placed under Landlock (kernel 5.13 or newer). The artifact root
+and ``proposals/`` are masked out of that view with a user namespace, or moved
+outside the workspace when that namespace is unavailable, because a Landlock
+rule cannot exclude a child of a granted directory. If neither is possible the
+shell does not start. On macOS ``sandbox-exec`` is the boundary; if it is
+missing or cannot be applied, ``bash_tool`` does not run. The network is not
+restricted on any platform.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ _EXPANSION = "Shell parameter expansion is not allowed"
 _GLOB = "Shell globbing is not allowed"
 _HEREDOC = "Shell heredoc is not allowed"
 _REJECTED = "Shell command is not allowed"
-_EVAL = "Interpreter eval is not allowed"
+_EVAL = "Interpreter eval is not allowed; this check is best-effort"
 _EXEC_OPEN = "Interpreter exec of a file is not allowed"
 _UNAVAILABLE = "Shell sandbox is unavailable"
 _KEY_INSIDE = "Shell cannot start because the user key directory is inside the workspace"
@@ -44,9 +47,18 @@ WINDOWS_BASH_WARNING = (
     "The command check is best-effort only. The network is not restricted."
 )
 
+# Best-effort only. Combined short flags (-Ic), an env prefix, and a bare
+# "-" (program on stdin) are included. A normal script path is not.
 _INTERPRETER_EVAL = re.compile(
-    r"(?:^|&&|\|\||[|;&(\n])\s*(?:python3?|perl|node)\b(?:\s+\S+)*?\s+-[ce]\b"
+    r"(?:^|&&|\|\||[|;&(\n])\s*"
+    r"(?:(?:[^\s|;&()]*/)?env\b"
+    r"(?:\s+(?:-[A-Za-z0-9]+|[A-Za-z_][A-Za-z0-9_]*=\S+))*\s+)?"
+    r"(?:python3?|perl|node)\b"
+    r"(?:\s+\S+)*?"
+    r"(?:\s+-[A-Za-z0-9]*[ce][A-Za-z0-9]*|\s+-)(?!\S)"
 )
+SANDBOX_EXEC_READY = "ATLAS_SANDBOX_READY"
+SANDBOX_EXEC_FAILED = f"{_UNAVAILABLE}: sandbox-exec could not be applied"
 _EXEC_OPEN_CALL = re.compile(r"\bexec\s*\(\s*open\s*\(")
 _SANDBOX_PATH_CHARS = set('"\\\n()')
 
@@ -75,6 +87,9 @@ _PATH_IN_WORD = re.compile(
 # private TMPDIR, argv[4] an empty mask directory, and the rest are paths to
 # hide. The script is stdlib-only so the child does not import Atlas before
 # Landlock. Landlock needs Linux 5.13 or newer. The network is not restricted.
+# A path-beneath rule covers every child, so the workspace root is granted
+# only after those paths are masked or renamed to mask_dir + ".hold" outside
+# the workspace. ATLAS_SHELL_NO_USERNS=1 forces the rename path.
 _LAUNCHER = r"""
 import ctypes
 import os
@@ -223,39 +238,78 @@ def _libc():
     return libc
 
 
-def _carve(libc, ruleset, workspace, excluded, access, handled):
-    def inside(path):
-        return any(path == root or path.startswith(root + os.sep) for root in excluded)
+_PARK_FAIL = "needs user namespaces or an artifact root outside the workspace"
 
-    def contains(path):
-        return any(root == path or root.startswith(path + os.sep) for root in excluded)
 
-    def walk(path):
-        if inside(path):
-            return
+def _outside_workspace(workspace, path):
+    root = os.path.realpath(workspace)
+    probe = path
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        real = os.path.realpath(probe)
+    except OSError:
+        return False
+    return real != root and not real.startswith(root + os.sep)
+
+
+def _hold_for(mask_dir):
+    parent = os.path.dirname(mask_dir) or os.sep
+    return os.path.join(parent, os.path.basename(mask_dir) + ".hold")
+
+
+def _unpark(excluded, hold):
+    if not hold or not os.path.isdir(hold):
+        return
+    for index, path in enumerate(excluded):
+        src = os.path.join(hold, str(index))
+        if not os.path.lexists(src):
+            continue
         try:
-            info = os.lstat(path)
+            if os.path.lexists(path):
+                displaced = path + ".shell-displaced"
+                suffix = 0
+                while os.path.lexists(displaced):
+                    suffix += 1
+                    displaced = path + ".shell-displaced-" + str(suffix)
+                os.rename(path, displaced)
+            parent = os.path.dirname(path)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            os.rename(src, path)
         except OSError:
-            return
-        if stat.S_ISLNK(info.st_mode):
-            return
-        if stat.S_ISDIR(info.st_mode) and contains(path):
-            try:
-                names = os.listdir(path)
-            except OSError:
-                return
-            for name in names:
-                walk(os.path.join(path, name))
-            return
+            continue
+
+
+def _park(workspace, excluded, mask_dir):
+    if not mask_dir or not _outside_workspace(workspace, mask_dir):
+        _fail(_PARK_FAIL)
+    hold = _hold_for(mask_dir)
+    if not _outside_workspace(workspace, hold):
+        _fail(_PARK_FAIL)
+    try:
+        os.makedirs(hold, 0o700)
+    except OSError:
+        _fail(_PARK_FAIL)
+    for index, path in enumerate(excluded):
+        if not os.path.lexists(path):
+            continue
+        if os.path.islink(path):
+            _unpark(excluded, hold)
+            _fail(_PARK_FAIL)
+        dest = os.path.join(hold, str(index))
         try:
-            _add(libc, ruleset, path, access, handled)
+            os.rename(path, dest)
         except OSError:
-            _fail("Landlock could not be applied")
+            _unpark(excluded, hold)
+            _fail(_PARK_FAIL)
+    return hold
 
-    walk(workspace)
 
-
-def _apply(libc, workspace, tmpdir, excluded, cover_workspace):
+def _apply(libc, workspace, tmpdir):
     try:
         abi = _syscall(libc, _SYS_LANDLOCK_CREATE, None, 0, _LANDLOCK_CREATE_VERSION)
     except OSError:
@@ -271,14 +325,11 @@ def _apply(libc, workspace, tmpdir, excluded, cover_workspace):
     except OSError:
         _fail("Landlock could not be applied")
     try:
-        if cover_workspace:
-            try:
-                if not _add(libc, ruleset, workspace, handled, handled):
-                    _fail("Landlock could not be applied")
-            except OSError:
+        try:
+            if not _add(libc, ruleset, workspace, handled, handled):
                 _fail("Landlock could not be applied")
-        else:
-            _carve(libc, ruleset, workspace, excluded, handled, handled)
+        except OSError:
+            _fail("Landlock could not be applied")
         try:
             _add(libc, ruleset, tmpdir, handled, handled)
         except OSError:
@@ -350,12 +401,92 @@ def _exec_bash(command):
     os.execvpe(bash, [bash, "-c", command], os.environ)
 
 
-def _confine(libc, workspace, command, tmpdir, excluded, cover):
+def _confine(libc, workspace, command, tmpdir):
     os.environ["TMPDIR"] = tmpdir
     os.environ["TMP"] = tmpdir
     os.environ["TEMP"] = tmpdir
-    _apply(libc, workspace, tmpdir, excluded, cover)
+    _apply(libc, workspace, tmpdir)
     _exec_bash(command)
+
+
+def _reap(pid):
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+
+
+def _prepare(libc, workspace, command, tmpdir, mask_dir, excluded):
+    notify_r, notify_w = os.pipe()
+    go_r, go_w = os.pipe()
+    done_r, done_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(notify_r)
+        os.close(go_w)
+        os.close(done_r)
+        try:
+            if libc.unshare(_CLONE_NEWUSER | _CLONE_NEWNS) != 0:
+                os.write(notify_w, b"C")
+                os.close(notify_w)
+                os.close(go_r)
+                os.close(done_w)
+                os._exit(0)
+            os.write(notify_w, b"R")
+            os.close(notify_w)
+            os.read(go_r, 1)
+            os.close(go_r)
+            if _mask(libc, excluded, mask_dir):
+                os.write(done_w, b"K")
+                os.close(done_w)
+                _drop_caps(libc)
+                _confine(libc, workspace, command, tmpdir)
+            else:
+                os.write(done_w, b"P")
+                os.close(done_w)
+                os._exit(0)
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 126
+            os._exit(code)
+        except Exception:
+            try:
+                _fail("Landlock could not be applied")
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 126
+                os._exit(code)
+        os._exit(126)
+    os.close(notify_w)
+    os.close(go_r)
+    os.close(done_w)
+    try:
+        kind = os.read(notify_r, 1)
+        if kind == b"C":
+            os.waitpid(pid, 0)
+            return "park"
+        if kind != b"R":
+            _reap(pid)
+            _fail("Landlock could not be applied")
+        if not _write_id_maps(pid):
+            _reap(pid)
+            _fail("Landlock could not be applied")
+        os.write(go_w, b"G")
+        outcome = os.read(done_r, 1)
+        if outcome == b"P":
+            os.waitpid(pid, 0)
+            return "park"
+        if outcome != b"K":
+            _reap(pid)
+            _fail("Landlock could not be applied")
+        _pid, status = os.waitpid(pid, 0)
+        return status
+    finally:
+        os.close(notify_r)
+        os.close(go_w)
+        os.close(done_r)
 
 
 def _write_id_maps(pid):
@@ -373,64 +504,28 @@ def _write_id_maps(pid):
     return True
 
 
-def _run(workspace, command, tmpdir, mask_dir, excluded):
-    libc = _libc()
-    if not excluded:
-        _confine(libc, workspace, command, tmpdir, excluded, True)
-        return
-    notify_r, notify_w = os.pipe()
-    go_r, go_w = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(notify_r)
-        os.close(go_w)
-        try:
-            if libc.unshare(_CLONE_NEWUSER | _CLONE_NEWNS) != 0:
-                os.write(notify_w, b"C")
-                os.close(notify_w)
-                os.close(go_r)
-                _confine(libc, workspace, command, tmpdir, excluded, False)
-                return
-            os.write(notify_w, b"R")
-            os.close(notify_w)
-            os.read(go_r, 1)
-            os.close(go_r)
-            if _mask(libc, excluded, mask_dir):
-                _drop_caps(libc)
-                _confine(libc, workspace, command, tmpdir, excluded, True)
-            else:
-                _confine(libc, workspace, command, tmpdir, excluded, False)
-        except SystemExit as exc:
-            code = exc.code if isinstance(exc.code, int) else 126
-            os._exit(code)
-        except Exception:
-            try:
-                _fail("Landlock could not be applied")
-            except SystemExit as exc:
-                code = exc.code if isinstance(exc.code, int) else 126
-                os._exit(code)
-        os._exit(126)
-    os.close(notify_w)
-    os.close(go_r)
-    try:
-        kind = os.read(notify_r, 1)
-        if kind == b"R":
-            if not _write_id_maps(pid):
-                os.kill(pid, 9)
-                _fail("Landlock could not be applied")
-            os.write(go_w, b"G")
-        elif kind != b"C":
-            os.kill(pid, 9)
-            _fail("Landlock could not be applied")
-    finally:
-        os.close(notify_r)
-        os.close(go_w)
-    _pid, status = os.waitpid(pid, 0)
+def _forward(status):
     if os.WIFEXITED(status):
         os._exit(os.WEXITSTATUS(status))
     if os.WIFSIGNALED(status):
         os._exit(128 + os.WTERMSIG(status))
     os._exit(126)
+
+
+def _run(workspace, command, tmpdir, mask_dir, excluded):
+    libc = _libc()
+    force_park = os.environ.get("ATLAS_SHELL_NO_USERNS") == "1"
+    if force_park or not excluded:
+        if excluded:
+            _park(workspace, excluded, mask_dir)
+        _confine(libc, workspace, command, tmpdir)
+        return
+    status = _prepare(libc, workspace, command, tmpdir, mask_dir, excluded)
+    if status == "park":
+        _park(workspace, excluded, mask_dir)
+        _confine(libc, workspace, command, tmpdir)
+        return
+    _forward(status)
 
 
 def main():
@@ -550,7 +645,7 @@ def shell_excluded_paths(workspace: Path, artifact_root: Path, proposals: Path) 
     root = workspace.resolve()
     chosen: list[Path] = []
     for path in (artifact_root.resolve(), proposals.resolve()):
-        if path == root or not _contains(root, path):
+        if _paths_equal(path, root) or not _contains(root, path):
             continue
         if any(_contains(earlier, path) for earlier in chosen):
             continue
@@ -585,6 +680,52 @@ def cleanup_mount_points(created: Sequence[Path]) -> None:
             path.rmdir()
         except OSError:
             continue
+
+
+def parked_hold_dir(mask_dir: Path) -> Path:
+    """Return the sibling directory that holds trees parked outside the workspace.
+
+    The hold is ``mask_dir`` with ``.hold`` appended to its name. It must not
+    be the mask directory itself: that directory is the bind-mount source, and
+    a numeric child would be confused with a parked tree.
+    """
+    return mask_dir.with_name(mask_dir.name + ".hold")
+
+
+def restore_parked_paths(mask_dir: Path | None, excluded: Sequence[Path]) -> bool:
+    """Move parked trees back next to ``mask_dir``. Return True if none remain.
+
+    A path the command recreated is renamed aside with a ``.shell-displaced``
+    suffix so the parked tree can return to its original path. A failure
+    leaves the hold in place so the parked files are not deleted.
+    """
+    if mask_dir is None:
+        return True
+    hold = parked_hold_dir(mask_dir)
+    if not hold.is_dir():
+        return True
+    leftover = False
+    for index, path in enumerate(excluded):
+        src = hold / str(index)
+        if not src.exists() and not src.is_symlink():
+            continue
+        try:
+            if path.exists() or path.is_symlink():
+                path.rename(_displaced_path(path))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            src.rename(path)
+        except OSError:
+            leftover = True
+    return not leftover
+
+
+def _displaced_path(path: Path) -> Path:
+    candidate = path.with_name(path.name + ".shell-displaced")
+    suffix = 0
+    while candidate.exists() or candidate.is_symlink():
+        suffix += 1
+        candidate = path.with_name(f"{path.name}.shell-displaced-{suffix}")
+    return candidate
 
 
 def sandboxed_shell_argv(
@@ -634,7 +775,10 @@ def sandboxed_shell_argv(
             tmpdir=tmpdir,
         )
         bash = "/bin/bash" if Path("/bin/bash").exists() else "bash"
-        return [binary, "-p", profile, bash, "-c", command]
+        # The marker is printed only after sandbox-exec has started bash. A
+        # launch or profile failure has no marker and is not a command result.
+        marked = f"printf '%s\\n' '{SANDBOX_EXEC_READY}'; {command}"
+        return [binary, "-p", profile, bash, "-c", marked]
     if plat == "win32":
         # which() follows the real OS. A caller can name Windows while the
         # process is elsewhere, and then which() looks for Win32 path rules.
@@ -704,9 +848,11 @@ def guard_shell_command(
     """Refuse a command the text scan can see leaving the workspace.
 
     This check is best-effort. It does not see a path an interpreter builds
-    while the command runs. ``cwd`` is the directory the shell starts in.
-    ``proposals`` is the session proposal directory. ``home`` is the ``HOME``
-    value the child will see, used only to expand ``~``.
+    while the command runs. On Windows it is the only layer. ``cwd`` is the
+    directory the shell starts in. ``proposals`` is the session proposal
+    directory. ``home`` is the ``HOME`` value the child will see, used only
+    to expand ``~``. Interpreter eval covers ``-c``/``-e`` including combined
+    short flags, an ``env`` prefix, and a program read from stdin.
 
     Raises:
         SandboxDenied: The command is not safe to run. Key denials do not
@@ -751,15 +897,41 @@ def _profile_path(path: Path) -> str:
     return text
 
 
+def _casefold_enabled() -> bool:
+    """Return whether path checks should ignore case.
+
+    Linux can hold both casings as different files. macOS and Windows
+    filesystems usually cannot, and ``Path.relative_to`` stays case-sensitive
+    there too.
+    """
+    return sys.platform in {"darwin", "win32"}
+
+
+def _paths_equal(left: Path, right: Path) -> bool:
+    if _casefold_enabled():
+        return os.path.normcase(str(left)).casefold() == os.path.normcase(str(right)).casefold()
+    return left == right
+
+
+def _within_key(base: Path, candidate: Path) -> bool:
+    if _casefold_enabled():
+        base = Path(os.path.normcase(str(base)).casefold())
+        candidate = Path(os.path.normcase(str(candidate)).casefold())
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
 def _contains(root: Path, path: Path) -> bool:
     """Return whether ``path`` resolves inside ``root``, including equality."""
     try:
         candidate = path.resolve()
         base = root.resolve()
-        candidate.relative_to(base)
-    except (ValueError, OSError, RuntimeError):
+    except (OSError, RuntimeError):
         return False
-    return True
+    return _within_key(base, candidate)
 
 
 def _key_directories(home: Path | None) -> tuple[Path, ...]:
@@ -918,19 +1090,13 @@ def _is_key_path(path: Path, keys: Sequence[Path]) -> bool:
 def _under_proposals(path: Path, proposals: Path) -> bool:
     lexical = path if path.is_absolute() else path.absolute()
     root = proposals if proposals.is_absolute() else proposals.absolute()
-    try:
-        lexical.relative_to(root)
+    if _within_key(root, lexical):
         return True
-    except ValueError:
-        return _is_within(proposals, path)
+    return _is_within(proposals, path)
 
 
 def _is_within(root: Path, path: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-    except (ValueError, OSError, RuntimeError):
-        return False
-    return True
+    return _contains(root, path)
 
 
 def _is_allowed_device(path: Path) -> bool:

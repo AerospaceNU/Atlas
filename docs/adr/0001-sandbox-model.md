@@ -42,9 +42,11 @@ This is two different guarantees, and they must not be confused:
 - **`bash_tool` is confined by the OS sandbox, not by the text scan.** The
   scan is best-effort. It resolves paths it can see, and it rejects
   command substitution, parameter expansion, globs, a few `python` / `perl`
-  / `node` `-c`/`-e` shapes, and `exec(open(...))`. An interpreter can
-  still build a path the scan never sees. That path is stopped by the
-  sandbox, or the shell does not start.
+  / `node` eval shapes (`-c` / `-e`, combined short flags, an `env`
+  prefix, and a program read from stdin), and `exec(open(...))`. An
+  interpreter can still build a path the scan never sees. That path is
+  stopped by the sandbox, or the shell does not start. On Windows the scan
+  is the only layer.
 
   The shell refuses to start when the user key directory or `ATLAS_HOME`
   resolves inside the workspace. A key denial does not include the path or
@@ -53,13 +55,20 @@ This is two different guarantees, and they must not be confused:
   private `TMPDIR` inside the workspace, and the toolchain (`/usr`, `/bin`,
   `/lib`, `/lib64`, plus the interpreter prefix). The artifact root and
   `proposals/` are not in that accessible tree. Landlock cannot exclude a
-  child of a granted directory, so those directories are masked with a
-  private bind mount before the ruleset is applied; if the mask cannot be
-  applied, only sibling trees are granted. If Landlock cannot be applied,
-  the child exits with a clear message and bash is not started. On macOS,
-  `sandbox-exec` denies the key directory and file access outside the
-  workspace, aside from the toolchain and system read paths. If
-  `sandbox-exec` is missing, `bash_tool` is disabled. The network is
+  child of a granted directory, so a rule on the workspace root is applied
+  only after those directories are hidden. The usual hide is a private bind
+  mount in a user namespace. If user namespaces or the mount are
+  unavailable, those directories are moved outside the workspace for the
+  command and moved back when it ends, and the root is then granted whole.
+  If they cannot be moved outside the workspace, the shell does not start
+  and the error says it needs user namespaces or an artifact root outside
+  the workspace. Granting the root while they still sit inside it would
+  make them readable. If Landlock cannot be applied, the child exits with
+  a clear message and bash is not started. On macOS, `sandbox-exec` denies
+  the key directory and file access outside the workspace, aside from the
+  toolchain and system read paths. If `sandbox-exec` is missing, cannot be
+  launched, or rejects the profile, `bash_tool` raises a sandbox-unavailable
+  denial rather than returning a normal command result. The network is
   unrestricted on every platform. A child that calls `setsid()` still
   leaves the process group.
 
@@ -120,11 +129,16 @@ Both fail with a clear error; neither silently truncates.
   runnable path when the scan can see it, including `python proposals/tool.py`
   and a working directory inside that folder. Command substitution,
   parameter expansion, and globs are refused because they can hide a path.
-  `python` / `perl` / `node` with `-c` or `-e`, and `exec(open(...))`, are
-  refused when they appear in the command text. A path built inside a
-  script is not visible to this scan. A hardlinked regular file is refused,
-  matching the file tools. The OS sandbox is what stops a path the scan
-  misses, including a symlink created while the command is running.
+  `python` / `perl` / `node` eval is refused when the command text shows
+  `-c` or `-e` (including a combined short flag such as `-Ic`), an `env`
+  prefix, or a program taken from stdin (`python3 -`). That check is
+  best-effort and is the only layer on opt-in Windows. A path built inside
+  a script is not visible to this scan. A hardlinked regular file is
+  refused, matching the file tools. Path comparison folds case on macOS and
+  Windows. The OS sandbox is what stops a path the scan misses, including a
+  symlink created while the command is running: creating the link inside
+  the workspace can succeed, and reading or writing through it to a file
+  outside the ruleset is denied.
 - **Environment.** The child receives only `PATH`, `HOME`, `LANG`,
   `LC_ALL`, `USER` and `SHELL`, plus a private `TMPDIR` created inside the
   workspace for that command. The host `TMPDIR` is not passed through, so
@@ -184,10 +198,13 @@ the workspace is executable, `/etc` is read-only, temp files go to a private
 and executable. The interpreter prefix is included so a virtualenv outside
 the workspace can still start; it is not writable. The artifact root and
 `proposals/` are kept out of that
-tree. Devices a redirect needs (`/dev/null` and the other null devices) are
-included. On macOS the same boundary is a `sandbox-exec` profile; without
-that program the tool does not run. Windows has no such confinement, so
-`bash_tool` is opt-in and warns. The network is unrestricted. A container
+tree. When user namespaces are unavailable those directories are moved
+outside the workspace for the command, or the shell does not start. Devices
+a redirect needs (`/dev/null` and the other null devices) are included. On
+macOS the same boundary is a `sandbox-exec` profile. If that program is
+missing, cannot be launched, or rejects the profile, the tool does not run.
+Windows has no such confinement, so `bash_tool` is opt-in and warns, and the
+text scan is the only layer. The network is unrestricted. A container
 remains out of scope.
 
 **Container/VM isolation** was rejected for now. It is a much larger
@@ -219,7 +236,8 @@ same user who started it.
   the child can open. They do not bound CPU, memory, or disk. On Windows
   there is no OS file boundary; the tool is off unless it is opted in, and
   it warns. A path the text scan misses can still be opened when it stays
-  inside the workspace and is not the masked artifact root or `proposals/`.
+  inside the workspace and is not the masked or parked artifact root or
+  `proposals/`.
 - **A child that calls `setsid()`** leaves the process group we kill and
   can outlive the call. Only OS-level tracking (cgroups, a job object or a
   container) closes this.
@@ -271,10 +289,14 @@ Offline tests, run in CI:
   is inside the workspace; a drafted tool under `proposals/` is not
   executed, including an interpreter-built path and a copy of that tree;
   a symlink created during the command cannot read or write a host file;
-  Landlock denies an interpreter-built path outside the workspace;
-  a failed Landlock syscall exits without running the command; `$(...)`,
-  backticks, and `$VAR` are rejected; macOS builds a `sandbox-exec`
-  profile and disables the tool when that program is missing; Windows
+  without user namespaces a file can still be created at the workspace
+  root, or the shell reports that it needs user namespaces or an artifact
+  root outside the workspace; Landlock denies an interpreter-built path
+  outside the workspace; a failed Landlock syscall exits without running
+  the command; `$(...)`, backticks, and `$VAR` are rejected; interpreter
+  eval flags combined flags, an `env` prefix, and stdin; macOS builds a
+  `sandbox-exec` profile, disables the tool when that program is missing,
+  and treats a launch or profile failure as a sandbox denial; Windows
   keeps the tool opt-in and off the default list.
 - `tests/test_tool_write_file.py`: oversized writes, byte rather than
   character counting, absolute and `..` paths, and not writing through a
