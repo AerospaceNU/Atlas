@@ -14,6 +14,8 @@ from atlas.agent.metrics import (
     catalog_spend,
     format_token_count,
     format_tui_status,
+    output_tokens_per_second,
+    tokens_per_second,
 )
 from atlas.cli import main
 from atlas.cli.tui import TuiLaunchError, ensure_tui_binary, launch_tui
@@ -107,6 +109,68 @@ def test_output_speed_is_the_last_call_after_the_first_token() -> None:
     )
 
     assert totals.tokens_per_second == 10.0
+
+
+def test_output_rate_uses_a_normal_window_and_drops_a_near_zero_one() -> None:
+    normal = CallTiming(
+        http_status=200,
+        elapsed_seconds=0.5,
+        time_to_first_token_seconds=0.1,
+    )
+    # 4 completion tokens over the 0.4s spent generating them.
+    assert tokens_per_second(4, 0.4) == 10.0
+    assert output_tokens_per_second(4, normal) == 10.0
+
+    # 250 tokens over 1ms is the first chunk and the end of the stream
+    # landing together, which prints as 250000.0 without the floor.
+    sliver = CallTiming(
+        http_status=200,
+        elapsed_seconds=0.501,
+        time_to_first_token_seconds=0.5,
+    )
+    assert tokens_per_second(250, 0.001) is None
+    assert tokens_per_second(4, 0.0) is None
+    assert output_tokens_per_second(250, sliver) is None
+
+
+def test_near_zero_generation_window_keeps_the_previous_rate() -> None:
+    totals = SessionTotals(tokens_per_second=8.0)
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(completion_tokens=250),
+            timing=CallTiming(
+                http_status=200,
+                elapsed_seconds=0.501,
+                time_to_first_token_seconds=0.5,
+            ),
+        ),
+    )
+
+    assert totals.tokens_per_second == 8.0
+    text = format_tui_status(totals)
+    assert "last 8.0 tok/s" in text
+    assert "250000.0" not in text
+
+
+def test_near_zero_generation_window_stays_unset_without_a_previous_rate() -> None:
+    totals = SessionTotals()
+    apply_call(
+        totals,
+        ModelCall(
+            usage=TokenUsage(completion_tokens=250),
+            timing=CallTiming(
+                http_status=200,
+                elapsed_seconds=0.501,
+                time_to_first_token_seconds=0.5,
+            ),
+        ),
+    )
+
+    assert totals.tokens_per_second is None
+    text = format_tui_status(totals)
+    assert "last n/a tok/s" in text
+    assert "250000.0" not in text
 
 
 def test_fresh_session_spend_is_zero() -> None:

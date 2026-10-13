@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -101,6 +102,46 @@ class FakeClient:
         )
 
     def close(self) -> None:
+        return None
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 10.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _ClockedStream:
+    """SSE body whose lines arrive at explicit clock instants.
+
+    The response has no injected elapsed or time-to-first-token fields, so
+    the model has to measure both from ``perf_counter`` while reading.
+    """
+
+    def __init__(self, clock: _Clock, lines: list[tuple[float, str]]) -> None:
+        self.clock = clock
+        self.lines = lines
+        self.status_code = 200
+
+    def iter_lines(self) -> Iterator[str]:
+        for instant, line in self.lines:
+            self.clock.now = instant
+            yield line
+
+
+class _ClockedClient:
+    def __init__(self, response: _ClockedStream) -> None:
+        self.response = response
+
+    def stream(self, _method: str, _url: str, **_kwargs: Any) -> _ClockedClient:
+        return self
+
+    def __enter__(self) -> _ClockedStream:
+        return self.response
+
+    def __exit__(self, *_exc: object) -> None:
         return None
 
 
@@ -275,6 +316,72 @@ def test_complete_keeps_usage_cost_status_and_elapsed_time() -> None:
     speed = output_tokens_per_second(response.usage.completion_tokens, response.timing)
     assert speed == 10.0
     assert client.calls[0]["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_spaced_chunks_measure_the_generation_window_after_the_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    monkeypatch.setattr("atlas.agent.model.time.perf_counter", clock)
+    usage = json.dumps(
+        {
+            "choices": [{"delta": {"content": "coast"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 5, "total_tokens": 7},
+        }
+    )
+    response = _ClockedStream(
+        clock,
+        [
+            (10.5, 'data: {"choices":[{"delta":{"content":"clear "}}]}'),
+            (11.0, f"data: {usage}"),
+            (11.0, "data: [DONE]"),
+        ],
+    )
+    model = OpenRouterModel(
+        ModelConfig(model="example/model", api_key="test"),
+        _ClockedClient(response),
+    )
+
+    parsed = model.complete([ChatMessage(role=Role.USER, content="look")], [])
+
+    assert parsed.content == "clear coast"
+    assert parsed.timing is not None
+    assert parsed.timing.time_to_first_token_seconds == 0.5
+    assert parsed.timing.elapsed_seconds == 1.0
+    assert output_tokens_per_second(parsed.usage.completion_tokens, parsed.timing) == 10.0
+
+
+def test_single_late_chunk_does_not_publish_a_six_digit_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    monkeypatch.setattr("atlas.agent.model.time.perf_counter", clock)
+    body = json.dumps(
+        {
+            "choices": [{"delta": {"content": "late"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 250, "total_tokens": 252},
+        }
+    )
+    response = _ClockedStream(
+        clock,
+        [
+            (10.5, f"data: {body}"),
+            (10.501, "data: [DONE]"),
+        ],
+    )
+    model = OpenRouterModel(
+        ModelConfig(model="example/model", api_key="test"),
+        _ClockedClient(response),
+    )
+
+    parsed = model.complete([ChatMessage(role=Role.USER, content="look")], [])
+
+    assert parsed.content == "late"
+    assert parsed.timing is not None
+    assert parsed.timing.time_to_first_token_seconds == 0.5
+    window = parsed.timing.elapsed_seconds - parsed.timing.time_to_first_token_seconds
+    assert 0 < window < 0.05
+    assert output_tokens_per_second(parsed.usage.completion_tokens, parsed.timing) is None
 
 
 def test_complete_reads_the_trailing_usage_frame_without_replacing_content() -> None:
