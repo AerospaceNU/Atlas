@@ -37,13 +37,17 @@ This is two different guarantees, and they must not be confused:
 - **The file tools are confined.** `write_file` and `segment_landcover`
   write only inside the session's artifact folder, and `read_file` and
   `segment_landcover` read only from that folder or the project workspace.
-- **`bash_tool` is not confined.** Only its *starting* directory is
-  checked, and by default it starts in the project workspace. A command
-  runs with the user's full privileges: it can `cd ..`, read `~`, change
-  any file the user can, and use the network. We accept that in exchange
-  for having a general shell available by default. The measures below
-  limit what the process inherits and how long it lives, not what it can
-  reach.
+- **`bash_tool` is confined to the workspace.** It starts in the project
+  workspace (or the write root when no workspace is mounted). Before the
+  process starts, every path the command names is resolved. Absolute paths
+  and `..` that leave the workspace, symlinks whose targets leave it, the
+  user key directory, and the session `proposals/` directory are refused
+  with `SandboxDenied`. A key denial does not include the path or the file
+  contents. On Linux the child is also placed in a Landlock ruleset that
+  can read and execute only the system runtime and can read and write only
+  the workspace, so a missed path still cannot open `~/.atlas/keys` or
+  another host file. The network is still reachable. A child that calls
+  `setsid()` still leaves the process group.
 
 ### Two roots
 
@@ -91,7 +95,18 @@ Both fail with a clear error; neither silently truncates.
   root when no workspace is mounted). Any other value goes through
   `resolve_read()`, and an absolute or escaping path raises
   `SandboxDenied`, so it is audited, rather than being returned as plain
-  text.
+  text. The same check refuses a directory that resolves into
+  `~/.atlas/keys` or `<artifact root>/proposals`.
+- **Command paths.** `shell_guard.guard_shell_command()` resolves every
+  path, redirect, and `cd` target before launch. `..` and absolute paths
+  that stay inside the workspace are allowed. Ones that leave fail closed.
+  Symlinks are judged after resolution. `~/.atlas/keys` is refused even
+  when the workspace contains it or a link points at it, and the error
+  text does not include the key. `<artifact root>/proposals` is not a
+  runnable path, including `python proposals/tool.py` and a working
+  directory inside that folder. Command substitution, parameter expansion,
+  and globs are refused because they can hide a path. A hardlinked regular
+  file is refused, matching the file tools.
 - **Environment.** The child receives only `PATH`, `HOME`, `LANG`,
   `LC_ALL`, `TMPDIR`, `USER` and `SHELL`, so API keys and tokens held by
   the host process aren't inherited.
@@ -142,12 +157,16 @@ tools can create files where the log lives:
 
 ## Rejected alternatives and why
 
-**OS-level confinement** was rejected for now. It is the only option that
-would actually confine `bash_tool`. The cost is platform-specific code
-(different primitives on macOS and Linux, and CI runners that may not
-support them) and the work of writing a policy that still lets ordinary
-commands run. We chose to keep Bash available by default without this, and
-to record the gap instead of implying it's closed.
+**OS-level confinement** of the whole session was rejected. The shell does
+use Landlock on Linux, which is a filesystem-only slice of option 2: the
+child can use the system runtime (`/usr`, `/bin`, `/lib`) and the devices
+a redirect needs (`/dev/null` and the other null devices), and it can read
+and write the workspace. It cannot open the rest of the host, including
+the user key directory. Landlock cannot revoke a right granted on a parent
+directory, so `proposals/` is refused by the path check before launch
+rather than by a hole punched in the workspace rule. macOS has no
+Landlock; the path check still fails closed there. Network confinement
+and a container remain out of scope.
 
 **Container/VM isolation** was rejected for now. It is a much larger
 operational change (image builds, session lifecycle tied to container
@@ -156,10 +175,10 @@ same user who started it.
 
 ## Revisit when
 
-- `bash_tool` is expected to be safe against prompt injection, for example
-  when the agent starts reading untrusted content such as downloaded
-  files, web pages or third-party metadata. Option 2 is then the right
-  fix.
+- `bash_tool` is expected to be safe against prompt injection that uses
+  the network, or that hides a workspace path the preflight cannot see.
+  Full OS confinement, including the network, is then the right fix.
+  Landlock already covers host files the preflight can miss.
 - A tool starts executing content not written by us, such as running a
   model-authored script under its own interpreter and dependencies.
 - Atlas serves sessions for anyone other than the person running it
@@ -173,9 +192,12 @@ same user who started it.
   the single path for every file-touching tool. A new tool that builds a
   path without `resolve()` or `resolve_read()` bypasses the sandbox. This
   is a code-review invariant, not something the OS enforces.
-- **`bash_tool` is unconfined** beyond its starting directory, as stated
-  in the decision. There are no filesystem, network, CPU, memory or disk
-  limits on what a command does.
+- **`bash_tool` can still use the network**, and a child that calls
+  `setsid()` leaves the process group. Landlock bounds the files the
+  Linux child can open. It does not bound CPU, memory, or disk. A path
+  hidden by an encoding the preflight does not recognize can still be
+  opened when it stays inside the workspace; `proposals/` is refused only
+  for paths the check can see.
 - **A child that calls `setsid()`** leaves the process group we kill and
   can outlive the call. Only OS-level tracking (cgroups, a job object or a
   container) closes this.
@@ -220,6 +242,11 @@ Offline tests, run in CI:
   (working directory checks, scrubbed environment, stdin cut off, timeout
   bounds, group kill on timeout and on normal return, output truncation,
   escape stripping and binary output).
+- `tests/test_shell_workspace_guard.py`: the shell's cwd is the workspace;
+  `..` and absolute paths that leave it fail closed; a symlink escape is
+  denied; a user-key read is denied and the error does not contain the
+  key, including a symlink and a workspace that contains the key
+  directory; a drafted tool under `proposals/` is not executed.
 - `tests/test_tool_write_file.py`: oversized writes, byte rather than
   character counting, absolute and `..` paths, and not writing through a
   hardlink.

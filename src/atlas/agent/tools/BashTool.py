@@ -10,8 +10,13 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
-from atlas.agent.artifacts import LocalArtifactStore
+from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.shell_guard import (
+    guard_shell_command,
+    sandbox_unavailable,
+    sandboxed_shell_argv,
+)
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
@@ -38,21 +43,22 @@ class BashInputModel(BaseModel):
 class BashTool(Tool):
     """Run a shell command confined to one local artifact workspace.
 
-    Three invariants hold: the working directory is resolved only through
-    :class:`~atlas.agent.artifacts.LocalArtifactStore`, so the command starts
-    inside the sandbox; the child runs with a minimal, explicit environment
-    rather than inheriting the host process's secrets; and every call ends by
-    killing the whole process group, so a backgrounded or disowned child
-    cannot outlive it. Only the starting directory is confined: the command
-    itself runs with the user's privileges, and a child that calls
-    ``setsid()`` leaves the group. See docs/adr/0001-sandbox-model.md.
+    The working directory is the project workspace when one is mounted, and
+    the artifact root otherwise. Every path the command names is resolved
+    before launch: absolute paths and ``..`` that leave the workspace fail,
+    a symlink is judged by its target, ``~/.atlas/keys`` is refused even when
+    a path only lands there after resolution, and the session ``proposals/``
+    directory is not a runnable path. The child gets a minimal environment,
+    and on Linux Landlock keeps it from opening anything else on the host.
+    Every call still kills the whole process group. A child that calls
+    ``setsid()`` leaves that group. See docs/adr/0001-sandbox-model.md.
     """
 
     name = "bash_tool"
     description = (
-        "Run a shell command with the working directory confined to the artifact/workspace "
-        "sandbox, a timeout, captured stdout/stderr, and a non-zero exit reported as a result "
-        "rather than an exception."
+        "Run a shell command inside the workspace. The working directory is the workspace. "
+        "Absolute paths, '..' escapes, the user key directory, and drafted tool paths are denied. "
+        "stdout and stderr are captured, and a non-zero exit is a result rather than an exception."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     input_model = BashInputModel
@@ -66,11 +72,19 @@ class BashTool(Tool):
         if not cwd.is_dir():
             return ToolResult(text=f"Working directory not found: {request.working_directory}")
 
+        workspace = store.read_root or store.root
         env = {key: os.environ[key] for key in _INHERITED_ENV_KEYS if key in os.environ}
+        home = Path(env["HOME"]) if "HOME" in env else None
+        guard_shell_command(
+            request.command,
+            cwd=cwd,
+            workspace=workspace,
+            proposals=store.root / "proposals",
+            home=home,
+        )
 
         process = subprocess.Popen(
-            request.command,
-            shell=True,
+            sandboxed_shell_argv(workspace, request.command),
             cwd=cwd,
             env=env,
             # The session's own stdin carries the user's protocol messages.
@@ -94,6 +108,9 @@ class BashTool(Tool):
             # return normally, so the group is killed on every exit path.
             self._kill_process_group(process, pgid)
 
+        if sandbox_unavailable(process.returncode, stderr):
+            raise SandboxDenied("Shell sandbox is unavailable")
+
         output = (
             f"exit_code: {process.returncode}\n"
             f"stdout:\n{self._sanitize(stdout)}\n"
@@ -106,7 +123,9 @@ class BashTool(Tool):
 
         The default (``.``) is the project workspace when one is mounted, else
         the artifact root. Any other path goes through the store; an absolute
-        path or a ``..`` escape raises ``SandboxDenied``.
+        path or a ``..`` escape raises ``SandboxDenied``. A directory that
+        resolves into the user key directory or the session proposal directory
+        is refused by :func:`atlas.agent.shell_guard.guard_shell_command`.
         """
         if working_directory in ("", "."):
             return store.read_root or store.root
