@@ -1,8 +1,13 @@
-"""Match a reprocessed scene by collection, time, and footprint.
+"""Match a reprocessed scene by collection, time, footprint, and grid key.
 
 A dynamic reprocess keeps the acquisition and the footprint but issues a new
-scene id. The pull manifest stores those three facts beside the id so a later
+scene id. The pull manifest stores those facts beside the id so a later
 refresh or resume can find the replacement when the stored id is gone.
+
+Only STAC sources resolve replacements. ``StacApiClient`` confirms which
+stored ids still exist and searches by place and time. Every other source
+returns None from those hooks, and the pull leaves that source's ids
+unchecked.
 """
 
 from __future__ import annotations
@@ -10,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from itertools import combinations
 from typing import Any, Literal
 
 from atlas.data.base import BBox, Scene
@@ -18,7 +24,42 @@ from atlas.data.base import BBox, Scene
 # without reaching the next distinct pass.
 SCENE_DATETIME_TOLERANCE = timedelta(seconds=60)
 
+# A neighbour that merely touches, or overlaps on a sliver at the AOI edge,
+# is a different tile. Reprocessing keeps the footprint, so the boxes agree.
+FOOTPRINT_IOU_MIN = 0.8
+
+# Float noise on a ratio that is exactly the threshold still counts as enough.
+_IOU_ABS = 1e-9
+
+_MGRS = "s2:mgrs_tile"
+_GRID_CODE = "grid:code"
+_WRS_PATH = "landsat:wrs_path"
+_WRS_ROW = "landsat:wrs_row"
+_ORBIT = "sat:relative_orbit"
+_BASELINE = "s2:processing_baseline"
+_BASELINE_WIDTH = 4
+
 UnresolvedReason = Literal["no match", "ambiguous"]
+GridValue = str | int
+
+
+@dataclass(frozen=True)
+class GridKey:
+    """Stable tile or orbit identity taken from STAC properties.
+
+    Attributes:
+        fields: Property names and values, in canonical order.
+    """
+
+    fields: tuple[tuple[str, GridValue], ...]
+
+    def as_manifest(self) -> dict[str, GridValue]:
+        """Return the JSON object stored on a scene row.
+
+        Returns:
+            The property names and values that identify the tile or orbit.
+        """
+        return dict(self.fields)
 
 
 @dataclass(frozen=True)
@@ -30,12 +71,14 @@ class StoredScene:
         collection: Catalog collection, when the manifest recorded one.
         observed_at: Acquisition time, when the manifest recorded one.
         footprint: Footprint box, when the manifest recorded one.
+        grid_key: Tile or orbit key, when the manifest recorded one.
     """
 
     id: str
     collection: str | None = None
     observed_at: datetime | None = None
     footprint: BBox | None = None
+    grid_key: GridKey | None = None
 
 
 @dataclass(frozen=True)
@@ -46,12 +89,14 @@ class SceneRecord:
     collection: str | None = None
     observed_at: datetime | None = None
     footprint: BBox | None = None
+    grid_key: GridKey | None = None
 
     def as_manifest(self) -> dict[str, object]:
         """Return the JSON object stored beside this id.
 
         Returns:
-            ``id`` plus collection, datetime, and footprint when they are known.
+            ``id`` plus collection, datetime, footprint, and grid key when
+            they are known.
         """
         body: dict[str, object] = {"id": self.id}
         if self.collection:
@@ -60,6 +105,8 @@ class SceneRecord:
             body["datetime"] = format_datetime(self.observed_at)
         if self.footprint is not None:
             body["footprint"] = self.footprint.as_list()
+        if self.grid_key is not None:
+            body["grid_key"] = self.grid_key.as_manifest()
         return body
 
 
@@ -99,7 +146,11 @@ class SourceResolution:
 
     @staticmethod
     def unchecked() -> SourceResolution:
-        """Return a resolution that leaves stored ids as they are."""
+        """Return a resolution that leaves stored ids as they are.
+
+        Non-STAC sources use this. Their ids are not checked and are not
+        replaced.
+        """
         return SourceResolution(checked=False)
 
 
@@ -143,8 +194,8 @@ def parse_datetime(value: object) -> datetime | None:
 def stored_scenes(row: Mapping[str, Any] | None) -> list[StoredScene]:
     """Read scene identity from one manifest source.
 
-    ``scenes`` carries collection, datetime, and footprint beside the id.
-    ``scene_ids`` from an older manifest are ids with no place or time.
+    ``scenes`` carries collection, datetime, footprint, and grid key beside
+    the id. ``scene_ids`` from an older manifest are ids with no place or time.
     A missing ``scenes`` field still loads.
 
     Args:
@@ -183,10 +234,12 @@ def reconcile(
 ) -> SourceResolution:
     """Replace stored ids that no longer resolve.
 
-    A missing id is replaced only when exactly one candidate shares the
-    collection, falls within :data:`SCENE_DATETIME_TOLERANCE`, and overlaps
-    the stored footprint. Zero matches or several matches are reported and
-    the stored id is kept.
+    A missing id is replaced when one candidate shares the collection, falls
+    within :data:`SCENE_DATETIME_TOLERANCE`, has footprint IoU of at least
+    :data:`FOOTPRINT_IOU_MIN`, and carries the stored grid key when one was
+    recorded. Several matches collapse to the newest processing baseline
+    only when they are otherwise the same scene. Zero matches, or several
+    matches that are different scenes, are reported and the stored id is kept.
 
     Args:
         stored: Scene rows from the manifest.
@@ -216,11 +269,11 @@ def reconcile(
             collection=wanted,
             claimed=claimed,
         )
-        if len(matches) == 1:
-            scene = matches[0]
-            claimed.add(scene.id)
-            replacements.append(Replacement(old_id=item.id, new_id=scene.id, scene=scene))
-        elif len(matches) == 0:
+        chosen = _choose_match(matches)
+        if chosen is not None:
+            claimed.add(chosen.id)
+            replacements.append(Replacement(old_id=item.id, new_id=chosen.id, scene=chosen))
+        elif not matches:
             unresolved.append(Unresolved(item.id, "no match"))
         else:
             names = tuple(sorted({scene.id for scene in matches}))
@@ -331,11 +384,151 @@ def _good_matches(
             continue
         if not _within_tolerance(stored.observed_at, scene.datetime):
             continue
-        if not stored.footprint.intersects(scene.bbox):
+        if not _same_grid(stored.grid_key, scene):
+            continue
+        if not _footprint_matches(stored.footprint, scene.bbox):
             continue
         seen.add(scene.id)
         found.append(scene)
     return found
+
+
+def _choose_match(matches: Sequence[Scene]) -> Scene | None:
+    """Pick the replacement, or None when the candidates stay ambiguous.
+
+    One match is that scene. Several matches are a replacement only when
+    they are the same scene apart from processing, in which case the newest
+    baseline wins. A tie, or two different scenes, stays unresolved.
+    """
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) < 2 or not _same_scene(matches):
+        return None
+    newest = max(matches, key=_recency)
+    top = _recency(newest)
+    if sum(1 for scene in matches if _recency(scene) == top) != 1:
+        return None
+    return newest
+
+
+def _same_scene(matches: Sequence[Scene]) -> bool:
+    """True when every candidate is one acquisition with a new id."""
+    keys = [grid_key_from_properties(scene.properties) for scene in matches]
+    if any(key != keys[0] for key in keys):
+        return False
+    for left, right in combinations(matches, 2):
+        if not _within_tolerance(left.datetime, right.datetime):
+            return False
+        if not _footprint_matches(left.bbox, right.bbox):
+            return False
+    return True
+
+
+def _same_grid(stored: GridKey | None, scene: Scene) -> bool:
+    if stored is None:
+        return True
+    return grid_key_from_properties(scene.properties) == stored
+
+
+def _footprint_matches(stored: BBox, candidate: BBox) -> bool:
+    return stored.iou(candidate) + _IOU_ABS >= FOOTPRINT_IOU_MIN
+
+
+def _recency(scene: Scene) -> tuple[int, tuple[int, ...], float]:
+    """Rank a candidate by processing baseline, then created or updated."""
+    baseline = _processing_baseline(scene.properties)
+    stamp = _processing_stamp(scene.properties)
+    stamp_key = float("-inf") if stamp is None else stamp.timestamp()
+    if baseline is None:
+        return (0, (), stamp_key)
+    return (1, baseline, stamp_key)
+
+
+def grid_key_from_properties(properties: Mapping[str, Any]) -> GridKey | None:
+    """Return the stable tile or orbit key carried by these properties.
+
+    The first family that is present wins: ``s2:mgrs_tile``, then
+    ``grid:code``, then ``landsat:wrs_path`` with ``landsat:wrs_row``,
+    then ``sat:relative_orbit``. The manifest stores that key, and a
+    later lookup requires the same key.
+
+    Args:
+        properties: STAC item properties, or a manifest ``grid_key`` object.
+
+    Returns:
+        The key to store and compare, or None when none of those fields
+        is usable.
+    """
+    mgrs = _token(properties.get(_MGRS))
+    if mgrs is not None:
+        return GridKey(((_MGRS, mgrs),))
+    code = _token(properties.get(_GRID_CODE))
+    if code is not None:
+        return GridKey(((_GRID_CODE, code),))
+    path = _whole_number(properties.get(_WRS_PATH))
+    row = _whole_number(properties.get(_WRS_ROW))
+    if path is not None and row is not None:
+        return GridKey(((_WRS_PATH, path), (_WRS_ROW, row)))
+    orbit = _whole_number(properties.get(_ORBIT))
+    if orbit is not None:
+        return GridKey(((_ORBIT, orbit),))
+    return None
+
+
+def _processing_baseline(properties: Mapping[str, Any]) -> tuple[int, ...] | None:
+    raw = properties.get(_BASELINE)
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        text = str(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+    else:
+        return None
+    if not text:
+        return None
+    pieces = text.split(".")
+    if any(not piece.isdigit() for piece in pieces):
+        return None
+    numbers = [int(piece) for piece in pieces]
+    if len(numbers) < _BASELINE_WIDTH:
+        numbers.extend([0] * (_BASELINE_WIDTH - len(numbers)))
+    return tuple(numbers)
+
+
+def _processing_stamp(properties: Mapping[str, Any]) -> datetime | None:
+    created = parse_datetime(properties.get("created"))
+    updated = parse_datetime(properties.get("updated"))
+    if created is None:
+        return updated
+    if updated is None:
+        return created
+    return max(created, updated)
+
+
+def _token(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _whole_number(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            return None
+        number = int(value)
+    elif isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+    else:
+        return None
+    if number < 0:
+        return None
+    return number
 
 
 def _within_tolerance(stored_at: datetime, observed_at: datetime) -> bool:
@@ -358,7 +551,19 @@ def _parse_stored(value: object) -> StoredScene | None:
         collection=collection if isinstance(collection, str) and collection else None,
         observed_at=parse_datetime(value.get("datetime")),
         footprint=_parse_footprint(value.get("footprint")),
+        grid_key=_parse_grid_key(value.get("grid_key")),
     )
+
+
+def _parse_grid_key(value: object) -> GridKey | None:
+    if not isinstance(value, dict) or not value:
+        return None
+    parsed = grid_key_from_properties(value)
+    if parsed is None:
+        return None
+    if set(parsed.as_manifest()) != set(value):
+        return None
+    return parsed
 
 
 def _parse_footprint(value: object) -> BBox | None:
@@ -385,6 +590,7 @@ def _record_from_scene(scene: Scene, *, collection: str) -> SceneRecord:
         collection=scene.collection or collection or None,
         observed_at=scene.datetime,
         footprint=scene.bbox,
+        grid_key=grid_key_from_properties(scene.properties),
     )
 
 
@@ -394,4 +600,5 @@ def _record_from_stored(item: StoredScene) -> SceneRecord:
         collection=item.collection,
         observed_at=item.observed_at,
         footprint=item.footprint,
+        grid_key=item.grid_key,
     )

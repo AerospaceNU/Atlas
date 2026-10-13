@@ -951,8 +951,10 @@ async def _resolve_catalog(
 ) -> dict[str, SourceResolution]:
     """Check stored ids and look up a reprocessed scene by place and time.
 
-    A source whose search failed is skipped so a later retry still has the
-    stored id. A client that cannot check ids leaves those ids unchanged.
+    Only a STAC source resolves replacements. A client that cannot check ids
+    returns an unchecked resolution, and that source keeps its ids as they
+    are. A source whose search failed is skipped so a later retry still has
+    the stored id.
     """
     if identity is None:
         return {}

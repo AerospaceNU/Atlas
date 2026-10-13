@@ -29,6 +29,13 @@ _PLACE_TIME_LIMIT = 20
 
 
 class StacApiClient(DataPullClient):
+    """STAC search client.
+
+    Subclasses are the sources that resolve a reprocessed scene. They confirm
+    stored ids and search by place and time. Every other source leaves those
+    hooks unimplemented, so the pull keeps that source's ids unchecked.
+    """
+
     search_url: ClassVar[str] = ""
     default_collection: ClassVar[str] = ""
     include_datetime: ClassVar[bool] = True
@@ -152,7 +159,7 @@ class StacApiClient(DataPullClient):
 
         Returns:
             One page of hits. The caller keeps a scene only when the
-            collection, time tolerance, and footprint overlap all agree.
+            collection, time tolerance, footprint IoU, and grid key all agree.
 
         Raises:
             MissingCredentialError: The provider returned 401 or 403 and a
