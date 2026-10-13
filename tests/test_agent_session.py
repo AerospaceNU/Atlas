@@ -720,6 +720,72 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     assert "test-key" not in json.dumps(events)
 
 
+def test_degenerate_window_does_not_replace_the_session_rate(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                content="paced",
+                usage=TokenUsage(prompt_tokens=4, completion_tokens=4, total_tokens=8),
+                timing=CallTiming(
+                    http_status=200,
+                    elapsed_seconds=0.5,
+                    time_to_first_token_seconds=0.1,
+                ),
+            ),
+            ModelResponse(
+                reasoning="bundled",
+                content="late",
+                usage=TokenUsage(prompt_tokens=8, completion_tokens=250, total_tokens=258),
+                timing=CallTiming(
+                    http_status=200,
+                    elapsed_seconds=0.501,
+                    time_to_first_token_seconds=0.5,
+                ),
+            ),
+        ]
+    )
+    session = _session(model, tmp_path=tmp_path)
+
+    events = _run_protocol(
+        ['{"type":"user","text":"one"}', '{"type":"user","text":"two"}'],
+        session,
+    )
+
+    done = [event for event in events if event["type"] == "done"]
+    thoughts = [event for event in events if event["type"] == "thought"]
+    assert done[0]["tokens_per_second"] == 10.0
+    assert "last 10.0 tok/s" in done[0]["status_line"]
+    assert [event["text"] for event in thoughts] == ["bundled"]
+    assert "tokens_per_second" not in thoughts[0]
+    assert done[1]["tokens_per_second"] == 10.0
+    assert "last 10.0 tok/s" in done[1]["status_line"]
+    assert "250000.0" not in done[1]["status_line"]
+
+
+def test_degenerate_window_on_a_fresh_session_stays_unavailable(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                content="late",
+                usage=TokenUsage(completion_tokens=250),
+                timing=CallTiming(
+                    http_status=200,
+                    elapsed_seconds=0.501,
+                    time_to_first_token_seconds=0.5,
+                ),
+            )
+        ]
+    )
+    session = _session(model, tmp_path=tmp_path)
+
+    events = _run_protocol(['{"type":"user","text":"hi"}'], session)
+
+    done = next(event for event in events if event["type"] == "done")
+    assert done["tokens_per_second"] is None
+    assert "last n/a tok/s" in done["status_line"]
+    assert "250000.0" not in done["status_line"]
+
+
 def test_http_error_keeps_status_and_short_body(tmp_path: Path) -> None:
     client = _QueueClient(
         [{"error": {"message": "slow down"}}],
