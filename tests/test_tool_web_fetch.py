@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 import socket
 from pathlib import Path
@@ -12,7 +13,14 @@ from pydantic import ValidationError
 
 from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
 from atlas.agent.contracts import default_registry
-from atlas.agent.tools.web_fetch import WebFetchTool, _DeadlineBackend
+from atlas.agent.tools.web_fetch import (
+    WebFetchTool,
+    _DeadlineBackend,
+    _embedded_ipv4,
+    _is_blocked,
+    _now,
+    _open_client,
+)
 
 _PUBLIC = "93.184.216.34"
 
@@ -184,6 +192,20 @@ def test_errors_omit_the_query_string_and_userinfo(tmp_path: Path) -> None:
     assert "s3cret" not in str(credentials.value)
 
 
+def test_errors_omit_the_fragment(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    tool = _tool(_handler(httpx.Response(500, text="boom")))
+
+    with pytest.raises(RuntimeError, match="HTTP 500") as exc:
+        tool.run({"url": "https://example.com/broken?token=topsecret#section"}, store)
+
+    message = str(exc.value)
+    assert "topsecret" not in message
+    assert "section" not in message
+    assert "#" not in message
+    assert "https://example.com/broken" in message
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -196,7 +218,13 @@ def test_errors_omit_the_query_string_and_userinfo(tmp_path: Path) -> None:
         "http://172.16.5.5/admin",
         "http://192.168.1.10/admin",
         "http://169.254.1.1/admin",
-        "http://[fc00::1]/admin",
+        "http://100.100.100.200/admin",
+        "http://100.64.0.1/admin",
+        "http://[64:ff9b::a9fe:a9fe]/admin",
+        "http://[64:ff9b::7f00:1]/admin",
+        "http://[fec0::1]/admin",
+        "http://[2002:7f00:1::]/admin",
+        "http://[2001:0:102:304::f5ff:fffe]/admin",
         "http://[fe80::1]/admin",
         "http://224.0.0.1/admin",
         "http://0.0.0.0/admin",
@@ -235,6 +263,8 @@ def test_rejects_non_public_address_literals(tmp_path: Path, url: str) -> None:
         ),
         ("https://cdn.example/a?token=topsecret", ["10.0.0.5"], "cdn.example"),
         ("https://cdn.example/a?token=topsecret", ["93.184.216.34", "192.168.0.9"], "cdn.example"),
+        ("https://cgnat.example/a?token=topsecret", ["100.100.100.200"], "cgnat.example"),
+        ("https://tailnet.example/a?token=topsecret", ["100.64.0.1"], "tailnet.example"),
     ],
 )
 def test_rejects_names_that_resolve_to_a_non_public_address(
@@ -439,6 +469,35 @@ def test_ignores_proxy_env_and_netrc(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert "token=topsecret" in seen["url"]
 
 
+def test_dns_resolution_counts_against_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    clock = {"t": 0.0}
+    monkeypatch.setattr("atlas.agent.tools.web_fetch._now", lambda: clock["t"])
+    called = False
+
+    def fake(host: str, port: int, *_args: Any, **_kwargs: Any) -> list[Any]:
+        clock["t"] += 2.0
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (_PUBLIC, port or 0))]
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return _html("never returned")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
+    with pytest.raises(httpx.TimeoutException) as exc:
+        _tool(handle).run(
+            {"url": "https://example.com/slow?token=topsecret#section", "timeout": 1}, store
+        )
+
+    assert called is False
+    assert "topsecret" not in str(exc.value)
+    assert "section" not in str(exc.value)
+    assert "https://example.com/slow" in str(exc.value)
+
+
 def test_deadline_covers_connect_and_the_full_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -555,3 +614,120 @@ def _nonce_of(text: str) -> str:
     match = re.search(r"untrusted_web_content_([0-9a-f]{16})", text)
     assert match is not None
     return match.group(1)
+
+
+def test_transition_addresses_are_judged_by_the_embedded_ipv4() -> None:
+    nat64_metadata = ipaddress.IPv6Address("64:ff9b::a9fe:a9fe")
+    nat64_loopback = ipaddress.IPv6Address("64:ff9b::7f00:1")
+    sixtofour = ipaddress.IPv6Address("2002:7f00:1::")
+    teredo = ipaddress.IPv6Address("2001:0:102:304::f5ff:fffe")
+
+    assert _embedded_ipv4(nat64_metadata) == (ipaddress.IPv4Address("169.254.169.254"),)
+    assert _embedded_ipv4(nat64_loopback) == (ipaddress.IPv4Address("127.0.0.1"),)
+    assert _embedded_ipv4(sixtofour) == (ipaddress.IPv4Address("127.0.0.1"),)
+    assert _embedded_ipv4(teredo) == (
+        ipaddress.IPv4Address("1.2.3.4"),
+        ipaddress.IPv4Address("10.0.0.1"),
+    )
+    assert _is_blocked(nat64_metadata)
+    assert _is_blocked(nat64_loopback)
+    assert _is_blocked(sixtofour)
+    assert _is_blocked(teredo)
+    assert _is_blocked(ipaddress.IPv6Address("fec0::1"))
+    assert _is_blocked(ipaddress.IPv4Address("100.64.0.1"))
+    assert _is_blocked(ipaddress.IPv4Address("100.100.100.200"))
+    assert not _is_blocked(ipaddress.IPv4Address("8.8.8.8"))
+    assert not _is_blocked(ipaddress.IPv4Address("100.128.0.1"))
+
+
+def test_open_client_patches_the_pool_network_backend() -> None:
+    client = _open_client(_now() + 5)
+    try:
+        transport = client._transport
+        pool = getattr(transport, "_pool", None)
+        assert isinstance(pool, httpcore.ConnectionPool)
+        assert isinstance(pool._network_backend, _DeadlineBackend)
+    finally:
+        client.close()
+
+
+def test_sni_hostname_reaches_start_tls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = LocalArtifactStore(tmp_path)
+    seen: dict[str, Any] = {}
+
+    class RecordingStream(httpcore.NetworkStream):
+        def __init__(self) -> None:
+            self._response = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Content-Length: 2\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+                b"ok"
+            )
+            self._offset = 0
+
+        def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+            chunk = self._response[self._offset : self._offset + max_bytes]
+            self._offset += len(chunk)
+            return chunk
+
+        def write(self, buffer: bytes, timeout: float | None = None) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def start_tls(
+            self,
+            ssl_context: Any,
+            server_hostname: str | None = None,
+            timeout: float | None = None,
+        ) -> httpcore.NetworkStream:
+            seen["sni"] = server_hostname
+            return self
+
+        def get_extra_info(self, info: str) -> Any:
+            return None
+
+    class RecordingBackend(httpcore.NetworkBackend):
+        def connect_tcp(
+            self,
+            host: str,
+            port: int,
+            timeout: float | None = None,
+            local_address: str | None = None,
+            socket_options: Any = None,
+        ) -> httpcore.NetworkStream:
+            seen["connect_host"] = host
+            seen["connect_port"] = port
+            return RecordingStream()
+
+        def connect_unix_socket(
+            self,
+            path: str,
+            timeout: float | None = None,
+            socket_options: Any = None,
+        ) -> httpcore.NetworkStream:
+            raise AssertionError("unix socket")
+
+        def sleep(self, seconds: float) -> None:
+            return None
+
+    def open_and_record(deadline: float) -> httpx.Client:
+        client = _open_client(deadline)
+        pool = client._transport._pool
+        backend = pool._network_backend
+        assert isinstance(backend, _DeadlineBackend)
+        seen["deadline_backend"] = True
+        backend._inner = RecordingBackend()
+        return client
+
+    monkeypatch.setattr("atlas.agent.tools.web_fetch._open_client", open_and_record)
+    result = WebFetchTool().run({"url": "https://example.com/page"}, store)
+
+    assert seen["deadline_backend"] is True
+    assert seen["connect_host"] == _PUBLIC
+    assert seen["connect_port"] == 443
+    assert seen["sni"] == "example.com"
+    assert "ok" in result.text
