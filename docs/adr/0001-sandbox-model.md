@@ -217,8 +217,20 @@ same user who started it.
 ## Revisit when
 
 - `bash_tool` is expected to be safe against prompt injection that uses
-  the network. The network is unrestricted. Landlock and `sandbox-exec`
-  cover host files the text scan cannot see; they do not cover the network.
+  the network, for example when the agent reads untrusted content such as
+  downloaded files, web pages, or third-party metadata. The network is
+  unrestricted. Landlock and `sandbox-exec` cover host files the text scan
+  cannot see; they do not cover the network.
+
+  `web_fetch` now reads web pages by default. That is the case this bullet
+  names. The page is returned as text inside per-session untrusted tags,
+  with OSC sequences, C0 controls, and bidi controls removed, and the
+  system prompt says web content is data, not instructions. The fetch
+  resolves the host, refuses a non-public address, and connects only to
+  the address it checked. None of that closes the network gap above. File
+  confinement of `bash_tool` is in place on Linux and macOS; a page can
+  still induce a network action through the shell.
+
 - A tool starts executing content not written by us, such as running a
   model-authored script under its own interpreter and dependencies.
 - Atlas serves sessions for anyone other than the person running it
@@ -263,7 +275,8 @@ same user who started it.
 - **Terminal escape injection.** Only CSI sequences are stripped from Bash
   output, and `read_file` output isn't sanitized at all. OSC sequences
   (window title, clipboard via OSC 52) reach the TUI, which doesn't filter
-  them.
+  them. `web_fetch` strips OSC sequences, C0 controls, and bidi controls
+  from page text before it reaches the model.
 - **Check-then-use.** The file tools check a path, then open it later.
   Exploiting the gap needs a concurrent process, such as a `setsid()`
   escapee, since tool calls otherwise run one at a time.
@@ -308,3 +321,7 @@ Offline tests, run in CI:
   agent loop; the turn surviving a failed audit write; the log refusing a
   symlinked `.atlas`, a symlinked log file and a hardlinked log file; and
   one line per record.
+- `tests/test_tool_web_fetch.py`: `web_fetch` refuses non-public addresses,
+  including names that resolve to one, ignores proxy settings and netrc,
+  stops at one deadline for the connect and the body, wraps the body as
+  untrusted text, and omits the query string from errors.
