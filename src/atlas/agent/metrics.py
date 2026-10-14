@@ -10,6 +10,10 @@ from pydantic import BaseModel, Field
 from atlas.agent.contracts import CallTiming, ModelCall, ModelResponse, TokenUsage
 
 _RECENT_LIMIT = 8
+# A single late chunk timestamps the first token and the end of the stream
+# on top of each other. A few milliseconds is that sliver, not a generation
+# interval, and dividing the completion by it publishes a six-digit spike.
+_MIN_GENERATION_SECONDS = 0.05
 
 
 class SessionTotals(BaseModel):
@@ -63,9 +67,11 @@ def tokens_per_second(completion_tokens: int, generation_seconds: float) -> floa
 
     ``generation_seconds`` excludes time to first token and any tool
     execution between calls. A call with no output tokens does not produce
-    a rate.
+    a rate. A window that is ``<= 0``, or only a few milliseconds (the first
+    measured chunk and the end of the stream landing together), does not
+    either: that quotient is not the speed of the call.
     """
-    if completion_tokens <= 0 or generation_seconds <= 0:
+    if completion_tokens <= 0 or generation_seconds <= _MIN_GENERATION_SECONDS:
         return None
     return completion_tokens / generation_seconds
 
@@ -74,9 +80,10 @@ def output_tokens_per_second(completion_tokens: int, timing: CallTiming | None) 
     """Latest-call output speed, measured from the first token.
 
     The denominator is ``elapsed_seconds - time_to_first_token_seconds``.
-    When the transport did not record that instant, the rate is left unset
-    so the whole HTTP wait is not reported as generation speed. ``None``
-    means a previously measured rate should stay on the status line.
+    When the transport did not record that instant, or the gap is too small
+    to be a generation interval, the rate is left unset so the whole HTTP
+    wait and a collapsed window are not reported as generation speed.
+    ``None`` means a previously measured rate should stay on the status line.
     """
     if timing is None or timing.time_to_first_token_seconds is None:
         return None
@@ -150,9 +157,10 @@ def apply_call(
     the call used tokens, the catalog per-token prices are applied and
     ``estimated`` is set so the status line can prefix ``~``. If those rates
     are missing too, the session spend becomes unknown. A session that has
-    not used tokens stays at ``$0``. Output speed is the latest call that
-    reported time to first token; a later call without that instant does not
-    replace it.
+    not used tokens stays at ``$0``. Output speed is the latest call whose
+    generation window, after time to first token, is long enough to be a
+    rate. A later call with no time to first token, or a window of only a
+    few milliseconds, does not replace it.
     """
     usage = call.usage
     totals.prompt_tokens += usage.prompt_tokens

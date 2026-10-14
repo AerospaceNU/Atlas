@@ -5,7 +5,7 @@ import json
 import re
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Self
@@ -219,10 +219,13 @@ def _read_completion(resp: Any, started: float) -> tuple[dict[str, Any], CallTim
 
 
 def _completion_elapsed(resp: Any, started: float) -> float:
-    """Wall time for a streamed body.
+    """Wall time for a streamed body, read after that body has arrived.
 
     ``Response.elapsed`` stops at the headers, which arrive before the tokens.
     An injected ``elapsed_seconds`` still wins so tests can pin the duration.
+    The clock used here includes generation only when the stream was consumed
+    first; pairing it with a time to first token taken at the same instant
+    collapses the rate.
     """
     explicit = getattr(resp, "elapsed_seconds", None)
     if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and explicit >= 0:
@@ -231,6 +234,11 @@ def _completion_elapsed(resp: Any, started: float) -> float:
 
 
 def _completion_ttft(resp: Any, measured: float | None) -> float | None:
+    """Time to the first token.
+
+    ``measured`` is the instant the first chunk was applied. An injected
+    ``time_to_first_token_seconds`` still wins so tests can pin it.
+    """
     if hasattr(resp, "time_to_first_token_seconds"):
         return _as_optional_seconds(resp.time_to_first_token_seconds)
     return measured
@@ -314,15 +322,20 @@ def _stream_error(payload: dict[str, Any], resp: Any, started: float) -> OpenRou
     )
 
 
-def _iter_events(resp: Any) -> list[dict[str, Any]]:
+def _iter_events(resp: Any) -> Iterator[dict[str, Any]]:
+    """Yield SSE payloads as each line arrives.
+
+    The first token is timestamped while this iterator is consumed. Buffering
+    every line before that stamp puts the first chunk and the end of the
+    stream on the same instant, and the generation window collapses to the
+    time spent walking an already-finished body.
+    """
     lines = getattr(resp, "iter_lines", None)
-    raw_lines: list[object]
     if callable(lines):
-        raw_lines = list(lines())
+        raw_lines = lines()
     else:
         body = resp.json()
-        raw_lines = [json.dumps(body), "[DONE]"]
-    events: list[dict[str, Any]] = []
+        raw_lines = (json.dumps(body), "[DONE]")
     for raw in raw_lines:
         text = raw.decode() if isinstance(raw, bytes) else raw
         if not isinstance(text, str):
@@ -339,8 +352,7 @@ def _iter_events(resp: Any) -> list[dict[str, Any]]:
         except json.JSONDecodeError as exc:
             raise ValueError(f"Unexpected OpenRouter stream event: {line!r}") from exc
         if isinstance(payload, dict):
-            events.append(payload)
-    return events
+            yield payload
 
 
 def _apply_choice(
@@ -375,6 +387,11 @@ def _apply_piece(
 
 
 def _append_text(parts: list[str], value: object, started: float, measured: list[float]) -> None:
+    """Append text and, on the first chunk, record when it arrived.
+
+    The stamp is time to first token only when this runs as the chunk is
+    read. A body that was buffered first records the end of the stream.
+    """
     if not isinstance(value, str) or not value:
         return
     parts.append(value)
