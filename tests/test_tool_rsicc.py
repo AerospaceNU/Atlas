@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import io
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -16,21 +17,38 @@ from pydantic import ValidationError
 
 from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
 from atlas.agent.contracts import build_registry, default_registry
-from atlas.agent.tools.rsicc_tool import RSICCTool
+from atlas.agent.tools.rsicc_tool import ChangeReport, GeoCheckFailed, RSICCTool
+
+
+def _report(confidence: float = 0.9, flags: tuple[str, ...] = ()) -> str:
+    return json.dumps(
+        {
+            "change_detected": True,
+            "change_types": ["water"],
+            "description": "The lake in the before image is dry in the after image.",
+            "confidence": confidence,
+            "quality_flags": list(flags),
+        }
+    )
 
 
 @dataclass
 class _FakeResponse:
     text: str | None
+    parsed: Any = None
 
 
 @dataclass
 class _FakeModels:
     reply: str | None
     calls: list[dict[str, Any]] = field(default_factory=list)
+    # Replies for the second call onward. ``reply`` answers the first call.
+    later: list[str] = field(default_factory=list)
 
     def generate_content(self, **kwargs: Any) -> _FakeResponse:
         self.calls.append(kwargs)
+        if len(self.calls) > 1 and self.later:
+            return _FakeResponse(self.later.pop(0))
         return _FakeResponse(self.reply)
 
 
@@ -67,8 +85,16 @@ class _FakeAutomaticFunctionCallingConfig:
 
 
 class _FakeGenerateContentConfig:
-    def __init__(self, *, automatic_function_calling: _FakeAutomaticFunctionCallingConfig) -> None:
+    def __init__(
+        self,
+        *,
+        automatic_function_calling: _FakeAutomaticFunctionCallingConfig,
+        response_mime_type: str | None = None,
+        response_schema: Any = None,
+    ) -> None:
         self.automatic_function_calling = automatic_function_calling
+        self.response_mime_type = response_mime_type
+        self.response_schema = response_schema
 
 
 def _install_fake_genai(monkeypatch: pytest.MonkeyPatch, client: _FakeGemini) -> None:
@@ -94,7 +120,7 @@ def _install_fake_genai(monkeypatch: pytest.MonkeyPatch, client: _FakeGemini) ->
 
 @pytest.fixture
 def gemini(monkeypatch: pytest.MonkeyPatch) -> _FakeGemini:
-    fake = _FakeGemini(reply="  The lake in the before image is dry in the after image.\n")
+    fake = _FakeGemini(reply=_report())
     _install_fake_genai(monkeypatch, fake)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     return fake
@@ -141,7 +167,13 @@ def test_returns_the_gemini_reply(tmp_path: Path, gemini: _FakeGemini) -> None:
 
     result = RSICCTool().run({"image1": before, "image2": after}, store)
 
-    assert result.text == "The lake in the before image is dry in the after image."
+    output = json.loads(result.text)
+    assert output["report"]["description"] == (
+        "The lake in the before image is dry in the after image."
+    )
+    assert output["report"]["change_types"] == ["water"]
+    assert output["escalated"] is False
+    assert output["needs_review"] is False
     assert result.artifacts == []
     assert gemini.api_keys == ["test-key"]
 
@@ -173,6 +205,54 @@ def test_disables_automatic_function_calling(tmp_path: Path, gemini: _FakeGemini
 
     config = gemini.models.calls[0]["config"]
     assert config.automatic_function_calling.disable is True
+
+
+def test_asks_gemini_for_a_change_report(tmp_path: Path, gemini: _FakeGemini) -> None:
+    store = LocalArtifactStore(tmp_path)
+    before = _save(_rgb(8, 8), tmp_path / "before.png")
+
+    RSICCTool().run({"image1": before, "image2": before}, store)
+
+    config = gemini.models.calls[0]["config"]
+    assert config.response_mime_type == "application/json"
+    assert config.response_schema is ChangeReport
+
+
+def test_low_confidence_retries_on_the_fallback_model(tmp_path: Path, gemini: _FakeGemini) -> None:
+    gemini.models.reply = _report(confidence=0.3)
+    gemini.models.later = [_report(confidence=0.4, flags=("misalignment",))]
+    store = LocalArtifactStore(tmp_path)
+    before = _save(_rgb(8, 8), tmp_path / "before.png")
+
+    tool = RSICCTool(fallback_model="strong-model")
+    arguments = {"image1": before, "image2": before, "model": "fast-model"}
+    output = json.loads(tool.run(arguments, store).text)
+
+    assert [call["model"] for call in gemini.models.calls] == ["fast-model", "strong-model"]
+    assert output["escalated"] is True
+    assert output["model"] == "strong-model"
+    assert output["needs_review"] is True
+    assert len(output["attempts"]) == 2
+
+
+def test_confident_answer_is_not_retried(tmp_path: Path, gemini: _FakeGemini) -> None:
+    store = LocalArtifactStore(tmp_path)
+    before = _save(_rgb(8, 8), tmp_path / "before.png")
+
+    RSICCTool().run({"image1": before, "image2": before}, store)
+
+    assert len(gemini.models.calls) == 1
+
+
+def test_catalog_cloud_cover_flags_the_result(tmp_path: Path, gemini: _FakeGemini) -> None:
+    store = LocalArtifactStore(tmp_path)
+    before = _save(_rgb(8, 8), tmp_path / "before.png")
+
+    arguments = {"image1": before, "image2": before, "after_cloud_cover": 60}
+    output = json.loads(RSICCTool().run(arguments, store).text)
+
+    assert "cloud_cover" in output["report"]["quality_flags"]
+    assert output["needs_review"] is True
 
 
 def test_reads_images_from_subdirectories(tmp_path: Path, gemini: _FakeGemini) -> None:
@@ -326,7 +406,7 @@ def test_supported_values_are_sent_fine(
         assert part.inline_data.data == b"image bytes"
 
 
-@pytest.mark.parametrize("filename", ["palette.gif", "rgb.bmp", "rgb.tif", "gray.tiff"])
+@pytest.mark.parametrize("filename", ["palette.gif", "rgb.bmp"])
 def test_unsupported_formats_are_rejected_without_calling_gemini(
     tmp_path: Path, gemini: _FakeGemini, filename: str
 ) -> None:
@@ -335,6 +415,75 @@ def test_unsupported_formats_are_rejected_without_calling_gemini(
 
     with pytest.raises(ValueError, match="Unsupported image type"):
         RSICCTool().run({"image1": filename, "image2": filename}, store)
+
+    assert gemini.models.calls == []
+
+
+def test_geotiff_mixed_with_a_plain_image_is_rejected(tmp_path: Path, gemini: _FakeGemini) -> None:
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path / "scene.tif").write_bytes(b"not read")
+    plain = _save(_rgb(8, 8), tmp_path / "plain.png")
+
+    with pytest.raises(GeoCheckFailed, match="Both images"):
+        RSICCTool().run({"image1": "scene.tif", "image2": plain}, store)
+
+    assert gemini.models.calls == []
+
+
+def _geotiff(path: Path, x0: float, *, res: float = 10.0, crs: str = "EPSG:32633") -> str:
+    """Write a 64x64 three-band GeoTIFF whose top-left corner sits at ``x0``."""
+    rasterio = pytest.importorskip("rasterio")
+    from rasterio.transform import from_origin
+
+    data = np.random.default_rng(0).integers(0, 4000, (3, 64, 64), dtype=np.uint16)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=64,
+        height=64,
+        count=3,
+        dtype="uint16",
+        crs=crs,
+        transform=from_origin(x0, 5000, res, res),
+    ) as dataset:
+        dataset.write(data)
+        dataset.update_tags(CLOUD_COVER="45")
+    return path.name
+
+
+def test_aligned_geotiffs_are_cropped_and_sent_as_png(tmp_path: Path, gemini: _FakeGemini) -> None:
+    store = LocalArtifactStore(tmp_path)
+    before = _geotiff(tmp_path / "before.tif", 0)
+    after = _geotiff(tmp_path / "after.tif", 100)
+
+    output = json.loads(RSICCTool().run({"image1": before, "image2": after}, store).text)
+
+    parts = _sent_images(gemini)
+    assert [part.inline_data.mime_type for part in parts] == ["image/png", "image/png"]
+    assert _decode(parts[0]).size == _decode(parts[1]).size == (54, 64)
+    assert output["geo_check"]["before_cloud_cover"] == 45
+    assert "cloud_cover" in output["report"]["quality_flags"]
+
+
+@pytest.mark.parametrize(
+    ("x0", "res", "crs", "message"),
+    [
+        (0, 10.0, "EPSG:32634", "coordinate reference"),
+        (10_000, 10.0, "EPSG:32633", "do not overlap"),
+        (500, 10.0, "EPSG:32633", "only share"),
+        (0, 30.0, "EPSG:32633", "pixel sizes"),
+    ],
+)
+def test_misaligned_geotiffs_are_refused_without_calling_gemini(
+    tmp_path: Path, gemini: _FakeGemini, x0: float, res: float, crs: str, message: str
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    before = _geotiff(tmp_path / "before.tif", 0)
+    after = _geotiff(tmp_path / "after.tif", x0, res=res, crs=crs)
+
+    with pytest.raises(GeoCheckFailed, match=message):
+        RSICCTool().run({"image1": before, "image2": after}, store)
 
     assert gemini.models.calls == []
 
@@ -356,5 +505,5 @@ def test_live_gemini_describes_an_obvious_change(tmp_path: Path) -> None:
 
     result = RSICCTool().run({"image1": before, "image2": after}, store)
 
-    assert result.text.strip()
-    assert "red" in result.text.lower() or "square" in result.text.lower()
+    description = json.loads(result.text)["report"]["description"].lower()
+    assert "red" in description or "square" in description
