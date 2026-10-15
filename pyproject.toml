@@ -1,6 +1,6 @@
 [project]
 name = "atlas"
-version = "0.13.0"
+version = "0.14.0"
 description = "Automated satellite data analysis framework"
 readme = "README.md"
 authors = [
@@ -28,6 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gemini = ["google-genai>=2.28.0"]
+geotiff = ["rasterio>=1.4.0"]
 lightgbm = ["lightgbm>=4.6.0"]
 
 [project.scripts]
