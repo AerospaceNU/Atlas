@@ -38,6 +38,7 @@ _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOOL_CALLS = 256
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
+MAX_TOOL_RESULT_CHARS = 20_000
 
 _STOPPED_RESPONSE = "Stopped after reaching the configured tool-use limit."
 
@@ -323,7 +324,14 @@ def _kind(exc: Exception) -> ErrorKind:
 
 def _tool_message(step: AgentStep) -> str:
     if step.result is not None:
-        return step.result.model_dump_json()
+        result = step.result
+        if len(result.text) > MAX_TOOL_RESULT_CHARS:
+            cut = len(result.text) - MAX_TOOL_RESULT_CHARS
+            marker = f"...[truncated {cut} characters]"
+            result = result.model_copy(
+                update={"text": result.text[:MAX_TOOL_RESULT_CHARS] + marker}
+            )
+        return result.model_dump_json()
     return json.dumps({"error": step.error, "error_kind": step.error_kind})
 
 
