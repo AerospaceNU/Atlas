@@ -325,3 +325,62 @@ async def test_other_sources_still_refuse_browse_assets(tmp_path: Path) -> None:
     assert not (out / "other").exists()
     failed = _manifest(out)["other"]["failed"]
     assert failed == [{"id": "browse-only", "error": "no native-resolution asset"}]
+
+
+async def test_unexpected_gibs_error_fails_one_day_and_keeps_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A decoder bug on one day must not abort the rest of the pull."""
+    from atlas.cli import source_outputs
+
+    real_inspect = source_outputs._inspect_image
+    calls = {"n": 0}
+
+    def flaky(payload: bytes) -> tuple[str, bool]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("decoder exploded")
+        return real_inspect(payload)
+
+    monkeypatch.setattr("atlas.cli.source_outputs._inspect_image", flaky)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_png(), headers={"content-type": "image/png"})
+
+    out = tmp_path / "out"
+    code = await _pull(
+        out,
+        {"gibs_modis_truecolor": GibsModisTrueColorClient()},
+        httpx.MockTransport(handler),
+        _request(days=2),
+    )
+
+    assert code == 0
+    row = _manifest(out)["gibs_modis_truecolor"]
+    assert len(row["saved"]) == 1
+    assert len(row["failed"]) == 1
+    assert "RuntimeError" in str(row["failed"][0]["error"])
+
+
+def test_unexpected_detections_error_is_a_failed_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A renderer bug is recorded instead of escaping the pull."""
+    scenes = _rows_to_scenes(
+        VIIRS_CSV,
+        source=FirmsClient.source,
+        platform=FirmsClient.platform_name,
+        instrument=FirmsClient.instrument_name,
+        kind=SceneKind.detection,
+        gsd_m=375.0,
+    )
+    scenes = [scene.model_copy(update={"source": "firms_viirs"}) for scene in scenes]
+
+    def boom(path: Path, payload: bytes) -> None:
+        raise RuntimeError("writer exploded")
+
+    monkeypatch.setattr("atlas.cli.source_outputs._write_atomic", boom)
+    outcome = write_detections_csv(scenes, tmp_path, "firms_viirs")
+
+    assert outcome.status == "failed"
+    assert outcome.error is not None and "RuntimeError" in outcome.error

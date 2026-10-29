@@ -56,6 +56,13 @@ class BBox(BaseModel):
     east: float = Field(..., ge=-180, le=180)
     north: float = Field(..., ge=-90, le=90)
 
+    @model_validator(mode="after")
+    def _ordered_latitudes(self) -> Self:
+        """Reject an upside-down box, which no catalog or raster read can serve."""
+        if self.south > self.north:
+            raise ValueError("south must be less than or equal to north")
+        return self
+
     @classmethod
     def from_corners(cls, lon1: float, lat1: float, lon2: float, lat2: float) -> Self:
         return cls.enclosing([lon1, lon2], [lat1, lat2])

@@ -81,6 +81,11 @@ def normalize(name: str) -> str:
     return name.strip().lower().replace("-", "").replace("_", "")
 
 
+def _is_all(name: str) -> bool:
+    """True when ``name`` is the ``all`` token (any case or spacing)."""
+    return normalize(_SAT_ALIASES.get(normalize(name), name)) == ALL
+
+
 def _registry(
     registry: Mapping[str, type[DataPullClient]] | None,
 ) -> dict[str, type[DataPullClient]]:
@@ -249,6 +254,29 @@ def format_catalog(registry: Mapping[str, type[DataPullClient]] | None = None) -
     return _capture(lambda console: render_catalog(console, registry))
 
 
+def _render_all_tree(
+    console: Console,
+    registry: Mapping[str, type[DataPullClient]] | None,
+    *,
+    kind: str | None,
+) -> None:
+    """Print every satellite as a tree branch, optionally for one kind."""
+    want = _parse_kind(kind) if kind else None
+    infos = list_satellites(registry)
+    if want is not None:
+        infos = [info for info in infos if want in info.sources_by_kind]
+        if not infos:
+            available = ", ".join(item.value for item in satellite_kinds(ALL, registry))
+            raise CatalogError(f"No sources with kind {kind!r}. Available kinds: {available}")
+    tree = Tree(Text(ALL, style="bold cyan"))
+    for info in infos:
+        branch = tree.add(Text(info.name, style="bold cyan"))
+        _add_kinds(branch, info, (want,) if want is not None else info.kinds)
+    console.print(tree)
+    console.print()
+    console.print(Text(_PULL_HINT, style="dim"))
+
+
 def render_satellite_tree(
     console: Console,
     name: str,
@@ -256,7 +284,13 @@ def render_satellite_tree(
     *,
     kind: str | None = None,
 ) -> None:
-    """Print one satellite's kinds as a tree (``atlas alos --list``)."""
+    """Print one satellite's kinds as a tree (``atlas alos --list``).
+
+    ``all`` prints every satellite, optionally narrowed to one kind.
+    """
+    if _is_all(name):
+        _render_all_tree(console, registry, kind=kind)
+        return
     info = _find_satellite(name, registry)
     kinds = info.kinds
     if kind:
@@ -281,7 +315,10 @@ def render_satellite(
     name: str,
     registry: Mapping[str, type[DataPullClient]] | None = None,
 ) -> None:
-    """Print kinds and sources for one satellite."""
+    """Print kinds and sources for one satellite. ``all`` prints the catalog."""
+    if _is_all(name):
+        render_catalog(console, registry)
+        return
     info = _find_satellite(name, registry)
     grid = Table.grid(padding=(0, 2))
     grid.add_column(no_wrap=True)
@@ -317,13 +354,39 @@ def satellite_pull_hint(info: SatelliteInfo) -> str:
 def only_kind(name: str, registry: Mapping[str, type[DataPullClient]] | None = None) -> str | None:
     """Return the kind value when ``name`` has exactly one kind.
 
-    ``None`` means the caller should keep asking for a kind. An unknown name
-    raises ``CatalogError``.
+    ``None`` means the caller should keep asking for a kind. ``all`` has more
+    than one kind. An unknown name raises ``CatalogError``.
     """
+    if _is_all(name):
+        return None
     info = _find_satellite(name, registry)
     if len(info.kinds) != 1:
         return None
     return info.kinds[0].value
+
+
+def satellite_kinds(
+    name: str,
+    registry: Mapping[str, type[DataPullClient]] | None = None,
+) -> tuple[SceneKind, ...]:
+    """Return the kinds registered for a satellite token.
+
+    ``all`` returns every kind in the registry. An unknown name raises
+    ``CatalogError``.
+
+    Args:
+        name: Satellite family, registry key, shorthand, or ``all``.
+        registry: Source map to walk. Defaults to ``SOURCES``.
+
+    Returns:
+        Kind values in sorted order.
+    """
+    if _is_all(name):
+        reg = _registry(registry)
+        return tuple(
+            sorted({client_kind(cls) for cls in reg.values()}, key=lambda item: item.value)
+        )
+    return _find_satellite(name, registry).kinds
 
 
 def is_known_target(
@@ -427,7 +490,10 @@ def _pin_source(token: str, reg: Mapping[str, type[DataPullClient]]) -> str | No
     lower = token.lower()
     if lower in reg:
         return lower
-    return None
+    # A hyphen or underscore spelling of a registry key (``hls-sentinel``)
+    # names the same client, so listing and routing accept it too.
+    norm = normalize(token)
+    return next((key for key in reg if normalize(key) == norm), None)
 
 
 def _find_satellite(

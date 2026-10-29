@@ -34,6 +34,7 @@ from PIL import Image, UnidentifiedImageError
 
 from atlas.cli.download import (
     DownloadOutcome,
+    describe_error,
     inside_output,
     output_source_dir,
     retire_product,
@@ -131,16 +132,23 @@ def write_detections_csv(scenes: Sequence[Scene], out: Path, source: str) -> Dow
             if key not in columns:
                 columns.append(key)
     ordered = sorted(scenes, key=lambda s: (s.datetime, s.lat or 0.0, s.lon or 0.0, s.id))
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=columns, lineterminator="\n")
-    writer.writeheader()
-    for scene in ordered:
-        writer.writerow(_detection_row(scene))
     try:
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=columns, lineterminator="\n")
+        writer.writeheader()
+        for scene in ordered:
+            writer.writerow(_detection_row(scene))
         path.parent.mkdir(parents=True, exist_ok=True)
         _write_atomic(path, buffer.getvalue().encode("utf-8"))
     except OSError as exc:
         return DownloadOutcome(source=source, scene_id=scene_id, status="failed", error=str(exc))
+    except Exception as exc:
+        return DownloadOutcome(
+            source=source,
+            scene_id=scene_id,
+            status="failed",
+            error=describe_error(exc),
+        )
     return DownloadOutcome(source=source, scene_id=scene_id, status="saved", path=path)
 
 
@@ -178,7 +186,16 @@ async def _save_gibs_images(
 
     async def one(scene: Scene) -> DownloadOutcome:
         async with sem:
-            outcome = await _save_gibs_image(scene, out, http=http)
+            try:
+                outcome = await _save_gibs_image(scene, out, http=http)
+            except Exception as exc:
+                # An unexpected decoder or disk error fails this day only.
+                outcome = DownloadOutcome(
+                    source=scene.source,
+                    scene_id=scene.id,
+                    status="failed",
+                    error=describe_error(exc),
+                )
         done[scene.source] += 1
         if on_progress is not None:
             on_progress(scene.source, done[scene.source], totals[scene.source])
@@ -278,8 +295,9 @@ def _write_atomic(path: Path, payload: bytes) -> None:
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as handle:
-            os.fchmod(handle.fileno(), 0o644)
             handle.write(payload)
+        # ``os.fchmod`` is Unix-only; ``os.chmod`` exists on Windows too.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)

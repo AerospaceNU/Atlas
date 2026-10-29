@@ -634,3 +634,169 @@ def test_inverted_cloud_bounds_exit_2(tmp_path: Path, capsys: pytest.CaptureFixt
     args = _request_pull_args(tmp_path, "--min-cloud-cover", "80", "--max-cloud-cover", "20")
     assert run_data(args, clients={"sentinel2": RecordingPullClient()}) == 2
     assert "min_cloud_cover" in capsys.readouterr().err
+
+
+def test_polygon_alone_infers_the_only_kind(tmp_path: Path) -> None:
+    client = RecordingPullClient()
+    args = _parse_pull_args(
+        [
+            "data",
+            "sentinel2",
+            "--date",
+            "2024-07-01:2024-07-07",
+            "--polygon",
+            "0,0;1,0;1,1;0,1",
+            "--out",
+            str(tmp_path),
+            "--search-only",
+        ]
+    )
+    assert args.kind is None
+    assert run_data(args, clients={"sentinel2": client}) == 0
+    request = client.requests[0]
+    assert request.polygon is not None
+    assert request.polygon.contains(0.5, 0.5)
+
+
+def test_pull_options_without_a_satellite_exit_2(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["data", "--date", "2024-07-01:2024-07-07", "--coords", "0,0,1,1"])
+    assert code == 2
+    assert "requires a satellite" in capsys.readouterr().err
+
+
+def test_several_kinds_without_a_kind_exit_2(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["data", "modis", "--date", "2024-07-01:2024-07-07", "--coords", "0,0,1,1"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "several kinds" in err
+    assert "optical" in err
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--limit", "0"], "between 1 and 1000"),
+        (["--limit", "1001"], "between 1 and 1000"),
+        (["--limit", "many"], "must be an integer"),
+        (["--concurrency", "0"], "at least 1"),
+    ],
+)
+def test_bounded_options_exit_2(
+    extra: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "data",
+                "sentinel2",
+                "optical",
+                "--date",
+                "2024-07-01:2024-07-07",
+                "--coords",
+                "0,0,1,1",
+                "--search-only",
+                *extra,
+            ]
+        )
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_inverted_latitudes_are_rejected() -> None:
+    with pytest.raises(ValueError, match="south must be less than or equal to north"):
+        parse_coords("0,40,1,30")
+
+
+def test_zero_area_coords_are_rejected() -> None:
+    with pytest.raises(ValueError, match="span more than one longitude"):
+        parse_coords("1,0,1,1")
+    with pytest.raises(ValueError, match="span more than one latitude"):
+        parse_coords("0,1,1,1")
+
+
+def test_non_numeric_coords_name_the_arguments() -> None:
+    with pytest.raises(ValueError, match="four numbers"):
+        parse_coords("a,b,c,d")
+
+
+def test_output_path_that_is_a_file_exits_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "not-a-dir"
+    target.write_text("x", encoding="utf-8")
+    args = _pull_args(target, search_only=True)
+    assert run_data(args, clients={"sentinel2": FakePullClient()}) == 2
+    assert "output directory" in capsys.readouterr().err
+
+
+def test_table_options_without_fldas_exit_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = _request_pull_args(tmp_path, "--table", str(tmp_path / "table.csv"))
+    assert run_data(args, clients={"sentinel2": RecordingPullClient()}) == 2
+    assert "--table" in capsys.readouterr().err
+
+
+def test_all_lists_the_catalog(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["all"]) == 0
+    out = capsys.readouterr().out
+    assert "satellites" in out
+    assert "sentinel2" in out
+
+
+def test_all_list_shows_sources_in_a_tree(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["data", "all", "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "alos_palsar" in out
+    assert "firms_viirs" in out
+
+
+def test_all_with_a_kind_narrows_the_list(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["data", "all", "optical", "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "sentinel2" in out
+    assert "alos_fnf" not in out
+
+
+def test_hyphenated_registry_key_is_listed(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["hls-sentinel"]) == 0
+    assert "hls_sentinel" in capsys.readouterr().out
+
+
+def test_directory_fsync_is_best_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from atlas.cli import data as data_cli
+
+    def refuse(*_args: object, **_kwargs: object) -> int:
+        raise OSError("directory fsync is not supported")
+
+    monkeypatch.setattr(data_cli.os, "open", refuse)
+    data_cli._fsync_directory(tmp_path)
+
+
+def test_directory_fsync_is_skipped_off_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from atlas.cli import data as data_cli
+
+    called: list[object] = []
+    monkeypatch.setattr(data_cli.os, "name", "nt")
+    monkeypatch.setattr(data_cli.os, "open", lambda *args, **kwargs: called.append(args))
+    data_cli._fsync_directory(tmp_path)
+    assert called == []
+
+
+def test_own_output_sources_report_unknown_bytes() -> None:
+    from atlas.cli.data import _unknown_byte_sources
+    from atlas.data.firms import FirmsClient
+    from atlas.data.gibs import GibsModisTrueColorClient
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _r: httpx.Response(200)))
+    gibs = GibsModisTrueColorClient(client=http)
+    firms = FirmsClient(map_key="k", client=http)
+    try:
+        unknown = _unknown_byte_sources(
+            {"gibs": gibs, "firms": firms, "sentinel2": FakePullClient()}, False
+        )
+    finally:
+        asyncio.run(http.aclose())
+    assert unknown == frozenset({"gibs", "firms"})

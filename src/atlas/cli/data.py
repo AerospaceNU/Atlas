@@ -34,6 +34,7 @@ from atlas.cli.catalog import (
     render_satellite,
     render_satellite_tree,
     resolve_sources,
+    satellite_kinds,
 )
 from atlas.cli.download import (
     BrowseAssetError,
@@ -83,8 +84,68 @@ _EXAMPLE = (
     "--coords -71.2,42.2,-70.9,42.5 --out .atlas/data/fldas"
 )
 _EXTRACT_HINT = "FLDAS table extraction runs alone; pass only the fldas source"
+_TABLE_OPTIONS_HINT = "--table, --variables, and --points apply only to the fldas source"
 _TABLE_NAME = "fldas.csv"
 _EMPTY_WINDOW = "requested window is empty"
+_PULL_OPTIONS = (
+    "date",
+    "coords",
+    "polygon",
+    "resume",
+    "asset",
+    "table",
+    "variables",
+    "points",
+    "search_only",
+    "yes",
+    "min_cloud_cover",
+    "max_cloud_cover",
+)
+
+
+def _pull_requested(args: argparse.Namespace) -> bool:
+    """True when an option asks for a pull rather than a listing."""
+    for name in _PULL_OPTIONS:
+        value = getattr(args, name, None)
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif isinstance(value, bool):
+            if value:
+                return True
+        elif value is not None:
+            return True
+    return False
+
+
+def _bounded_int(low: int, high: int, label: str) -> Callable[[str], int]:
+    """Argparse type for a whole number in ``[low, high]`` with a clean message."""
+
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer") from None
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"{label} must be between {low} and {high}")
+        return value
+
+    return parse
+
+
+def _at_least(low: int, label: str) -> Callable[[str], int]:
+    """Argparse type for a whole number of at least ``low``."""
+
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer") from None
+        if value < low:
+            raise argparse.ArgumentTypeError(f"{label} must be at least {low}")
+        return value
+
+    return parse
 
 
 def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -146,7 +207,12 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         default=project_data_dir(),
         help="Output directory (default: .atlas/data)",
     )
-    data.add_argument("--limit", type=int, default=100, help="Max scenes per source (1-1000)")
+    data.add_argument(
+        "--limit",
+        type=_bounded_int(1, 1000, "--limit"),
+        default=100,
+        help="Max scenes per source (1-1000)",
+    )
     data.add_argument(
         "--min-cloud-cover",
         type=float,
@@ -161,9 +227,9 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     data.add_argument(
         "--concurrency",
-        type=int,
+        type=_at_least(1, "--concurrency"),
         default=8,
-        help="Max parallel preview downloads",
+        help="Max parallel preview downloads (at least 1)",
     )
     data.add_argument(
         "--search-only",
@@ -233,7 +299,14 @@ def run_data(
     """
     load_repo_env()
     console = Console(highlight=False)
+    pull_intent = _pull_requested(args)
     if args.satellite is None:
+        if pull_intent:
+            print(
+                "data pull requires a satellite; run 'atlas data' to list them",
+                file=sys.stderr,
+            )
+            return 2
         render_catalog(console)
         return 0
     if args.list_catalog:
@@ -243,21 +316,37 @@ def run_data(
             Console(stderr=True, highlight=False).print(str(exc), style="red")
             return 2
         return 0
-    if args.kind is None and args.date and args.coords:
+    polygon_text = getattr(args, "polygon", None)
+    has_area = bool(args.coords or polygon_text)
+    if args.kind is None and (args.date or has_area):
         try:
-            args.kind = only_kind(args.satellite)
+            inferred = only_kind(args.satellite)
         except CatalogError as exc:
             Console(stderr=True, highlight=False).print(str(exc), style="red")
             return 2
+        if inferred is None:
+            kinds = ", ".join(kind.value for kind in satellite_kinds(args.satellite))
+            print(
+                f"satellite {args.satellite!r} has several kinds ({kinds}); pass one as the "
+                f"second argument, for example: atlas data {args.satellite} <kind> --date ...",
+                file=sys.stderr,
+            )
+            return 2
+        args.kind = inferred
     if args.kind is None:
+        if pull_intent:
+            print(
+                "data pull requires --date START:END and --coords W,S,E,N or --polygon",
+                file=sys.stderr,
+            )
+            return 2
         try:
             render_satellite(console, args.satellite)
         except CatalogError as exc:
             Console(stderr=True, highlight=False).print(str(exc), style="red")
             return 2
         return 0
-    polygon_text = getattr(args, "polygon", None)
-    if not args.date or not (args.coords or polygon_text):
+    if not args.date or not has_area:
         print(
             "data pull requires --date START:END and --coords W,S,E,N or --polygon",
             file=sys.stderr,
@@ -278,6 +367,9 @@ def run_data(
         if args.coords:
             request_body["bbox"] = parse_coords(args.coords)
         request = PullRequest.model_validate(request_body)
+    except ValidationError as exc:
+        print(_validation_error(exc, "pull request is invalid"), file=sys.stderr)
+        return 2
     except (CatalogError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -296,11 +388,13 @@ def run_data(
     fldas_only = extracting and len(names) == 1
     variables = None
     points = None
-    if (
-        extracting
-        and not fldas_only
-        and any(getattr(args, flag, None) is not None for flag in ("table", "variables", "points"))
-    ):
+    table_options = any(
+        getattr(args, flag, None) is not None for flag in ("table", "variables", "points")
+    )
+    if table_options and not extracting:
+        print(_TABLE_OPTIONS_HINT, file=sys.stderr)
+        return 2
+    if extracting and not fldas_only and table_options:
         print(_EXTRACT_HINT, file=sys.stderr)
         return 2
     if fldas_only:
@@ -388,12 +482,31 @@ def parse_date_range(text: str) -> tuple[date, date]:
 
 
 def parse_coords(text: str) -> BBox:
-    """Parse ``west,south,east,north`` into a ``BBox``."""
+    """Parse ``west,south,east,north`` into a ``BBox``.
+
+    A zero-width or zero-height box is rejected: it cannot overlap a raster
+    window or a catalog item, so it is almost always a typo. A box with west
+    greater than east still means a box across the antimeridian.
+
+    Raises:
+        ValueError: The text is not four numbers, the latitudes are inverted,
+            or the box has no area.
+    """
     parts = [item.strip() for item in text.split(",")]
     if len(parts) != 4:
         raise ValueError("coords must be west,south,east,north")
-    west, south, east, north = (float(item) for item in parts)
-    return BBox(west=west, south=south, east=east, north=north)
+    try:
+        west, south, east, north = (float(item) for item in parts)
+    except ValueError:
+        raise ValueError("coords must be four numbers: west,south,east,north") from None
+    if east == west:
+        raise ValueError("coords must span more than one longitude (west must not equal east)")
+    if south == north:
+        raise ValueError("coords must span more than one latitude (south must not equal north)")
+    try:
+        return BBox(west=west, south=south, east=east, north=north)
+    except ValidationError as exc:
+        raise ValueError(_validation_error(exc)) from None
 
 
 def parse_polygon(text: str) -> Polygon:
@@ -424,9 +537,9 @@ def parse_polygon(text: str) -> Polygon:
             payload = payload.get("geometry")
         try:
             if isinstance(payload, dict):
-                return Polygon.from_geojson(payload)
+                return Polygon.from_geojson(_closed_geojson(payload))
             if isinstance(payload, list):
-                return Polygon(ring=payload)
+                return Polygon(ring=_closed_ring(payload))
         except ValidationError as exc:
             raise ValueError(_polygon_error(exc)) from exc
         raise ValueError("polygon JSON must be a Polygon or a ring")
@@ -448,9 +561,39 @@ def parse_polygon(text: str) -> Polygon:
         raise ValueError(_polygon_error(exc)) from exc
 
 
-def _polygon_error(exc: ValidationError) -> str:
+def _validation_error(exc: ValidationError, fallback: str = "value is invalid") -> str:
+    """One-line text for a Pydantic error, without the URL-laden default block."""
     messages = [error["msg"].removeprefix("Value error, ") for error in exc.errors()]
-    return "; ".join(messages) if messages else "polygon is invalid"
+    return "; ".join(messages) if messages else fallback
+
+
+def _polygon_error(exc: ValidationError) -> str:
+    return _validation_error(exc, "polygon is invalid")
+
+
+def _closed_ring(ring: list[Any]) -> list[Any]:
+    """Append the first position to an open JSON ring so the AOI is closed.
+
+    The semicolon form already closes its ring. A GeoJSON Polygon is expected
+    to be closed by its producer, but the CLI accepts an open one too, as the
+    ``--polygon`` help says.
+    """
+    if not ring:
+        return ring
+    first, last = ring[0], ring[-1]
+    if isinstance(first, list) and isinstance(last, list) and first != last:
+        return [*ring, first]
+    return ring
+
+
+def _closed_geojson(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a Polygon geometry with its exterior ring closed."""
+    coordinates = payload.get("coordinates")
+    if payload.get("type") != "Polygon" or not isinstance(coordinates, list) or not coordinates:
+        return payload
+    closed = [*coordinates]
+    closed[0] = _closed_ring(coordinates[0]) if isinstance(coordinates[0], list) else closed[0]
+    return {**payload, "coordinates": closed}
 
 
 async def execute_pull(
@@ -507,6 +650,10 @@ async def execute_pull(
         http if http is not None else httpx.AsyncClient(timeout=300.0, follow_redirects=True)
     )
     try:
+        trouble = _prepare_output_dir(out_dir)
+        if trouble is not None:
+            print(trouble, file=sys.stderr)
+            return 2
         if prior_manifest is not None:
             mismatch = _resume_mismatch(prior_manifest, live_clients)
             if mismatch is not None:
@@ -634,14 +781,18 @@ async def execute_pull(
         )
         for src in catalog.sources:
             reporter.source_done(src.source)
-        _write_manifest(
-            out_dir,
-            catalog,
-            report,
-            prior=prior_manifest,
-            identity=identity,
-            resolutions=resolutions,
-        )
+        try:
+            _write_manifest(
+                out_dir,
+                catalog,
+                report,
+                prior=prior_manifest,
+                identity=identity,
+                resolutions=resolutions,
+            )
+        except OSError as exc:
+            print(f"cannot write the pull manifest in {out_dir}: {exc}", file=sys.stderr)
+            return 1
         reporter.close()
         _print_run_summary(catalog, report, search_only=search_only)
         for src in catalog.sources:
@@ -670,19 +821,32 @@ async def execute_pull(
             await _aclose_all(live_clients)
 
 
+def _prepare_output_dir(out_dir: Path) -> str | None:
+    """Create ``out_dir`` for a pull; return an error line when it cannot hold one."""
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return f"cannot use output directory {out_dir}: {exc}"
+    if not out_dir.is_dir():
+        return f"output path is not a directory: {out_dir}"
+    return None
+
+
 def _unknown_byte_sources(
     clients: Mapping[str, DataPullClient],
     extract_tables: bool,
 ) -> frozenset[str]:
     """Return sources whose download size is not a catalog asset size.
 
-    A training-table extract reads a subset of each granule. The asset's
-    ``file:size``, when one exists, is not the table, so the estimate leaves
-    those bytes unknown.
+    A training-table extract reads a subset of each granule, and GIBS and
+    FIRMS write a rendered image or a detection table instead of the catalog
+    asset. The asset's ``file:size``, when one exists, is not the bytes the
+    pull transfers, so the estimate leaves those sources unknown.
     """
-    if not extract_tables:
-        return frozenset()
-    return frozenset(name for name, client in clients.items() if isinstance(client, FldasClient))
+    unknown = {name for name, client in clients.items() if writes_own_output(client)}
+    if extract_tables:
+        unknown.update(name for name, client in clients.items() if isinstance(client, FldasClient))
+    return frozenset(unknown)
 
 
 async def _extract_table(
@@ -1463,10 +1627,23 @@ def _unavailable_cursors(payload: Mapping[str, Any]) -> dict[str, str]:
 
 
 def _fsync_directory(directory: Path) -> None:
-    """Flush the directory entry written by ``os.replace``."""
-    fd = os.open(directory, os.O_RDONLY)
+    """Flush the directory entry written by ``os.replace`` when the OS allows it.
+
+    Opening a directory and calling ``fsync`` is POSIX. Windows does not
+    support it, and some filesystems reject it, so this is best effort. The
+    manifest file itself is fsynced before the replace.
+    """
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError:
+        return
     try:
         os.fsync(fd)
+    except OSError:
+        return
     finally:
         os.close(fd)
 
