@@ -52,6 +52,7 @@ _TAG_PHOTOMETRIC: Final[int] = 262
 _TAG_SAMPLES: Final[int] = 277
 _TAG_PLANAR: Final[int] = 284
 _TAG_PREDICTOR: Final[int] = 317
+_TAG_COLORMAP: Final[int] = 320
 _TAG_TILE_WIDTH: Final[int] = 322
 _TAG_TILE_HEIGHT: Final[int] = 323
 _TAG_TILE_OFFSETS: Final[int] = 324
@@ -63,6 +64,7 @@ _TAG_GEOKEYS: Final[int] = 34735
 _TAG_NODATA: Final[int] = 42113
 _GEO_GEOGRAPHIC: Final[int] = 2048
 _GEO_PROJECTED: Final[int] = 3072
+_PHOTOMETRIC_PALETTE: Final[int] = 3
 _COMPRESS_NONE: Final[int] = 1
 _COMPRESS_LZW: Final[int] = 5
 # TIFF 6.0 requires tile width and length to be multiples of 16. macOS ImageIO
@@ -114,7 +116,10 @@ class CogRead:
 
     ``array`` has shape ``(bands, height, width)``. ``origin_x`` and
     ``origin_y`` are the upper-left corner of this window in the raster CRS.
-    ``pixel_size_y`` is positive; row 0 is the northern edge.
+    ``pixel_size_y`` is positive; row 0 is the northern edge. ``colormap`` is
+    the source TIFF ColorMap (all reds, then greens, then blues) when the
+    source is a single-band 8-bit palette image, so class rasters keep their
+    colors.
     """
 
     array: NDArray[np.uint8] | NDArray[np.uint16]
@@ -128,6 +133,7 @@ class CogRead:
     bytes_fetched: int
     granule_size: int | None = None
     nodata: str | None = None
+    colormap: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -149,6 +155,7 @@ class _Image:
     pixel_size_y: float
     epsg: int | None
     nodata: str | None
+    colormap: tuple[int, ...] | None = None
 
 
 class _RangeReader:
@@ -333,6 +340,7 @@ class CogFile:
             bytes_fetched=self._reader.bytes_fetched,
             granule_size=self._reader.granule_size,
             nodata=image.nodata,
+            colormap=image.colormap,
         )
 
 
@@ -455,7 +463,8 @@ def encode_cog(read: CogRead) -> bytes:
 
     The tile is padded with zeros up to a multiple of 16 on each side, as the
     TIFF spec requires. ImageWidth and ImageLength stay the window size, so
-    readers drop the padding.
+    readers drop the padding. A ``read.colormap`` is written as a palette
+    image, so the stored values stay the source codes.
 
     Args:
         read: Window returned by :func:`read_cog_window`.
@@ -464,7 +473,8 @@ def encode_cog(read: CogRead) -> bytes:
         A classic TIFF whose first tile is the window.
 
     Raises:
-        CogError: ``read.array`` is not uint8 or uint16.
+        CogError: ``read.array`` is not uint8 or uint16, or ``read.colormap``
+            is set on more than one band or has the wrong length.
     """
     array = read.array
     if array.dtype == np.uint8:
@@ -489,14 +499,20 @@ def encode_cog(read: CogRead) -> bytes:
     tie = struct.pack(endian + "6d", 0.0, 0.0, 0.0, read.origin_x, read.origin_y, 0.0)
     geokeys = _geokey_bytes(read.epsg, endian)
     nodata_bytes = _nodata_bytes(read.nodata)
+    colormap = _colormap_bytes(read.colormap, bands=bands, bits=bits, endian=endian)
     payloads: list[bytes] = [scale, tie]
     if geokeys is not None:
         payloads.append(geokeys)
+    colormap_index = len(payloads)
+    if colormap is not None:
+        payloads.append(colormap)
     nodata_inline = nodata_bytes is not None and len(nodata_bytes) <= 4
     if nodata_bytes is not None and not nodata_inline:
         payloads.append(nodata_bytes)
-    # Width through tiepoint, plus an optional GeoKey directory and GDAL_NODATA.
-    n_entries = 13 + int(geokeys is not None) + int(nodata_bytes is not None)
+    # Width through tiepoint, plus optional GeoKey directory, ColorMap, and GDAL_NODATA.
+    n_entries = (
+        13 + int(geokeys is not None) + int(colormap is not None) + int(nodata_bytes is not None)
+    )
     ifd_size = 2 + n_entries * 12 + 4
     cursor = 8 + ifd_size
     payload_offsets = []
@@ -505,6 +521,8 @@ def encode_cog(read: CogRead) -> bytes:
         cursor += len(payload)
     tile_offset = cursor
     photometric = 2 if bands == 3 else 1
+    if colormap is not None:
+        photometric = _PHOTOMETRIC_PALETTE
     fields: list[tuple[int, int, int, bytes]] = [
         (_TAG_WIDTH, 4, 1, struct.pack(endian + "I", width)),
         (_TAG_HEIGHT, 4, 1, struct.pack(endian + "I", height)),
@@ -524,6 +542,15 @@ def encode_cog(read: CogRead) -> bytes:
         fields.append(
             (_TAG_GEOKEYS, 3, len(geokeys) // 2, struct.pack(endian + "I", payload_offsets[2]))
         )
+    if colormap is not None:
+        fields.append(
+            (
+                _TAG_COLORMAP,
+                3,
+                len(colormap) // 2,
+                struct.pack(endian + "I", payload_offsets[colormap_index]),
+            )
+        )
     if nodata_bytes is not None:
         if nodata_inline:
             nodata_value = nodata_bytes + bytes(4 - len(nodata_bytes))
@@ -541,6 +568,16 @@ def encode_cog(read: CogRead) -> bytes:
         out += payload
     out += tile
     return bytes(out)
+
+
+def _colormap_bytes(
+    colormap: tuple[int, ...] | None, *, bands: int, bits: int, endian: str
+) -> bytes | None:
+    if colormap is None:
+        return None
+    if bands != 1 or len(colormap) != 3 << bits:
+        raise CogError("a colormap needs one band and 3 * 2**bits entries")
+    return struct.pack(endian + f"{len(colormap)}H", *colormap)
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -749,6 +786,7 @@ async def _image_from_entries(
     if _TAG_GEOKEYS in entries:
         epsg = _epsg_from_geokeys(await _entry_ints(reader, endian, entries[_TAG_GEOKEYS]))
     nodata = await _nodata_text(reader, endian, entries.get(_TAG_NODATA))
+    colormap = await _palette(reader, endian, entries, samples=samples, bits=bits)
     return _Image(
         endian=endian,
         width=width,
@@ -767,7 +805,30 @@ async def _image_from_entries(
         pixel_size_y=pixel_size_y,
         epsg=epsg,
         nodata=nodata,
+        colormap=colormap,
     )
+
+
+async def _palette(
+    reader: _RangeReader,
+    endian: str,
+    entries: dict[int, tuple[int, int, bytes]],
+    *,
+    samples: int,
+    bits: int,
+) -> tuple[int, ...] | None:
+    """Read the ColorMap of a single-band 8-bit palette TIFF, else None."""
+    if samples != 1 or bits != 8 or _TAG_COLORMAP not in entries:
+        return None
+    if _TAG_PHOTOMETRIC not in entries:
+        return None
+    photometric = _int_value(await _entry_ints(reader, endian, entries[_TAG_PHOTOMETRIC]))
+    if photometric != _PHOTOMETRIC_PALETTE:
+        return None
+    values = await _entry_ints(reader, endian, entries[_TAG_COLORMAP])
+    if len(values) != 3 << bits:
+        return None
+    return tuple(values)
 
 
 async def _nodata_text(

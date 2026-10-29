@@ -1,6 +1,6 @@
 [project]
 name = "atlas"
-version = "0.14.1"
+version = "0.14.2"
 description = "Automated satellite data analysis framework"
 readme = "README.md"
 authors = [
