@@ -225,7 +225,8 @@ async def test_stac_search_sends_polygon_intersects() -> None:
         result = await client.search(request)
     assert result.scenes == []
     body = fake.calls[0]
-    assert body["bbox"] == [0.0, 0.0, 1.0, 1.0]
+    # STAC Item Search rejects bbox and intersects in the same request.
+    assert "bbox" not in body
     assert body["intersects"] == {
         "type": "Polygon",
         "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]],
@@ -454,7 +455,7 @@ async def test_stac_search_sends_a_dateline_multipolygon() -> None:
     async with Sentinel2Client(client=cast(httpx.AsyncClient, fake)) as client:
         await client.search(request)
     assert fake.calls[0]["intersects"] == FIJI_INTERSECTS
-    assert fake.calls[0]["bbox"] == [178.0, -18.0, -178.0, -16.0]
+    assert "bbox" not in fake.calls[0]
 
 
 def _scene(scene_id: str, bbox: BBox, **kwargs: object) -> Scene:
@@ -571,3 +572,49 @@ def test_cli_requires_coords_or_polygon(tmp_path: Path, capsys: pytest.CaptureFi
     )
     assert run_data(args, clients={"sentinel2": _Recording()}) == 2
     assert "--polygon" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_resumed_polygon_search_does_not_reintroduce_bbox() -> None:
+    """A next-link body that repeats the envelope must not add bbox to a ring search."""
+    fake = _FakeStac()
+    request = PullRequest(
+        start_date=date(2024, 7, 1),
+        end_date=date(2024, 7, 3),
+        polygon=Polygon(ring=SQUARE),
+        limit=2,
+    )
+    cursor = json.dumps(
+        {"method": "POST", "merge": True, "body": {"bbox": [0.0, 0.0, 1.0, 1.0], "token": "t"}}
+    )
+    async with Sentinel2Client(client=cast(httpx.AsyncClient, fake)) as client:
+        await client.search_from_cursor(request, cursor)
+    body = fake.calls[0]
+    assert "bbox" not in body
+    assert "intersects" in body
+    assert body["token"] == "t"
+
+
+def test_parse_polygon_closes_an_open_json_ring() -> None:
+    closed = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]
+    assert parse_polygon("[[0,0],[1,0],[1,1],[0,1]]").ring == closed
+    geometry = {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1]]]}
+    assert parse_polygon(json.dumps(geometry)).ring == closed
+    feature = {"type": "Feature", "geometry": geometry}
+    assert parse_polygon(json.dumps(feature)).ring == closed
+
+
+def test_geojson_positions_may_carry_altitude() -> None:
+    """RFC 7946 positions may have a third number; only lon/lat define the AOI."""
+    square = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]
+    closed = {
+        "type": "Polygon",
+        "coordinates": [[[0, 0, 10], [1, 0, 20], [1, 1, 30], [0, 1, 40], [0, 0, 50]]],
+    }
+    opened = {
+        "type": "Polygon",
+        "coordinates": [[[0, 0, 10], [1, 0, 20], [1, 1, 30], [0, 1, 40]]],
+    }
+    assert Polygon.from_geojson(closed).ring == square
+    assert parse_polygon(json.dumps(closed)).ring == square
+    assert parse_polygon(json.dumps(opened)).ring == square

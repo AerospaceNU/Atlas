@@ -1218,3 +1218,44 @@ async def test_live_fldas_cmr_search_january_2020() -> None:
     scene = result.scenes[0]
     assert scene.assets["opendap"].href.startswith("https://")
     assert scene.bbox.south <= 42.2 <= scene.bbox.north
+
+
+def test_parse_points_csv_accepts_a_utf8_bom(tmp_path: Path) -> None:
+    path = tmp_path / "bom.csv"
+    path.write_text("longitude,latitude\n-71.18,42.22\n", encoding="utf-8-sig")
+    assert parse_points_csv(path) == [(-71.18, 42.22)]
+
+
+def test_resume_does_not_retire_the_training_table(tmp_path: Path) -> None:
+    """An extract source has no page cursor, so a resume searches it again.
+
+    The table from the first run must not be moved aside by the rewrite.
+    """
+    fake = FakeFldas()
+    client = _FakeFldasSource(fake, token="token")
+    try:
+        assert run_data(_pull_args(tmp_path), clients={"fldas": client}) == 0
+        table = tmp_path / "fldas.csv"
+        before = table.read_text(encoding="utf-8")
+        assert run_data(_pull_args(tmp_path, resume=True), clients={"fldas": client}) == 0
+    finally:
+        asyncio.run(client.aclose())
+    assert table.read_text(encoding="utf-8") == before
+    assert not table.with_name(table.name + ".stale").exists()
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"][0]["saved"] == ["fldas.csv"]
+    assert manifest["sources"][0]["failed"] == []
+
+
+def test_resume_after_search_only_writes_the_table(tmp_path: Path) -> None:
+    fake = FakeFldas()
+    client = _FakeFldasSource(fake, token="token")
+    try:
+        assert run_data(_pull_args(tmp_path, search_only=True), clients={"fldas": client}) == 0
+        assert not (tmp_path / "fldas.csv").exists()
+        assert run_data(_pull_args(tmp_path, resume=True), clients={"fldas": client}) == 0
+    finally:
+        asyncio.run(client.aclose())
+    assert (tmp_path / "fldas.csv").is_file()
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"][0]["saved"] == ["fldas.csv"]

@@ -197,7 +197,7 @@ def parse_points_csv(path: Path) -> list[tuple[float, float]]:
         FldasRequestError: if the file is unreadable, headerless, or malformed.
     """
     try:
-        with path.open(newline="", encoding="utf-8") as handle:
+        with path.open(newline="", encoding="utf-8-sig") as handle:
             rows = [row for row in csv.reader(handle) if any(cell.strip() for cell in row)]
     except OSError as exc:
         raise FldasRequestError(f"cannot read points file {path}: {exc}") from exc

@@ -108,7 +108,10 @@ async def test_token_goes_only_to_the_download_host_and_is_reused(
         assert await client.download_headers(f"{ODATA}/Nodes(x.nc)/$value") == {
             "Authorization": "Bearer tok"
         }
+        zipper = "https://zipper.dataspace.copernicus.eu/odata/v1/Products(abc)/Nodes(x.nc)/$value"
+        assert await client.download_headers(zipper) == {"Authorization": "Bearer tok"}
         assert await client.download_headers("https://eodata.s3.amazonaws.com/x.nc") == {}
+        assert await client.download_headers("https://example.com/x.nc") == {}
         assert await client.download_headers(ODATA.replace("https", "http", 1)) == {}
     assert len(forms) == 1
     assert b"grant_type=password" in forms[0]

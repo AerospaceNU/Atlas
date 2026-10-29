@@ -220,11 +220,16 @@ class StacApiClient(DataPullClient):
     def _search_body(self, request: PullRequest, *, token: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {
             "collections": [self.collection],
-            "bbox": request.bbox.as_list(),
             "limit": request.limit,
         }
+        # STAC Item Search treats bbox and intersects as mutually exclusive.
+        # Sending both is rejected (HTTP 400) by compliant APIs, so the ring
+        # wins when there is one; the envelope stays on the request for the
+        # cookie-cutter window and for sources that only take a box.
         if request.polygon is not None:
             body["intersects"] = request.polygon.as_stac_geometry()
+        else:
+            body["bbox"] = request.bbox.as_list()
         if self.include_datetime:
             body["datetime"] = (
                 f"{request.start_date.isoformat()}T00:00:00Z/"
@@ -528,6 +533,10 @@ def _call_from_object(
         posted = search_body(request)
         if body:
             posted.update(body)
+        # A server-provided next-link body can repeat the original box even
+        # when this search used a ring. bbox and intersects are exclusive.
+        if "intersects" in posted:
+            posted.pop("bbox", None)
         return _CursorCall("POST", url, posted)
     if body is None:
         return _CursorCall("POST", url, {})

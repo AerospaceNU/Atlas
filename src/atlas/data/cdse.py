@@ -23,7 +23,11 @@ CDSE_SEARCH_URL = "https://stac.dataspace.copernicus.eu/v1/search"
 CDSE_TOKEN_URL = (
     "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 )
+# A full product is served from ``download``; a per-node asset (a single band
+# or metadata file) is served from ``zipper``. Both need the same bearer token.
 CDSE_DOWNLOAD_HOST = "download.dataspace.copernicus.eu"
+CDSE_ASSET_HOST = "zipper.dataspace.copernicus.eu"
+CDSE_DOWNLOAD_HOSTS = frozenset({CDSE_DOWNLOAD_HOST, CDSE_ASSET_HOST})
 # Refresh this long before the token's stated expiry. A whole-file GET reuses
 # its headers across up to three attempts with Retry-After waits of up to 60 s
 # each, plus the transfer itself, so the margin covers several minutes.
@@ -44,7 +48,8 @@ class CdseStacClient(StacApiClient):
 
     Downloads go to the OData https alternate of each asset. The username and
     password are exchanged for an access token, which is sent only to
-    ``download.dataspace.copernicus.eu`` and reused until a few minutes
+    ``download.dataspace.copernicus.eu`` and ``zipper.dataspace.copernicus.eu``
+    and reused until a few minutes
     before it expires. A download from that host with either variable unset
     raises ``MissingCredentialError`` naming the unset variables, and sends no
     token request. A rejected exchange (401, or 400 ``invalid_grant``) raises
@@ -73,7 +78,7 @@ class CdseStacClient(StacApiClient):
 
     async def download_headers(self, href: str) -> dict[str, str]:
         parsed = urlparse(href)
-        if parsed.scheme != "https" or (parsed.hostname or "").lower() != CDSE_DOWNLOAD_HOST:
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in CDSE_DOWNLOAD_HOSTS:
             return {}
         return {"Authorization": f"Bearer {await self._token()}"}
 
