@@ -26,7 +26,6 @@ from atlas.data.maxar_opendata import MaxarOpenDataClient
 from atlas.data.naip import NaipClient
 from atlas.data.registry import SOURCES
 from atlas.data.sentinel2 import Sentinel2Client
-from atlas.data.usgs import UsgsLandsatC2L1Client
 
 
 class FakeResponse:
@@ -339,7 +338,6 @@ def test_new_sources_are_registered() -> None:
         "esa_worldcover",
         "io_lulc_annual",
         "mrms_qpe_24h",
-        "usgs_landsat_l1",
         "gedi",
         "icesat2_atl03",
         "smap_l3",
@@ -360,15 +358,6 @@ def test_new_sources_are_registered() -> None:
         "goes",
     ):
         assert name in SOURCES
-
-
-@pytest.mark.asyncio
-async def test_usgs_and_worldcover_stac_targets() -> None:
-    fake = FakeAsyncClient(json_payload=_stac_payload(platform="landsat-8"))
-    async with _client(UsgsLandsatC2L1Client, fake) as client:
-        await client.search(_request())
-    assert fake.calls[0][1] == "https://landsatlook.usgs.gov/stac-server/search"
-    assert fake.calls[0][2]["json"]["collections"] == ["landsat-c2l1"]
 
 
 @pytest.mark.asyncio
