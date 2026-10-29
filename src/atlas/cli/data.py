@@ -664,6 +664,15 @@ async def execute_pull(
             if mismatch is not None:
                 print(mismatch, file=sys.stderr)
                 return 2
+        if page_cursors is not None:
+            # An extract source (FLDAS) has no page cursor. Marking it
+            # "finished" would skip it forever, so a resume after
+            # --search-only could never write its table. Search it again.
+            page_cursors = {
+                name: value
+                for name, value in page_cursors.items()
+                if not isinstance(live_clients.get(name), FldasClient)
+            }
         unavailable = _unavailable_cursors(prior_manifest) if prior_manifest is not None else None
         if unavailable:
             for name in sorted(unavailable):
@@ -755,12 +764,6 @@ async def execute_pull(
                 for src in catalog.sources:
                     client = live_clients.get(src.source)
                     if src.error is not None or not isinstance(client, FldasClient):
-                        continue
-                    if prior_manifest is not None and not src.scenes:
-                        # A resume does not search an extract source again: it
-                        # has no page cursor, so a resume finds it finished. An
-                        # empty scene list is not an empty date window, and the
-                        # table from the earlier run must stay in place.
                         continue
                     source_name = src.source
 
