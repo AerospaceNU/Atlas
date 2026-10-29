@@ -37,6 +37,9 @@ _SEGMENTS = 10
 # Full-disk line count by band. B03 is 0.5 km; B01, B02, and B04 are 1 km; the rest are 2 km.
 _FULL_DISK_LINES = {"B01": 11000, "B02": 11000, "B03": 22000, "B04": 11000}
 _DEFAULT_LINES = 5500
+# AOI segment search grid: sample spacing in degrees, and a cap per axis.
+_SAMPLE_STEP_DEG = 0.25
+_MAX_SAMPLES = 240
 # Line scaling factor (LFAC) per line count; LOFF is the disk centre line.
 _LFAC = {22000: 81865099, 11000: 40932549, 5500: 20466275}
 # Common band name to AHI band: 0.47, 0.51, 0.64, and 0.86 µm.
@@ -178,21 +181,50 @@ def _segment(lon: float, lat: float, band: str) -> int | None:
 
 
 def _aoi_segments(aoi: BBox, band: str) -> list[int]:
-    """Segments that hold any visible edge point of ``aoi`` for ``band``.
+    """Every segment between the northernmost and southernmost visible line of ``aoi``.
 
-    Segments are line strips, so the corners and edge midpoints of the box
-    bound the rows it covers; a box crossing the antimeridian is tested per side.
+    Along a meridian the disk line moves monotonically with latitude, but
+    along a parallel it peaks at the sub-satellite longitude, not at a box
+    corner. The box is therefore sampled on a grid at most
+    ``_SAMPLE_STEP_DEG`` apart that always includes the sub-satellite
+    longitude when the box spans it. The line range is continuous over the
+    visible part of the box, so all segments from the lowest to the highest
+    sampled one are returned. Near the limb the visible edge is resolved to
+    the grid step. A box crossing the antimeridian is tested per side.
     """
-    found: set[int] = set()
+    lines = _FULL_DISK_LINES.get(band, _DEFAULT_LINES)
+    low: float | None = None
+    high: float | None = None
     for part in aoi.antimeridian_parts():
-        mid_lon = (part.west + part.east) / 2
-        mid_lat = (part.south + part.north) / 2
-        for lon in (part.west, mid_lon, part.east):
-            for lat in (part.south, mid_lat, part.north):
-                segment = _segment(lon, lat, band)
-                if segment is not None:
-                    found.add(segment)
-    return sorted(found)
+        for lon in _sample_lons(part):
+            for lat in _sample_axis(part.south, part.north):
+                line = _disk_line(lon, lat, lines)
+                if line is None:
+                    continue
+                low = line if low is None else min(low, line)
+                high = line if high is None else max(high, line)
+    if low is None or high is None:
+        return []
+    strip = lines // _SEGMENTS
+    first = min(int((low - 1) // strip) + 1, _SEGMENTS)
+    last = min(int((high - 1) // strip) + 1, _SEGMENTS)
+    return list(range(first, last + 1))
+
+
+def _sample_axis(start: float, end: float) -> list[float]:
+    """Evenly spaced values from ``start`` to ``end``, at most ``_SAMPLE_STEP_DEG`` apart."""
+    span = end - start
+    count = min(max(math.ceil(span / _SAMPLE_STEP_DEG), 1), _MAX_SAMPLES)
+    return [start + span * index / count for index in range(count + 1)]
+
+
+def _sample_lons(part: BBox) -> list[float]:
+    """Longitude samples of one non-wrapping box, plus the sub-satellite longitude inside it."""
+    lons = _sample_axis(part.west, part.east)
+    for candidate in (_SUB_LON, _SUB_LON - 360.0):
+        if part.west < candidate < part.east:
+            lons.append(candidate)
+    return lons
 
 
 def _band_aliases(assets: dict[str, Asset], aoi: BBox) -> dict[str, str]:
