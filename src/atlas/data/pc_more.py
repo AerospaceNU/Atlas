@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import ClassVar
+from collections.abc import Mapping
+from typing import Any, ClassVar
 
-from atlas.data.base import SceneKind
+from atlas.data.base import PullRequest, PullResult, Scene, SceneKind
 from atlas.data.planetary_computer import PlanetaryComputerClient
 
 
@@ -70,13 +71,57 @@ class PcModis09A1Client(PlanetaryComputerClient):
     nominal_gsd_m: ClassVar[float | None] = 500.0
 
 
+# Preferred asset per alias, first present wins. Wavelength matching alone
+# picks ``C02_0.5km``: a 0.5 km full-disk band near 600 MB in the GEOS
+# projection, which the windowed reader cannot clip. The ``_wm`` 2 km assets
+# are Web Mercator (EPSG:3857) resamples, so the download reads only the AOI
+# window. A full-disk C02_2km_wm is about 15 MB whole with about 6.3 km
+# Mercator pixels. ``C02_2km`` (GEOS, about 38 MB full disk) is the fallback
+# when an item has no ``_wm`` asset. Sizes are from 2026-09-24 GOES-18 items.
+_GOES_BAND_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "red": ("C02_2km_wm", "C02_2km"),
+    "nir": ("C03_2km_wm", "C03_2km"),
+    "blue": ("C01_2km_wm", "C01_2km"),
+}
+
+
 class GoesCmiClient(PlanetaryComputerClient):
-    """GOES-R Cloud and Moisture Imagery on Planetary Computer STAC."""
+    """GOES-R Cloud and Moisture Imagery on Planetary Computer STAC.
+
+    ``red``, ``nir``, and ``blue`` name the 2 km Web Mercator band 2, 3, and
+    1 COGs, falling back to the 2 km GEOS COGs. The default download is
+    therefore a clippable 2 km red band, never the 0.5 km full-disk band.
+    ``C02_0.5km`` is still downloadable by name.
+
+    Search does not filter ``goes:image-type``. CONUS and mesoscale items are
+    smaller, but Planetary Computer has none over much of the AOIs and dates
+    that full disk covers, and the ``_wm`` default makes any image type
+    clippable.
+    """
 
     default_collection: ClassVar[str] = "goes-cmi"
     satellite: ClassVar[str] = "goes"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = 2000.0
+
+    def _scenes_in(self, payload: Mapping[str, Any]) -> list[Scene]:
+        return [_with_goes_aliases(scene) for scene in super()._scenes_in(payload)]
+
+    def _result_from_payload(self, request: PullRequest, payload: Any) -> PullResult:
+        result = super()._result_from_payload(request, payload)
+        scenes = [_with_goes_aliases(scene) for scene in result.scenes]
+        return result.model_copy(update={"scenes": scenes})
+
+
+def _with_goes_aliases(scene: Scene) -> Scene:
+    pinned: dict[str, str] = {}
+    for alias, keys in _GOES_BAND_ALIASES.items():
+        key = next((key for key in keys if key in scene.assets), None)
+        if key is not None:
+            pinned[alias] = key
+    if not pinned:
+        return scene
+    return scene.model_copy(update={"band_aliases": {**scene.band_aliases, **pinned}})
 
 
 class EsaWorldCoverClient(PlanetaryComputerClient):
