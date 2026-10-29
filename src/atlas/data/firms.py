@@ -330,13 +330,25 @@ def _row_to_scene(
         gsd_m=gsd_m,
         platform=str(row.get("satellite") or platform),
         instrument=instrument,
-        properties={
-            "source": source,
-            "frp": row.get("frp"),
-            "confidence": row.get("confidence"),
-            "daynight": row.get("daynight"),
-            "bright_ti4": row.get("bright_ti4"),
-            "latitude": lat,
-            "longitude": lon,
-        },
+        properties=_row_properties(row, source=source, lat=lat, lon=lon),
     )
+
+
+def _row_properties(row: dict[str, Any], *, source: str, lat: float, lon: float) -> dict[str, Any]:
+    """Keep every FIRMS column so a detection table loses nothing.
+
+    VIIRS rows carry ``bright_ti4``/``bright_ti5``; MODIS rows carry
+    ``brightness``/``bright_t31``. Column values stay as FIRMS sent them,
+    except ``latitude`` and ``longitude``, which are the parsed floats.
+    ``frp``, ``confidence``, ``daynight``, and ``bright_ti4`` are always
+    present (``None`` when the product has no such column).
+    """
+    properties: dict[str, Any] = {
+        key: value for key, value in row.items() if isinstance(key, str) and key
+    }
+    for key in ("frp", "confidence", "daynight", "bright_ti4"):
+        properties.setdefault(key, None)
+    properties["source"] = source
+    properties["latitude"] = lat
+    properties["longitude"] = lon
+    return properties

@@ -47,6 +47,7 @@ from atlas.cli.download import (
 )
 from atlas.cli.estimate import confirm_download, estimate_pull, render_pull_estimate
 from atlas.cli.progress import ProgressReporter, pick_reporter
+from atlas.cli.source_outputs import write_source_outputs, writes_own_output
 from atlas.compile.aggregate import aggregate
 from atlas.compile.product import SceneCatalog, SourceScenes
 from atlas.data.base import BBox, DataPullClient, Polygon, PullRequest, Scene
@@ -561,6 +562,10 @@ async def execute_pull(
                 if src.error is None and not isinstance(live_clients[src.source], FldasClient)
                 for scene in src.scenes
             ]
+            # GIBS images and FIRMS detection tables are written by their own
+            # module; browse assets stay forbidden in download_assets.
+            own_output = [s for s in to_pull if writes_own_output(live_clients.get(s.source))]
+            to_pull = [s for s in to_pull if not writes_own_output(live_clients.get(s.source))]
             for src in catalog.sources:
                 if src.error is None:
                     reporter.source_pull(src.source, saved=0, total=len(src.scenes))
@@ -580,6 +585,18 @@ async def execute_pull(
             except BrowseAssetError as exc:
                 print(str(exc), file=sys.stderr)
                 return 2
+            report.outcomes.extend(
+                await write_source_outputs(
+                    own_output,
+                    out_dir,
+                    http=live_http,
+                    clients=live_clients,
+                    concurrency=concurrency,
+                    on_progress=lambda name, n_saved, total: reporter.source_pull(
+                        name, saved=n_saved, total=total
+                    ),
+                )
+            )
             if extract_tables:
                 for src in catalog.sources:
                     client = live_clients.get(src.source)
