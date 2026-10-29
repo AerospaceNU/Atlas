@@ -38,6 +38,12 @@ _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOOL_CALLS = 256
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
+MAX_TOOL_RESULT_CHARS = 20_000
+CHARS_PER_TOKEN = 4
+MAX_CONTEXT_TOKENS = 200_000
+COMPACT_PREVIEW_CHARS = 500
+KEEP_RECENT_MESSAGES = 6
+
 
 _STOPPED_RESPONSE = "Stopped after reaching the configured tool-use limit."
 
@@ -226,6 +232,8 @@ class Agent:
             config = getattr(self.model, "config", None)
             reasoning = True if config is None else bool(getattr(config, "reasoning", True))
             emit("thinking" if reasoning else "working")
+            if _estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
+                _compact(messages)
             response = self.model.complete(messages, self.tools.definitions)
             observed = observe_model_call(response)
             if observed is not None:
@@ -321,9 +329,45 @@ def _kind(exc: Exception) -> ErrorKind:
     return "tool_failure"
 
 
+def _compact(messages: list[ChatMessage]) -> int:
+    shrunk = 0
+    for index in range(len(messages) - KEEP_RECENT_MESSAGES):
+        if _estimate_tokens(messages) <= MAX_CONTEXT_TOKENS:
+            break
+        message = messages[index]
+        content = message.content or ""
+        if (
+            message.role != Role.TOOL
+            or len(content) <= COMPACT_PREVIEW_CHARS
+            or "[compacted" in content
+        ):
+            continue
+        removed = len(content) - COMPACT_PREVIEW_CHARS
+        marker = f"...[compacted {removed} characters]"
+        messages[index] = message.model_copy(
+            update={"content": content[:COMPACT_PREVIEW_CHARS] + marker}
+        )
+        shrunk += 1
+    return shrunk
+
+
+def _estimate_tokens(messages: list[ChatMessage]) -> int:
+    total = 0
+    for message in messages:
+        total += len(message.model_dump_json(exclude={"images"}))
+    return total // CHARS_PER_TOKEN
+
+
 def _tool_message(step: AgentStep) -> str:
     if step.result is not None:
-        return step.result.model_dump_json()
+        result = step.result
+        if len(result.text) > MAX_TOOL_RESULT_CHARS:
+            cut = len(result.text) - MAX_TOOL_RESULT_CHARS
+            marker = f"...[truncated {cut} characters]"
+            result = result.model_copy(
+                update={"text": result.text[:MAX_TOOL_RESULT_CHARS] + marker}
+            )
+        return result.model_dump_json()
     return json.dumps({"error": step.error, "error_kind": step.error_kind})
 
 
