@@ -800,3 +800,23 @@ def test_own_output_sources_report_unknown_bytes() -> None:
     finally:
         asyncio.run(http.aclose())
     assert unknown == frozenset({"gibs", "firms"})
+
+
+def test_path_options_expand_a_leading_tilde() -> None:
+    from atlas.cli.data import _path_arg
+
+    assert _path_arg("~/atlas/data") == Path.home() / "atlas" / "data"
+    assert _path_arg("relative/dir") == Path("relative/dir")
+
+
+def test_resume_refuses_a_symlinked_manifest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"sources": []}', encoding="utf-8")
+    link = tmp_path / "manifest.json"
+    link.symlink_to(outside)
+    args = _request_pull_args(tmp_path, "--resume")
+    assert run_data(args, clients={"sentinel2": RecordingPullClient()}) == 2
+    assert "symlink" in capsys.readouterr().err
+    assert outside.read_text(encoding="utf-8") == '{"sources": []}'

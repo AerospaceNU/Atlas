@@ -1218,3 +1218,34 @@ async def test_live_fldas_cmr_search_january_2020() -> None:
     scene = result.scenes[0]
     assert scene.assets["opendap"].href.startswith("https://")
     assert scene.bbox.south <= 42.2 <= scene.bbox.north
+
+
+def test_parse_points_csv_accepts_a_utf8_bom(tmp_path: Path) -> None:
+    path = tmp_path / "bom.csv"
+    path.write_text("longitude,latitude\n-71.18,42.22\n", encoding="utf-8-sig")
+    assert parse_points_csv(path) == [(-71.18, 42.22)]
+
+
+def test_resume_does_not_retire_the_training_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extract source has no page cursor, so a resume finds it finished.
+
+    The empty scene list must not be mistaken for an empty date window that
+    moves the table from the first run aside.
+    """
+    fake = FakeFldas()
+    client = _FakeFldasSource(fake, token="token")
+    _injected(monkeypatch, client)
+    try:
+        assert run_data(_pull_args(tmp_path)) == 0
+        table = tmp_path / "fldas.csv"
+        before = table.read_text(encoding="utf-8")
+        assert run_data(_pull_args(tmp_path, resume=True)) == 0
+    finally:
+        asyncio.run(client.aclose())
+    assert table.read_text(encoding="utf-8") == before
+    assert not table.with_name(table.name + ".stale").exists()
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"][0]["saved"] == ["fldas.csv"]
+    assert manifest["sources"][0]["failed"] == []

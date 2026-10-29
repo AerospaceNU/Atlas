@@ -118,6 +118,11 @@ def _pull_requested(args: argparse.Namespace) -> bool:
     return False
 
 
+def _path_arg(text: str) -> Path:
+    """Argparse type for a filesystem path; a leading ``~`` is expanded."""
+    return Path(text).expanduser()
+
+
 def _bounded_int(low: int, high: int, label: str) -> Callable[[str], int]:
     """Argparse type for a whole number in ``[low, high]`` with a clean message."""
 
@@ -203,7 +208,7 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     data.add_argument(
         "--out",
-        type=Path,
+        type=_path_arg,
         default=project_data_dir(),
         help="Output directory (default: .atlas/data)",
     )
@@ -265,7 +270,7 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     data.add_argument(
         "--table",
-        type=Path,
+        type=_path_arg,
         default=None,
         help="Training-table CSV path for extract sources (default: <out>/fldas.csv)",
     )
@@ -279,7 +284,7 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     data.add_argument(
         "--points",
-        type=Path,
+        type=_path_arg,
         default=None,
         help="CSV of points with a header (longitude/latitude, lon/lat, or x/y)",
     )
@@ -751,6 +756,12 @@ async def execute_pull(
                     client = live_clients.get(src.source)
                     if src.error is not None or not isinstance(client, FldasClient):
                         continue
+                    if prior_manifest is not None and not src.scenes:
+                        # A resume does not search an extract source again: it
+                        # has no page cursor, so a resume finds it finished. An
+                        # empty scene list is not an empty date window, and the
+                        # table from the earlier run must stay in place.
+                        continue
                     source_name = src.source
 
                     def report_extract(done: int, total: int, name: str = source_name) -> None:
@@ -1075,6 +1086,8 @@ def _load_pull_manifest(path: Path) -> dict[str, Any]:
     Raises:
         ValueError: The file is missing or has no source list.
     """
+    if path.is_symlink():
+        raise ValueError(f"pull manifest at {path} is a symlink; cannot resume")
     if not path.is_file():
         raise ValueError(f"no pull manifest at {path}; cannot resume")
     payload = json.loads(path.read_text(encoding="utf-8"))
