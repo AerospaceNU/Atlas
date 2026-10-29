@@ -109,6 +109,7 @@ def build_cog(
     place_tiles_at: int | None = None,
     nodata: str | None = None,
     tile_gap: int = 0,
+    colormap: list[int] | None = None,
 ) -> BuiltCog:
     """Build a classic tiled GeoTIFF the production reader does not share code with."""
     if dimensions is None:
@@ -153,7 +154,7 @@ def build_cog(
         _field(257, 4, [height], endian),
         _field(258, 3, [pixels.dtype.itemsize * 8] * bands, endian),
         _field(259, 3, [compression_code], endian),
-        _field(262, 3, [2 if bands == 3 else 1], endian),
+        _field(262, 3, [3 if colormap is not None else 2 if bands == 3 else 1], endian),
         _field(277, 3, [bands], endian),
         _field(284, 3, [1], endian),
         _field(317, 3, [2 if predictor else 1], endian),
@@ -175,6 +176,8 @@ def build_cog(
     ]
     if epsg is not None:
         fields.append(_field(34735, 3, [1, 1, 0, 1, key, 0, 1, epsg], endian))
+    if colormap is not None:
+        fields.append(_field(320, 3, colormap, endian))
     if nodata is not None:
         raw_nodata = nodata.encode("ascii") + b"\x00"
         fields.append(_Field(42113, 2, len(raw_nodata), raw_nodata, inline=len(raw_nodata) <= 4))
@@ -1488,3 +1491,48 @@ def test_encoded_tile_is_padded_to_a_multiple_of_16(bands: int) -> None:
         decoded = np.asarray(image)
     expected = pixels[0] if bands == 1 else np.transpose(pixels, (1, 2, 0))
     assert np.array_equal(decoded, expected)
+
+
+@pytest.mark.asyncio
+async def test_palette_colormap_is_carried_into_the_window() -> None:
+    # ALOS FNF on Planetary Computer is an 8-bit palette COG of class codes 0 to 4.
+    colormap = [0] * 768
+    for code, (red, green, blue) in enumerate(
+        [(0, 0, 0), (0, 100, 0), (120, 200, 80), (230, 220, 170), (30, 120, 200)]
+    ):
+        colormap[code] = red * 257
+        colormap[256 + code] = green * 257
+        colormap[512 + code] = blue * 257
+    classes = (np.arange(64) % 5).astype(np.uint8).reshape(1, 8, 8)
+    built = build_cog(
+        classes,
+        tile=4,
+        origin_x=0.0,
+        origin_y=8.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        colormap=colormap,
+    )
+    async with httpx.AsyncClient(transport=_RangeLog(built.blob).transport()) as http:
+        read = await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=1.0,
+            south=1.0,
+            east=6.0,
+            north=6.0,
+        )
+    assert read.colormap == tuple(colormap)
+    with Image.open(io.BytesIO(encode_cog(read))) as image:
+        assert image.mode == "P"
+        assert np.array_equal(np.asarray(image), read.array[0])
+        assert (
+            image.convert("RGB").getpixel((0, 0))
+            == {
+                0: (0, 0, 0),
+                1: (0, 100, 0),
+                2: (120, 200, 80),
+                3: (230, 220, 170),
+                4: (30, 120, 200),
+            }[int(read.array[0, 0, 0])]
+        )
