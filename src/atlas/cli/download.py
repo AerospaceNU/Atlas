@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import re
+import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -51,10 +53,37 @@ _RASTER_SUFFIXES = frozenset(
     {".tif", ".tiff", ".jp2", ".nc", ".hdf", ".h5", ".zip", ".las", ".laz"}
 )
 _COMPRESSED_SUFFIXES = frozenset({".bz2", ".gz"})
+# A whole-file GET that receives fewer than ``STALL_MIN_BYTES`` in
+# ``STALL_SECONDS`` is aborted. A trickling server would otherwise hold the
+# run for hours, since the socket read timeout resets on every byte.
+STALL_SECONDS = 120.0
+STALL_MIN_BYTES = 64 * 1024
+# Bounded retry of a whole-file GET answered 429 or 5xx.
+GET_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 2.0
+RETRY_AFTER_CAP_SECONDS = 60.0
 
 
 class BrowseAssetError(ValueError):
     """Raised when the requested asset is a preview or thumbnail."""
+
+
+class DownloadStallError(OSError):
+    """Raised when a whole-file GET stops making progress."""
+
+
+def describe_error(exc: BaseException) -> str:
+    """Readable, never-empty text for a failed download.
+
+    Some transport errors carry no message: an ``httpx.ReadTimeout`` raised
+    from a bare ``TimeoutError`` stringifies to ``""``. The class name is
+    always included so a failure is never rendered blank.
+    """
+    name = type(exc).__name__
+    text = str(exc).strip()
+    if not text and exc.__cause__ is not None:
+        text = str(exc.__cause__).strip()
+    return f"{name}: {text}" if text else name
 
 
 @dataclass
@@ -170,11 +199,22 @@ def _is_auxiliary(key: str, asset: Asset) -> bool:
 
 
 def scene_filename(scene_id: str, asset_key: str, suffix: str) -> str:
-    """Filesystem-safe name ``<id>_<asset><suffix>``."""
-    stem = _SAFE_ID.sub("_", scene_id)
-    key = _SAFE_ID.sub("_", asset_key)
+    """Filesystem-safe name ``<id>_<asset><suffix>``.
+
+    A scene id that already ends in ``suffix`` (GOES ids are file names such
+    as ``..._c2026152.nc``) drops that ending, so the extension is not
+    repeated: ``..._c2026152_data.nc``, not ``..._c2026152.nc_data.nc``.
+    Any other id, and the placeholder ``.bin`` suffix, keep the id whole.
+    """
     if not suffix.startswith("."):
         suffix = f".{suffix}"
+    base = scene_id
+    if suffix.lower() != ".bin" and base.lower().endswith(suffix.lower()):
+        trimmed = base[: -len(suffix)]
+        if trimmed.strip("._-"):
+            base = trimmed
+    stem = _SAFE_ID.sub("_", base)
+    key = _SAFE_ID.sub("_", asset_key)
     return f"{stem}_{key}{suffix}"
 
 
@@ -215,6 +255,10 @@ async def download_assets(
     asset_name: str | None = None,
     on_progress: Callable[[str, int, int], None] | None = None,
     bbox: BBox | None = None,
+    stall_seconds: float = STALL_SECONDS,
+    stall_min_bytes: int = STALL_MIN_BYTES,
+    attempts: int = GET_ATTEMPTS,
+    retry_backoff: float = RETRY_BACKOFF_SECONDS,
 ) -> DownloadReport:
     """GET one native-resolution asset per scene, streamed to disk.
 
@@ -229,6 +273,16 @@ async def download_assets(
     Optimized GeoTIFF is stored as the overlapping window. Those requests
     use HTTP Range and do not download the rest of the granule. Any other
     asset, including a COG in an unsupported CRS, is still fetched whole.
+
+    A whole-file GET answered 429 or 5xx is tried up to ``attempts`` times in
+    total, honoring ``Retry-After``; any other 4xx fails at once. No file is
+    opened until a 2xx arrives, so a retry never leaves a second partial
+    file. A body that delivers fewer than ``stall_min_bytes`` within
+    ``stall_seconds`` is aborted and its partial file removed.
+
+    Every ``failed`` or ``no_asset`` outcome carries a non-empty ``error``.
+    An unexpected exception fails that scene only and does not abort the
+    other downloads.
     """
     if asset_name and is_forbidden_asset_name(asset_name):
         raise BrowseAssetError(f"{asset_name!r} is a preview/thumbnail and cannot be downloaded")
@@ -311,16 +365,26 @@ async def download_assets(
                     _retire_previous(out, stale, path)
                     stale = None
                 else:
-                    async with http.stream(
-                        "GET", href, headers=headers, follow_redirects=True
-                    ) as response:
-                        response.raise_for_status()
-                        suffix = asset_suffix(asset, response.headers.get("content-type"))
-                        path = dest_dir / scene_filename(scene.id, key, suffix)
-                        _unlink_symlink(path)
-                        with path.open("wb") as handle:
-                            async for chunk in response.aiter_bytes():
-                                handle.write(chunk)
+                    total_attempts = max(1, attempts)
+                    for attempt in range(1, total_attempts + 1):
+                        async with http.stream(
+                            "GET", href, headers=headers, follow_redirects=True
+                        ) as response:
+                            if attempt < total_attempts and _retryable(response.status_code):
+                                delay = _retry_delay(response, attempt, retry_backoff)
+                                await response.aclose()
+                                await asyncio.sleep(delay)
+                                continue
+                            response.raise_for_status()
+                            suffix = asset_suffix(asset, response.headers.get("content-type"))
+                            path = dest_dir / scene_filename(scene.id, key, suffix)
+                            _unlink_symlink(path)
+                            with path.open("wb") as handle:
+                                async for chunk in _guarded_chunks(
+                                    response, stall_seconds, stall_min_bytes
+                                ):
+                                    handle.write(chunk)
+                        break
                     _retire_previous(out, stale, path)
                     stale = None
         except CogMissError as exc:
@@ -328,7 +392,10 @@ async def download_assets(
             _unlink_partial(path, stale)
             await record(
                 DownloadOutcome(
-                    source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
+                    source=scene.source,
+                    scene_id=scene.id,
+                    status="failed",
+                    error=str(exc) or describe_error(exc),
                 )
             )
             return
@@ -339,22 +406,33 @@ async def download_assets(
             _unlink_partial(path, stale)
             await record(
                 DownloadOutcome(
-                    source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
+                    source=scene.source,
+                    scene_id=scene.id,
+                    status="failed",
+                    error=str(exc) or describe_error(exc),
                 )
             )
             return
         except BrowseAssetError as exc:
             await record(
                 DownloadOutcome(
-                    source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
+                    source=scene.source,
+                    scene_id=scene.id,
+                    status="failed",
+                    error=str(exc) or describe_error(exc),
                 )
             )
             return
-        except (httpx.HTTPError, OSError, TypeError) as exc:
+        except Exception as exc:
+            # Transport, HTTP status, stall, disk, signing, and any unexpected
+            # client error fail this scene only. The partial file is removed.
             _unlink_partial(path, stale)
             await record(
                 DownloadOutcome(
-                    source=scene.source, scene_id=scene.id, status="failed", error=str(exc)
+                    source=scene.source,
+                    scene_id=scene.id,
+                    status="failed",
+                    error=describe_error(exc),
                 )
             )
             return
@@ -381,6 +459,70 @@ async def download_assets(
 
     await asyncio.gather(*(one(scene) for scene in scenes))
     return report
+
+
+def _retryable(status: int) -> bool:
+    """True for 429 and 5xx. Any other 4xx is the request's fault and final."""
+    return status == 429 or 500 <= status < 600
+
+
+def _retry_delay(response: httpx.Response, attempt: int, backoff: float) -> float:
+    """Seconds to wait before the next attempt.
+
+    ``Retry-After`` (delta-seconds or an HTTP date) wins when it parses and
+    is capped at ``RETRY_AFTER_CAP_SECONDS``. Otherwise the wait is
+    ``backoff * attempt``.
+    """
+    fallback = backoff * attempt
+    header = (response.headers.get("retry-after") or "").strip()
+    if not header:
+        return fallback
+    seconds: float | None = None
+    if header.isdigit():
+        seconds = float(header)
+    else:
+        try:
+            when = email.utils.parsedate_to_datetime(header)
+        except (TypeError, ValueError, IndexError):
+            when = None
+        if when is not None and when.tzinfo is not None:
+            seconds = when.timestamp() - time.time()
+    if seconds is None:
+        return fallback
+    return min(max(seconds, 0.0), RETRY_AFTER_CAP_SECONDS)
+
+
+async def _guarded_chunks(
+    response: httpx.Response, stall_seconds: float, min_bytes: int
+) -> AsyncIterator[bytes]:
+    """Yield body chunks; raise ``DownloadStallError`` when progress stops.
+
+    Progress means at least ``min_bytes`` within each ``stall_seconds``
+    window. A server that sends nothing, or trickles bytes so the socket
+    read timeout keeps resetting, is cut off.
+    """
+    loop = asyncio.get_running_loop()
+    chunks = response.aiter_bytes()
+    window_start = loop.time()
+    window_bytes = 0
+    total = 0
+    while True:
+        remaining = window_start + stall_seconds - loop.time()
+        try:
+            chunk = await asyncio.wait_for(anext(chunks), timeout=max(remaining, 0.0))
+        except StopAsyncIteration:
+            return
+        except TimeoutError:
+            raise DownloadStallError(
+                f"download stalled: fewer than {min_bytes} bytes in {stall_seconds:g}s "
+                f"after {total} bytes"
+            ) from None
+        total += len(chunk)
+        window_bytes += len(chunk)
+        if window_bytes >= min_bytes:
+            window_start = loop.time()
+            window_bytes = 0
+        yield chunk
 
 
 def _nonempty_file(path: Path) -> bool:

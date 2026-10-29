@@ -1538,8 +1538,10 @@ def _print_run_summary(
         elif src.next_cursor_unavailable:
             failure_lines.append(_unavailable_warning(src.source, src.next_cursor_unavailable))
         for item in items:
-            if item.error:
-                failure_lines.append(f"{src.source} {item.scene_id}: {item.error}")
+            # A failure is always listed, even one recorded without text.
+            if item.error or item.status in {"failed", "no_asset"}:
+                detail = item.error or f"{item.status} (no error detail recorded)"
+                failure_lines.append(f"{src.source} {item.scene_id}: {detail}")
     console.print()
     console.print(table)
     for line in failure_lines:
