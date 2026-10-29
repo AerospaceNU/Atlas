@@ -879,6 +879,7 @@ async def test_rate_limit_keeps_the_older_chip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("atlas.data.cog._retry_delay", lambda _exc, _attempt: 0.0)
+    monkeypatch.setattr("atlas.cli.download._retry_delay", lambda *_args: 0.0)
     dest = tmp_path / "sentinel2" / "chip_visual.tif"
     dest.parent.mkdir(parents=True)
     dest.write_bytes(b"yesterday")

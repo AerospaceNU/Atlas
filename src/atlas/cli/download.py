@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import email.utils
+import enum
 import os
 import re
 import time
@@ -27,6 +28,7 @@ from atlas.data.cog import (
     CogMissError,
     CogRangeError,
     CogRead,
+    CogUnsupportedError,
     encode_cog,
     model_bounds,
     open_cog,
@@ -188,6 +190,14 @@ class DownloadReport:
 
     def for_source(self, name: str) -> list[DownloadOutcome]:
         return [item for item in self.outcomes if item.source == name]
+
+
+class _Unwindowable(enum.Enum):
+    TOKEN = "unwindowable"
+
+
+UNWINDOWABLE = _Unwindowable.TOKEN
+"""``_windowed_cog`` result: the asset cannot be windowed, not a failed attempt."""
 
 
 def is_browse_asset(key: str, asset: Asset) -> bool:
@@ -497,7 +507,7 @@ async def download_assets(
                 href = await _signed_href(client, asset.href)
                 headers = await client.download_headers(href) if client is not None else {}
                 windowed = await _windowed_cog(http, href, asset, bbox, headers)
-                if windowed is not None:
+                if isinstance(windowed, tuple):
                     payload, chip = windowed
                     bytes_read, granule_size = chip.bytes_fetched, chip.granule_size
                     final = dest_dir / scene_filename(scene.id, key, ".tif")
@@ -508,7 +518,12 @@ async def download_assets(
                     partial = None
                     _retire_previous(out, stale, path)
                     stale = None
-                elif stale is not None and _nonempty_file(stale) and not stale.is_symlink():
+                elif (
+                    windowed is UNWINDOWABLE
+                    and stale is not None
+                    and _nonempty_file(stale)
+                    and not stale.is_symlink()
+                ):
                     # This asset cannot be windowed (unsupported CRS or layout),
                     # so the file on disk is a whole-file download, not an
                     # older chip. Keep it instead of fetching the granule again.
@@ -844,20 +859,23 @@ async def _windowed_cog(
     asset: Asset,
     bbox: BBox | None,
     headers: Mapping[str, str] | None = None,
-) -> tuple[bytes, CogRead] | None:
+) -> tuple[bytes, CogRead] | _Unwindowable | None:
     """Return the AOI GeoTIFF bytes and the window they encode.
 
-    None means the whole asset should be fetched. A miss is not a fallback:
+    ``UNWINDOWABLE`` means the asset itself cannot be windowed (no AOI, not a
+    GeoTIFF, unsupported CRS or layout), so a file already on disk is a
+    whole-file download. None means this attempt failed (transport error or
+    undecodable tile) and the whole asset should be fetched. A miss is not a fallback:
     the AOI is outside the raster, and downloading the granule would not
     contain it. The read carries bytes fetched, the object size from
     Content-Range, and the pixels used for the preview.
     """
     if bbox is None or not _is_geotiff_asset(asset):
-        return None
+        return UNWINDOWABLE
     try:
         cog = await open_cog(http, href, headers=headers)
         if cog.epsg is None:
-            return None
+            return UNWINDOWABLE
         bounds = model_bounds(
             cog.epsg,
             west=bbox.west,
@@ -866,11 +884,13 @@ async def _windowed_cog(
             north=bbox.north,
         )
         if bounds is None:
-            return None
+            return UNWINDOWABLE
         west, south, east, north = bounds
         read = await cog.read_window(west=west, south=south, east=east, north=north)
     except (CogMissError, CogRangeError, CogLimitError):
         raise
+    except CogUnsupportedError:
+        return UNWINDOWABLE
     except (CogError, httpx.HTTPError):
         return None
     return encode_cog(read), read
