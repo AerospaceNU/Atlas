@@ -102,7 +102,9 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
             "or listed in a resume manifest are left out of that estimate. "
             "The download starts only after confirmation, or when --yes is passed. "
             "Without a terminal, --yes is required. Remaining quota is included "
-            "when a provider publishes it; otherwise the estimate says quota is not readable."
+            "when a provider publishes it; otherwise the estimate says quota is not readable. "
+            "A saved 16-bit, signed, float, or multiband GeoTIFF that viewers show dark gets "
+            "a contrast-stretched <stem>.preview.png beside it; the data file is unchanged."
         ),
         epilog=f"example:\n  {_EXAMPLE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1250,6 +1252,11 @@ def _source_entry(
                 for item in report.for_source(src.source)
                 if item.status in {"failed", "no_asset"}
             ],
+            "previews": [
+                _rel(out_dir, item.preview)
+                for item in report.for_source(src.source)
+                if item.preview is not None
+            ],
             "windows": [
                 {
                     "id": item.scene_id,
@@ -1548,6 +1555,7 @@ def _merge_source(current: dict[str, Any], prior: Mapping[str, Any] | None) -> d
         kept["skipped"] = _extend_str(prior.get("skipped"), [])
         kept["failed"] = _merge_failed(prior.get("failed"), [])
         kept["windows"] = _merge_windows(prior.get("windows"), [])
+        kept["previews"] = _extend_str(prior.get("previews"), [])
         if rejected:
             kept["next_cursor"] = None
         elif not _cursor_present(current.get("next_cursor")):
@@ -1561,6 +1569,7 @@ def _merge_source(current: dict[str, Any], prior: Mapping[str, Any] | None) -> d
     merged["skipped"] = _extend_str(prior.get("skipped"), current.get("skipped"))
     merged["failed"] = _merge_failed(prior.get("failed"), current.get("failed"))
     merged["windows"] = _merge_windows(prior.get("windows"), current.get("windows"))
+    merged["previews"] = _extend_str(prior.get("previews"), current.get("previews"))
     return merged
 
 
@@ -1627,6 +1636,7 @@ def _print_run_summary(
     table.add_column("SKIPPED", justify="right")
     table.add_column("FAILED", justify="right")
     failure_lines: list[str] = []
+    preview_lines: list[str] = []
     for src in catalog.sources:
         items = report.for_source(src.source)
         n_saved = sum(1 for item in items if item.status == "saved")
@@ -1650,10 +1660,14 @@ def _print_run_summary(
             if item.error or item.status in {"failed", "no_asset"}:
                 detail = item.error or f"{item.status} (no error detail recorded)"
                 failure_lines.append(f"{src.source} {item.scene_id}: {detail}")
+            if item.preview_error:
+                preview_lines.append(f"{src.source} {item.scene_id}: {item.preview_error}")
     console.print()
     console.print(table)
     for line in failure_lines:
         console.print(f"[red]{line}[/red]")
+    for line in preview_lines:
+        console.print(f"[yellow]{line}[/yellow]")
 
 
 def _rel(out_dir: Path, path: Path) -> str:

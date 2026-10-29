@@ -35,6 +35,7 @@ _MANIFEST_FIELDS = {
     "skipped",
     "failed",
     "windows",
+    "previews",
 }
 
 

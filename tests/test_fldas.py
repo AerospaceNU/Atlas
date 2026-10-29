@@ -896,6 +896,7 @@ def test_empty_fldas_window_drops_the_previous_csv(
         "skipped",
         "failed",
         "windows",
+        "previews",
     }
     assert not table.exists()
     assert (

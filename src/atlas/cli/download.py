@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import email.utils
 import re
 import time
@@ -12,12 +13,19 @@ from urllib.parse import urlparse
 
 import httpx
 
+from atlas.cli.preview import (
+    clear_preview,
+    preview_path,
+    write_file_preview,
+    write_read_preview,
+)
 from atlas.data.base import Asset, BBox, DataPullClient, Scene
 from atlas.data.cog import (
     CogError,
     CogLimitError,
     CogMissError,
     CogRangeError,
+    CogRead,
     encode_cog,
     model_bounds,
     open_cog,
@@ -97,6 +105,8 @@ class DownloadOutcome:
     error: str | None = None
     bytes_read: int | None = None
     granule_size: int | None = None
+    preview: Path | None = None
+    preview_error: str | None = None
 
 
 @dataclass
@@ -274,6 +284,12 @@ async def download_assets(
     use HTTP Range and do not download the rest of the granule. Any other
     asset, including a COG in an unsupported CRS, is still fetched whole.
 
+    A saved GeoTIFF whose pixels display dark or not at all also gets a
+    ``<stem>.preview.png`` beside it (see ``atlas.cli.preview``); a skipped
+    whole-file GeoTIFF without one gets one too. The data file is not
+    changed. A preview failure is recorded in ``preview_error`` and never
+    fails the scene.
+
     A whole-file GET answered 429 or 5xx is tried up to ``attempts`` times in
     total, honoring ``Retry-After``; any other 4xx fails at once. No file is
     opened until a 2xx arrives, so a retry never leaves a second partial
@@ -311,6 +327,7 @@ async def download_assets(
         stale: Path | None = None
         bytes_read: int | None = None
         granule_size: int | None = None
+        chip: CogRead | None = None
         try:
             picked = pick_asset(scene, asset_name)
             if picked is None:
@@ -340,12 +357,15 @@ async def download_assets(
             window = bbox is not None and _is_geotiff_asset(asset)
             if _nonempty_file(planned) or (window and planned.is_symlink()):
                 if not window:
+                    preview, preview_error = await _missing_preview(planned)
                     await record(
                         DownloadOutcome(
                             source=scene.source,
                             scene_id=scene.id,
                             status="skipped",
                             path=planned,
+                            preview=preview,
+                            preview_error=preview_error,
                         )
                     )
                     return
@@ -358,7 +378,8 @@ async def download_assets(
                 headers = await client.download_headers(href) if client is not None else {}
                 windowed = await _windowed_cog(http, href, asset, bbox, headers)
                 if windowed is not None:
-                    payload, bytes_read, granule_size = windowed
+                    payload, chip = windowed
+                    bytes_read, granule_size = chip.bytes_fetched, chip.granule_size
                     path = dest_dir / scene_filename(scene.id, key, ".tif")
                     _unlink_symlink(path)
                     path.write_bytes(payload)
@@ -446,6 +467,7 @@ async def download_assets(
                 )
             )
             return
+        preview, preview_error = await _saved_preview(path, chip)
         await record(
             DownloadOutcome(
                 source=scene.source,
@@ -454,11 +476,46 @@ async def download_assets(
                 path=path,
                 bytes_read=bytes_read,
                 granule_size=granule_size,
+                preview=preview,
+                preview_error=preview_error,
             )
         )
 
     await asyncio.gather(*(one(scene) for scene in scenes))
     return report
+
+
+async def _saved_preview(path: Path, chip: CogRead | None) -> tuple[Path | None, str | None]:
+    """Write the preview for a file just saved; return its path or the error text.
+
+    A chip is previewed from its in-memory pixels, a whole-file GeoTIFF from
+    an overview of the file on disk. Any other file gets none. A failure
+    removes an older preview so it does not stand in for the new file.
+    """
+    if chip is None and not _is_tiff_path(path):
+        return None, None
+    try:
+        if chip is not None:
+            return write_read_preview(path, chip), None
+        return await write_file_preview(path), None
+    except Exception as exc:
+        with contextlib.suppress(OSError):
+            clear_preview(path)
+        return None, f"preview not written: {describe_error(exc)}"
+
+
+async def _missing_preview(path: Path) -> tuple[Path | None, str | None]:
+    """Preview a skipped whole-file GeoTIFF that has none yet."""
+    if not _is_tiff_path(path):
+        return None, None
+    existing = preview_path(path)
+    if existing.is_file() and not existing.is_symlink():
+        return existing, None
+    return await _saved_preview(path, None)
+
+
+def _is_tiff_path(path: Path) -> bool:
+    return path.suffix.lower() in {".tif", ".tiff"}
 
 
 def _retryable(status: int) -> bool:
@@ -587,8 +644,15 @@ def retire_product(path: Path) -> None:
     """Stop presenting one previous product without discarding its bytes.
 
     A regular file is moved to ``<name>.stale`` beside itself. A symlink is
-    unlinked and not followed. Directories are left alone.
+    unlinked and not followed. Directories are left alone. A GeoTIFF's
+    ``<stem>.preview.png`` is retired with it, so no preview outlives its data.
     """
+    if _is_tiff_path(path) and not path.name.endswith(".stale"):
+        _retire_one(preview_path(path))
+    _retire_one(path)
+
+
+def _retire_one(path: Path) -> None:
     if path.is_symlink():
         path.unlink()
         return
@@ -631,12 +695,13 @@ async def _windowed_cog(
     asset: Asset,
     bbox: BBox | None,
     headers: Mapping[str, str] | None = None,
-) -> tuple[bytes, int, int | None] | None:
-    """Return the AOI GeoTIFF, bytes read, and granule size.
+) -> tuple[bytes, CogRead] | None:
+    """Return the AOI GeoTIFF bytes and the window they encode.
 
     None means the whole asset should be fetched. A miss is not a fallback:
     the AOI is outside the raster, and downloading the granule would not
-    contain it. ``granule_size`` is the object size from Content-Range.
+    contain it. The read carries bytes fetched, the object size from
+    Content-Range, and the pixels used for the preview.
     """
     if bbox is None or not _is_geotiff_asset(asset):
         return None
@@ -659,7 +724,7 @@ async def _windowed_cog(
         raise
     except (CogError, httpx.HTTPError):
         return None
-    return encode_cog(read), read.bytes_fetched, read.granule_size
+    return encode_cog(read), read
 
 
 async def _signed_href(client: DataPullClient | None, href: str) -> str:
