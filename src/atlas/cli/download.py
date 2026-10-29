@@ -63,6 +63,7 @@ _AUXILIARY_KEYS = frozenset({"ang", "saa", "sza", "vaa", "vza", "aot", "wvp", "s
 _RASTER_SUFFIXES = frozenset(
     {".tif", ".tiff", ".jp2", ".nc", ".hdf", ".h5", ".zip", ".las", ".laz"}
 )
+_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
 _COMPRESSED_SUFFIXES = frozenset({".bz2", ".gz"})
 # A whole-file GET that receives fewer than ``STALL_MIN_BYTES`` in
 # ``STALL_SECONDS`` is aborted. A trickling server would otherwise hold the
@@ -359,8 +360,14 @@ def asset_suffix(asset: Asset, content_type: str | None = None) -> str:
             return ".nc"
         if "hdf" in lower:
             return ".hdf"
+        if "png" in lower:
+            return ".png"
+        if "jpeg" in lower or "jpg" in lower:
+            return ".jpg"
     path = Path(urlsplit(asset.href).path)
     ext = path.suffix.lower()
+    if ext in _IMAGE_SUFFIXES:
+        return ".jpg" if ext == ".jpeg" else ext
     if ext == ".tiff":
         return ".tif"
     if ext in _RASTER_SUFFIXES:

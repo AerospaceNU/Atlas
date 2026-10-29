@@ -836,3 +836,10 @@ def test_unknown_kind_is_named_before_the_missing_date(
     err = capsys.readouterr().err
     assert "Unknown kind" in err
     assert "--date" not in err
+
+
+def test_asset_suffix_keeps_image_extensions() -> None:
+    assert asset_suffix(Asset(href="https://example.com/a.png", media_type="image/png")) == ".png"
+    assert asset_suffix(Asset(href="https://example.com/a.jpg")) == ".jpg"
+    assert asset_suffix(Asset(href="https://example.com/a.jpeg")) == ".jpg"
+    assert asset_suffix(Asset(href="https://example.com/a.noext", media_type="image/png")) == ".png"
