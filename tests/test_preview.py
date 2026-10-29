@@ -443,3 +443,50 @@ def test_manifest_previews_accumulate_across_pages() -> None:
     assert merged["previews"] == ["naip/a.preview.png", "naip/b.preview.png"]
     failed = _merge_source({"previews": [], "error": "boom"}, prior)
     assert failed["previews"] == ["naip/a.preview.png"]
+
+
+@pytest.mark.parametrize("text", ["-3.4028235e+38", "-3.40282346638529e+38"])
+def test_float32_fill_written_as_short_text_still_counts_as_nodata(text: str) -> None:
+    band = np.full((1, 10, 10), np.finfo(np.float32).min, dtype=np.float32)
+    band[0, :5, :] = np.arange(50, dtype=np.float32).reshape(5, 10)
+    image = render_preview(band, text)
+    assert (image[5:, :] == 0).all()
+    assert 0 < image[:5].mean() < 255
+
+
+@pytest.mark.asyncio
+async def test_existing_whole_file_is_kept_when_the_asset_cannot_be_windowed(
+    tmp_path: Path,
+) -> None:
+    # NAIP is NAD83 UTM, a CRS the window reader does not project.
+    geographic = struct.pack("<HHHH", 2048, 0, 1, 4326)
+    nad83_utm = struct.pack("<HHHH", 3072, 0, 1, 26919)
+    blob = _tiled_tiff([_ramp(32, 32)]).replace(geographic, nad83_utm)
+    dest = tmp_path / "naip" / "tile_image.tif"
+    dest.parent.mkdir()
+    dest.write_bytes(blob)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "range" not in request.headers:
+            raise AssertionError("an existing whole file is not fetched again")
+        start, end = (int(v) for v in request.headers["range"].removeprefix("bytes=").split("-"))
+        end = min(end, len(blob) - 1)
+        return httpx.Response(
+            206,
+            content=blob[start : end + 1],
+            headers={"content-range": f"bytes {start}-{end}/{len(blob)}"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        report = await download_assets(
+            [_scene("https://example.com/naip.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=-71.2, south=42.0, east=-70.9, north=42.2),
+        )
+    outcome = report.outcomes[0]
+    assert outcome.status == "skipped"
+    assert outcome.path == dest
+    assert dest.read_bytes() == blob
+    assert outcome.preview == preview_path(dest)

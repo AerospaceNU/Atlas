@@ -31,6 +31,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -143,12 +144,33 @@ def _nodata_value(nodata: str | None) -> float | None:
         return None
 
 
+def _in_band_dtype(nodata: float, dtype: np.dtype[Any]) -> np.generic | None:
+    """``nodata`` as the band stores it, or None when the band cannot hold it.
+
+    GDAL compares nodata in the band's own type. A float32 fill written as
+    shortened text (``-3.4028235e+38``) rounds just past float32 and is
+    clamped to the type's extreme so it still matches.
+    """
+    if np.issubdtype(dtype, np.floating):
+        info = np.finfo(dtype)
+        clamped = min(max(nodata, float(info.min)), float(info.max))
+        value: np.generic = dtype.type(clamped)
+        return value
+    info_i = np.iinfo(dtype)
+    if nodata != round(nodata) or not info_i.min <= nodata <= info_i.max:
+        return None
+    whole: np.generic = dtype.type(int(nodata))
+    return whole
+
+
 def _stretch(band: NDArray[np.generic], nodata: float | None) -> NDArray[np.uint8]:
     """Scale one band's 2nd-98th percentile of valid pixels to 0-255."""
     values = band.astype(np.float64)
     valid = np.isfinite(values)
     if nodata is not None and math.isfinite(nodata):
-        valid &= values != nodata
+        fill = _in_band_dtype(nodata, band.dtype)
+        if fill is not None:
+            valid &= band != fill
     elif nodata is None:
         zeros = values == 0
         if zeros.mean() > ZERO_FILL_FRACTION:
