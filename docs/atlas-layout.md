@@ -10,7 +10,10 @@ read from an older location outside `.atlas/`.
 
 `AGENTS.md` stays at the workspace root. `.agents/skills` stays beside
 `.atlas`, not inside it. A data pull writes `manifest.json` in its output
-directory, which defaults to `.atlas/data`.
+directory, which defaults to `.atlas/data`. One output directory can hold
+several sources and windows: each row in the manifest's `sources` list carries
+its own `request`, and a pull replaces only the rows for the sources it
+searched.
 
 ## Project (`.atlas/` in the working directory)
 
@@ -18,7 +21,7 @@ directory, which defaults to `.atlas/data`.
 |---|---|
 | `sessions/<id>/` | One agent session. `meta.json` is the id and model. No keys. |
 | `artifacts/<id>/` | Files for that session. Removing the session removes this directory. |
-| `data/` | Data CLI pulls. This is the existing `.atlas/data` default. `manifest.json` is the pull manifest. |
+| `data/` | Data CLI pulls. This is the existing `.atlas/data` default. `manifest.json` is the pull manifest, one row per source, each with its own request. |
 | `skills/` | Vetted skills. |
 | `skills-drafts/` | Draft skills. They are not loaded until a person enables one. |
 | `agent.toml` | Workspace model and tool-call budget. |

@@ -245,16 +245,16 @@ def test_modis_sources_are_registered() -> None:
     assert SOURCES["modis_vegetation"] is MODISVegetationClient
 
 
-def test_earthdata_download_headers_only_reach_nasa_https_hosts(
+async def test_earthdata_download_headers_only_reach_nasa_https_hosts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("EARTHDATA_TOKEN", "aaa.bbb.ccc")
     client = MODISVegetationClient()
     lpdaac = "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/x.hdf"
-    assert client.download_headers(lpdaac) == {"Authorization": "Bearer aaa.bbb.ccc"}
-    assert client.download_headers("https://bucket.s3.amazonaws.com/x.hdf") == {}
-    assert client.download_headers("https://nasa.gov.example.com/x.hdf") == {}
-    assert client.download_headers("http://data.lpdaac.earthdatacloud.nasa.gov/x.hdf") == {}
+    assert await client.download_headers(lpdaac) == {"Authorization": "Bearer aaa.bbb.ccc"}
+    assert await client.download_headers("https://bucket.s3.amazonaws.com/x.hdf") == {}
+    assert await client.download_headers("https://nasa.gov.example.com/x.hdf") == {}
+    assert await client.download_headers("http://data.lpdaac.earthdatacloud.nasa.gov/x.hdf") == {}
     gedi = SOURCES["gedi"]()
-    assert gedi.download_headers(lpdaac) == {"Authorization": "Bearer aaa.bbb.ccc"}
-    assert SOURCES["sentinel2"]().download_headers(lpdaac) == {}
+    assert await gedi.download_headers(lpdaac) == {"Authorization": "Bearer aaa.bbb.ccc"}
+    assert await SOURCES["sentinel2"]().download_headers(lpdaac) == {}

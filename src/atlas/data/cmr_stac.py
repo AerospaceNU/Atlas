@@ -23,7 +23,7 @@ class CmrLpcloudClient(StacApiClient):
     search_url: ClassVar[str] = LPCLOUD_SEARCH
     required_credentials: ClassVar[tuple[str, ...]] = EARTHDATA_CREDENTIALS
 
-    def download_headers(self, href: str) -> dict[str, str]:
+    async def download_headers(self, href: str) -> dict[str, str]:
         return earthdata_headers(href)
 
 
@@ -40,7 +40,7 @@ class CmrNsidcClient(StacApiClient):
     search_url: ClassVar[str] = NSIDC_SEARCH
     required_credentials: ClassVar[tuple[str, ...]] = EARTHDATA_CREDENTIALS
 
-    def download_headers(self, href: str) -> dict[str, str]:
+    async def download_headers(self, href: str) -> dict[str, str]:
         return earthdata_headers(href)
 
 

@@ -1061,7 +1061,7 @@ class DataPullClient(ABC):
         """
         return PullResult(request=request, scenes=[], next_cursor=page_cursor)
 
-    def download_headers(self, href: str) -> dict[str, str]:
+    async def download_headers(self, href: str) -> dict[str, str]:
         """Headers to send when downloading ``href``, such as a bearer token.
 
         Sources whose assets are public send none. A source that adds a

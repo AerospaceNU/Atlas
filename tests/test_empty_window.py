@@ -14,10 +14,12 @@ import pytest
 
 from atlas.cli.data import run_data
 from atlas.data.base import Asset, BBox, DataPullClient, PullRequest, PullResult, Scene, SceneKind
+from atlas.data.firms import FirmsClient
 
 AOI = BBox(west=-71.12, south=42.32, east=-71.02, north=42.40)
 _MANIFEST_FIELDS = {
     "source",
+    "request",
     "collection",
     "bbox",
     "search_url",
@@ -34,6 +36,7 @@ _MANIFEST_FIELDS = {
     "skipped",
     "failed",
     "windows",
+    "previews",
 }
 
 
@@ -314,3 +317,29 @@ def test_dotdot_source_does_not_escape_the_output_directory(tmp_path: Path) -> N
         {"id": "..-window", "error": "requested window is empty"}
     ]
     assert set(tmp_path.iterdir()) == {out, secret}
+
+
+def test_rejected_firms_window_keeps_the_detections_table(tmp_path: Path) -> None:
+    table = tmp_path / "firms_viirs" / "VIIRS_SNPP_NRT_2024-07-08_detections.csv"
+    table.parent.mkdir(parents=True)
+    table.write_text("latitude,longitude\n42.36,-71.06\n", encoding="utf-8")
+    _previous_manifest(tmp_path, source="firms_viirs", saved=[f"firms_viirs/{table.name}"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="Invalid date")
+
+    firms_http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        code = run_data(
+            _pull_args(tmp_path),
+            clients={"firms_viirs": FirmsClient(map_key="abc", client=firms_http)},
+        )
+    finally:
+        asyncio.run(firms_http.aclose())
+    assert code == 1
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    source = manifest["sources"][0]
+    assert source["error"] is not None and "HTTP 400" in source["error"]
+    assert source["failed"] == []
+    assert table.read_text(encoding="utf-8").startswith("latitude")
+    assert not table.with_name(table.name + ".stale").exists()

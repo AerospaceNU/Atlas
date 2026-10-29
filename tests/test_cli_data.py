@@ -246,7 +246,7 @@ async def test_download_assets_sends_client_download_headers(tmp_path: Path) -> 
     seen: list[str | None] = []
 
     class TokenClient(FakePullClient):
-        def download_headers(self, href: str) -> dict[str, str]:
+        async def download_headers(self, href: str) -> dict[str, str]:
             return {"Authorization": "Bearer t"} if href.startswith("https://data.") else {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -402,7 +402,10 @@ async def test_download_assets_writes_raw_bytes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_download_assets_isolates_sign_timeout(tmp_path: Path) -> None:
+async def test_download_assets_isolates_sign_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("atlas.cli.download._sign_delay", lambda *_args: 0.0)
     payload = b"II*\x00ok"
 
     def handler(request: httpx.Request) -> httpx.Response:

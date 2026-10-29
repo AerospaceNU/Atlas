@@ -8,6 +8,7 @@ import io
 import json
 import math
 import struct
+import time
 import zlib
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -67,6 +68,8 @@ class BuiltCog:
 
 
 def _pack_values(endian: str, type_code: int, values: list[int] | list[float]) -> bytes:
+    if type_code == 16:
+        return struct.pack(endian + f"{len(values)}Q", *[int(value) for value in values])
     if type_code == 3:
         return struct.pack(endian + f"{len(values)}H", *values)
     if type_code == 4:
@@ -81,16 +84,56 @@ def _field(tag: int, type_code: int, values: list[int] | list[float], endian: st
     return _Field(tag, type_code, len(values), data, inline=len(data) <= 4)
 
 
-def _entry(field: _Field, endian: str) -> bytes:
+def _entry(field: _Field, endian: str, *, bigtiff: bool = False) -> bytes:
+    width = 8 if bigtiff else 4
     if field.inline:
-        value = field.data + bytes(4 - len(field.data))
+        value = field.data + bytes(width - len(field.data))
     else:
-        value = struct.pack(endian + "I", field.offset)
-    return struct.pack(endian + "HHI", field.tag, field.type_code, field.count) + value
+        value = struct.pack(endian + ("Q" if bigtiff else "I"), field.offset)
+    head = "HHQ" if bigtiff else "HHI"
+    return struct.pack(endian + head, field.tag, field.type_code, field.count) + value
+
+
+def _libtiff_lzw(raw: bytes, row_bytes: int) -> bytes:
+    """LZW-compress bytes with libtiff (through Pillow), not the production decoder.
+
+    LZW works on bytes, so any buffer can travel as one strip of an 8-bit image.
+    """
+    rows = len(raw) // row_bytes
+    assert rows * row_bytes == len(raw)
+    buffer = io.BytesIO()
+    Image.frombytes("L", (row_bytes, rows), raw).save(
+        buffer, "TIFF", compression="tiff_lzw", tiffinfo={278: rows}
+    )
+    with Image.open(io.BytesIO(buffer.getvalue())) as image:
+        offsets = image.tag_v2[273]
+        counts = image.tag_v2[279]
+    offsets = offsets if isinstance(offsets, tuple) else (offsets,)
+    counts = counts if isinstance(counts, tuple) else (counts,)
+    assert len(offsets) == 1
+    return buffer.getvalue()[offsets[0] : offsets[0] + counts[0]]
+
+
+def _float_predictor_rows(block: NDArray[np.generic]) -> bytes:
+    """Encode a (rows, cols, bands) float block with TIFF predictor 3.
+
+    Written from Adobe TIFF Technical Note 3: each row is split into
+    big-endian byte planes, then differenced with a stride of the band count.
+    """
+    height, width, bands = block.shape
+    itemsize = block.dtype.itemsize
+    out = bytearray()
+    for row in range(height):
+        values = np.asarray(block[row], dtype=f">f{itemsize}").reshape(width * bands)
+        planes = values.view(np.uint8).reshape(width * bands, itemsize).T.reshape(-1)
+        diff = planes.astype(np.int16)
+        diff[bands:] = planes[bands:].astype(np.int16) - planes[:-bands].astype(np.int16)
+        out += (diff % 256).astype(np.uint8).tobytes()
+    return bytes(out)
 
 
 def build_cog(
-    pixels: NDArray[np.uint8] | NDArray[np.uint16],
+    pixels: NDArray[np.generic],
     *,
     tile: int,
     origin_x: float,
@@ -99,7 +142,7 @@ def build_cog(
     pixel_size_y: float,
     epsg: int | None = 4326,
     compression: str = "none",
-    predictor: bool = False,
+    predictor: bool | int = False,
     endian: str = "<",
     trailer: int = 0,
     pad: int = 0,
@@ -110,14 +153,23 @@ def build_cog(
     nodata: str | None = None,
     tile_gap: int = 0,
     colormap: list[int] | None = None,
+    bigtiff: bool = False,
+    planar: int = 1,
 ) -> BuiltCog:
-    """Build a classic tiled GeoTIFF the production reader does not share code with."""
+    """Build a tiled GeoTIFF the production reader does not share code with.
+
+    ``predictor`` is True or 2 for horizontal differencing and 3 for the
+    floating-point predictor. ``compression`` is ``none``, ``deflate``, or
+    ``lzw`` (encoded by libtiff through Pillow).
+    """
+    predictor_code = 2 if predictor is True else int(predictor) if predictor else 1
+    sample_format = {"u": 1, "i": 2, "f": 3}[pixels.dtype.kind]
     if dimensions is None:
         bands, height, width = (int(pixels.shape[0]), int(pixels.shape[1]), int(pixels.shape[2]))
     else:
         height, width = dimensions
         bands = int(pixels.shape[0])
-    dtype = np.dtype(f"{endian}u{pixels.dtype.itemsize}")
+    dtype = np.dtype(f"{endian}{pixels.dtype.kind}{pixels.dtype.itemsize}")
     tiles_x = math.ceil(width / tile)
     tiles_y = math.ceil(height / tile)
     if compression == "deflate":
@@ -141,13 +193,21 @@ def build_cog(
                 block[: row1 - row0, : col1 - col0, :] = np.moveaxis(
                     source[:, row0:row1, col0:col1], 0, -1
                 )
-                if predictor:
+                if predictor_code == 2:
                     for col in range(block.shape[1] - 1, 0, -1):
                         block[:, col, :] -= block[:, col - 1, :]
-                raw = np.ascontiguousarray(block).tobytes()
-                stored.append(zlib.compress(raw) if compression == "deflate" else raw)
+                if predictor_code == 3:
+                    raw = _float_predictor_rows(block)
+                else:
+                    raw = np.ascontiguousarray(block).tobytes()
+                if compression == "deflate":
+                    raw = zlib.compress(raw)
+                elif compression == "lzw":
+                    raw = _libtiff_lzw(raw, tile * bands * pixels.dtype.itemsize)
+                stored.append(raw)
 
     ntiles = len(stored)
+    offset_type = 16 if bigtiff else 4
     key = 2048 if epsg in {4326, 4269, 4258, 4267} else 3072
     fields = [
         _field(256, 4, [width], endian),
@@ -156,21 +216,21 @@ def build_cog(
         _field(259, 3, [compression_code], endian),
         _field(262, 3, [3 if colormap is not None else 2 if bands == 3 else 1], endian),
         _field(277, 3, [bands], endian),
-        _field(284, 3, [1], endian),
-        _field(317, 3, [2 if predictor else 1], endian),
+        _field(284, 3, [planar], endian),
+        _field(317, 3, [predictor_code], endian),
         _field(322, 4, [tile], endian),
         _field(323, 4, [tile], endian),
-        _field(324, 4, [0] * ntiles, endian),
+        _field(324, offset_type, [0] * ntiles, endian),
         _field(
             325,
-            4,
+            offset_type,
             [
                 declared_tile_bytes if declared_tile_bytes is not None else len(blob)
                 for blob in stored
             ],
             endian,
         ),
-        _field(339, 3, [1], endian),
+        _field(339, 3, [sample_format] * bands, endian),
         _field(33550, 12, [pixel_size_x, pixel_size_y, 0.0], endian),
         _field(33922, 12, [0.0, 0.0, 0.0, origin_x, origin_y, 0.0], endian),
     ]
@@ -182,10 +242,12 @@ def build_cog(
         raw_nodata = nodata.encode("ascii") + b"\x00"
         fields.append(_Field(42113, 2, len(raw_nodata), raw_nodata, inline=len(raw_nodata) <= 4))
     fields.sort(key=lambda item: item.tag)
-    ifd_at = 8 + pad
-    ifd_size = 2 + len(fields) * 12 + 4
+    header_size = 16 if bigtiff else 8
+    ifd_at = header_size + pad
+    ifd_size = 8 + len(fields) * 20 + 8 if bigtiff else 2 + len(fields) * 12 + 4
     cursor = ifd_at + ifd_size
     for field in fields:
+        field.inline = len(field.data) <= (8 if bigtiff else 4)
         if field.inline:
             continue
         field.offset = cursor
@@ -207,21 +269,24 @@ def build_cog(
             spans.append((tile_cursor, tile_cursor + length - 1))
             tile_cursor += length
     offset_field = next(field for field in fields if field.tag == 324)
-    offset_field.data = _pack_values(endian, 4, offsets)
+    offset_field.data = _pack_values(endian, offset_type, offsets)
     count_field = next(field for field in fields if field.tag == 325)
     count_field.data = _pack_values(
         endian,
-        4,
+        offset_type,
         [declared_tile_bytes if declared_tile_bytes is not None else len(blob) for blob in stored],
     )
 
     order = 0x4949 if endian == "<" else 0x4D4D
-    out = bytearray(struct.pack(endian + "HHI", order, 42, ifd_at))
+    if bigtiff:
+        out = bytearray(struct.pack(endian + "HHHHQ", order, 43, 8, 0, ifd_at))
+    else:
+        out = bytearray(struct.pack(endian + "HHI", order, 42, ifd_at))
     out += bytes(pad)
-    out += struct.pack(endian + "H", len(fields))
+    out += struct.pack(endian + ("Q" if bigtiff else "H"), len(fields))
     for field in fields:
-        out += _entry(field, endian)
-    out += struct.pack(endian + "I", 0)
+        out += _entry(field, endian, bigtiff=bigtiff)
+    out += struct.pack(endian + ("Q" if bigtiff else "I"), 0)
     for field in fields:
         if not field.inline:
             out += field.data
@@ -292,6 +357,7 @@ class _RangeLog:
         fail_first: int = 0,
         retry_after: str | None = None,
         short_reads: int = 0,
+        fail_status: int = 503,
     ) -> None:
         self.blob = blob
         self.honor_range = honor_range
@@ -299,6 +365,7 @@ class _RangeLog:
         self.fail_first = fail_first
         self.retry_after = retry_after
         self.short_reads = short_reads
+        self.fail_status = fail_status
         self.failures = 0
         self.calls: list[tuple[int, int] | None] = []
         self.body_reads = 0
@@ -320,7 +387,7 @@ class _RangeLog:
             self.fail_first -= 1
             self.failures += 1
             headers = {} if self.retry_after is None else {"Retry-After": self.retry_after}
-            return httpx.Response(503, headers=headers, content=b"busy")
+            return httpx.Response(self.fail_status, headers=headers, content=b"busy")
         if not self.honor_range:
             return httpx.Response(200, stream=_CountingStream(self, self.blob))
         if start < 0 or end < start or end >= len(self.blob):
@@ -812,6 +879,7 @@ async def test_rate_limit_keeps_the_older_chip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("atlas.data.cog._retry_delay", lambda _exc, _attempt: 0.0)
+    monkeypatch.setattr("atlas.cli.download._retry_delay", lambda *_args: 0.0)
     dest = tmp_path / "sentinel2" / "chip_visual.tif"
     dest.parent.mkdir(parents=True)
     dest.write_bytes(b"yesterday")
@@ -1006,6 +1074,67 @@ async def test_deflate_bomb_is_rejected(tmp_path: Path) -> None:
     assert "exceeded its dimensions" in (report.outcomes[0].error or "")
     assert None not in log.calls
     assert list(tmp_path.rglob("*.tif")) == []
+
+
+@pytest.mark.asyncio
+async def test_oversized_declared_tile_is_refused_before_its_payload(tmp_path: Path) -> None:
+    # One 16384 x 16384 tile would inflate a few compressed bytes to 256 MiB.
+    built = build_cog(
+        np.zeros((1, 1, 1), dtype=np.uint8),
+        tile=16384,
+        origin_x=0.0,
+        origin_y=16.0,
+        pixel_size_x=0.001,
+        pixel_size_y=0.001,
+        compression="deflate",
+        dimensions=(16384, 16384),
+        tile_blobs=[zlib.compress(b"\x00" * 1024)],
+    )
+    log = _RangeLog(built.blob, allow_full=True)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogLimitError, match="tile is too large"):
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=0.0,
+                south=15.9,
+                east=0.1,
+                north=16.0,
+            )
+        assert not _tiles_touched(log.range_calls(), built.tile_spans)
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=0.0, south=15.9, east=0.1, north=16.0),
+        )
+    assert report.outcomes[0].status == "failed"
+    assert "tile is too large" in (report.outcomes[0].error or "")
+    assert None not in log.calls
+    assert not _tiles_touched(log.range_calls(), built.tile_spans)
+    assert list(tmp_path.rglob("*.tif")) == []
+
+
+@pytest.mark.asyncio
+async def test_window_byte_cap_counts_samples_per_pixel() -> None:
+    # 16M pixels pass the pixel cap, but 16 bands of them are 256 MB.
+    built = build_cog(
+        np.zeros((16, 1, 1), dtype=np.uint8),
+        tile=1000,
+        origin_x=0.0,
+        origin_y=4000.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        dimensions=(4000, 4000),
+        place_tiles_at=1_000_000,
+    )
+    log = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        opened = await open_cog(http, "https://example.com/granule.tif")
+        with pytest.raises(CogLimitError, match="too many bytes"):
+            await opened.read_window(west=0.0, south=0.0, east=4000.0, north=4000.0)
+    assert all(start < 1_000_000 for start, _ in log.range_calls())
 
 
 def test_run_data_passes_the_aoi_into_the_cog_read(tmp_path: Path) -> None:
@@ -1246,6 +1375,72 @@ async def test_range_backoff_includes_jitter(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
+async def test_a_thirty_second_rate_limit_burst_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _patch_backoff(monkeypatch)
+    built = _geographic()
+    log = _RangeLog(built.blob, fail_first=6, fail_status=429)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        read = await read_cog_window(
+            http,
+            "https://example.com/granule.tif",
+            west=-9.5,
+            south=8.5,
+            east=-9.0,
+            north=9.0,
+        )
+    assert delays == [0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
+    assert sum(delays) > 30.0
+    assert np.array_equal(read.array, np.array([[[42, 43], [52, 53]]], dtype=np.uint8))
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_retries_stop_after_the_attempt_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays = _patch_backoff(monkeypatch)
+    built = _geographic()
+    log = _RangeLog(built.blob, fail_first=100, fail_status=429)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(httpx.HTTPStatusError):
+            await open_cog(http, "https://example.com/granule.tif")
+    assert delays == [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 16.0]
+    assert log.failures == cog._RANGE_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_retry_after_waits_stop_at_the_total_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays = _patch_backoff(monkeypatch)
+    built = _geographic()
+    log = _RangeLog(built.blob, fail_first=100, fail_status=429, retry_after="50")
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(httpx.HTTPStatusError):
+            await open_cog(http, "https://example.com/granule.tif")
+    assert delays == [50.0, 50.0]
+    assert sum(delays) <= cog._MAX_RETRY_WAIT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_refused_range_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _patch_backoff(monkeypatch)
+    built = _geographic()
+    log = _RangeLog(built.blob[:200])
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogRangeError, match="rejected the byte range"):
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=-9.5,
+                south=8.5,
+                east=-9.0,
+                north=9.0,
+            )
+    assert delays == []
+    assert log.range_calls().count(log.range_calls()[-1]) == 1
+
+
+@pytest.mark.asyncio
 async def test_retry_after_header_sets_the_range_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     delays = _patch_backoff(monkeypatch)
     built = _geographic()
@@ -1401,53 +1596,335 @@ async def test_gdal_nodata_is_carried_through_the_window(nodata: str | None) -> 
     assert np.array_equal(again.array, read.array)
 
 
-def test_bigtiff_and_lzw_are_documented_as_later_work() -> None:
+def test_bigtiff_and_lzw_are_documented_as_supported() -> None:
     text = cog.__doc__ or ""
     assert "BigTIFF" in text
     assert "LZW" in text
-    assert "later work" in text
+    assert "later work" not in text
 
 
-@pytest.mark.asyncio
-async def test_bigtiff_is_rejected_as_later_work() -> None:
-    blob = struct.pack("<HHI", 0x4949, 43, 8)
+async def _read_all(blob: bytes, built: BuiltCog, **box: float) -> tuple[CogRead, _RangeLog]:
     log = _RangeLog(blob)
+    bounds = {
+        "west": built.origin_x,
+        "south": built.origin_y - built.pixel_size_y * built.height,
+        "east": built.origin_x + built.pixel_size_x * built.width,
+        "north": built.origin_y,
+    }
+    bounds.update(box)
     async with httpx.AsyncClient(transport=log.transport()) as http:
-        with pytest.raises(CogUnsupportedError, match="BigTIFF is later work"):
-            await read_cog_window(
-                http,
-                "https://example.com/granule.tif",
-                west=0.0,
-                south=0.0,
-                east=1.0,
-                north=1.0,
-            )
-    assert log.range_calls() == [(0, 7)]
+        read = await read_cog_window(http, "https://example.com/granule.tif", **bounds)
+    return read, log
+
+
+async def _reread(encoded: bytes, read: CogRead) -> CogRead:
+    async with httpx.AsyncClient(transport=_RangeLog(encoded).transport()) as http:
+        return await read_cog_window(
+            http,
+            "https://example.com/window.tif",
+            west=read.origin_x,
+            south=read.origin_y - read.pixel_size_y * read.array.shape[1],
+            east=read.origin_x + read.pixel_size_x * read.array.shape[2],
+            north=read.origin_y,
+        )
 
 
 @pytest.mark.asyncio
-async def test_lzw_is_rejected_as_later_work() -> None:
+@pytest.mark.parametrize("endian", ["<", ">"])
+async def test_bigtiff_window_reads_only_the_overlapping_tile(endian: str) -> None:
     built = build_cog(
-        _grid(4, 4),
-        tile=2,
+        _grid(8, 8),
+        tile=4,
+        origin_x=0.0,
+        origin_y=8.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        endian=endian,
+        bigtiff=True,
+        nodata="255",
+        trailer=50_000,
+    )
+    read, log = await _read_all(built.blob, built, west=5.0, south=1.0, east=7.0, north=3.0)
+    assert np.array_equal(read.array, _grid(8, 8)[:, 5:7, 5:7])
+    assert read.nodata == "255"
+    assert read.epsg == 4326
+    assert log.range_calls()[:2] == [(0, 7), (8, 15)]
+    assert _tiles_touched(log.range_calls(), built.tile_spans) == {3}
+
+
+@pytest.mark.asyncio
+async def test_bigtiff_with_a_bad_offset_size_is_rejected() -> None:
+    blob = struct.pack("<HHHHQ", 0x4949, 43, 4, 0, 16)
+    async with httpx.AsyncClient(transport=_RangeLog(blob).transport()) as http:
+        with pytest.raises(CogUnsupportedError, match="BigTIFF header"):
+            await open_cog(http, "https://example.com/granule.tif")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("predictor", [False, True])
+async def test_lzw_window_matches_libtiff(predictor: bool) -> None:
+    built = build_cog(
+        _grid(8, 8),
+        tile=4,
+        origin_x=0.0,
+        origin_y=8.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        compression="lzw",
+        predictor=predictor,
+    )
+    read, log = await _read_all(built.blob, built, west=1.0, south=5.0, east=3.0, north=7.0)
+    assert np.array_equal(read.array, _grid(8, 8)[:, 1:3, 1:3])
+    assert _tiles_touched(log.range_calls(), built.tile_spans) == {0}
+
+
+@pytest.mark.asyncio
+async def test_lzw_palette_bigtiff_like_io_lulc() -> None:
+    # io-lulc-annual-v02 on Planetary Computer: BigTIFF, LZW, 8-bit palette, 512px tiles.
+    rng = np.random.default_rng(7)
+    classes = np.repeat(np.repeat(rng.integers(0, 10, (1, 32, 32)), 32, 1), 32, 2)
+    classes = classes.astype(np.uint8)
+    colormap = [(code * 997) % 65536 for code in range(768)]
+    built = build_cog(
+        classes,
+        tile=512,
+        origin_x=300000.0,
+        origin_y=4700000.0,
+        pixel_size_x=10.0,
+        pixel_size_y=10.0,
+        epsg=32619,
+        compression="lzw",
+        bigtiff=True,
+        colormap=colormap,
+        nodata="0",
+        planar=2,
+    )
+    read, log = await _read_all(
+        built.blob, built, west=300000.0, south=4700000.0 - 5120.0, east=305120.0
+    )
+    assert read.array.shape == (1, 512, 512)
+    assert np.array_equal(read.array, classes[:, :512, :512])
+    assert read.colormap == tuple(colormap)
+    assert _tiles_touched(log.range_calls(), built.tile_spans) == {0}
+    again = await _reread(encode_cog(read), read)
+    assert np.array_equal(again.array, read.array)
+    assert again.colormap == tuple(colormap)
+
+
+@pytest.mark.asyncio
+async def test_separate_planes_with_several_bands_are_rejected() -> None:
+    built = build_cog(
+        _grid(4, 4, bands=3),
+        tile=4,
         origin_x=0.0,
         origin_y=4.0,
         pixel_size_x=1.0,
         pixel_size_y=1.0,
-        compression="lzw",
+        planar=2,
+    )
+    async with httpx.AsyncClient(transport=_RangeLog(built.blob).transport()) as http:
+        with pytest.raises(CogUnsupportedError, match="separate-plane"):
+            await open_cog(http, "https://example.com/granule.tif")
+
+
+@pytest.mark.asyncio
+async def test_a_continental_tile_grid_is_windowed() -> None:
+    # 101 by 175 tiles, as in an io-lulc-annual-v02 granule.
+    built = build_cog(
+        np.zeros((1, 1, 1), dtype=np.uint8),
+        tile=16,
+        origin_x=0.0,
+        origin_y=175.0 * 16,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        dimensions=(175 * 16, 101 * 16),
+        tile_blobs=[bytes(range(256))] * (101 * 175),
+        bigtiff=True,
+    )
+    read, log = await _read_all(built.blob, built, west=0.0, south=2784.0, east=16.0)
+    assert np.array_equal(read.array[0], np.arange(256, dtype=np.uint8).reshape(16, 16))
+    assert _tiles_touched(log.range_calls(), built.tile_spans) == {0}
+
+
+def test_lzw_decodes_a_noisy_512_tile_quickly() -> None:
+    # Noise keeps the code table full, so the decoder walks all four code widths
+    # and several ClearCodes.
+    rng = np.random.default_rng(3)
+    noise = rng.integers(0, 256, 512 * 512, dtype=np.uint8).tobytes()
+    smooth = (np.arange(512 * 512) // 4096 % 7).astype(np.uint8).tobytes()
+    for data in (noise, smooth):
+        assert cog._lzw_decode_bounded(_libtiff_lzw(data, 512), len(data)) == data
+    compressed = _libtiff_lzw(noise, 512)
+    started = time.perf_counter()
+    cog._lzw_decode_bounded(compressed, len(noise))
+    assert time.perf_counter() - started < 2.0
+
+
+def test_lzw_tile_that_expands_past_its_dimensions_is_rejected() -> None:
+    compressed = _libtiff_lzw(bytes(64 * 1024), 1024)
+    with pytest.raises(CogLimitError, match="LZW tile exceeded"):
+        cog._lzw_decode_bounded(compressed, 4096)
+
+
+def test_lzw_short_and_invalid_tiles_are_errors() -> None:
+    compressed = _libtiff_lzw(bytes(range(256)) * 4, 256)
+    with pytest.raises(CogError, match="shorter"):
+        cog._lzw_decode_bounded(compressed, 2048)
+    # ClearCode, then code 300 with no table entry yet. 9-bit codes, MSB first.
+    bits = f"{256:09b}{300:09b}{257:09b}"
+    bits += "0" * (-len(bits) % 8)
+    bogus = int(bits, 2).to_bytes(len(bits) // 8, "big")
+    with pytest.raises(CogError, match="invalid code"):
+        cog._lzw_decode_bounded(bogus, 16)
+
+
+def _short_tags(blob: bytes) -> dict[int, int]:
+    """Read the first value of each IFD entry of a little-endian classic TIFF."""
+    assert blob[:4] == b"II*\x00"
+    (ifd_at,) = struct.unpack_from("<I", blob, 4)
+    (count,) = struct.unpack_from("<H", blob, ifd_at)
+    tags: dict[int, int] = {}
+    for index in range(count):
+        tag, type_code, _number = struct.unpack_from("<HHI", blob, ifd_at + 2 + index * 12)
+        fmt = "<H" if type_code == 3 else "<I"
+        tags[tag] = struct.unpack_from(fmt, blob, ifd_at + 2 + index * 12 + 8)[0]
+    return tags
+
+
+def _signed_grid() -> NDArray[np.int16]:
+    values = (np.arange(8 * 8, dtype=np.int32).reshape(1, 8, 8) * 997) % 40000 - 20000
+    return values.astype(np.int16)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endian", ["<", ">"])
+@pytest.mark.parametrize("compression", ["none", "deflate", "lzw"])
+async def test_int16_window_with_horizontal_predictor(endian: str, compression: str) -> None:
+    pixels = _signed_grid()
+    built = build_cog(
+        pixels,
+        tile=4,
+        origin_x=0.0,
+        origin_y=8.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        compression=compression,
+        predictor=compression != "none",
+        endian=endian,
+        nodata="-999",
+    )
+    read, _ = await _read_all(built.blob, built, west=1.0, south=1.0, east=7.0, north=7.0)
+    assert read.array.dtype == np.int16
+    assert read.array.dtype.isnative
+    assert np.array_equal(read.array, pixels[:, 1:7, 1:7])
+    assert read.array.min() < 0
+    encoded = encode_cog(read)
+    tags = _short_tags(encoded)
+    assert tags[339] == 2
+    assert tags[258] == 16
+    again = await _reread(encoded, read)
+    assert again.array.dtype == np.int16
+    assert again.nodata == "-999"
+    assert np.array_equal(again.array, read.array)
+
+
+def _float_grid(bands: int = 1) -> NDArray[np.float32]:
+    rows = np.linspace(-120.5, 3000.25, 8 * 8 * bands, dtype=np.float32)
+    values = rows.reshape(bands, 8, 8)
+    values[0, 0, 0] = np.nan
+    return values
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endian", ["<", ">"])
+@pytest.mark.parametrize("bands", [1, 3])
+@pytest.mark.parametrize("compression", ["deflate", "lzw"])
+async def test_float32_window_with_floating_point_predictor(
+    endian: str, bands: int, compression: str
+) -> None:
+    pixels = _float_grid(bands)
+    built = build_cog(
+        pixels,
+        tile=4,
+        origin_x=0.0,
+        origin_y=8.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        compression=compression,
+        predictor=3,
+        endian=endian,
+        nodata="nan",
+    )
+    read, _ = await _read_all(built.blob, built, west=0.0, south=1.0, east=6.0, north=8.0)
+    assert read.array.dtype == np.float32
+    assert np.array_equal(read.array, pixels[:, 0:7, 0:6], equal_nan=True)
+    encoded = encode_cog(read)
+    tags = _short_tags(encoded)
+    assert tags[339] == 3
+    assert tags[258] == 32
+    assert 320 not in tags
+    again = await _reread(encoded, read)
+    assert again.array.dtype == np.float32
+    assert again.nodata == "nan"
+    assert np.array_equal(again.array, read.array, equal_nan=True)
+
+
+@pytest.mark.asyncio
+async def test_uncompressed_float32_window() -> None:
+    pixels = _float_grid()
+    built = build_cog(
+        pixels, tile=4, origin_x=0.0, origin_y=8.0, pixel_size_x=1.0, pixel_size_y=1.0
+    )
+    read, _ = await _read_all(built.blob, built)
+    assert np.array_equal(read.array, pixels, equal_nan=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pixels", "predictor", "message"),
+    [
+        (_float_grid(), 2, "predictor 2 on SampleFormat 3"),
+        (_signed_grid(), 3, "predictor 3 on SampleFormat 2"),
+        (np.zeros((1, 4, 4), dtype=np.int32), 1, "32-bit samples of SampleFormat 2"),
+        (np.zeros((1, 4, 4), dtype=np.float64), 1, "64-bit samples of SampleFormat 3"),
+    ],
+)
+async def test_unsupported_sample_layouts_are_rejected(
+    pixels: NDArray[np.generic], predictor: int, message: str
+) -> None:
+    built = build_cog(
+        pixels,
+        tile=4,
+        origin_x=0.0,
+        origin_y=4.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        predictor=predictor,
+        compression="deflate",
     )
     log = _RangeLog(built.blob)
     async with httpx.AsyncClient(transport=log.transport()) as http:
-        with pytest.raises(CogUnsupportedError, match="LZW compression is later work"):
-            await read_cog_window(
-                http,
-                "https://example.com/granule.tif",
-                west=0.0,
-                south=2.0,
-                east=2.0,
-                north=4.0,
-            )
+        with pytest.raises(CogUnsupportedError, match=message):
+            await open_cog(http, "https://example.com/granule.tif")
     assert _tiles_touched(log.range_calls(), built.tile_spans) == set()
+
+
+def test_encode_refuses_a_colormap_on_a_non_uint8_window() -> None:
+    with pytest.raises(CogError, match="one uint8 band"):
+        encode_cog(
+            CogRead(
+                array=np.zeros((1, 4, 4), dtype=np.int16),
+                origin_x=0.0,
+                origin_y=0.0,
+                pixel_size_x=1.0,
+                pixel_size_y=1.0,
+                epsg=4326,
+                col_off=0,
+                row_off=0,
+                bytes_fetched=0,
+                colormap=tuple(range(768)),
+            )
+        )
 
 
 def test_encode_rejects_an_empty_window() -> None:

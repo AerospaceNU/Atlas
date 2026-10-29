@@ -52,7 +52,7 @@ class MODISClient(DataPullClient):
     def collection(self) -> str:
         return self.short_name
 
-    def download_headers(self, href: str) -> dict[str, str]:
+    async def download_headers(self, href: str) -> dict[str, str]:
         return earthdata_headers(href, self._token)
 
     async def aclose(self) -> None:
