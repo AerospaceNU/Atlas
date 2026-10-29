@@ -116,6 +116,11 @@ _MAX_IFD_ENTRIES: Final[int] = 128
 # io-lulc-annual-v02 granules have about 17,700 tiles of 512 pixels.
 _MAX_TILES: Final[int] = 65_536
 _MAX_WINDOW_PIXELS: Final[int] = 16_000_000
+# Decoded size of one window: 16M pixels of four uint16 bands still fit.
+_MAX_WINDOW_BYTES: Final[int] = 128 * 1024 * 1024
+# Decoded size of one tile. Real COGs use 256 to 2048 px tiles (io-lulc uses
+# 512), so this only refuses a header that would inflate a small payload.
+_MAX_TILE_BYTES: Final[int] = 64 * 1024 * 1024
 _MAX_FIELD_BYTES: Final[int] = 1024 * 1024
 _COALESCE_GAP: Final[int] = 8192
 _MISS: Final[str] = "AOI does not overlap the COG"
@@ -384,7 +389,7 @@ class CogFile:
 
         Raises:
             CogMissError: The box does not cover any pixel.
-            CogLimitError: The window has too many pixels.
+            CogLimitError: The window has too many pixels or bytes.
             CogError: A tile could not be decoded.
             CogRangeError: The server did not honor Range.
         """
@@ -404,6 +409,8 @@ class CogFile:
         cols = col1 - col0
         if cols > _MAX_WINDOW_PIXELS or rows > _MAX_WINDOW_PIXELS // cols:
             raise CogLimitError("window has too many pixels")
+        if rows * cols * image.samples * (image.bits // 8) > _MAX_WINDOW_BYTES:
+            raise CogLimitError("window has too many bytes")
         tiles_x = math.ceil(image.width / image.tile_width)
         tx0 = col0 // image.tile_width
         tx1 = (col1 - 1) // image.tile_width
@@ -517,8 +524,9 @@ async def read_overview(path: Path, *, min_long_side: int = 1024) -> CogRead:
     overview (an IFD with NewSubfileType bit 0 set; mask IFDs are skipped)
     whose longer side is at least ``min_long_side``. With no such overview
     the full-resolution image is read. Every level must still fit the
-    window pixel cap, so a file without overviews larger than that cap
-    raises ``CogLimitError`` instead of being decoded.
+    window pixel and byte caps, so a file without overviews larger than
+    those caps raises ``CogLimitError`` instead of being decoded. An
+    overview or mask IFD that does not parse is skipped.
 
     The returned ``array`` is that level's pixels. Its georeferencing is the
     full-resolution grid scaled to the level, and ``nodata`` and
@@ -526,7 +534,8 @@ async def read_overview(path: Path, *, min_long_side: int = 1024) -> CogRead:
 
     Raises:
         CogUnsupportedError: The file is not a tiled TIFF this reader decodes.
-        CogLimitError: The chosen level has too many pixels.
+        CogLimitError: The chosen level has too many pixels or bytes, or a
+            tile of the full-resolution IFD is too large to decode.
         CogError: A tile could not be read or decoded.
     """
     reader = _FileReader(path)
@@ -867,6 +876,10 @@ def _wgs84_utm(lon_deg: float, lat_deg: float, zone: int, *, northern: bool) -> 
     return easting, northing
 
 
+_SECONDARY_IFD_ERRORS: Final = (CogError, KeyError, IndexError, struct.error)
+"""Parse failures that drop an overview or mask IFD instead of the whole file."""
+
+
 async def _parse_image(reader: _ByteReader) -> _Image:
     """Read the first IFD of a classic TIFF or a BigTIFF."""
     endian, layout, ifd_at = await _read_header(reader)
@@ -878,8 +891,11 @@ async def _parse_levels(reader: _ByteReader) -> list[_Image]:
     """Read the full-resolution IFD and every reduced-resolution IFD after it.
 
     Transparency-mask IFDs and IFDs this reader cannot decode are skipped.
-    At most ``_MAX_IFDS`` directories are walked, and a repeated offset ends
-    the walk, so a looping IFD chain cannot spin forever.
+    A secondary IFD that fails to parse (malformed, over a limit, or past the
+    end of the file) is skipped too; an unreadable directory ends the walk
+    because its next offset is unknown. IFD0 errors stay fatal. At most
+    ``_MAX_IFDS`` directories are walked, and a repeated offset ends the walk,
+    so a looping IFD chain cannot spin forever.
     """
     endian, layout, ifd_at = await _read_header(reader)
     entries, next_at = await _read_ifd(reader, endian, layout, ifd_at)
@@ -887,10 +903,13 @@ async def _parse_levels(reader: _ByteReader) -> list[_Image]:
     seen = {ifd_at}
     while next_at and next_at not in seen and len(seen) < _MAX_IFDS:
         seen.add(next_at)
-        entries, next_at = await _read_ifd(reader, endian, layout, next_at)
+        try:
+            entries, next_at = await _read_ifd(reader, endian, layout, next_at)
+        except _SECONDARY_IFD_ERRORS:
+            break
         try:
             image = await _image_from_entries(reader, endian, entries, georeferenced=False)
-        except CogUnsupportedError:
+        except _SECONDARY_IFD_ERRORS:
             continue
         if image.subfile_type & _SUBFILE_REDUCED and not image.subfile_type & _SUBFILE_MASK:
             images.append(image)
@@ -1006,6 +1025,8 @@ async def _image_from_entries(
     tiles_y = math.ceil(height / tile_height)
     if tiles_x > _MAX_TILES or tiles_y > _MAX_TILES or tiles_x > _MAX_TILES // tiles_y:
         raise CogLimitError("too many tiles")
+    if tile_width * tile_height * samples * (bits // 8) > _MAX_TILE_BYTES:
+        raise CogLimitError("TIFF tile is too large to decode")
     offsets = await _entry_ints(reader, endian, entries[_TAG_TILE_OFFSETS])
     counts = await _entry_ints(reader, endian, entries[_TAG_TILE_COUNTS])
     if len(offsets) != tiles_x * tiles_y or len(counts) != len(offsets):

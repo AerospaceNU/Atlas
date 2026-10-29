@@ -273,6 +273,78 @@ async def test_overview_reader_refuses_a_full_level_over_the_pixel_cap(
 
 
 @pytest.mark.asyncio
+async def test_overview_reader_refuses_a_level_over_the_byte_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 32 x 32 pixels pass the pixel cap; four uint16 bands are 8192 bytes.
+    monkeypatch.setattr("atlas.data.cog._MAX_WINDOW_BYTES", 4096)
+    path = tmp_path / "bands.tif"
+    path.write_bytes(_tiled_tiff([_ramp(32, 32, bands=4)]))
+    with pytest.raises(CogLimitError, match="too many bytes"):
+        await read_overview(path)
+
+
+def _last_next_slot(blob: bytes) -> int:
+    """Offset of the next-IFD pointer of the last IFD in a little-endian classic TIFF."""
+    slot = 4
+    ifd_at = struct.unpack_from("<I", blob, slot)[0]
+    while ifd_at:
+        count = struct.unpack_from("<H", blob, ifd_at)[0]
+        slot = ifd_at + 2 + 12 * count
+        ifd_at = struct.unpack_from("<I", blob, slot)[0]
+    return slot
+
+
+def _short_ifd(entries: list[tuple[int, int]]) -> bytes:
+    """Classic little-endian IFD of inline LONG fields, ending the chain."""
+    body = struct.pack("<H", len(entries))
+    for tag, value in sorted(entries):
+        body += struct.pack("<HHII", tag, 4, 1, value)
+    return body + struct.pack("<I", 0)
+
+
+@pytest.mark.parametrize(
+    "trailer",
+    [
+        "too_many_entries",
+        "missing_width",
+        "too_many_tiles",
+        "past_end_of_file",
+    ],
+)
+@pytest.mark.asyncio
+async def test_overview_reader_skips_a_bad_trailing_ifd(tmp_path: Path, trailer: str) -> None:
+    full = _ramp(64, 64)
+    half = _ramp(32, 32)
+    out = bytearray(_tiled_tiff([full, half]))
+    out += b"\x00" * (len(out) % 2)
+    target = len(out)
+    if trailer == "too_many_entries":
+        out += struct.pack("<H", 200) + b"\x00" * 16
+    elif trailer == "missing_width":
+        out += _short_ifd([(254, 1), (322, 16), (323, 16)])
+    elif trailer == "too_many_tiles":
+        out += _short_ifd([(254, 1), (256, 100_000), (257, 100_000), (258, 8), (322, 1), (323, 1)])
+    else:
+        target = len(out) + 4096
+    struct.pack_into("<I", out, _last_next_slot(bytes(out)), target)
+    path = tmp_path / "trailer.tif"
+    path.write_bytes(bytes(out))
+    read = await read_overview(path, min_long_side=30)
+    assert np.array_equal(read.array, half)
+    whole = await read_overview(path, min_long_side=10_000)
+    assert np.array_equal(whole.array, full)
+
+
+@pytest.mark.asyncio
+async def test_a_bad_first_ifd_is_still_fatal(tmp_path: Path) -> None:
+    path = tmp_path / "broken.tif"
+    path.write_bytes(struct.pack("<HHIH", 0x4949, 42, 8, 200) + b"\x00" * 16)
+    with pytest.raises(CogLimitError, match="200 entries"):
+        await read_overview(path)
+
+
+@pytest.mark.asyncio
 async def test_untiled_file_is_not_previewed(tmp_path: Path) -> None:
     path = tmp_path / "strip.tif"
     Image.fromarray(np.zeros((8, 8), dtype=np.uint16)).save(path)

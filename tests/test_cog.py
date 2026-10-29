@@ -1076,6 +1076,67 @@ async def test_deflate_bomb_is_rejected(tmp_path: Path) -> None:
     assert list(tmp_path.rglob("*.tif")) == []
 
 
+@pytest.mark.asyncio
+async def test_oversized_declared_tile_is_refused_before_its_payload(tmp_path: Path) -> None:
+    # One 16384 x 16384 tile would inflate a few compressed bytes to 256 MiB.
+    built = build_cog(
+        np.zeros((1, 1, 1), dtype=np.uint8),
+        tile=16384,
+        origin_x=0.0,
+        origin_y=16.0,
+        pixel_size_x=0.001,
+        pixel_size_y=0.001,
+        compression="deflate",
+        dimensions=(16384, 16384),
+        tile_blobs=[zlib.compress(b"\x00" * 1024)],
+    )
+    log = _RangeLog(built.blob, allow_full=True)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        with pytest.raises(CogLimitError, match="tile is too large"):
+            await read_cog_window(
+                http,
+                "https://example.com/granule.tif",
+                west=0.0,
+                south=15.9,
+                east=0.1,
+                north=16.0,
+            )
+        assert not _tiles_touched(log.range_calls(), built.tile_spans)
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=0.0, south=15.9, east=0.1, north=16.0),
+        )
+    assert report.outcomes[0].status == "failed"
+    assert "tile is too large" in (report.outcomes[0].error or "")
+    assert None not in log.calls
+    assert not _tiles_touched(log.range_calls(), built.tile_spans)
+    assert list(tmp_path.rglob("*.tif")) == []
+
+
+@pytest.mark.asyncio
+async def test_window_byte_cap_counts_samples_per_pixel() -> None:
+    # 16M pixels pass the pixel cap, but 16 bands of them are 256 MB.
+    built = build_cog(
+        np.zeros((16, 1, 1), dtype=np.uint8),
+        tile=1000,
+        origin_x=0.0,
+        origin_y=4000.0,
+        pixel_size_x=1.0,
+        pixel_size_y=1.0,
+        dimensions=(4000, 4000),
+        place_tiles_at=1_000_000,
+    )
+    log = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        opened = await open_cog(http, "https://example.com/granule.tif")
+        with pytest.raises(CogLimitError, match="too many bytes"):
+            await opened.read_window(west=0.0, south=0.0, east=4000.0, north=4000.0)
+    assert all(start < 1_000_000 for start, _ in log.range_calls())
+
+
 def test_run_data_passes_the_aoi_into_the_cog_read(tmp_path: Path) -> None:
     built = _geographic()
     log = _RangeLog(built.blob)
