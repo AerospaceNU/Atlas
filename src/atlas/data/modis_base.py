@@ -16,7 +16,11 @@ from atlas.data.base import (
     Scene,
     SceneKind,
 )
-from atlas.data.credentials import EARTHDATA_CREDENTIALS, raise_for_missing_credential
+from atlas.data.credentials import (
+    EARTHDATA_CREDENTIALS,
+    earthdata_headers,
+    raise_for_missing_credential,
+)
 
 CMR_SEARCH_URL = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
 
@@ -47,6 +51,9 @@ class MODISClient(DataPullClient):
     @property
     def collection(self) -> str:
         return self.short_name
+
+    def download_headers(self, href: str) -> dict[str, str]:
+        return earthdata_headers(href, self._token)
 
     async def aclose(self) -> None:
         if self._owns_client:

@@ -25,9 +25,18 @@ _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
 _BROWSE_KEYS = frozenset({"rendered_preview", "thumbnail", "preview"})
 _BROWSE_ROLES = frozenset({"thumbnail", "overview", "preview", "rendered_preview"})
 _PREFERRED_KEYS = ("visual",)
+# Roles and key fragments of quality, mask, and geometry layers. A default pick
+# skips them so an optical download is imagery, not a QA band or cloud mask.
+_AUXILIARY_ROLES = frozenset(
+    {"cloud", "cloud-shadow", "snow-ice", "water-mask", "data-mask", "saturation", "metadata"}
+)
+_AUXILIARY_PREFIXES = ("qa", "oa_")
+_AUXILIARY_PARTS = ("mask", "cloud", "angle", "azimuth", "zenith")
+_AUXILIARY_KEYS = frozenset({"ang", "saa", "sza", "vaa", "vza", "aot", "wvp", "scl"})
 _RASTER_SUFFIXES = frozenset(
     {".tif", ".tiff", ".jp2", ".nc", ".hdf", ".h5", ".zip", ".las", ".laz"}
 )
+_COMPRESSED_SUFFIXES = frozenset({".bz2", ".gz"})
 
 
 class BrowseAssetError(ValueError):
@@ -85,9 +94,11 @@ def is_forbidden_asset_name(name: str) -> bool:
 def pick_asset(scene: Scene, name: str | None = None) -> tuple[str, Asset] | None:
     """Choose one native-resolution asset. Never returns a preview or thumbnail.
 
-    Prefers ``visual`` (full-res RGB COG) when it is not browse, then any ``data``
-    role, then the first remaining non-browse asset. ``name`` pins a band alias
-    such as ``red``, otherwise a literal asset key.
+    Prefers ``visual`` (full-res RGB COG) when it is not browse, then the
+    ``red`` band, then a ``reflectance`` asset, then a ``data`` asset that is not
+    a QA, mask, or angle layer, then any ``data`` asset, then the first
+    remaining non-browse asset. ``name`` pins a band alias such as ``red``,
+    otherwise a literal asset key.
 
     Raises:
         BrowseAssetError: if ``name`` is a preview/thumbnail key or asset.
@@ -105,21 +116,41 @@ def pick_asset(scene: Scene, name: str | None = None) -> tuple[str, Asset] | Non
             raise BrowseAssetError(f"{key!r} is a preview/thumbnail and cannot be downloaded")
         # The native key, not the alias, so the filename records the band fetched.
         return key, asset
-    for key in _PREFERRED_KEYS:
+    preferred = [*_PREFERRED_KEYS]
+    if "red" in scene.band_aliases:
+        preferred.append(scene.band_aliases["red"])
+    for key in preferred:
         asset = scene.assets.get(key)
         if asset is not None and not is_browse_asset(key, asset):
             return key, asset
     data_hits = [
         (key, asset)
         for key, asset in scene.assets.items()
-        if not is_browse_asset(key, asset) and "data" in {role.lower() for role in asset.roles}
+        if not is_browse_asset(key, asset) and "data" in _roles(asset)
     ]
-    if data_hits:
-        return data_hits[0]
+    reflectance = [hit for hit in data_hits if "reflectance" in _roles(hit[1])]
+    imagery = [hit for hit in data_hits if not _is_auxiliary(*hit)]
+    for hits in (reflectance, imagery, data_hits):
+        if hits:
+            return hits[0]
     for key, asset in scene.assets.items():
         if not is_browse_asset(key, asset):
             return key, asset
     return None
+
+
+def _roles(asset: Asset) -> set[str]:
+    return {role.lower() for role in asset.roles}
+
+
+def _is_auxiliary(key: str, asset: Asset) -> bool:
+    """True for a QA, mask, or sun/view geometry layer."""
+    if _roles(asset) & _AUXILIARY_ROLES:
+        return True
+    lower = key.lower()
+    if lower in _AUXILIARY_KEYS or lower.startswith(_AUXILIARY_PREFIXES):
+        return True
+    return any(part in lower for part in _AUXILIARY_PARTS)
 
 
 def scene_filename(scene_id: str, asset_key: str, suffix: str) -> str:
@@ -145,11 +176,16 @@ def asset_suffix(asset: Asset, content_type: str | None = None) -> str:
             return ".nc"
         if "hdf" in lower:
             return ".hdf"
-    ext = Path(urlparse(asset.href).path).suffix.lower()
+    path = Path(urlparse(asset.href).path)
+    ext = path.suffix.lower()
     if ext == ".tiff":
         return ".tif"
     if ext in _RASTER_SUFFIXES:
         return ext
+    if ext in _COMPRESSED_SUFFIXES:
+        # A compressed file keeps its inner extension, e.g. Himawari ``.DAT.bz2``.
+        inner = Path(path.stem).suffix.lower()
+        return f"{inner}{ext}" if inner else ext
     return ".bin"
 
 
@@ -247,8 +283,10 @@ async def download_assets(
                 # report that file as the result of this request.
                 stale = planned
             async with sem:
-                href = await _signed_href(clients.get(scene.source), asset.href)
-                windowed = await _windowed_cog(http, href, asset, bbox)
+                client = clients.get(scene.source)
+                href = await _signed_href(client, asset.href)
+                headers = client.download_headers(href) if client is not None else {}
+                windowed = await _windowed_cog(http, href, asset, bbox, headers)
                 if windowed is not None:
                     payload, bytes_read, granule_size = windowed
                     path = dest_dir / scene_filename(scene.id, key, ".tif")
@@ -257,7 +295,9 @@ async def download_assets(
                     _retire_previous(out, stale, path)
                     stale = None
                 else:
-                    async with http.stream("GET", href, follow_redirects=True) as response:
+                    async with http.stream(
+                        "GET", href, headers=headers, follow_redirects=True
+                    ) as response:
                         response.raise_for_status()
                         suffix = asset_suffix(asset, response.headers.get("content-type"))
                         path = dest_dir / scene_filename(scene.id, key, suffix)
@@ -432,6 +472,7 @@ async def _windowed_cog(
     href: str,
     asset: Asset,
     bbox: BBox | None,
+    headers: Mapping[str, str] | None = None,
 ) -> tuple[bytes, int, int | None] | None:
     """Return the AOI GeoTIFF, bytes read, and granule size.
 
@@ -442,7 +483,7 @@ async def _windowed_cog(
     if bbox is None or not _is_geotiff_asset(asset):
         return None
     try:
-        cog = await open_cog(http, href)
+        cog = await open_cog(http, href, headers=headers)
         if cog.epsg is None:
             return None
         bounds = model_bounds(

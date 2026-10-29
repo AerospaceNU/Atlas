@@ -1061,6 +1061,15 @@ class DataPullClient(ABC):
         """
         return PullResult(request=request, scenes=[], next_cursor=page_cursor)
 
+    def download_headers(self, href: str) -> dict[str, str]:
+        """Headers to send when downloading ``href``, such as a bearer token.
+
+        Sources whose assets are public send none. A source that adds a
+        credential must scope it to its own hosts so a redirect or a foreign
+        href never receives it.
+        """
+        return {}
+
     async def resolve_scene_ids(self, scene_ids: Sequence[str]) -> Mapping[str, Scene] | None:
         """Return stored scenes whose ids still exist.
 

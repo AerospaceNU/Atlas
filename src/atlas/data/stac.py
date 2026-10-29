@@ -704,14 +704,27 @@ def _stac_bbox(feature: dict[str, Any]) -> BBox | None:
     # A 6-number bbox is [west, south, floor, east, north, ceiling].
     half = len(bbox_list) // 2
     try:
+        west, east = float(bbox_list[0]), float(bbox_list[half])
+        # GOES-West full disk publishes west=-218.3. Wrap past +/-180 so the box
+        # crosses the antimeridian instead of failing validation.
+        if east - west >= 360.0:
+            west, east = -180.0, 180.0
+        else:
+            west, east = _wrap_longitude(west), _wrap_longitude(east)
         return BBox.try_new(
-            west=float(bbox_list[0]),
+            west=west,
             south=float(bbox_list[1]),
-            east=float(bbox_list[half]),
+            east=east,
             north=float(bbox_list[half + 1]),
         )
     except (TypeError, ValueError):
         return None
+
+
+def _wrap_longitude(lon: float) -> float:
+    if -180.0 <= lon <= 180.0:
+        return lon
+    return ((lon + 180.0) % 360.0) - 180.0
 
 
 def _stac_cloud_cover(raw: object) -> float | None:
@@ -729,6 +742,10 @@ def _stac_cloud_cover(raw: object) -> float | None:
     return min(max(value, 0.0), 100.0)
 
 
+# Digital Earth Africa buckets live in af-south-1, an opt-in region.
+_OPT_IN_BUCKET_REGIONS: tuple[tuple[str, str], ...] = (("deafrica-", "af-south-1"),)
+
+
 def _http_href(href: str) -> str:
     """Expose S3 object URLs over HTTPS so callers can fetch without an s3 client."""
     if not href.startswith("s3://"):
@@ -737,6 +754,10 @@ def _http_href(href: str) -> str:
     bucket, _, key = rest.partition("/")
     if not bucket or not key:
         return href
+    # Buckets in an opt-in region answer the global endpoint with HTTP 400.
+    for prefix, region in _OPT_IN_BUCKET_REGIONS:
+        if bucket.startswith(prefix):
+            return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
     return f"https://{bucket}.s3.amazonaws.com/{key}"
 
 

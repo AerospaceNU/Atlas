@@ -189,7 +189,8 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         default=None,
         help=(
             "Band name (red, nir) or asset key to download; band names win over a "
-            "literal key of the same name. Default: visual COG, then data. "
+            "literal key of the same name. Default: visual COG, then the red band, then "
+            "an imagery band; QA, mask, and angle layers are skipped. "
             "Previews/thumbnails are rejected."
         ),
     )
