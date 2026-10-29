@@ -30,8 +30,22 @@ _PREFERRED_KEYS = ("visual",)
 _AUXILIARY_ROLES = frozenset(
     {"cloud", "cloud-shadow", "snow-ice", "water-mask", "data-mask", "saturation", "metadata"}
 )
-_AUXILIARY_PREFIXES = ("qa", "oa_")
-_AUXILIARY_PARTS = ("mask", "cloud", "angle", "azimuth", "zenith")
+_AUXILIARY_PREFIXES = ("qa", "oa_", "tie_", "tie-")
+_AUXILIARY_PARTS = (
+    "mask",
+    "cloud",
+    "angle",
+    "azimuth",
+    "zenith",
+    "meteo",
+    "coordinates",
+    "geometr",
+    "flags",
+    "quality",
+    "manifest",
+    "removed",
+    "instrument",
+)
 _AUXILIARY_KEYS = frozenset({"ang", "saa", "sza", "vaa", "vza", "aot", "wvp", "scl"})
 _RASTER_SUFFIXES = frozenset(
     {".tif", ".tiff", ".jp2", ".nc", ".hdf", ".h5", ".zip", ".las", ".laz"}
@@ -95,9 +109,9 @@ def pick_asset(scene: Scene, name: str | None = None) -> tuple[str, Asset] | Non
     """Choose one native-resolution asset. Never returns a preview or thumbnail.
 
     Prefers ``visual`` (full-res RGB COG) when it is not browse, then the
-    ``red`` band, then a ``reflectance`` asset, then a ``data`` asset that is not
-    a QA, mask, or angle layer, then any ``data`` asset, then the first
-    remaining non-browse asset. ``name`` pins a band alias such as ``red``,
+    ``red`` band, then a ``reflectance`` asset, then a ``data`` file that is not
+    a QA, mask, angle, or geometry layer, then a whole-product archive, then
+    any ``data`` asset, then the first remaining non-browse asset. ``name`` pins a band alias such as ``red``,
     otherwise a literal asset key.
 
     Raises:
@@ -129,8 +143,10 @@ def pick_asset(scene: Scene, name: str | None = None) -> tuple[str, Asset] | Non
         if not is_browse_asset(key, asset) and "data" in _roles(asset)
     ]
     reflectance = [hit for hit in data_hits if "reflectance" in _roles(hit[1])]
+    # A whole-product archive (CDSE ``product``) ranks after a single file.
     imagery = [hit for hit in data_hits if not _is_auxiliary(*hit)]
-    for hits in (reflectance, imagery, data_hits):
+    files = [hit for hit in imagery if "archive" not in _roles(hit[1])]
+    for hits in (reflectance, files, imagery, data_hits):
         if hits:
             return hits[0]
     for key, asset in scene.assets.items():
@@ -285,7 +301,7 @@ async def download_assets(
             async with sem:
                 client = clients.get(scene.source)
                 href = await _signed_href(client, asset.href)
-                headers = client.download_headers(href) if client is not None else {}
+                headers = await client.download_headers(href) if client is not None else {}
                 windowed = await _windowed_cog(http, href, asset, bbox, headers)
                 if windowed is not None:
                     payload, bytes_read, granule_size = windowed

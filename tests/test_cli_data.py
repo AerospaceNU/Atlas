@@ -246,7 +246,7 @@ async def test_download_assets_sends_client_download_headers(tmp_path: Path) -> 
     seen: list[str | None] = []
 
     class TokenClient(FakePullClient):
-        def download_headers(self, href: str) -> dict[str, str]:
+        async def download_headers(self, href: str) -> dict[str, str]:
             return {"Authorization": "Bearer t"} if href.startswith("https://data.") else {}
 
     def handler(request: httpx.Request) -> httpx.Response:

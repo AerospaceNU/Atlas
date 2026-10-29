@@ -599,7 +599,7 @@ def item_to_scene(
             roles = spec.get("roles")
             scale, offset = _raster_calibration(spec.get("raster:bands"))
             asset = Asset.try_new(
-                href=_http_href(spec["href"]),
+                href=_asset_href(spec),
                 media_type=spec.get("type") if isinstance(spec.get("type"), str) else None,
                 title=spec.get("title") if isinstance(spec.get("title"), str) else None,
                 roles=list(roles) if isinstance(roles, list) else [],
@@ -744,6 +744,22 @@ def _stac_cloud_cover(raw: object) -> float | None:
 
 # Digital Earth Africa buckets live in af-south-1, an opt-in region.
 _OPT_IN_BUCKET_REGIONS: tuple[tuple[str, str], ...] = (("deafrica-", "af-south-1"),)
+
+
+def _asset_href(spec: dict[str, Any]) -> str:
+    """Primary href, or its ``alternate.https`` href when the primary is S3.
+
+    CDSE lists ``s3://eodata/...`` first. That bucket needs CDSE S3 keys, while
+    the https alternate is the OData download that takes a bearer token.
+    """
+    href = str(spec["href"])
+    alternate = spec.get("alternate")
+    if href.startswith("s3://") and isinstance(alternate, dict):
+        https = alternate.get("https")
+        alt = https.get("href") if isinstance(https, dict) else None
+        if isinstance(alt, str) and alt.startswith("https://"):
+            return alt
+    return _http_href(href)
 
 
 def _http_href(href: str) -> str:

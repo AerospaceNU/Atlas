@@ -68,7 +68,7 @@ STAC and related search clients. `search` is the only required method, and it is
 | `cop_dem` | Copernicus DEM (30 m and 90 m). |
 | `earth_search` | Element84 Earth Search (Sentinel-1 GRD, Sentinel-2 L2A). |
 | `usgs` | USGS Landsat Collection 2. |
-| `cdse` | Copernicus Data Space: Sentinel-3, Sentinel-5P, burnt area. A 401 or 403 names `CDSE_USERNAME` and `CDSE_PASSWORD` as missing or rejected. CDSE is set with the env var only. The value is not printed. |
+| `cdse` | Copernicus Data Space: Sentinel-3, Sentinel-5P, burnt area. A 401 or 403 names `CDSE_USERNAME` and `CDSE_PASSWORD` as missing or rejected. CDSE is set with the env var only. The value is not printed. Downloads use each asset's OData `alternate.https` link with a bearer token from the CDSE identity service, sent only to `download.dataspace.copernicus.eu`. |
 | `cmr_stac` | NASA CMR STAC: GEDI, ICESat-2, SMAP, VIIRS. A 401 or 403 names `EARTHDATA_TOKEN` as missing or rejected and does not print the value. Downloads send the token as a bearer header to `https` hosts under `nasa.gov` only. |
 | `digitalearth` | Digital Earth Australia and Africa Sentinel-2. |
 | `inpe` | CBERS-4 and Amazonia-1. |
