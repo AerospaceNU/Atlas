@@ -20,7 +20,7 @@ from atlas.data.credentials import MissingCredentialError
 from atlas.data.earth_search import EarthSearchSentinel1GrdClient
 from atlas.data.firms import FirmsClient
 from atlas.data.gibs import GibsModisTrueColorClient
-from atlas.data.goes import GOES_EAST_BUCKET, GoesClient
+from atlas.data.goes import GoesClient
 from atlas.data.himawari import HIMAWARI_BUCKET, HimawariClient
 from atlas.data.hls_sentinel import HLSSentinelClient
 from atlas.data.maxar_opendata import MaxarOpenDataClient
@@ -281,7 +281,8 @@ async def test_goes_lists_netcdf_from_s3() -> None:
         )
     assert [s.datetime.strftime("%H%M") for s in result.scenes] == ["1506", "1601"]
     scene = result.scenes[0]
-    assert scene.assets["data"].href.startswith(f"https://{GOES_EAST_BUCKET}.s3.amazonaws.com/")
+    # 2024 was served by GOES-16 as GOES-East, not by GOES-19.
+    assert scene.assets["data"].href.startswith("https://noaa-goes16.s3.amazonaws.com/")
     assert scene.assets["data"].href.endswith(".nc")
     assert scene.kind is SceneKind.optical
     assert scene.bbox.as_list() != BOSTON.as_list()

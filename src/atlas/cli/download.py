@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import email.utils
 import enum
+import hashlib
+import json
 import os
 import re
 import time
@@ -15,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from atlas.cli.fs import replace_with_retry
 from atlas.cli.preview import (
     clear_preview,
     preview_path,
@@ -35,7 +38,7 @@ from atlas.data.cog import (
 )
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
-_BROWSE_KEYS = frozenset({"rendered_preview", "thumbnail", "preview"})
+_BROWSE_KEYS = frozenset({"rendered_preview", "thumbnail", "preview", "quicklook", "browse"})
 _BROWSE_ROLES = frozenset({"thumbnail", "overview", "preview", "rendered_preview"})
 _PREFERRED_KEYS = ("visual",)
 # Roles and key fragments of quality, mask, and geometry layers. A default pick
@@ -64,6 +67,39 @@ _RASTER_SUFFIXES = frozenset(
     {".tif", ".tiff", ".jp2", ".nc", ".hdf", ".h5", ".zip", ".las", ".laz"}
 )
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+# Suffixes checked when a scene asset may already be on disk under a name the
+# catalog does not predict (a response content type chose it).
+KNOWN_SUFFIXES = (
+    ".tif",
+    ".tiff",
+    ".bin",
+    ".jp2",
+    ".nc",
+    ".hdf",
+    ".h5",
+    ".zip",
+    ".png",
+    ".jpg",
+    ".dat.bz2",
+    ".grib2.gz",
+)
+# A windowed chip gets a small sibling that records the AOI it was read for,
+# so a later pull of the same area can skip it. The georeferenced file itself
+# is not modified.
+AOI_MARKER_SUFFIX = ".aoi.json"
+_MAX_NAME_BYTES = 240
+_WINDOWS_RESERVED = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+)
 _COMPRESSED_SUFFIXES = frozenset({".bz2", ".gz"})
 # A whole-file GET that receives fewer than ``STALL_MIN_BYTES`` in
 # ``STALL_SECONDS`` is aborted. A trickling server would otherwise hold the
@@ -283,13 +319,29 @@ def _is_auxiliary(key: str, asset: Asset) -> bool:
     return any(part in lower for part in _AUXILIARY_PARTS)
 
 
+def _safe_part(text: str) -> str:
+    """Sanitize one filename part and avoid a reserved Windows device name."""
+    cleaned = _SAFE_ID.sub("_", text.rstrip(" .")).rstrip(" .")
+    return cleaned or "_"
+
+
+def _avoid_reserved(name: str) -> str:
+    """Prefix ``_`` when the stem is a reserved Windows device name."""
+    return f"_{name}" if name.split(".", 1)[0].upper() in _WINDOWS_RESERVED else name
+
+
 def scene_filename(scene_id: str, asset_key: str, suffix: str) -> str:
-    """Filesystem-safe name ``<id>_<asset><suffix>``.
+    """Return a portable filename: ``<id>_<key><suffix>``.
 
     A scene id that already ends in ``suffix`` (GOES ids are file names such
     as ``..._c2026152.nc``) drops that ending, so the extension is not
     repeated: ``..._c2026152_data.nc``, not ``..._c2026152.nc_data.nc``.
     Any other id, and the placeholder ``.bin`` suffix, keep the id whole.
+
+    The name is limited to 240 bytes so a long CMR asset key or scene id does
+    not fail with ``ENAMETOOLONG``; the shortened stem keeps a hash of the id
+    so two long ids do not collide. A Windows reserved device name is prefixed
+    with ``_`` and trailing dots or spaces are dropped.
     """
     if not suffix.startswith("."):
         suffix = f".{suffix}"
@@ -298,9 +350,19 @@ def scene_filename(scene_id: str, asset_key: str, suffix: str) -> str:
         trimmed = base[: -len(suffix)]
         if trimmed.strip("._-"):
             base = trimmed
-    stem = _SAFE_ID.sub("_", base)
-    key = _SAFE_ID.sub("_", asset_key)
-    return f"{stem}_{key}{suffix}"
+    stem = _safe_part(base)
+    key = _safe_part(asset_key)
+    tail = f"_{key}{suffix}"
+    if len(tail.encode("utf-8")) > _MAX_NAME_BYTES - 24:
+        digest = hashlib.sha1(asset_key.encode("utf-8")).hexdigest()[:8]
+        room = max(1, _MAX_NAME_BYTES - 24 - len(suffix.encode("utf-8")) - 9)
+        key = f"{key[:room]}~{digest}"
+        tail = f"_{key}{suffix}"
+    room = max(1, _MAX_NAME_BYTES - len(tail.encode("utf-8")))
+    if len(stem.encode("utf-8")) > room:
+        digest = hashlib.sha1(scene_id.encode("utf-8")).hexdigest()[:8]
+        stem = f"{stem[: max(1, room - 9)]}~{digest}"
+    return _avoid_reserved(f"{stem}{tail}")
 
 
 def legacy_scene_filename(scene_id: str, asset_key: str, suffix: str) -> str:
@@ -330,7 +392,7 @@ def _commit_partial(partial: Path, final: Path) -> Path:
     A symlink at ``final`` is unlinked first so the rename does not follow it.
     """
     _unlink_symlink(final)
-    os.replace(partial, final)
+    replace_with_retry(partial, final)
     return final
 
 
@@ -343,7 +405,67 @@ def _adopt_legacy_name(planned: Path, legacy: Path) -> None:
     if legacy == planned or planned.exists() or planned.is_symlink():
         return
     if _nonempty_file(legacy):
-        legacy.replace(planned)
+        replace_with_retry(legacy, planned)
+
+
+def aoi_path(data_path: Path) -> Path:
+    """Sibling marker that records the AOI a windowed chip was read for."""
+    return data_path.with_name(data_path.name + AOI_MARKER_SUFFIX)
+
+
+def write_aoi(data_path: Path, bbox: BBox) -> None:
+    """Record ``bbox`` beside a windowed chip; best effort, never fails a pull."""
+    target = aoi_path(data_path)
+    tmp = target.with_name(target.name + ".part")
+    _unlink_symlink(tmp)
+    with contextlib.suppress(OSError):
+        tmp.write_text(
+            json.dumps(bbox.model_dump(mode="json"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        replace_with_retry(tmp, target)
+
+
+def same_aoi(data_path: Path, bbox: BBox) -> bool:
+    """True when the marker beside ``data_path`` is exactly this AOI."""
+    marker = aoi_path(data_path)
+    if marker.is_symlink() or not marker.is_file():
+        return False
+    try:
+        stored = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(stored, dict):
+        return False
+    current = bbox.model_dump(mode="json")
+    return all(stored.get(key) == current[key] for key in ("west", "south", "east", "north"))
+
+
+def clear_aoi(data_path: Path) -> None:
+    """Remove an AOI marker so it cannot describe a later whole-file download."""
+    _unlink_file(aoi_path(data_path))
+
+
+def existing_product(
+    dest_dir: Path,
+    scene_id: str,
+    asset_key: str,
+    suffix: str,
+) -> Path | None:
+    """Return a non-empty file for this scene asset under any known name.
+
+    The catalog often predicts the suffix, but a server's content type can
+    choose a different one. Checking the known suffixes and the pre-rename
+    GOES name keeps a later pull from downloading the same scene again.
+    """
+    for candidate in dict.fromkeys((suffix, *KNOWN_SUFFIXES)):
+        path = dest_dir / scene_filename(scene_id, asset_key, candidate)
+        if _nonempty_file(path):
+            return path
+    legacy = dest_dir / legacy_scene_filename(scene_id, asset_key, suffix)
+    if _nonempty_file(legacy):
+        return legacy
+    return None
 
 
 def asset_suffix(asset: Asset, content_type: str | None = None) -> str:
@@ -494,22 +616,27 @@ async def download_assets(
                 planned, dest_dir / legacy_scene_filename(scene.id, key, planned_suffix)
             )
             window = bbox is not None and _is_geotiff_asset(asset)
-            if _nonempty_file(planned) or (window and planned.is_symlink()):
-                if not window:
-                    preview, preview_error = await _missing_preview(planned)
+            present = existing_product(dest_dir, scene.id, key, planned_suffix)
+            if present is not None:
+                if not window or (bbox is not None and same_aoi(present, bbox)):
+                    # A whole-file download is AOI-independent. A chip is only
+                    # reusable when its marker records this same AOI.
+                    preview, preview_error = await _missing_preview(present)
                     await record(
                         DownloadOutcome(
                             source=scene.source,
                             scene_id=scene.id,
                             status="skipped",
-                            path=planned,
+                            path=present,
                             preview=preview,
                             preview_error=preview_error,
                         )
                     )
                     return
-                # The chip on disk may be an earlier window. A miss must not
-                # report that file as the result of this request.
+                # The chip on disk is an earlier window. A miss must not report
+                # that file as the result of this request.
+                stale = present
+            elif window and planned.is_symlink():
                 stale = planned
             async with sem:
                 client = clients.get(scene.source)
@@ -525,6 +652,8 @@ async def download_assets(
                     partial.write_bytes(payload)
                     path = _commit_partial(partial, final)
                     partial = None
+                    if bbox is not None:
+                        write_aoi(final, bbox)
                     _retire_previous(out, stale, path)
                     stale = None
                 elif (
@@ -532,10 +661,12 @@ async def download_assets(
                     and stale is not None
                     and _nonempty_file(stale)
                     and not stale.is_symlink()
+                    and not aoi_path(stale).exists()
                 ):
-                    # This asset cannot be windowed (unsupported CRS or layout),
-                    # so the file on disk is a whole-file download, not an
-                    # older chip. Keep it instead of fetching the granule again.
+                    # This asset cannot be windowed (unsupported CRS or layout)
+                    # and the file on disk is a whole-file download without an
+                    # AOI marker, not an older chip. Keep it instead of fetching
+                    # the granule again.
                     preview, preview_error = await _missing_preview(stale)
                     await record(
                         DownloadOutcome(
@@ -573,6 +704,7 @@ async def download_assets(
                                 ):
                                     handle.write(chunk)
                             path = _commit_partial(partial, final)
+                            clear_aoi(path)
                             partial = None
                         break
                     _retire_previous(out, stale, path)
@@ -800,7 +932,15 @@ def inside_output(root: Path, candidate: Path) -> bool:
             location = candidate.parent.resolve() / candidate.name
         else:
             location = candidate.resolve()
-        location.relative_to(resolved_root)
+        try:
+            location.relative_to(resolved_root)
+        except ValueError:
+            # Windows paths are case-insensitive, so a differently-cased path
+            # can still be inside. normcase is the identity on POSIX.
+            location_text = os.path.normcase(str(location))
+            root_text = os.path.normcase(str(resolved_root))
+            if location_text != root_text and not location_text.startswith(root_text + os.sep):
+                return False
     except (OSError, RuntimeError, ValueError):
         return False
     return location != resolved_root
@@ -821,10 +961,12 @@ def retire_product(path: Path) -> None:
 
     A regular file is moved to ``<name>.stale`` beside itself. A symlink is
     unlinked and not followed. Directories are left alone. A GeoTIFF's
-    ``<stem>.preview.png`` is retired with it, so no preview outlives its data.
+    ``<stem>.preview.png`` and AOI marker are retired with it, so neither
+    outlives its data.
     """
     if _is_tiff_path(path) and not path.name.endswith(".stale"):
         _retire_one(preview_path(path))
+        _retire_one(aoi_path(path))
     _retire_one(path)
 
 
@@ -839,7 +981,7 @@ def _retire_one(path: Path) -> None:
         dest.unlink()
     elif dest.exists():
         return
-    path.replace(dest)
+    replace_with_retry(path, dest)
 
 
 def _retire_previous(root: Path, previous: Path | None, keep: Path | None) -> None:
@@ -881,6 +1023,10 @@ async def _windowed_cog(
     the AOI is outside the raster, and downloading the granule would not
     contain it. The read carries bytes fetched, the object size from
     Content-Range, and the pixels used for the preview.
+
+    A box that crosses the antimeridian is read one side at a time. A scene on
+    one side is windowed normally; a global raster whose two edges both meet
+    the AOI cannot be one rectangular chip, so that case stays whole-file.
     """
     if bbox is None or not _is_geotiff_asset(asset):
         return UNWINDOWABLE
@@ -888,17 +1034,35 @@ async def _windowed_cog(
         cog = await open_cog(http, href, headers=headers)
         if cog.epsg is None:
             return UNWINDOWABLE
-        bounds = model_bounds(
-            cog.epsg,
-            west=bbox.west,
-            south=bbox.south,
-            east=bbox.east,
-            north=bbox.north,
-        )
-        if bounds is None:
+        try:
+            parts = bbox.antimeridian_parts()
+        except ValueError:
             return UNWINDOWABLE
-        west, south, east, north = bounds
-        read = await cog.read_window(west=west, south=south, east=east, north=north)
+        reads: list[CogRead] = []
+        unsupported = False
+        for part in parts:
+            bounds = model_bounds(
+                cog.epsg,
+                west=part.west,
+                south=part.south,
+                east=part.east,
+                north=part.north,
+            )
+            if bounds is None:
+                unsupported = True
+                continue
+            west, south, east, north = bounds
+            try:
+                reads.append(await cog.read_window(west=west, south=south, east=east, north=north))
+            except CogMissError:
+                continue
+        if not reads and unsupported:
+            return UNWINDOWABLE
+        if not reads:
+            raise CogMissError("AOI does not overlap the COG")
+        if len(reads) > 1:
+            return UNWINDOWABLE
+        read = reads[0]
     except (CogMissError, CogRangeError, CogLimitError):
         raise
     except CogUnsupportedError:

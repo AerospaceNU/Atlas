@@ -29,7 +29,6 @@ Invariants:
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +36,7 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
+from atlas.cli.fs import replace_with_retry
 from atlas.data.cog import CogArray, CogRead, read_overview
 
 PREVIEW_SUFFIX = ".preview.png"
@@ -102,7 +102,7 @@ def write_preview(
     _remove(tmp)
     try:
         Image.fromarray(image).save(tmp, format="PNG")
-        os.replace(tmp, dest)
+        replace_with_retry(tmp, dest)
     except BaseException:
         _remove(tmp)
         raise

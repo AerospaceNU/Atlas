@@ -40,6 +40,7 @@ from atlas.cli.download import (
     retire_product,
     scene_filename,
 )
+from atlas.cli.fs import replace_with_retry
 from atlas.data.base import DataPullClient, Scene
 from atlas.data.firms import FirmsClient
 from atlas.data.gibs import GibsClient
@@ -63,6 +64,11 @@ ProgressCallback = Callable[[str, int, int], None]
 def writes_own_output(client: DataPullClient | None) -> bool:
     """True for sources this module saves instead of ``download_assets``."""
     return isinstance(client, GibsClient | FirmsClient)
+
+
+def writes_own_output_type(cls: type[DataPullClient]) -> bool:
+    """True for a registered class this module saves itself."""
+    return issubclass(cls, GibsClient | FirmsClient)
 
 
 def detections_path(out: Path, source: str) -> Path | None:
@@ -298,7 +304,7 @@ def _write_atomic(path: Path, payload: bytes) -> None:
             handle.write(payload)
         # ``os.fchmod`` is Unix-only; ``os.chmod`` exists on Windows too.
         os.chmod(tmp, 0o644)
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise

@@ -13,7 +13,14 @@ import httpx
 
 from atlas.cli import _attach_negative_option_values
 from atlas.cli.data import add_data_parser, execute_pull, run_data
-from atlas.cli.download import asset_suffix, output_source_dir, pick_asset, scene_filename
+from atlas.cli.download import (
+    asset_suffix,
+    legacy_scene_filename,
+    output_source_dir,
+    pick_asset,
+    scene_filename,
+    write_aoi,
+)
 from atlas.cli.estimate import (
     CONFIRM_PROMPT,
     CONFIRMATION_REQUIRED,
@@ -583,3 +590,54 @@ def _write_scene(out: Path, scene: Scene, *, content: bytes = b"present") -> Pat
 
 def _unused_http(request: httpx.Request) -> httpx.Response:
     raise AssertionError(f"download started: {request.url}")
+
+
+def test_a_windowed_scene_says_its_catalog_size_is_an_upper_bound() -> None:
+    scene = _scene("win", size=700_000_000, href="https://example.com/win.tif")
+    estimate = estimate_pull(_catalog(_source("sentinel2", [scene])), bbox=AOI)
+    assert estimate.scene_count == 1
+    assert estimate.windowed_scenes == 1
+    assert "windowed: 1 scenes read a smaller window" in render_pull_estimate(estimate)
+
+
+def test_already_present_recognizes_the_legacy_goes_name(tmp_path: Path) -> None:
+    scene = Scene(
+        id="OR_ABI-L2-CMIPF-M6C13_G19_s2026152_e2026152_c20261522359236.nc",
+        source="goes",
+        datetime=_WHEN,
+        bbox=AOI,
+        platform="GOES-19",
+        assets={
+            "data": Asset(
+                href="https://example.com/file.nc",
+                media_type="application/x-netcdf",
+                roles=["data"],
+            )
+        },
+    )
+    dest = output_source_dir(tmp_path, "goes")
+    assert dest is not None
+    dest.mkdir(parents=True)
+    (dest / legacy_scene_filename(scene.id, "data", ".nc")).write_bytes(b"old-goes")
+    estimate = estimate_pull(_catalog(_source("goes", [scene])), out_dir=tmp_path)
+    assert estimate.already_present == 1
+    assert estimate.scene_count == 0
+
+
+def test_a_windowed_chip_counts_as_present_only_for_its_own_aoi(tmp_path: Path) -> None:
+    scene = _scene("win", size=1000, href="https://example.com/win.tif")
+    dest = output_source_dir(tmp_path, "sentinel2")
+    assert dest is not None
+    dest.mkdir(parents=True)
+    chip = dest / scene_filename(scene.id, "data", ".tif")
+    chip.write_bytes(b"chip")
+    write_aoi(chip, AOI)
+
+    same = estimate_pull(_catalog(_source("sentinel2", [scene])), out_dir=tmp_path, bbox=AOI)
+    assert same.already_present == 1
+    assert same.scene_count == 0
+
+    other = BBox(west=-71.2, south=42.2, east=-70.9, north=42.5)
+    different = estimate_pull(_catalog(_source("sentinel2", [scene])), out_dir=tmp_path, bbox=other)
+    assert different.already_present == 0
+    assert different.scene_count == 1

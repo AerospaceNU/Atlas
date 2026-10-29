@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import importlib
 import json
 import os
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -47,12 +48,17 @@ from atlas.cli.download import (
     retire_product,
 )
 from atlas.cli.estimate import confirm_download, estimate_pull, render_pull_estimate
+from atlas.cli.fs import replace_with_retry
 from atlas.cli.progress import ProgressReporter, pick_reporter
-from atlas.cli.source_outputs import write_source_outputs, writes_own_output
+from atlas.cli.source_outputs import (
+    write_source_outputs,
+    writes_own_output,
+    writes_own_output_type,
+)
 from atlas.compile.aggregate import aggregate
 from atlas.compile.product import SceneCatalog, SourceScenes
 from atlas.data.base import BBox, DataPullClient, Polygon, PullRequest, Scene
-from atlas.data.registry import sources
+from atlas.data.registry import SOURCES, sources
 from atlas.data.scene_identity import (
     SourceResolution,
     StoredScene,
@@ -85,8 +91,12 @@ _EXAMPLE = (
 )
 _EXTRACT_HINT = "FLDAS table extraction runs alone; pass only the fldas source"
 _TABLE_OPTIONS_HINT = "--table, --variables, and --points apply only to the fldas source"
+_SEARCH_ONLY_TABLE_WARNING = (
+    "warning: --search-only writes no FLDAS table; --table, --variables, and --points are ignored"
+)
 _TABLE_NAME = "fldas.csv"
 _EMPTY_WINDOW = "requested window is empty"
+_MANIFEST_LOCK_NAME = ".manifest.json.lock"
 _PULL_OPTIONS = (
     "date",
     "coords",
@@ -302,7 +312,8 @@ def run_data(
     """Dispatch ``atlas data``: list catalog, list one satellite, or pull.
 
     Returns:
-        Process exit code (0 ok, 1 all sources failed, 2 usage).
+        Process exit code (0 ok, 1 all sources failed or no download was saved,
+        2 usage).
     """
     load_repo_env()
     console = Console(highlight=False)
@@ -390,6 +401,12 @@ def run_data(
             file=sys.stderr,
         )
         return 2
+    if args.asset and all(writes_own_output_type(SOURCES[name]) for name in names):
+        print(
+            "--asset does not apply to GIBS or FIRMS; they write a WMS image or a detection table",
+            file=sys.stderr,
+        )
+        return 2
 
     # Keyed off the resolved registry names so family tokens (fldas, all) work too.
     # A mixed catalog pull still extracts FLDAS and downloads the other sources.
@@ -422,16 +439,19 @@ def run_data(
                 file=sys.stderr,
             )
             return 2
-        try:
-            raw_variables = getattr(args, "variables", None)
-            raw_points = getattr(args, "points", None)
-            if raw_variables is not None:
-                variables = resolve_variables(split_variables(raw_variables))
-            if raw_points is not None:
-                points = parse_points_csv(raw_points)
-        except FldasRequestError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
+        if args.search_only and table_options:
+            print(_SEARCH_ONLY_TABLE_WARNING, file=sys.stderr)
+        else:
+            try:
+                raw_variables = getattr(args, "variables", None)
+                raw_points = getattr(args, "points", None)
+                if raw_variables is not None:
+                    variables = resolve_variables(split_variables(raw_variables))
+                if raw_points is not None:
+                    points = parse_points_csv(raw_points)
+            except FldasRequestError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
     if (
         fldas_only
         and not args.search_only
@@ -676,6 +696,12 @@ async def execute_pull(
         if trouble is not None:
             print(trouble, file=sys.stderr)
             return 2
+        if request.polygon is not None and not search_only:
+            print(
+                "warning: downloads use the polygon envelope; pixels outside the ring "
+                "can be included",
+                file=sys.stderr,
+            )
         if prior_manifest is not None:
             mismatch = _resume_mismatch(prior_manifest, live_clients)
             if mismatch is not None:
@@ -735,6 +761,7 @@ async def execute_pull(
         report = DownloadReport()
         table_failed = False
         table_usage = False
+        attempted = 0
         if not search_only:
             to_pull = [
                 scene
@@ -746,6 +773,7 @@ async def execute_pull(
             # module; browse assets stay forbidden in download_assets.
             own_output = [s for s in to_pull if writes_own_output(live_clients.get(s.source))]
             to_pull = [s for s in to_pull if not writes_own_output(live_clients.get(s.source))]
+            attempted = len(to_pull) + len(own_output)
             for src in catalog.sources:
                 if src.error is None:
                     reporter.source_pull(src.source, saved=0, total=len(src.scenes))
@@ -832,6 +860,18 @@ async def execute_pull(
             ):
                 print(line, file=sys.stderr)
         if catalog.sources and all(src.error for src in catalog.sources):
+            return 1
+        # A pull that attempted downloads and saved nothing did not do its job,
+        # even when every search worked. A window failure has no attempted
+        # scene and stays a recorded note with exit 0.
+        downloaded = [
+            item for item in report.outcomes if not item.scene_id.endswith(("-window", "-table"))
+        ]
+        if (
+            not search_only
+            and attempted > 0
+            and not any(item.status in {"saved", "skipped"} for item in downloaded)
+        ):
             return 1
         # Usage and auth failures change the exit code only for a FLDAS-only pull.
         # A mixed catalog pull keeps the existing rule: search success exits 0,
@@ -1066,8 +1106,13 @@ def _same_window(previous: object, request: PullRequest) -> bool:
     current = request.bbox.model_dump(mode="json")
     if any(bbox.get(key) != current[key] for key in ("west", "south", "east", "north")):
         return False
+    previous_polygon = previous.get("polygon")
     current_polygon = None if request.polygon is None else request.polygon.model_dump(mode="json")
-    return previous.get("polygon") == current_polygon
+    if previous_polygon is None or current_polygon is None:
+        return previous_polygon is current_polygon
+    left = _stored_polygon_signature(previous_polygon)
+    right = _stored_polygon_signature(current_polygon)
+    return left is not None and left == right
 
 
 def _listed_product(out_dir: Path, source: str, rel: object) -> Path | None:
@@ -1085,12 +1130,27 @@ def _listed_product(out_dir: Path, source: str, rel: object) -> Path | None:
 
 def _catalog_bbox_note(request: PullRequest) -> str:
     if request.polygon is None:
+        if request.bbox.west > request.bbox.east:
+            return (
+                "A box across the antimeridian was sent to STAC catalogs as two rings. "
+                "Catalogs that only accept a box were cut at 180 degrees."
+            )
         return "Every catalog was searched with this bounding box."
     return (
         "Catalogs that only accept a bounding box were searched with this box. "
         "The polygon is the area of interest. Scenes from every source are filtered "
         "to it by footprint bounding-box overlap; point scenes must fall inside the ring. "
         "A scene stores that box, not the full footprint outline."
+    )
+
+
+def _download_note(request: PullRequest) -> str | None:
+    """Explain that a polygon pull writes the envelope, not a clipped ring."""
+    if request.polygon is None:
+        return None
+    return (
+        "Downloads use the polygon envelope: a WMS image or a windowed raster covers "
+        "the box, so pixels outside the ring can be included."
     )
 
 
@@ -1131,14 +1191,66 @@ def _same_pull(stored: object, request: PullRequest) -> bool:
         previous.start_date == request.start_date
         and previous.end_date == request.end_date
         and previous.bbox == request.bbox
-        and previous.polygon == request.polygon
+        and _same_polygon(previous.polygon, request.polygon)
         and previous.min_cloud_cover == request.min_cloud_cover
         and previous.max_cloud_cover == request.max_cloud_cover
     )
 
 
+def _same_polygon(previous: Polygon | None, current: Polygon | None) -> bool:
+    """True when two rings describe the same surface, ignoring the start vertex."""
+    if previous is None or current is None:
+        return previous is current
+    left = _ring_signature(previous.ring)
+    right = _ring_signature(current.ring)
+    return left is not None and left == right
+
+
+def _ring_signature(ring: object) -> tuple[tuple[float, float], ...] | None:
+    """Canonical closed ring: start at the smallest position, altitude dropped."""
+    if not isinstance(ring, Sequence) or isinstance(ring, str | bytes):
+        return None
+    points: list[tuple[float, float]] = []
+    for item in ring:
+        if not isinstance(item, Sequence) or isinstance(item, str | bytes) or len(item) < 2:
+            return None
+        lon, lat = item[0], item[1]
+        if isinstance(lon, bool) or isinstance(lat, bool):
+            return None
+        if not isinstance(lon, int | float) or not isinstance(lat, int | float):
+            return None
+        points.append((float(lon), float(lat)))
+    if points and points[0] == points[-1]:
+        points = points[:-1]
+    if not points:
+        return None
+    start = min(range(len(points)), key=lambda index: points[index])
+    rotated = points[start:] + points[:start]
+    return (*rotated, rotated[0])
+
+
+def _stored_polygon_signature(value: object) -> tuple[tuple[float, float], ...] | None:
+    """Ring signature from a stored request polygon (``ring`` or GeoJSON)."""
+    if not isinstance(value, dict):
+        return None
+    ring = value.get("ring")
+    if isinstance(ring, list):
+        return _ring_signature(ring)
+    coordinates = value.get("coordinates")
+    if isinstance(coordinates, list) and coordinates:
+        return _ring_signature(coordinates[0])
+    return None
+
+
 def _page_cursors(payload: Mapping[str, Any]) -> dict[str, str | None]:
-    """Return each source's stored next-page cursor, including explicit nulls."""
+    """Return each source's stored next-page cursor, including explicit nulls.
+
+    A row whose search failed and stored no cursor is left out of the map, so
+    a resume searches it from page one instead of treating the failure as a
+    finished source. A row whose next page was signed and deliberately not
+    stored stays in the map, so resume repeats the warning rather than
+    repeating page one.
+    """
     cursors: dict[str, str | None] = {}
     sources = payload.get("sources")
     if not isinstance(sources, list):
@@ -1149,8 +1261,28 @@ def _page_cursors(payload: Mapping[str, Any]) -> dict[str, str | None]:
         name = item.get("source")
         if not isinstance(name, str) or not name:
             continue
-        cursors[name] = _wire_cursor(item.get("next_cursor"))
+        cursor = _wire_cursor(item.get("next_cursor"))
+        if cursor is None and _failed_without_cursor(item):
+            continue
+        cursors[name] = cursor
     return cursors
+
+
+def _failed_without_cursor(row: Mapping[str, Any]) -> bool:
+    """True when a row records a failed search, no cursor, and no signed link.
+
+    Such a source is retried from page one by a resume. A signed next link
+    that was deliberately not stored has no error and is left as recorded.
+    """
+    error = row.get("error")
+    if not isinstance(error, str) or not error.strip():
+        return False
+    if row.get("cursor_rejected") is True:
+        # The cursor was rejected and cleared on purpose; a resume must not
+        # silently start over. A pull without --resume starts at page one.
+        return False
+    reason = row.get("next_cursor_unavailable")
+    return not (isinstance(reason, str) and reason.strip())
 
 
 def _write_manifest(
@@ -1195,15 +1327,22 @@ def _write_manifest(
         )
         for src in catalog.sources
     ]
-    existing = _read_manifest(out_dir)
-    payload = {
-        "request": request_json,
-        "polygon": None if request.polygon is None else request.polygon.as_geojson(),
-        "catalog_bbox": bbox,
-        "catalog_bbox_note": _catalog_bbox_note(request),
-        "sources": _merge_rows([] if existing is None else _source_rows(existing), sources_payload),
-    }
-    _write_json_atomic(pull_manifest_path(out_dir), json.dumps(payload, indent=2) + "\n")
+    # The read, merge, and replace are one critical section. Two pulls into
+    # the same directory would otherwise read the same file and each write
+    # only its own row, dropping the other source.
+    with _manifest_lock(out_dir):
+        existing = _read_manifest(out_dir)
+        payload = {
+            "request": request_json,
+            "polygon": None if request.polygon is None else request.polygon.as_geojson(),
+            "catalog_bbox": bbox,
+            "catalog_bbox_note": _catalog_bbox_note(request),
+            "download_note": _download_note(request),
+            "sources": _merge_rows(
+                [] if existing is None else _source_rows(existing), sources_payload
+            ),
+        }
+        _write_json_atomic(pull_manifest_path(out_dir), json.dumps(payload, indent=2) + "\n")
 
 
 def _stamp_request(row: dict[str, Any], request_json: object) -> dict[str, Any]:
@@ -1431,7 +1570,7 @@ def _source_entry(
             if src.next_cursor_unavailable
             else None,
             "error": src.error,
-            "_cursor_rejected": src.cursor_rejected,
+            "cursor_rejected": bool(src.cursor_rejected),
             "n_scenes": len(src.scenes),
             "scene_ids": [scene.id for scene in src.scenes],
             "saved": [
@@ -1716,6 +1855,51 @@ def _sweep_manifest_temps(directory: Path) -> None:
             leftover.unlink()
 
 
+@contextlib.contextmanager
+def _manifest_lock(directory: Path) -> Iterator[None]:
+    """Hold an exclusive lock for one manifest read-merge-write.
+
+    The lock file is permanent; the OS lock, not its existence, serializes
+    writers. POSIX uses ``flock``. Windows has no ``flock``, so it locks one
+    byte with ``msvcrt`` and waits for the holder to release it.
+    """
+    path = directory / _MANIFEST_LOCK_NAME
+    if os.name == "posix":
+        import fcntl
+
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        return
+
+    msvcrt = importlib.import_module("msvcrt")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    try:
+        for _ in range(600):
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise OSError(f"timed out waiting for the pull manifest lock: {path}")
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)
+
+
 def _write_json_atomic(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` via an exclusive temp file, fsync, and ``os.replace``.
 
@@ -1738,7 +1922,7 @@ def _write_json_atomic(path: Path, text: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp, _manifest_file_mode())
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
         _fsync_directory(directory)
     except Exception:
         if tmp.exists():
@@ -1754,7 +1938,7 @@ def _merge_source(current: dict[str, Any], prior: Mapping[str, Any] | None) -> d
     next resume can try the same page again. A rejected cursor is cleared
     instead of being copied back.
     """
-    rejected = bool(current.pop("_cursor_rejected", False))
+    rejected = bool(current.get("cursor_rejected", False))
     if prior is None:
         return current
     if current.get("error"):
@@ -1773,6 +1957,7 @@ def _merge_source(current: dict[str, Any], prior: Mapping[str, Any] | None) -> d
         return kept
     scene_ids = _extend_str(prior.get("scene_ids"), current.get("scene_ids"))
     merged = dict(current)
+    merged["cursor_rejected"] = False
     merged["scene_ids"] = scene_ids
     merged["n_scenes"] = len(scene_ids)
     merged["saved"] = _extend_str(prior.get("saved"), current.get("saved"))

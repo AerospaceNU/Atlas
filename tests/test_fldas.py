@@ -794,7 +794,7 @@ def test_mixed_catalog_pull_still_writes_the_fldas_table(tmp_path: Path) -> None
     finally:
         asyncio.run(fldas.aclose())
         asyncio.run(http.aclose())
-    assert code == 0
+    assert code == 1
     assert (tmp_path / "fldas.csv").exists()
     # A GeoTIFF whose server ignores Range is failed, not fetched a second time.
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
@@ -887,6 +887,7 @@ def test_empty_fldas_window_drops_the_previous_csv(
         "next_cursor_unavailable",
         "note",
         "error",
+        "cursor_rejected",
         "n_scenes",
         "scene_ids",
         "scenes",
@@ -1259,3 +1260,38 @@ def test_resume_after_search_only_writes_the_table(tmp_path: Path) -> None:
     assert (tmp_path / "fldas.csv").is_file()
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["sources"][0]["saved"] == ["fldas.csv"]
+
+
+@pytest.mark.asyncio
+async def test_points_outside_the_polygon_are_rejected() -> None:
+    from atlas.data.base import Polygon
+
+    polygon = Polygon(ring=[(0.0, 0.0), (10.0, 0.0), (0.0, 10.0), (0.0, 0.0)])
+    request = PullRequest(
+        start_date=date(2020, 1, 1),
+        end_date=date(2020, 1, 31),
+        bbox=BBox(west=0.0, south=0.0, east=10.0, north=10.0),
+        polygon=polygon,
+    )
+    client = FldasClient(token="t")
+    try:
+        with pytest.raises(FldasRequestError, match="outside the request polygon"):
+            await client.extract_training_table(request, [_scene()], points=[(9.0, 9.0)])
+    finally:
+        await client.aclose()
+
+
+def test_search_only_warns_that_table_options_are_ignored(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeFldas()
+    client = _FakeFldasSource(fake, token="token")
+    table = tmp_path / "custom.csv"
+    args = _pull_args(tmp_path, search_only=True, variables="Nope_tavg", table=table)
+    try:
+        assert run_data(args, clients={"fldas": client}) == 0
+    finally:
+        asyncio.run(client.aclose())
+    assert "--search-only writes no FLDAS table" in capsys.readouterr().err
+    assert not table.exists()
+    assert fake.queries == []

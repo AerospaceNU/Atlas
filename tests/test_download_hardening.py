@@ -402,3 +402,49 @@ def test_tall_box_returns_every_segment_between_its_edges() -> None:
     segments = _aoi_segments(box, "B03")
     assert segments == list(range(segments[0], segments[-1] + 1))
     assert segments[0] == 1 and segments[-1] == 10
+
+
+@pytest.mark.asyncio
+async def test_a_response_content_type_is_found_on_the_next_pull(tmp_path: Path) -> None:
+    """The catalog may not predict the suffix the server chooses; find it anyway."""
+    scene = Scene.model_validate(
+        {
+            "id": "granule",
+            "datetime": datetime(2024, 7, 1, tzinfo=UTC),
+            "bbox": AOI,
+            "platform": "x",
+            "source": "sentinel2",
+            "assets": {"data": Asset(href="https://example.com/download", roles=["data"])},
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"tiff", headers={"content-type": "image/tiff"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        first = await download_assets([scene], tmp_path, http=http, clients={})
+    path = first.outcomes[0].path
+    assert first.outcomes[0].status == "saved" and path is not None
+    assert path.name == "granule_data.tif"
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"an existing asset is not fetched again: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as http:
+        second = await download_assets([scene], tmp_path, http=http, clients={})
+    assert second.outcomes[0].status == "skipped"
+    assert second.outcomes[0].path == path
+
+
+def test_inside_output_accepts_a_case_differing_path_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from atlas.cli import download as download_module
+    from atlas.cli.download import inside_output
+
+    monkeypatch.setattr(download_module.os.path, "normcase", lambda value: value.lower())
+    root = tmp_path / "Root"
+    root.mkdir()
+    candidate = tmp_path / "root" / "file.bin"
+    assert inside_output(root, candidate)
+    assert not inside_output(root, tmp_path / "other" / "file.bin")

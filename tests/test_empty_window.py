@@ -27,6 +27,7 @@ _MANIFEST_FIELDS = {
     "next_cursor_unavailable",
     "note",
     "error",
+    "cursor_rejected",
     "n_scenes",
     "scene_ids",
     "scenes",
