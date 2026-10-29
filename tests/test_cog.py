@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import math
 import struct
@@ -17,6 +18,7 @@ import httpx
 import numpy as np
 import pytest
 from numpy.typing import NDArray
+from PIL import Image
 
 import atlas.data.cog as cog
 from atlas.cli.data import run_data
@@ -1460,3 +1462,29 @@ def test_encode_rejects_an_empty_window() -> None:
                 bytes_fetched=0,
             )
         )
+
+
+@pytest.mark.parametrize("bands", [1, 3])
+def test_encoded_tile_is_padded_to_a_multiple_of_16(bands: int) -> None:
+    # 810 by 360 is the ALOS FNF chip that macOS Preview refused to open.
+    pixels = (np.arange(bands * 810 * 360) % 251).astype(np.uint8).reshape(bands, 810, 360)
+    encoded = encode_cog(
+        CogRead(
+            array=pixels,
+            origin_x=-71.0,
+            origin_y=42.22,
+            pixel_size_x=0.0002222,
+            pixel_size_y=0.0002222,
+            epsg=4326,
+            col_off=0,
+            row_off=0,
+            bytes_fetched=0,
+        )
+    )
+    with Image.open(io.BytesIO(encoded)) as image:
+        assert image.size == (360, 810)
+        assert image.tag_v2[322] == 368
+        assert image.tag_v2[323] == 816
+        decoded = np.asarray(image)
+    expected = pixels[0] if bands == 1 else np.transpose(pixels, (1, 2, 0))
+    assert np.array_equal(decoded, expected)
