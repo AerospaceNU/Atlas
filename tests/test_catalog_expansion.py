@@ -10,8 +10,9 @@ import httpx
 import pytest
 
 import atlas.data as atlas_data
+from atlas.cli.download import pick_asset
 from atlas.compile.select import coverage_fraction
-from atlas.data import goes
+from atlas.data import goes, himawari
 from atlas.data.base import BBox, GeometryKind, PullRequest, SceneKind
 from atlas.data.cdse import CdseSentinel3OlciClient
 from atlas.data.cop_dem import CopDemGlo30Client
@@ -391,6 +392,77 @@ async def test_himawari_lists_ahi_slots() -> None:
     assert "delimiter=/" in fake.calls[0][1]
     assert "max-keys=1" not in " ".join(url for _, url, _ in fake.calls)
     assert "continuation-token=page-2" in fake.calls[-1][1]
+
+
+def _himawari_slot(day: str, segments: Sequence[int]) -> dict[str, str]:
+    slot = f"{day}2350/"
+    name = "HS_H09_20260601_2350_{band}_FLDK_R{res}_S{seg:02d}10.DAT.bz2"
+    res = {"B01": "10", "B02": "10", "B03": "05", "B04": "10", "B13": "20"}
+    keys = [
+        slot + name.format(band=band, res=r, seg=seg) for band, r in res.items() for seg in segments
+    ]
+    return {day: _s3_listing(prefixes=[slot]), slot: _s3_listing(keys=keys)}
+
+
+async def _himawari_scene(bbox: BBox, segments: Sequence[int] = range(1, 11)) -> Any:
+    day = "AHI-L1b-FLDK/2026/06/01/"
+    fake = S3Fake(_himawari_slot(day, segments))
+    async with _client(HimawariClient, fake) as client:
+        result = await client.search(
+            _request(bbox=bbox, limit=1, start_date=date(2026, 6, 1), end_date=date(2026, 6, 1))
+        )
+    return result.scenes[0]
+
+
+@pytest.mark.asyncio
+async def test_himawari_red_alias_is_the_segment_holding_the_aoi() -> None:
+    # Checked against HSD block 7 of real B03 files: Tokyo rows 3845-3877 lie in
+    # segment 2 (lines 2201-4400); Sydney rows 17812-17837 lie in segment 9.
+    tokyo = await _himawari_scene(TOKYO)
+    assert tokyo.band_aliases == {
+        "blue": "B01_S0210",
+        "green": "B02_S0210",
+        "red": "B03_S0210",
+        "nir": "B04_S0210",
+    }
+    assert tokyo.properties["aoi_segments"] == [2]
+    picked = pick_asset(tokyo)
+    assert picked is not None and picked[0] == "B03_S0210"
+    sydney = await _himawari_scene(BBox(west=151.1, south=-33.95, east=151.3, north=-33.8))
+    assert sydney.band_aliases["red"] == "B03_S0910"
+    assert sydney.properties["aoi_segments"] == [9]
+
+
+@pytest.mark.asyncio
+async def test_himawari_aoi_across_a_segment_edge_lists_both_segments() -> None:
+    # B03 segment 5 ends at line 11000, just south of the equator under the satellite.
+    equator = BBox(west=140.0, south=-1.0, east=141.0, north=1.0)
+    scene = await _himawari_scene(equator)
+    assert scene.properties["aoi_segments"] == [5, 6]
+    assert scene.band_aliases["red"] in {"B03_S0510", "B03_S0610"}
+
+
+@pytest.mark.asyncio
+async def test_himawari_omits_an_alias_whose_segment_is_missing() -> None:
+    scene = await _himawari_scene(TOKYO, segments=[1])
+    assert scene.band_aliases == {}
+    assert scene.properties["aoi_segments"] == [2]
+
+
+@pytest.mark.asyncio
+async def test_himawari_dateline_aoi_centres_across_180() -> None:
+    fiji = BBox(west=179.0, south=-18.5, east=-179.0, north=-17.5)
+    scene = await _himawari_scene(fiji)
+    assert scene.band_aliases["red"] == "B03_S0710"
+    assert scene.properties["aoi_segments"] == [7]
+
+
+def test_himawari_disk_line_matches_hsd_navigation() -> None:
+    assert himawari._disk_line(140.7, 0.0, 22000) == pytest.approx(11000.5)
+    assert himawari._disk_line(140.7, 0.0, 5500) == pytest.approx(2750.5)
+    assert himawari._disk_line(-74.0, 40.0, 5500) is None
+    assert himawari._segment(140.7, 70.0, "B13") == 1
+    assert himawari._segment(140.7, -70.0, "B13") == 10
 
 
 @pytest.mark.asyncio
