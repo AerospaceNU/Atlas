@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import ClassVar
+from collections.abc import Mapping
+from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 import httpx
 
-from atlas.data.base import SceneKind
+from atlas.data.base import PullRequest, PullResult, Scene, SceneKind
 from atlas.data.credentials import CDSE_CREDENTIALS, CDSE_PASSWORD, CDSE_USERNAME
 from atlas.data.stac import StacApiClient
 
@@ -90,13 +91,43 @@ class CdseStacClient(StacApiClient):
             return self._access_token
 
 
+# OLCI items publish no ``eo:bands``, so wavelength matching finds nothing and
+# the default pick would fall to the first radiance file, Oa01 at 400 nm.
+# Centres from the OLCI band table: Oa06 560 nm, Oa08 665 nm, Oa17 865 nm.
+_OLCI_BAND_ALIASES: Mapping[str, str] = {
+    "green": "Oa06_radianceData",
+    "red": "Oa08_radianceData",
+    "nir": "Oa17_radianceData",
+}
+
+
 class CdseSentinel3OlciClient(CdseStacClient):
-    """Sentinel-3 OLCI L1 EFR, not-time-critical."""
+    """Sentinel-3 OLCI L1 EFR, not-time-critical.
+
+    ``red``, ``green``, and ``nir`` name the Oa08, Oa06, and Oa17 radiance
+    files, so the default download is the 665 nm band. An alias is set only
+    when the item has that asset. Other aliases from the item are kept.
+    """
 
     default_collection: ClassVar[str] = "sentinel-3-olci-1-efr-ntc"
     satellite: ClassVar[str] = "sentinel3"
     scene_kind: ClassVar[SceneKind] = SceneKind.optical
     nominal_gsd_m: ClassVar[float | None] = 300.0
+
+    def _scenes_in(self, payload: Mapping[str, Any]) -> list[Scene]:
+        return [_with_olci_aliases(scene) for scene in super()._scenes_in(payload)]
+
+    def _result_from_payload(self, request: PullRequest, payload: Any) -> PullResult:
+        result = super()._result_from_payload(request, payload)
+        scenes = [_with_olci_aliases(scene) for scene in result.scenes]
+        return result.model_copy(update={"scenes": scenes})
+
+
+def _with_olci_aliases(scene: Scene) -> Scene:
+    pinned = {alias: key for alias, key in _OLCI_BAND_ALIASES.items() if key in scene.assets}
+    if not pinned:
+        return scene
+    return scene.model_copy(update={"band_aliases": {**scene.band_aliases, **pinned}})
 
 
 class CdseSentinel5PNo2Client(CdseStacClient):
