@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import email.utils
+import os
 import re
 import time
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -70,6 +71,27 @@ STALL_MIN_BYTES = 64 * 1024
 GET_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 2.0
 RETRY_AFTER_CAP_SECONDS = 60.0
+# Bounded retry of an href signing call (Planetary Computer SAS) answered 429,
+# 5xx, or a transport error. Same budget as the COG range reader.
+SIGN_ATTEMPTS = 8
+SIGN_BACKOFF_SECONDS = 0.5
+SIGN_WAIT_CAP_SECONDS = 16.0
+# Whole-file downloads are written under this sibling prefix and renamed on
+# success, so a killed run never leaves a truncated file at the final name.
+PARTIAL_PREFIX = "."
+PARTIAL_SUFFIX = ".part"
+_REDACTED = "***"
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
+# FIRMS puts MAP_KEY in the path: /api/area/csv/<key>/<source>/<area>/...
+_FIRMS_KEY_PATH = re.compile(r"(/api/(?:area|country)/csv/)[^/]+", re.IGNORECASE)
+# A credential-shaped parameter outside a URL, e.g. echoed in a message body.
+_SECRET_PARAM = re.compile(
+    r"(?i)(?<![A-Za-z0-9_-])"
+    r"(sig|se|st|sp|sv|sr|skoid|sktid|skt|ske|sks|skv|token|access_token|id_token|"
+    r"refresh_token|api_key|apikey|key|map_key|password|x-amz-[a-z-]+)"
+    r"=([^&\s\"'<>]+)"
+)
+_BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+")
 
 
 class BrowseAssetError(ValueError):
@@ -80,23 +102,61 @@ class DownloadStallError(OSError):
     """Raised when a whole-file GET stops making progress."""
 
 
+def redact_url(url: str) -> str:
+    """Return ``url`` without credentials.
+
+    The query string and fragment are replaced by ``***`` (SAS ``sig``/``se``,
+    ``X-Amz-*``, ``token``, and ``key`` all live there), user info is
+    dropped, and a FIRMS ``MAP_KEY`` path segment is masked. Scheme, host,
+    and path stay so the failure still names the file.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return _REDACTED
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    path = _FIRMS_KEY_PATH.sub(rf"\1{_REDACTED}", parts.path)
+    query = _REDACTED if parts.query else ""
+    fragment = _REDACTED if parts.fragment else ""
+    return urlunsplit((parts.scheme, netloc, path, query, fragment))
+
+
+def redact_secrets(text: str) -> str:
+    """Mask URL query strings, FIRMS path keys, and credential parameters in ``text``.
+
+    Applied to every error that is rendered or persisted (CLI table,
+    ``DownloadOutcome.error``, ``manifest.json``). httpx puts the full
+    request URL in ``HTTPStatusError`` text, and a signed href carries its
+    token in the query.
+    """
+    text = _URL_RE.sub(lambda match: redact_url(match.group(0)), text)
+    text = _SECRET_PARAM.sub(rf"\1={_REDACTED}", text)
+    return _BEARER.sub(rf"\1 {_REDACTED}", text)
+
+
 def describe_error(exc: BaseException) -> str:
-    """Readable, never-empty text for a failed download.
+    """Readable, never-empty, redacted text for a failed download.
 
     Some transport errors carry no message: an ``httpx.ReadTimeout`` raised
     from a bare ``TimeoutError`` stringifies to ``""``. The class name is
-    always included so a failure is never rendered blank.
+    always included so a failure is never rendered blank. URL queries and
+    credential parameters are masked by ``redact_secrets``.
     """
     name = type(exc).__name__
     text = str(exc).strip()
     if not text and exc.__cause__ is not None:
         text = str(exc.__cause__).strip()
-    return f"{name}: {text}" if text else name
+    return redact_secrets(f"{name}: {text}") if text else name
 
 
 @dataclass
 class DownloadOutcome:
-    """One scene's download attempt."""
+    """One scene's download attempt.
+
+    ``error`` is passed through ``redact_secrets`` on construction, so a
+    signed href or key in an exception message never reaches the CLI table
+    or ``manifest.json``.
+    """
 
     source: str
     scene_id: str
@@ -107,6 +167,10 @@ class DownloadOutcome:
     granule_size: int | None = None
     preview: Path | None = None
     preview_error: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.error is not None:
+            self.error = redact_secrets(self.error)
 
 
 @dataclass
@@ -228,6 +292,49 @@ def scene_filename(scene_id: str, asset_key: str, suffix: str) -> str:
     return f"{stem}_{key}{suffix}"
 
 
+def legacy_scene_filename(scene_id: str, asset_key: str, suffix: str) -> str:
+    """The name ``scene_filename`` gave before ids stopped repeating the suffix.
+
+    GOES files saved by older runs are ``<id>.nc_data.nc``. This name is only
+    read to adopt such a file; nothing is written under it.
+    """
+    if not suffix.startswith("."):
+        suffix = f".{suffix}"
+    return f"{_SAFE_ID.sub('_', scene_id)}_{_SAFE_ID.sub('_', asset_key)}{suffix}"
+
+
+def partial_path(final: Path) -> Path:
+    """Hidden sibling a download is written to before it is renamed to ``final``.
+
+    The name never equals a ``scene_filename`` result (those do not start
+    with ``.`` for a real id and never end in ``.part``), so the skip-existing
+    check cannot mistake an interrupted download for a finished one.
+    """
+    return final.with_name(f"{PARTIAL_PREFIX}{final.name}{PARTIAL_SUFFIX}")
+
+
+def _commit_partial(partial: Path, final: Path) -> Path:
+    """Atomically move a finished download to its final name and return it.
+
+    A symlink at ``final`` is unlinked first so the rename does not follow it.
+    """
+    _unlink_symlink(final)
+    os.replace(partial, final)
+    return final
+
+
+def _adopt_legacy_name(planned: Path, legacy: Path) -> None:
+    """Rename a file saved under a legacy name to ``planned`` when that is free.
+
+    Only a non-empty regular file is adopted, and never over an existing
+    ``planned`` entry, so the skip check then sees it as present.
+    """
+    if legacy == planned or planned.exists() or planned.is_symlink():
+        return
+    if _nonempty_file(legacy):
+        legacy.replace(planned)
+
+
 def asset_suffix(asset: Asset, content_type: str | None = None) -> str:
     """Infer a file extension from media type or the href path."""
     for media in (content_type, asset.media_type):
@@ -242,7 +349,7 @@ def asset_suffix(asset: Asset, content_type: str | None = None) -> str:
             return ".nc"
         if "hdf" in lower:
             return ".hdf"
-    path = Path(urlparse(asset.href).path)
+    path = Path(urlsplit(asset.href).path)
     ext = path.suffix.lower()
     if ext == ".tiff":
         return ".tif"
@@ -273,6 +380,8 @@ async def download_assets(
     """GET one native-resolution asset per scene, streamed to disk.
 
     Existing non-empty files are skipped, except a GeoTIFF read as a window.
+    A file under the pre-rename GOES name (``<id>.nc_data.nc``) counts as
+    present and is renamed in place to the current name.
     That read is checked again: an empty window fails the scene and moves an
     older chip aside, so it is not this request's file. A range failure, a
     window over the read limit, and a transport error leave that chip in
@@ -296,7 +405,13 @@ async def download_assets(
     file. A body that delivers fewer than ``stall_min_bytes`` within
     ``stall_seconds`` is aborted and its partial file removed.
 
-    Every ``failed`` or ``no_asset`` outcome carries a non-empty ``error``.
+    Bytes are written to a hidden ``.<name>.part`` sibling and renamed to the
+    final name only after the body completes, so a killed run never leaves a
+    truncated file at a name the skip check treats as done. A failure removes
+    the partial file.
+
+    Every ``failed`` or ``no_asset`` outcome carries a non-empty ``error``
+    with URL queries and credentials masked (see ``redact_secrets``).
     An unexpected exception fails that scene only and does not abort the
     other downloads.
     """
@@ -324,6 +439,7 @@ async def download_assets(
 
     async def one(scene: Scene) -> None:
         path: Path | None = None
+        partial: Path | None = None
         stale: Path | None = None
         bytes_read: int | None = None
         granule_size: int | None = None
@@ -353,7 +469,11 @@ async def download_assets(
                 )
                 return
             dest_dir.mkdir(parents=True, exist_ok=True)
-            planned = dest_dir / scene_filename(scene.id, key, asset_suffix(asset))
+            planned_suffix = asset_suffix(asset)
+            planned = dest_dir / scene_filename(scene.id, key, planned_suffix)
+            _adopt_legacy_name(
+                planned, dest_dir / legacy_scene_filename(scene.id, key, planned_suffix)
+            )
             window = bbox is not None and _is_geotiff_asset(asset)
             if _nonempty_file(planned) or (window and planned.is_symlink()):
                 if not window:
@@ -380,11 +500,30 @@ async def download_assets(
                 if windowed is not None:
                     payload, chip = windowed
                     bytes_read, granule_size = chip.bytes_fetched, chip.granule_size
-                    path = dest_dir / scene_filename(scene.id, key, ".tif")
-                    _unlink_symlink(path)
-                    path.write_bytes(payload)
+                    final = dest_dir / scene_filename(scene.id, key, ".tif")
+                    partial = partial_path(final)
+                    _unlink_symlink(partial)
+                    partial.write_bytes(payload)
+                    path = _commit_partial(partial, final)
+                    partial = None
                     _retire_previous(out, stale, path)
                     stale = None
+                elif stale is not None and _nonempty_file(stale) and not stale.is_symlink():
+                    # This asset cannot be windowed (unsupported CRS or layout),
+                    # so the file on disk is a whole-file download, not an
+                    # older chip. Keep it instead of fetching the granule again.
+                    preview, preview_error = await _missing_preview(stale)
+                    await record(
+                        DownloadOutcome(
+                            source=scene.source,
+                            scene_id=scene.id,
+                            status="skipped",
+                            path=stale,
+                            preview=preview,
+                            preview_error=preview_error,
+                        )
+                    )
+                    return
                 else:
                     total_attempts = max(1, attempts)
                     for attempt in range(1, total_attempts + 1):
@@ -398,19 +537,23 @@ async def download_assets(
                                 continue
                             response.raise_for_status()
                             suffix = asset_suffix(asset, response.headers.get("content-type"))
-                            path = dest_dir / scene_filename(scene.id, key, suffix)
-                            _unlink_symlink(path)
-                            with path.open("wb") as handle:
+                            final = dest_dir / scene_filename(scene.id, key, suffix)
+                            partial = partial_path(final)
+                            _unlink_symlink(partial)
+                            with partial.open("wb") as handle:
                                 async for chunk in _guarded_chunks(
                                     response, stall_seconds, stall_min_bytes
                                 ):
                                     handle.write(chunk)
+                            path = _commit_partial(partial, final)
+                            partial = None
                         break
                     _retire_previous(out, stale, path)
                     stale = None
         except CogMissError as exc:
             _retire_previous(out, stale, None)
             _unlink_partial(path, stale)
+            _unlink_file(partial)
             await record(
                 DownloadOutcome(
                     source=scene.source,
@@ -425,6 +568,7 @@ async def download_assets(
             # empty window. The previous chip stays. A partial file from this
             # attempt is removed.
             _unlink_partial(path, stale)
+            _unlink_file(partial)
             await record(
                 DownloadOutcome(
                     source=scene.source,
@@ -435,6 +579,7 @@ async def download_assets(
             )
             return
         except BrowseAssetError as exc:
+            _unlink_file(partial)
             await record(
                 DownloadOutcome(
                     source=scene.source,
@@ -448,6 +593,7 @@ async def download_assets(
             # Transport, HTTP status, stall, disk, signing, and any unexpected
             # client error fail this scene only. The partial file is removed.
             _unlink_partial(path, stale)
+            _unlink_file(partial)
             await record(
                 DownloadOutcome(
                     source=scene.source,
@@ -530,23 +676,26 @@ def _retry_delay(response: httpx.Response, attempt: int, backoff: float) -> floa
     is capped at ``RETRY_AFTER_CAP_SECONDS``. Otherwise the wait is
     ``backoff * attempt``.
     """
-    fallback = backoff * attempt
+    seconds = _retry_after(response)
+    if seconds is None:
+        return backoff * attempt
+    return min(seconds, RETRY_AFTER_CAP_SECONDS)
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    """Non-negative ``Retry-After`` seconds (delta or HTTP date), or None."""
     header = (response.headers.get("retry-after") or "").strip()
     if not header:
-        return fallback
-    seconds: float | None = None
+        return None
     if header.isdigit():
-        seconds = float(header)
-    else:
-        try:
-            when = email.utils.parsedate_to_datetime(header)
-        except (TypeError, ValueError, IndexError):
-            when = None
-        if when is not None and when.tzinfo is not None:
-            seconds = when.timestamp() - time.time()
-    if seconds is None:
-        return fallback
-    return min(max(seconds, 0.0), RETRY_AFTER_CAP_SECONDS)
+        return float(header)
+    try:
+        when = email.utils.parsedate_to_datetime(header)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None or when.tzinfo is None:
+        return None
+    return max(when.timestamp() - time.time(), 0.0)
 
 
 async def _guarded_chunks(
@@ -686,7 +835,7 @@ def _is_geotiff_asset(asset: Asset) -> bool:
     media = (asset.media_type or "").lower()
     if "geotiff" in media or "tiff" in media:
         return True
-    return Path(urlparse(asset.href).path).suffix.lower() in {".tif", ".tiff"}
+    return Path(urlsplit(asset.href).path).suffix.lower() in {".tif", ".tiff"}
 
 
 async def _windowed_cog(
@@ -727,14 +876,27 @@ async def _windowed_cog(
     return encode_cog(read), read
 
 
-async def _signed_href(client: DataPullClient | None, href: str) -> str:
+async def _signed_href(
+    client: DataPullClient | None,
+    href: str,
+    *,
+    attempts: int = SIGN_ATTEMPTS,
+    backoff: float = SIGN_BACKOFF_SECONDS,
+) -> str:
+    """Return ``href`` signed by the client's ``sign_href``, or unchanged.
+
+    A 429, a 5xx, or a transport error is retried up to ``attempts`` times in
+    total. The wait honors ``Retry-After`` and is otherwise exponential from
+    ``backoff``; every wait is capped at ``SIGN_WAIT_CAP_SECONDS``. Any other
+    4xx and any non-HTTP error are raised at once.
+    """
     if client is None:
         return href
     sign = getattr(client, "sign_href", None)
     if sign is None:
         return href
-    last_error: httpx.HTTPError | None = None
-    for attempt in range(3):
+    total = max(1, attempts)
+    for attempt in range(1, total + 1):
         try:
             signed = sign(href)
             if asyncio.iscoroutine(signed):
@@ -742,9 +904,20 @@ async def _signed_href(client: DataPullClient | None, href: str) -> str:
             if not isinstance(signed, str):
                 raise TypeError(f"sign_href must return str, got {type(signed)}")
             return signed
-        except httpx.HTTPError as exc:
-            last_error = exc
-            await asyncio.sleep(0.4 * (attempt + 1))
-    if last_error is not None:
-        raise last_error
+        except httpx.HTTPStatusError as exc:
+            if attempt >= total or not _retryable(exc.response.status_code):
+                raise
+            await asyncio.sleep(_sign_delay(exc.response, attempt, backoff))
+        except httpx.TransportError:
+            if attempt >= total:
+                raise
+            await asyncio.sleep(_sign_delay(None, attempt, backoff))
     return href
+
+
+def _sign_delay(response: httpx.Response | None, attempt: int, backoff: float) -> float:
+    """Wait before signing attempt ``attempt + 1``, capped at ``SIGN_WAIT_CAP_SECONDS``."""
+    header = None if response is None else _retry_after(response)
+    if header is not None:
+        return min(header, SIGN_WAIT_CAP_SECONDS)
+    return min(backoff * 2.0 ** (attempt - 1), SIGN_WAIT_CAP_SECONDS)
