@@ -270,3 +270,39 @@ def test_summary_lists_a_failure_without_error_text(capsys: pytest.CaptureFixtur
     err = capsys.readouterr().err
     assert "goes_cmi big: failed (no error detail recorded)" in err
     assert "goes_cmi slow: Stall" in err
+
+
+async def test_each_retry_asks_for_fresh_download_headers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_wait(delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(download_module.asyncio, "sleep", no_wait)
+
+    class Rotating(DataPullClient):
+        issued = 0
+
+        async def search(self, request: PullRequest) -> PullResult:
+            raise NotImplementedError
+
+        async def download_headers(self, href: str) -> dict[str, str]:
+            self.issued += 1
+            return {"Authorization": f"Bearer tok{self.issued}"}
+
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        if len(seen) == 1:
+            return httpx.Response(503, headers={"retry-after": "60"})
+        if request.headers.get("authorization") != f"Bearer tok{len(seen)}":
+            return httpx.Response(401)
+        return httpx.Response(200, content=b"ok")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        report = await download_assets(
+            [_scene()], tmp_path, http=http, clients={"goes": Rotating()}, retry_backoff=0.0
+        )
+    assert report.outcomes[0].status == "saved"
+    assert seen == ["Bearer tok1", "Bearer tok2"]

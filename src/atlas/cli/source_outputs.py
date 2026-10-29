@@ -6,6 +6,9 @@ nothing for them. This module writes:
 
 * GIBS: the WMS GetMap image the scene already names, fetched for the
   request AOI and day, as ``<out>/<source>/<scene>_wms.png`` (or ``.jpg``).
+  The name carries no AOI, so a failed fetch moves an existing image at
+  that name to ``<name>.stale`` rather than leaving another AOI's render
+  in place.
 * FIRMS: one CSV per source, ``<out>/<source>/<source>_detections.csv``,
   with one row per detection and every column FIRMS returned.
 
@@ -29,7 +32,13 @@ from typing import Any
 import httpx
 from PIL import Image, UnidentifiedImageError
 
-from atlas.cli.download import DownloadOutcome, output_source_dir, scene_filename
+from atlas.cli.download import (
+    DownloadOutcome,
+    inside_output,
+    output_source_dir,
+    retire_product,
+    scene_filename,
+)
 from atlas.data.base import DataPullClient, Scene
 from atlas.data.firms import FirmsClient
 from atlas.data.gibs import GibsClient
@@ -75,7 +84,8 @@ async def write_source_outputs(
     Scenes whose client is neither GIBS nor FIRMS are ignored. A failed GIBS
     day records ``failed`` and does not stop other days or sources. GIBS
     images are always fetched again, because the file name does not encode
-    the AOI. A FIRMS table is rewritten from this pull's scenes.
+    the AOI; a failed day moves any earlier image at that name to
+    ``<name>.stale``. A FIRMS table is rewritten from this pull's scenes.
     """
     gibs: list[Scene] = []
     firms: dict[str, list[Scene]] = {}
@@ -178,17 +188,24 @@ async def _save_gibs_images(
 
 
 async def _save_gibs_image(scene: Scene, out: Path, *, http: httpx.AsyncClient) -> DownloadOutcome:
-    """GET one GIBS GetMap and keep it only when it decodes and is not blank."""
+    """GET one GIBS GetMap and keep it only when it decodes and is not blank.
+
+    The image name has no AOI, so a file already at that name may be another
+    AOI's render. A failed fetch retires it (``<name>.stale``) so the
+    manifest row for this request never points readers at that image.
+    """
+    dest_dir = output_source_dir(out, scene.source)
 
     def failed(error: str) -> DownloadOutcome:
+        if dest_dir is not None:
+            _retire_gibs_images(out, dest_dir, scene.id)
         return DownloadOutcome(source=scene.source, scene_id=scene.id, status="failed", error=error)
 
+    if dest_dir is None:
+        return failed("source name is not a directory inside the output")
     asset = scene.assets.get(GIBS_ASSET_KEY)
     if asset is None:
         return failed("GIBS scene has no WMS image URL")
-    dest_dir = output_source_dir(out, scene.source)
-    if dest_dir is None:
-        return failed("source name is not a directory inside the output")
     try:
         response = await http.get(asset.href, follow_redirects=True)
         response.raise_for_status()
@@ -214,6 +231,14 @@ async def _save_gibs_image(scene: Scene, out: Path, *, http: httpx.AsyncClient) 
         path=path,
         bytes_read=None,
     )
+
+
+def _retire_gibs_images(out: Path, dest_dir: Path, scene_id: str) -> None:
+    """Move aside an earlier image saved under this scene's name, in any format."""
+    for suffix in _IMAGE_SUFFIXES.values():
+        previous = dest_dir / scene_filename(scene_id, "wms", suffix)
+        if inside_output(out, previous):
+            retire_product(previous)
 
 
 def _inspect_image(payload: bytes) -> tuple[str, bool]:

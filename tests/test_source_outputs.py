@@ -184,6 +184,33 @@ async def test_gibs_write_replaces_a_symlink_without_following_it(tmp_path: Path
     assert link.read_bytes() == _png()
 
 
+async def test_gibs_failed_fetch_retires_another_aois_image(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    dest = out / "gibs_modis_truecolor"
+    dest.mkdir(parents=True)
+    earlier = dest / "MODIS_Terra_CorrectedReflectance_TrueColor_2024-07-01_wms.png"
+    earlier.write_bytes(b"other-aoi")
+    earlier_jpg = earlier.with_suffix(".jpg")
+    earlier_jpg.write_bytes(b"other-aoi-jpg")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    code = await _pull(
+        out, {"gibs_modis_truecolor": GibsModisTrueColorClient()}, httpx.MockTransport(handler)
+    )
+
+    assert code == 0
+    assert not earlier.exists()
+    assert not earlier_jpg.exists()
+    assert earlier.with_name(earlier.name + ".stale").read_bytes() == b"other-aoi"
+    assert earlier_jpg.with_name(earlier_jpg.name + ".stale").read_bytes() == b"other-aoi-jpg"
+    row = _manifest(out)["gibs_modis_truecolor"]
+    assert row["saved"] == []
+    failed = row["failed"]
+    assert isinstance(failed, list) and "GIBS request failed" in str(failed[0]["error"])
+
+
 async def test_firms_pull_writes_one_csv_row_per_detection(tmp_path: Path) -> None:
     def firms(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=VIIRS_CSV)
