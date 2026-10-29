@@ -16,6 +16,7 @@ import math
 import random
 import struct
 import zlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -161,9 +162,15 @@ class _Image:
 class _RangeReader:
     """HTTP Range reader that remembers spans it has already fetched."""
 
-    def __init__(self, http: httpx.AsyncClient, href: str) -> None:
+    def __init__(
+        self,
+        http: httpx.AsyncClient,
+        href: str,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         self._http = http
         self._href = href
+        self._headers = dict(headers or {})
         self._spans: list[tuple[int, int, bytes]] = []
         self.bytes_fetched = 0
         self.granule_size: int | None = None
@@ -213,10 +220,14 @@ class _RangeReader:
         async with self._http.stream(
             "GET",
             self._href,
-            headers={"Range": f"bytes={start}-{end}"},
+            headers={**self._headers, "Range": f"bytes={start}-{end}"},
             follow_redirects=True,
         ) as response:
             status = response.status_code
+            if status == 200 and _is_html(response):
+                raise CogRangeError(
+                    f"asset needs a login: {response.url.host} returned a web page, not the file"
+                )
             if status == 200:
                 raise CogRangeError(
                     "server returned the whole object instead of the requested range"
@@ -344,12 +355,18 @@ class CogFile:
         )
 
 
-async def open_cog(http: httpx.AsyncClient, href: str) -> CogFile:
+async def open_cog(
+    http: httpx.AsyncClient,
+    href: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> CogFile:
     """Open a tiled GeoTIFF and read its header, not its pixels.
 
     Args:
         http: Client used for range requests.
         href: Absolute http(s) URL of the COG.
+        headers: Sent with every range request, for example a bearer token.
 
     Returns:
         A handle that can read one or more windows.
@@ -362,7 +379,7 @@ async def open_cog(http: httpx.AsyncClient, href: str) -> CogFile:
     parsed = urlparse(href)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise CogUnsupportedError("COG href must be an absolute http(s) URL")
-    reader = _RangeReader(http, href)
+    reader = _RangeReader(http, href, headers)
     image = await _parse_image(reader)
     return CogFile(reader, image)
 
@@ -977,6 +994,11 @@ def _apply_jitter(delay: float) -> float:
     if not math.isfinite(jittered):
         return min(delay, _MAX_BACKOFF_SECONDS)
     return min(_MAX_BACKOFF_SECONDS, max(0.0, jittered))
+
+
+def _is_html(response: httpx.Response) -> bool:
+    content_type = str(response.headers.get("content-type", ""))
+    return content_type.lower().startswith("text/html")
 
 
 def _retry_delay(exc: BaseException, attempt: int) -> float:

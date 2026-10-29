@@ -61,7 +61,7 @@ STAC and related search clients. `search` is the only required method, and it is
 | `planetary_computer` | Microsoft Planetary Computer search and asset signing. |
 | `sentinel1`, `sentinel2`, `landsat8`, `landsat9` | Those collections on Planetary Computer. Landsat 8 and 9 share a collection and are split by platform. |
 | `pc_more` | Extra Planetary Computer collections (ASTER, ALOS, DEM, WorldCover, GOES CMI, MODIS, precipitation). |
-| `modis_base` | Shared NASA CMR client for MODIS granules. A 401 or 403 names `EARTHDATA_TOKEN` as missing or rejected and does not print the value. |
+| `modis_base` | Shared NASA CMR client for MODIS granules. A 401 or 403 names `EARTHDATA_TOKEN` as missing or rejected and does not print the value. Downloads send the token as a bearer header to `https` hosts under `nasa.gov` only. |
 | `modis_active_fire`, `modis_land_cover`, `modis_surface`, `modis_vegetation` | Those MODIS products. |
 | `hls_landsat`, `hls_sentinel` | Harmonized Landsat–Sentinel. |
 | `naip` | NAIP aerial imagery. |
@@ -69,7 +69,7 @@ STAC and related search clients. `search` is the only required method, and it is
 | `earth_search` | Element84 Earth Search (Sentinel-1 GRD, Sentinel-2 L2A). |
 | `usgs` | USGS Landsat Collection 2. |
 | `cdse` | Copernicus Data Space: Sentinel-3, Sentinel-5P, burnt area. A 401 or 403 names `CDSE_USERNAME` and `CDSE_PASSWORD` as missing or rejected. CDSE is set with the env var only. The value is not printed. |
-| `cmr_stac` | NASA CMR STAC: GEDI, ICESat-2, SMAP, VIIRS. A 401 or 403 names `EARTHDATA_TOKEN` as missing or rejected and does not print the value. |
+| `cmr_stac` | NASA CMR STAC: GEDI, ICESat-2, SMAP, VIIRS. A 401 or 403 names `EARTHDATA_TOKEN` as missing or rejected and does not print the value. Downloads send the token as a bearer header to `https` hosts under `nasa.gov` only. |
 | `digitalearth` | Digital Earth Australia and Africa Sentinel-2. |
 | `inpe` | CBERS-4 and Amazonia-1. |
 | `maxar_opendata` | Maxar Open Data. |

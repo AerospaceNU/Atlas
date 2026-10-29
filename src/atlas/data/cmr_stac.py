@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 from atlas.data.base import SceneKind
-from atlas.data.credentials import EARTHDATA_CREDENTIALS
+from atlas.data.credentials import EARTHDATA_CREDENTIALS, earthdata_headers
 from atlas.data.stac import StacApiClient
 
 LPCLOUD_SEARCH = "https://cmr.earthdata.nasa.gov/stac/LPCLOUD/search"
@@ -23,6 +23,9 @@ class CmrLpcloudClient(StacApiClient):
     search_url: ClassVar[str] = LPCLOUD_SEARCH
     required_credentials: ClassVar[tuple[str, ...]] = EARTHDATA_CREDENTIALS
 
+    def download_headers(self, href: str) -> dict[str, str]:
+        return earthdata_headers(href)
+
 
 class CmrNsidcClient(StacApiClient):
     """NASA CMR STAC on NSIDC_CPRD.
@@ -36,6 +39,9 @@ class CmrNsidcClient(StacApiClient):
 
     search_url: ClassVar[str] = NSIDC_SEARCH
     required_credentials: ClassVar[tuple[str, ...]] = EARTHDATA_CREDENTIALS
+
+    def download_headers(self, href: str) -> dict[str, str]:
+        return earthdata_headers(href)
 
 
 class GediL2AClient(CmrLpcloudClient):

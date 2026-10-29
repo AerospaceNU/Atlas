@@ -12,7 +12,13 @@ import pytest
 from atlas.cli import _attach_negative_option_values, _inject_data_command, main
 from atlas.cli.catalog import CatalogError, format_catalog, list_satellites, resolve_sources
 from atlas.cli.data import add_data_parser, parse_coords, parse_date_range, run_data
-from atlas.cli.download import BrowseAssetError, download_assets, pick_asset, scene_filename
+from atlas.cli.download import (
+    BrowseAssetError,
+    asset_suffix,
+    download_assets,
+    pick_asset,
+    scene_filename,
+)
 from atlas.data.base import Asset, BBox, DataPullClient, PullRequest, PullResult, Scene, SceneKind
 from atlas.data.registry import SOURCES
 
@@ -195,6 +201,70 @@ def test_pick_asset_alias_cannot_smuggle_a_browse_asset() -> None:
     )
     with pytest.raises(BrowseAssetError):
         pick_asset(scene, "red")
+
+
+def test_pick_asset_default_skips_qa_and_mask_layers() -> None:
+    tif = "image/tiff; application=geotiff; profile=cloud-optimized"
+    # Planetary Computer Landsat C2 L2 lists the ST QA band first.
+    landsat = _scene(
+        assets={
+            "qa": Asset(href="https://example.com/qa.tif", media_type=tif, roles=["data"]),
+            "blue": Asset(
+                href="https://example.com/blue.tif", media_type=tif, roles=["data", "reflectance"]
+            ),
+            "red": Asset(
+                href="https://example.com/red.tif", media_type=tif, roles=["data", "reflectance"]
+            ),
+        },
+        band_aliases={"red": "red"},
+    )
+    assert pick_asset(landsat) == ("red", landsat.assets["red"])
+    # Digital Earth Australia lists a cloud mask first and publishes no band metadata.
+    dea = _scene(
+        assets={
+            "oa_fmask": Asset(href="https://example.com/fmask.tif", media_type=tif, roles=["data"]),
+            "nbart_red": Asset(href="https://example.com/red.tif", media_type=tif, roles=["data"]),
+        }
+    )
+    assert pick_asset(dea) == ("nbart_red", dea.assets["nbart_red"])
+    only_qa = _scene(
+        assets={"qa": Asset(href="https://example.com/qa.tif", media_type=tif, roles=["data"])}
+    )
+    assert pick_asset(only_qa) == ("qa", only_qa.assets["qa"])
+
+
+def test_asset_suffix_keeps_the_inner_extension_of_a_compressed_file() -> None:
+    himawari = Asset(
+        href="https://noaa-himawari9.s3.amazonaws.com/x/HS_H09_B01_FLDK_R10_S0310.DAT.bz2",
+        media_type="application/octet-stream",
+    )
+    assert asset_suffix(himawari) == ".dat.bz2"
+    assert asset_suffix(Asset(href="https://example.com/a.gz")) == ".gz"
+
+
+async def test_download_assets_sends_client_download_headers(tmp_path: Path) -> None:
+    seen: list[str | None] = []
+
+    class TokenClient(FakePullClient):
+        def download_headers(self, href: str) -> dict[str, str]:
+            return {"Authorization": "Bearer t"} if href.startswith("https://data.") else {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(
+            200, content=b"\x89HDF", headers={"content-type": "application/x-hdf"}
+        )
+
+    scene = _scene(
+        id="granule",
+        assets={"data": Asset(href="https://data.example.gov/g.hdf", roles=["data"])},
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        report = await download_assets(
+            [scene], tmp_path, http=http, clients={"sentinel2": TokenClient()}
+        )
+    assert report.outcomes[0].status == "saved"
+    assert seen == ["Bearer t"]
 
 
 def test_resolve_satellite_kind() -> None:

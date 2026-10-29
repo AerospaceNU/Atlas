@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Collection
+from urllib.parse import urlparse
 
 from atlas.agent.layout import (
     EARTHDATA_TOKEN,
@@ -152,3 +153,23 @@ def _rejected_message(status: int, names: tuple[str, ...]) -> str:
     if len(names) == 1:
         return f"{names[0]} was rejected (HTTP {status})"
     return f"{' and '.join(names)} were rejected (HTTP {status})"
+
+
+def earthdata_headers(href: str, token: str | None = None) -> dict[str, str]:
+    """Bearer header for an Earthdata download, or no headers.
+
+    The token goes only to an ``https`` host under ``nasa.gov``. LP DAAC and
+    NSIDC then redirect to S3, and httpx drops ``Authorization`` on that
+    cross-origin redirect.
+
+    Args:
+        href: Asset URL about to be fetched.
+        token: Token held by the client. Resolved from ``EARTHDATA_TOKEN``
+            when None.
+    """
+    parsed = urlparse(href)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not (host == "nasa.gov" or host.endswith(".nasa.gov")):
+        return {}
+    value = (token if token is not None else resolve_credential(EARTHDATA_TOKEN) or "").strip()
+    return {"Authorization": f"Bearer {value}"} if value else {}

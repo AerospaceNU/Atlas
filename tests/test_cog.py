@@ -1536,3 +1536,30 @@ async def test_palette_colormap_is_carried_into_the_window() -> None:
                 4: (30, 120, 200),
             }[int(read.array[0, 0, 0])]
         )
+
+
+@pytest.mark.asyncio
+async def test_range_reads_send_headers_and_name_a_login_page() -> None:
+    built = _geographic()
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        if request.url.host == "login.example.com":
+            return httpx.Response(
+                200, text="<html>sign in</html>", headers={"content-type": "text/html"}
+            )
+        start, end = (int(v) for v in request.headers["range"].removeprefix("bytes=").split("-"))
+        return httpx.Response(
+            206,
+            content=built.blob[start : end + 1],
+            headers={"content-range": f"bytes {start}-{end}/{len(built.blob)}"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        await open_cog(
+            http, "https://example.com/granule.tif", headers={"Authorization": "Bearer t"}
+        )
+        assert seen and set(seen) == {"Bearer t"}
+        with pytest.raises(CogRangeError, match=r"needs a login: login\.example\.com"):
+            await open_cog(http, "https://login.example.com/granule.tif")
