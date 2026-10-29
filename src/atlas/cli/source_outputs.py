@@ -198,7 +198,11 @@ async def _save_gibs_image(scene: Scene, out: Path, *, http: httpx.AsyncClient) 
 
     def failed(error: str) -> DownloadOutcome:
         if dest_dir is not None:
-            _retire_gibs_images(out, dest_dir, scene.id)
+            try:
+                _retire_gibs_images(out, dest_dir, scene.id)
+            except OSError as exc:
+                # The scene already failed; a stuck old file must not hide that.
+                error = f"{error}; older image not moved aside: {exc}"
         return DownloadOutcome(source=scene.source, scene_id=scene.id, status="failed", error=error)
 
     if dest_dir is None:

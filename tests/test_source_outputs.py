@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import httpx
+import pytest
 from PIL import Image
 
 from atlas.cli.data import execute_pull
@@ -209,6 +210,32 @@ async def test_gibs_failed_fetch_retires_another_aois_image(tmp_path: Path) -> N
     assert row["saved"] == []
     failed = row["failed"]
     assert isinstance(failed, list) and "GIBS request failed" in str(failed[0]["error"])
+
+
+async def test_gibs_failure_survives_an_old_image_that_cannot_be_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    dest = out / "gibs_modis_truecolor"
+    dest.mkdir(parents=True)
+    (dest / "MODIS_Terra_CorrectedReflectance_TrueColor_2024-07-01_wms.png").write_bytes(b"x")
+
+    def stuck(_path: Path) -> None:
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr("atlas.cli.source_outputs.retire_product", stuck)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    code = await _pull(
+        out, {"gibs_modis_truecolor": GibsModisTrueColorClient()}, httpx.MockTransport(handler)
+    )
+
+    assert code == 0
+    failed = _manifest(out)["gibs_modis_truecolor"]["failed"]
+    assert isinstance(failed, list)
+    assert "older image not moved aside" in str(failed[0]["error"])
 
 
 async def test_firms_pull_writes_one_csv_row_per_detection(tmp_path: Path) -> None:
