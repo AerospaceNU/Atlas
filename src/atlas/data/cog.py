@@ -65,6 +65,9 @@ _GEO_GEOGRAPHIC: Final[int] = 2048
 _GEO_PROJECTED: Final[int] = 3072
 _COMPRESS_NONE: Final[int] = 1
 _COMPRESS_LZW: Final[int] = 5
+# TIFF 6.0 requires tile width and length to be multiples of 16. macOS ImageIO
+# (Preview, Finder, Quick Look) refuses a file that breaks this.
+_TILE_MULTIPLE: Final[int] = 16
 _COMPRESS_DEFLATE: Final[frozenset[int]] = frozenset({8, 32946})
 _MAX_RANGE_BYTES: Final[int] = 8 * 1024 * 1024
 # First try plus three retries. The waits are about 0.5s, 1s, and 2s.
@@ -450,6 +453,10 @@ def model_bounds(
 def encode_cog(read: CogRead) -> bytes:
     """Encode ``read`` as a single-tile little-endian GeoTIFF.
 
+    The tile is padded with zeros up to a multiple of 16 on each side, as the
+    TIFF spec requires. ImageWidth and ImageLength stay the window size, so
+    readers drop the padding.
+
     Args:
         read: Window returned by :func:`read_cog_window`.
 
@@ -472,7 +479,11 @@ def encode_cog(read: CogRead) -> bytes:
     if bands < 1 or height < 1 or width < 1:
         raise CogError("window array is empty")
     endian = "<"
-    cube = np.transpose(array, (1, 2, 0)).astype(np.dtype(f"{endian}u{bits // 8}"), copy=False)
+    dtype = np.dtype(f"{endian}u{bits // 8}")
+    tile_width = _round_up(width, _TILE_MULTIPLE)
+    tile_height = _round_up(height, _TILE_MULTIPLE)
+    cube = np.zeros((tile_height, tile_width, bands), dtype=dtype)
+    cube[:height, :width, :] = np.transpose(array, (1, 2, 0))
     tile = cube.tobytes()
     scale = struct.pack(endian + "3d", read.pixel_size_x, read.pixel_size_y, 0.0)
     tie = struct.pack(endian + "6d", 0.0, 0.0, 0.0, read.origin_x, read.origin_y, 0.0)
@@ -501,8 +512,8 @@ def encode_cog(read: CogRead) -> bytes:
         (_TAG_COMPRESSION, 3, 1, struct.pack(endian + "H", _COMPRESS_NONE) + b"\x00\x00"),
         (_TAG_PHOTOMETRIC, 3, 1, struct.pack(endian + "H", photometric) + b"\x00\x00"),
         (_TAG_SAMPLES, 3, 1, struct.pack(endian + "H", bands) + b"\x00\x00"),
-        (_TAG_TILE_WIDTH, 4, 1, struct.pack(endian + "I", width)),
-        (_TAG_TILE_HEIGHT, 4, 1, struct.pack(endian + "I", height)),
+        (_TAG_TILE_WIDTH, 4, 1, struct.pack(endian + "I", tile_width)),
+        (_TAG_TILE_HEIGHT, 4, 1, struct.pack(endian + "I", tile_height)),
         (_TAG_TILE_OFFSETS, 4, 1, struct.pack(endian + "I", tile_offset)),
         (_TAG_TILE_COUNTS, 4, 1, struct.pack(endian + "I", len(tile))),
         (_TAG_SAMPLE_FORMAT, 3, 1, struct.pack(endian + "H", 1) + b"\x00\x00"),
@@ -530,6 +541,10 @@ def encode_cog(read: CogRead) -> bytes:
         out += payload
     out += tile
     return bytes(out)
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
 
 
 def _nodata_bytes(nodata: str | None) -> bytes | None:
