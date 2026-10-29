@@ -213,9 +213,14 @@ _POLE_RING = (
 
 
 def _as_position(value: object) -> tuple[float, float]:
-    if isinstance(value, str) or not isinstance(value, Sequence) or len(value) != 2:
+    """Return ``(lon, lat)`` from a GeoJSON position.
+
+    RFC 7946 allows a position to carry more than two numbers (altitude is
+    the third). Only the first two are used; the ring is a surface AOI.
+    """
+    if isinstance(value, str) or not isinstance(value, Sequence) or len(value) < 2:
         raise ValueError("each position must be lon, lat")
-    lon, lat = value
+    lon, lat = value[0], value[1]
     if isinstance(lon, bool) or isinstance(lat, bool):
         raise ValueError("each position must be lon, lat")
     if not isinstance(lon, int | float) or not isinstance(lat, int | float):

@@ -79,7 +79,7 @@ _EXAMPLE = (
     "atlas data sentinel2 optical --date 2024-07-01:2024-07-07 "
     "--coords -71.12,42.32,-71.02,42.40\n"
     "  atlas data sentinel2 optical --date 2024-07-01:2024-07-07 "
-    "--polygon -71.12,42.32;-71.02,42.32;-71.02,42.40;-71.12,42.40\n"
+    "--polygon '-71.12,42.32;-71.02,42.32;-71.02,42.40;-71.12,42.40'\n"
     "  atlas data fldas landsurface --date 2020-01-01:2020-01-31 "
     "--coords -71.2,42.2,-70.9,42.5 --out .atlas/data/fldas"
 )
@@ -576,18 +576,29 @@ def _polygon_error(exc: ValidationError) -> str:
     return _validation_error(exc, "polygon is invalid")
 
 
+def _same_json_position(left: object, right: object) -> bool:
+    """True when two GeoJSON positions name the same point (altitude ignored)."""
+    return (
+        isinstance(left, list)
+        and isinstance(right, list)
+        and len(left) >= 2
+        and len(right) >= 2
+        and left[:2] == right[:2]
+    )
+
+
 def _closed_ring(ring: list[Any]) -> list[Any]:
     """Append the first position to an open JSON ring so the AOI is closed.
 
     The semicolon form already closes its ring. A GeoJSON Polygon is expected
     to be closed by its producer, but the CLI accepts an open one too, as the
-    ``--polygon`` help says.
+    ``--polygon`` help says. A closing position that differs only in altitude
+    already closes the surface ring.
     """
     if not ring:
         return ring
-    first, last = ring[0], ring[-1]
-    if isinstance(first, list) and isinstance(last, list) and first != last:
-        return [*ring, first]
+    if not _same_json_position(ring[0], ring[-1]):
+        return [*ring, ring[0]]
     return ring
 
 

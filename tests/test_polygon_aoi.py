@@ -602,3 +602,19 @@ def test_parse_polygon_closes_an_open_json_ring() -> None:
     assert parse_polygon(json.dumps(geometry)).ring == closed
     feature = {"type": "Feature", "geometry": geometry}
     assert parse_polygon(json.dumps(feature)).ring == closed
+
+
+def test_geojson_positions_may_carry_altitude() -> None:
+    """RFC 7946 positions may have a third number; only lon/lat define the AOI."""
+    square = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]
+    closed = {
+        "type": "Polygon",
+        "coordinates": [[[0, 0, 10], [1, 0, 20], [1, 1, 30], [0, 1, 40], [0, 0, 50]]],
+    }
+    opened = {
+        "type": "Polygon",
+        "coordinates": [[[0, 0, 10], [1, 0, 20], [1, 1, 30], [0, 1, 40]]],
+    }
+    assert Polygon.from_geojson(closed).ring == square
+    assert parse_polygon(json.dumps(closed)).ring == square
+    assert parse_polygon(json.dumps(opened)).ring == square
