@@ -48,8 +48,11 @@ class FirmsClient(DataPullClient):
     The area API takes ``west,south,east,north`` and requires west <= east.
     A dateline AOI is two area requests, one on each side of ±180°, and the
     rows are merged. An error document is raised so a rejected box is a source
-    error rather than an empty scene list. HTTP 400 is still skipped: NRT uses
-    it when the requested day is not published yet.
+    error rather than an empty scene list. HTTP 400 on one area request is
+    skipped: NRT uses it when the requested day is not published yet. When
+    every request was answered 400, nothing was searched, so that is a
+    source error too. An empty window must be a CSV with no rows, or a pull
+    would retire the detections table of the same window.
     """
 
     source: ClassVar[str] = "VIIRS_SNPP_NRT"
@@ -97,14 +100,16 @@ class FirmsClient(DataPullClient):
                 a value.
             CredentialRejectedError: FIRMS returned 401 or 403 and the map
                 key is present. The message names the variable and the status.
-            ValueError: The box cannot be cut at 180°, or FIRMS returns an
-                error document instead of CSV.
+            ValueError: The box cannot be cut at 180°, FIRMS returns an
+                error document instead of CSV, or FIRMS rejected every area
+                request with HTTP 400.
         """
         if not self._map_key:
             raise MissingCredentialError(FIRMS_MAP_KEY)
         parts = request.bbox.antimeridian_parts()
         scenes: list[Scene] = []
         seen: set[str] = set()
+        sent = rejected = 0
         start_date, end_date = _nrt_window(request.start_date, request.end_date)
         if start_date > end_date:
             return PullResult(request=request, scenes=[])
@@ -125,6 +130,7 @@ class FirmsClient(DataPullClient):
                     date=start.isoformat(),
                 )
                 resp = await self._get(url)
+                sent += 1
                 raise_for_missing_credential(
                     resp,
                     FIRMS_CREDENTIALS,
@@ -132,6 +138,7 @@ class FirmsClient(DataPullClient):
                 )
                 if resp.status_code == 400:
                     # NRT rejects "today" / future dates depending on FIRMS' calendar.
+                    rejected += 1
                     continue
                 self._raise_for_status(resp)
                 filled = False
@@ -152,6 +159,11 @@ class FirmsClient(DataPullClient):
                         break
                 if filled:
                     break
+        if sent and rejected == sent:
+            raise ValueError(
+                f"FIRMS rejected all {sent} area request(s) for this window (HTTP 400); "
+                "the dates may not be published yet"
+            )
         return PullResult(request=request, scenes=scenes)
 
     async def _get(self, url: str) -> httpx.Response:

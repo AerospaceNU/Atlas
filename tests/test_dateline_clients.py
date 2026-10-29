@@ -255,7 +255,21 @@ async def test_firms_error_document_is_a_source_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_firms_unpublished_day_is_still_skipped() -> None:
+async def test_firms_unpublished_side_is_skipped_when_the_other_answers() -> None:
+    fake = FirmsFake(
+        {
+            "178.0,-18.0,180.0,-16.0": (400, "Invalid date"),
+            "-180.0,-18.0,-178.0,-16.0": (200, _hotspot(-179.0)),
+        }
+    )
+    async with FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, fake)) as client:
+        result = await client.search(_request(DATELINE))
+    assert len(result.scenes) == 1
+    assert len(fake.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_firms_every_request_rejected_is_a_source_error() -> None:
     fake = FirmsFake(
         {
             "178.0,-18.0,180.0,-16.0": (400, "Invalid date"),
@@ -263,9 +277,29 @@ async def test_firms_unpublished_day_is_still_skipped() -> None:
         }
     )
     async with FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, fake)) as client:
+        with pytest.raises(ValueError, match="rejected all 2 area request"):
+            await client.search(_request(DATELINE))
+    assert len(fake.calls) == 2
+    catalog = await aggregate(
+        _request(DATELINE),
+        {"firms_viirs": FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, fake))},
+    )
+    assert catalog.sources[0].error is not None
+    assert "abc" not in catalog.sources[0].error
+
+
+@pytest.mark.asyncio
+async def test_firms_header_only_csv_is_still_an_empty_window() -> None:
+    header = "latitude,longitude,acq_date,acq_time\n"
+    fake = FirmsFake(
+        {
+            "178.0,-18.0,180.0,-16.0": (200, header),
+            "-180.0,-18.0,-178.0,-16.0": (400, "Invalid date"),
+        }
+    )
+    async with FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, fake)) as client:
         result = await client.search(_request(DATELINE))
     assert result.scenes == []
-    assert len(fake.calls) == 2
 
 
 class _RowPerRequest(FakeAsyncClient):

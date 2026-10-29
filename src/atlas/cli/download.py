@@ -410,7 +410,9 @@ async def download_assets(
     fails the scene.
 
     A whole-file GET answered 429 or 5xx is tried up to ``attempts`` times in
-    total, honoring ``Retry-After``; any other 4xx fails at once. No file is
+    total, honoring ``Retry-After``; any other 4xx fails at once. Each retry
+    asks the client for its download headers again, so a bearer token that
+    expired during the wait is refreshed. No file is
     opened until a 2xx arrives, so a retry never leaves a second partial
     file. A body that delivers fewer than ``stall_min_bytes`` within
     ``stall_seconds`` is aborted and its partial file removed.
@@ -542,6 +544,9 @@ async def download_assets(
                 else:
                     total_attempts = max(1, attempts)
                     for attempt in range(1, total_attempts + 1):
+                        if attempt > 1 and client is not None:
+                            # A Retry-After wait can outlast a short-lived token.
+                            headers = await client.download_headers(href)
                         async with http.stream(
                             "GET", href, headers=headers, follow_redirects=True
                         ) as response:

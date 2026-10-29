@@ -10,7 +10,13 @@ from urllib.parse import urlparse
 import httpx
 
 from atlas.data.base import PullRequest, PullResult, Scene, SceneKind
-from atlas.data.credentials import CDSE_CREDENTIALS, CDSE_PASSWORD, CDSE_USERNAME
+from atlas.data.credentials import (
+    CDSE_CREDENTIALS,
+    CDSE_PASSWORD,
+    CDSE_USERNAME,
+    CredentialRejectedError,
+    MissingCredentialError,
+)
 from atlas.data.stac import StacApiClient
 
 CDSE_SEARCH_URL = "https://stac.dataspace.copernicus.eu/v1/search"
@@ -18,8 +24,12 @@ CDSE_TOKEN_URL = (
     "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 )
 CDSE_DOWNLOAD_HOST = "download.dataspace.copernicus.eu"
-# Refresh this long before the token's stated expiry.
-_TOKEN_MARGIN_SECONDS = 60.0
+# Refresh this long before the token's stated expiry. A whole-file GET reuses
+# its headers across up to three attempts with Retry-After waits of up to 60 s
+# each, plus the transfer itself, so the margin covers several minutes.
+_TOKEN_MARGIN_SECONDS = 300.0
+# Keycloak answers a wrong username or password with 401, or 400 invalid_grant.
+_REJECTED_GRANT_STATUSES = frozenset({400, 401})
 
 
 class CdseStacClient(StacApiClient):
@@ -34,9 +44,13 @@ class CdseStacClient(StacApiClient):
 
     Downloads go to the OData https alternate of each asset. The username and
     password are exchanged for an access token, which is sent only to
-    ``download.dataspace.copernicus.eu`` and reused until shortly before it
-    expires. A rejected exchange is an HTTP error for that scene. The values
-    are never logged.
+    ``download.dataspace.copernicus.eu`` and reused until a few minutes
+    before it expires. A download from that host with either variable unset
+    raises ``MissingCredentialError`` naming the unset variables, and sends no
+    token request. A rejected exchange (401, or 400 ``invalid_grant``) raises
+    ``CredentialRejectedError`` and is remembered for the client's lifetime:
+    later scenes fail with the same error without posting the password again,
+    so a wrong password cannot lock the account. The values are never logged.
     """
 
     search_url: ClassVar[str] = CDSE_SEARCH_URL
@@ -53,25 +67,39 @@ class CdseStacClient(StacApiClient):
         self._access_token: str | None = None
         self._token_expires_at = 0.0
         self._token_lock = asyncio.Lock()
+        # Status of a rejected password grant; a fresh error is raised each time
+        # so one shared exception does not collect every scene's traceback.
+        self._rejected_status: int | None = None
 
     async def download_headers(self, href: str) -> dict[str, str]:
         parsed = urlparse(href)
         if parsed.scheme != "https" or (parsed.hostname or "").lower() != CDSE_DOWNLOAD_HOST:
             return {}
-        token = await self._token()
-        return {"Authorization": f"Bearer {token}"} if token else {}
+        return {"Authorization": f"Bearer {await self._token()}"}
 
-    async def _token(self) -> str | None:
-        """Access token for downloads, or None when the credentials are unset.
+    async def _token(self) -> str:
+        """Access token for downloads.
 
         Raises:
-            httpx.HTTPStatusError: CDSE rejected the username and password.
+            MissingCredentialError: ``CDSE_USERNAME`` or ``CDSE_PASSWORD`` is
+                unset. No request is sent.
+            CredentialRejectedError: CDSE rejected the username and password,
+                now or earlier in this client's lifetime.
+            httpx.HTTPStatusError: The token endpoint failed for another
+                reason. That failure is not remembered.
         """
         username = os.environ.get(CDSE_USERNAME, "").strip()
         password = os.environ.get(CDSE_PASSWORD, "")
-        if not username or not password.strip():
-            return None
+        missing = tuple(
+            name
+            for name, value in ((CDSE_USERNAME, username), (CDSE_PASSWORD, password.strip()))
+            if not value
+        )
+        if missing:
+            raise MissingCredentialError(*missing)
         async with self._token_lock:
+            if self._rejected_status is not None:
+                raise CredentialRejectedError(self._rejected_status, *CDSE_CREDENTIALS)
             if self._access_token and time.monotonic() < self._token_expires_at:
                 return self._access_token
             response = await self._client.post(
@@ -83,12 +111,32 @@ class CdseStacClient(StacApiClient):
                     "password": password,
                 },
             )
+            if _is_rejected_grant(response):
+                self._rejected_status = response.status_code
+                raise CredentialRejectedError(response.status_code, *CDSE_CREDENTIALS)
             response.raise_for_status()
             payload = response.json()
             self._access_token = str(payload["access_token"])
             lifetime = float(payload.get("expires_in", 600))
             self._token_expires_at = time.monotonic() + max(0.0, lifetime - _TOKEN_MARGIN_SECONDS)
             return self._access_token
+
+
+def _is_rejected_grant(response: httpx.Response) -> bool:
+    """True when the token endpoint refused the username and password.
+
+    401 always counts. 400 counts only with ``invalid_grant``; another 400
+    says nothing about the password, so it is not remembered.
+    """
+    if response.status_code not in _REJECTED_GRANT_STATUSES:
+        return False
+    if response.status_code == 401:
+        return True
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("error") == "invalid_grant"
 
 
 # OLCI items publish no ``eo:bands``, so wavelength matching finds nothing and
