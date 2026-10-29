@@ -5,8 +5,11 @@ with HTTP Range requests. Pixel tiles outside that box stay on the server.
 The full-resolution IFD is the one that is read; overview levels are not
 substituted for it.
 
-BigTIFF and LZW compression are later work. A BigTIFF header or an LZW tile
-is rejected instead of being read as a classic TIFF.
+Classic TIFF and BigTIFF headers are read. Tiles may be uncompressed,
+Deflate, or LZW, with no predictor, the horizontal predictor (2) on integer
+samples, or the floating-point predictor (3) on float samples. Samples may be
+uint8, uint16, int16, or float32. Every decoder stops once a tile's output
+passes the tile's dimensions, so a compressed tile cannot expand without bound.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ _TYPE_SIZE: Final[dict[int, int]] = {
     3: 2,  # SHORT
     4: 4,  # LONG
     12: 8,  # DOUBLE
+    16: 8,  # LONG8 (BigTIFF)
 }
 _TAG_WIDTH: Final[int] = 256
 _TAG_HEIGHT: Final[int] = 257
@@ -72,15 +76,38 @@ _COMPRESS_LZW: Final[int] = 5
 # (Preview, Finder, Quick Look) refuses a file that breaks this.
 _TILE_MULTIPLE: Final[int] = 16
 _COMPRESS_DEFLATE: Final[frozenset[int]] = frozenset({8, 32946})
+_PREDICTOR_NONE: Final[int] = 1
+_PREDICTOR_HORIZONTAL: Final[int] = 2
+_PREDICTOR_FLOAT: Final[int] = 3
+_FORMAT_UINT: Final[int] = 1
+_FORMAT_INT: Final[int] = 2
+_FORMAT_FLOAT: Final[int] = 3
+# (SampleFormat, BitsPerSample) -> numpy kind. Anything else is not windowed.
+_SAMPLE_KINDS: Final[dict[tuple[int, int], str]] = {
+    (_FORMAT_UINT, 8): "u",
+    (_FORMAT_UINT, 16): "u",
+    (_FORMAT_INT, 16): "i",
+    (_FORMAT_FLOAT, 32): "f",
+}
+_CLASSIC_MAGIC: Final[int] = 42
+_BIGTIFF_MAGIC: Final[int] = 43
+_LZW_CLEAR: Final[int] = 256
+_LZW_EOI: Final[int] = 257
+_LZW_MAX_BITS: Final[int] = 12
 _MAX_RANGE_BYTES: Final[int] = 8 * 1024 * 1024
-# First try plus three retries. The waits are about 0.5s, 1s, and 2s.
-_RANGE_ATTEMPTS: Final[int] = 4
+# First try plus seven retries. Without Retry-After the waits are about 0.5s,
+# 1s, 2s, 4s, 8s, 16s, and 16s, so a rate-limit burst of about 30s recovers.
+_RANGE_ATTEMPTS: Final[int] = 8
 _BACKOFF_SECONDS: Final[float] = 0.5
+_MAX_STEP_SECONDS: Final[float] = 16.0
 _JITTER_FRACTION: Final[float] = 0.2
 _MAX_BACKOFF_SECONDS: Final[float] = 60.0
+# Total sleep across all retries of one range, Retry-After included.
+_MAX_RETRY_WAIT_SECONDS: Final[float] = 120.0
 _RETRY_STATUS: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
 _MAX_IFD_ENTRIES: Final[int] = 128
-_MAX_TILES: Final[int] = 8192
+# io-lulc-annual-v02 granules have about 17,700 tiles of 512 pixels.
+_MAX_TILES: Final[int] = 65_536
 _MAX_WINDOW_PIXELS: Final[int] = 16_000_000
 _MAX_FIELD_BYTES: Final[int] = 1024 * 1024
 _COALESCE_GAP: Final[int] = 8192
@@ -111,19 +138,24 @@ class CogLimitError(CogError):
     """A COG would exceed a read limit, so the whole granule is not fetched."""
 
 
+type CogArray = NDArray[np.uint8] | NDArray[np.uint16] | NDArray[np.int16] | NDArray[np.float32]
+"""Window pixels: uint8, uint16, int16, or float32 in native byte order."""
+
+
 @dataclass(frozen=True)
 class CogRead:
     """Pixels and georeferencing for one window of a COG.
 
     ``array`` has shape ``(bands, height, width)``. ``origin_x`` and
     ``origin_y`` are the upper-left corner of this window in the raster CRS.
-    ``pixel_size_y`` is positive; row 0 is the northern edge. ``colormap`` is
+    ``pixel_size_y`` is positive; row 0 is the northern edge. ``array`` keeps
+    the source sample type (uint8, uint16, int16, or float32). ``colormap`` is
     the source TIFF ColorMap (all reds, then greens, then blues) when the
     source is a single-band 8-bit palette image, so class rasters keep their
     colors.
     """
 
-    array: NDArray[np.uint8] | NDArray[np.uint16]
+    array: CogArray
     origin_x: float
     origin_y: float
     pixel_size_x: float
@@ -144,6 +176,7 @@ class _Image:
     height: int
     samples: int
     bits: int
+    sample_format: int
     compression: int
     predictor: int
     tile_width: int
@@ -192,10 +225,14 @@ class _RangeReader:
     async def _fetch_with_retries(self, start: int, end: int, expected: int) -> bytes:
         """Retry transport failures and a few server statuses, not a refused range.
 
-        A 200 or 416 is not retried. The wait is a finite ``Retry-After`` when
-        the response has one, otherwise about 0.5s, 1s, and 2s with jitter.
+        A 200, 416, or other refused range is not retried. The wait is a
+        finite ``Retry-After`` when the response has one, otherwise a doubling
+        backoff from 0.5s with jitter, each step at most 16s. Retries stop
+        after ``_RANGE_ATTEMPTS`` tries or once the next wait would push the
+        total past ``_MAX_RETRY_WAIT_SECONDS``.
         """
         attempt = 0
+        waited = 0.0
         retried_short = False
         while True:
             try:
@@ -209,7 +246,11 @@ class _RangeReader:
                 attempt += 1
                 if attempt >= _RANGE_ATTEMPTS:
                     raise
-                await asyncio.sleep(_retry_delay(exc, attempt))
+                delay = _retry_delay(exc, attempt)
+                if waited + delay > _MAX_RETRY_WAIT_SECONDS:
+                    raise
+                waited += delay
+                await asyncio.sleep(delay)
 
     async def _stream_range(self, start: int, end: int, expected: int) -> bytes:
         """Read one range, and do not buffer a body the server did not slice.
@@ -319,8 +360,8 @@ class CogFile:
         tx1 = (col1 - 1) // image.tile_width
         ty0 = row0 // image.tile_height
         ty1 = (row1 - 1) // image.tile_height
-        out_dtype = np.dtype(np.uint16 if image.bits == 16 else np.uint8)
-        out: NDArray[np.uint8] | NDArray[np.uint16] = np.zeros(
+        out_dtype = _sample_dtype(image).newbyteorder("=")
+        out: CogArray = np.zeros(
             (image.samples, row1 - row0, col1 - col0),
             dtype=out_dtype,
         )
@@ -480,8 +521,11 @@ def encode_cog(read: CogRead) -> bytes:
 
     The tile is padded with zeros up to a multiple of 16 on each side, as the
     TIFF spec requires. ImageWidth and ImageLength stay the window size, so
-    readers drop the padding. A ``read.colormap`` is written as a palette
-    image, so the stored values stay the source codes.
+    readers drop the padding. SampleFormat is written from the array dtype
+    (unsigned, signed, or float), and ``read.nodata`` is written as
+    GDAL_NODATA unchanged. A ``read.colormap`` is written as a palette image,
+    so the stored values stay the source codes; only a single-band uint8
+    window can carry one.
 
     Args:
         read: Window returned by :func:`read_cog_window`.
@@ -490,23 +534,22 @@ def encode_cog(read: CogRead) -> bytes:
         A classic TIFF whose first tile is the window.
 
     Raises:
-        CogError: ``read.array`` is not uint8 or uint16, or ``read.colormap``
-            is set on more than one band or has the wrong length.
+        CogError: ``read.array`` is not uint8, uint16, int16, or float32, or
+            ``read.colormap`` is set on anything but one uint8 band, or has
+            the wrong length.
     """
     array = read.array
-    if array.dtype == np.uint8:
-        bits = 8
-    elif array.dtype == np.uint16:
-        bits = 16
-    else:
+    encoded = _encoded_format(array.dtype)
+    if encoded is None:
         raise CogError(f"cannot encode dtype {array.dtype}")
+    sample_format, bits = encoded
     if array.ndim != 3:
         raise CogError("window array must have shape (bands, height, width)")
     bands, height, width = (int(array.shape[0]), int(array.shape[1]), int(array.shape[2]))
     if bands < 1 or height < 1 or width < 1:
         raise CogError("window array is empty")
     endian = "<"
-    dtype = np.dtype(f"{endian}u{bits // 8}")
+    dtype = np.dtype(f"{endian}{_SAMPLE_KINDS[encoded]}{bits // 8}")
     tile_width = _round_up(width, _TILE_MULTIPLE)
     tile_height = _round_up(height, _TILE_MULTIPLE)
     cube = np.zeros((tile_height, tile_width, bands), dtype=dtype)
@@ -516,7 +559,9 @@ def encode_cog(read: CogRead) -> bytes:
     tie = struct.pack(endian + "6d", 0.0, 0.0, 0.0, read.origin_x, read.origin_y, 0.0)
     geokeys = _geokey_bytes(read.epsg, endian)
     nodata_bytes = _nodata_bytes(read.nodata)
-    colormap = _colormap_bytes(read.colormap, bands=bands, bits=bits, endian=endian)
+    colormap = _colormap_bytes(
+        read.colormap, bands=bands, bits=bits, sample_format=sample_format, endian=endian
+    )
     payloads: list[bytes] = [scale, tie]
     if geokeys is not None:
         payloads.append(geokeys)
@@ -551,7 +596,7 @@ def encode_cog(read: CogRead) -> bytes:
         (_TAG_TILE_HEIGHT, 4, 1, struct.pack(endian + "I", tile_height)),
         (_TAG_TILE_OFFSETS, 4, 1, struct.pack(endian + "I", tile_offset)),
         (_TAG_TILE_COUNTS, 4, 1, struct.pack(endian + "I", len(tile))),
-        (_TAG_SAMPLE_FORMAT, 3, 1, struct.pack(endian + "H", 1) + b"\x00\x00"),
+        (_TAG_SAMPLE_FORMAT, 3, 1, struct.pack(endian + "H", sample_format) + b"\x00\x00"),
         (_TAG_PIXEL_SCALE, 12, 3, struct.pack(endian + "I", payload_offsets[0])),
         (_TAG_TIEPOINT, 12, 6, struct.pack(endian + "I", payload_offsets[1])),
     ]
@@ -587,12 +632,29 @@ def encode_cog(read: CogRead) -> bytes:
     return bytes(out)
 
 
+def _encoded_format(dtype: np.dtype[np.generic]) -> tuple[int, int] | None:
+    """Return ``(SampleFormat, BitsPerSample)`` for a dtype the encoder writes."""
+    kinds = {"u": _FORMAT_UINT, "i": _FORMAT_INT, "f": _FORMAT_FLOAT}
+    sample_format = kinds.get(dtype.kind)
+    if sample_format is None:
+        return None
+    key = (sample_format, dtype.itemsize * 8)
+    return key if key in _SAMPLE_KINDS else None
+
+
 def _colormap_bytes(
-    colormap: tuple[int, ...] | None, *, bands: int, bits: int, endian: str
+    colormap: tuple[int, ...] | None,
+    *,
+    bands: int,
+    bits: int,
+    sample_format: int,
+    endian: str,
 ) -> bytes | None:
     if colormap is None:
         return None
-    if bands != 1 or len(colormap) != 3 << bits:
+    if bands != 1 or bits != 8 or sample_format != _FORMAT_UINT:
+        raise CogError("a colormap needs one uint8 band")
+    if len(colormap) != 3 << bits:
         raise CogError("a colormap needs one band and 3 * 2**bits entries")
     return struct.pack(endian + f"{len(colormap)}H", *colormap)
 
@@ -709,6 +771,12 @@ def _wgs84_utm(lon_deg: float, lat_deg: float, zone: int, *, northern: bool) -> 
 
 
 async def _parse_image(reader: _RangeReader) -> _Image:
+    """Read the first IFD of a classic TIFF or a BigTIFF.
+
+    A classic entry is 12 bytes with a 4-byte value; a BigTIFF entry is 20
+    bytes with an 8-byte value. Each entry keeps its raw value field, so the
+    width of that field says whether an out-of-line offset is 4 or 8 bytes.
+    """
     header = await reader.read(0, 7)
     if header[:2] == b"II":
         endian = "<"
@@ -717,22 +785,29 @@ async def _parse_image(reader: _RangeReader) -> _Image:
     else:
         raise CogUnsupportedError("not a TIFF")
     magic = struct.unpack_from(endian + "H", header, 2)[0]
-    if magic == 43:
-        raise CogUnsupportedError("BigTIFF is later work")
-    if magic != 42:
-        raise CogUnsupportedError("only classic TIFF COGs can be windowed")
-    ifd_at = struct.unpack_from(endian + "I", header, 4)[0]
-    count_raw = await reader.read(ifd_at, ifd_at + 1)
-    count = struct.unpack(endian + "H", count_raw)[0]
+    if magic == _BIGTIFF_MAGIC:
+        offset_size, pad = struct.unpack_from(endian + "HH", header, 4)
+        if offset_size != 8 or pad != 0:
+            raise CogUnsupportedError("BigTIFF header is malformed")
+        ifd_at = struct.unpack(endian + "Q", await reader.read(8, 15))[0]
+        count_fmt, entry_fmt, count_size, entry_size, value_size = "Q", "HHQ", 8, 20, 8
+    elif magic == _CLASSIC_MAGIC:
+        ifd_at = struct.unpack_from(endian + "I", header, 4)[0]
+        count_fmt, entry_fmt, count_size, entry_size, value_size = "H", "HHI", 2, 12, 4
+    else:
+        raise CogUnsupportedError("not a classic TIFF or BigTIFF")
+    count_raw = await reader.read(ifd_at, ifd_at + count_size - 1)
+    count = struct.unpack(endian + count_fmt, count_raw)[0]
     if count < 1 or count > _MAX_IFD_ENTRIES:
         raise CogLimitError(f"TIFF IFD has {count} entries")
-    ifd_end = ifd_at + 2 + count * 12 + 4 - 1
+    ifd_end = ifd_at + count_size + count * entry_size + value_size - 1
     ifd = await reader.read(ifd_at, ifd_end)
     entries: dict[int, tuple[int, int, bytes]] = {}
     for index in range(count):
-        offset = 2 + index * 12
-        tag, type_code, number = struct.unpack_from(endian + "HHI", ifd, offset)
-        entries[tag] = (type_code, number, ifd[offset + 8 : offset + 12])
+        offset = count_size + index * entry_size
+        tag, type_code, number = struct.unpack_from(endian + entry_fmt, ifd, offset)
+        value_at = offset + entry_size - value_size
+        entries[tag] = (type_code, number, ifd[value_at : value_at + value_size])
     return await _image_from_entries(reader, endian, entries)
 
 
@@ -743,38 +818,40 @@ async def _image_from_entries(
 ) -> _Image:
     if _TAG_TILE_WIDTH not in entries or _TAG_TILE_HEIGHT not in entries:
         raise CogUnsupportedError("COG is not tiled")
-    if (
-        _TAG_PLANAR in entries
-        and _int_value(await _entry_ints(reader, endian, entries[_TAG_PLANAR])) != 1
-    ):
-        raise CogUnsupportedError("separate-plane TIFFs are not windowed")
     width = _int_value(await _entry_ints(reader, endian, entries[_TAG_WIDTH]))
     height = _int_value(await _entry_ints(reader, endian, entries[_TAG_HEIGHT]))
     samples = 1
     if _TAG_SAMPLES in entries:
         samples = _int_value(await _entry_ints(reader, endian, entries[_TAG_SAMPLES]))
+    planar = 1
+    if _TAG_PLANAR in entries:
+        planar = _int_value(await _entry_ints(reader, endian, entries[_TAG_PLANAR]))
+    # With one sample per pixel, separate planes store the same bytes as chunky.
+    if planar != 1 and not (planar == 2 and samples == 1):
+        raise CogUnsupportedError("separate-plane TIFFs are not windowed")
     bits_values = await _entry_ints(reader, endian, entries[_TAG_BITS])
     if len(bits_values) not in {1, samples} or any(bits != bits_values[0] for bits in bits_values):
         raise CogUnsupportedError("mixed bit depths are not windowed")
     bits = bits_values[0]
-    if bits not in {8, 16}:
-        raise CogUnsupportedError(f"{bits}-bit samples are not windowed")
+    sample_format = _FORMAT_UINT
     if _TAG_SAMPLE_FORMAT in entries:
         formats = await _entry_ints(reader, endian, entries[_TAG_SAMPLE_FORMAT])
-        if any(fmt != 1 for fmt in formats):
-            raise CogUnsupportedError("only unsigned integer samples are windowed")
+        if len(formats) not in {1, samples} or any(fmt != formats[0] for fmt in formats):
+            raise CogUnsupportedError("mixed sample formats are not windowed")
+        sample_format = formats[0]
+    if (sample_format, bits) not in _SAMPLE_KINDS:
+        raise CogUnsupportedError(
+            f"{bits}-bit samples of SampleFormat {sample_format} are not windowed"
+        )
     compression = _COMPRESS_NONE
     if _TAG_COMPRESSION in entries:
         compression = _int_value(await _entry_ints(reader, endian, entries[_TAG_COMPRESSION]))
-    if compression == _COMPRESS_LZW:
-        raise CogUnsupportedError("LZW compression is later work")
-    if compression != _COMPRESS_NONE and compression not in _COMPRESS_DEFLATE:
+    if compression not in {_COMPRESS_NONE, _COMPRESS_LZW} | _COMPRESS_DEFLATE:
         raise CogUnsupportedError(f"TIFF compression {compression} is not windowed")
-    predictor = 1
+    predictor = _PREDICTOR_NONE
     if _TAG_PREDICTOR in entries:
         predictor = _int_value(await _entry_ints(reader, endian, entries[_TAG_PREDICTOR]))
-    if predictor not in {1, 2}:
-        raise CogUnsupportedError(f"TIFF predictor {predictor} is not windowed")
+    _check_predictor(predictor, sample_format)
     tile_width = _int_value(await _entry_ints(reader, endian, entries[_TAG_TILE_WIDTH]))
     tile_height = _int_value(await _entry_ints(reader, endian, entries[_TAG_TILE_HEIGHT]))
     if min(width, height, samples, tile_width, tile_height) < 1:
@@ -810,6 +887,7 @@ async def _image_from_entries(
         height=height,
         samples=samples,
         bits=bits,
+        sample_format=sample_format,
         compression=compression,
         predictor=predictor,
         tile_width=tile_width,
@@ -826,6 +904,25 @@ async def _image_from_entries(
     )
 
 
+def _check_predictor(predictor: int, sample_format: int) -> None:
+    """Allow predictor 2 on integer samples and predictor 3 on float samples."""
+    if predictor == _PREDICTOR_NONE:
+        return
+    if predictor == _PREDICTOR_HORIZONTAL and sample_format != _FORMAT_FLOAT:
+        return
+    if predictor == _PREDICTOR_FLOAT and sample_format == _FORMAT_FLOAT:
+        return
+    raise CogUnsupportedError(
+        f"TIFF predictor {predictor} on SampleFormat {sample_format} is not windowed"
+    )
+
+
+def _sample_dtype(image: _Image) -> np.dtype[np.generic]:
+    """Return the stored sample dtype, in the file's byte order."""
+    kind = _SAMPLE_KINDS[(image.sample_format, image.bits)]
+    return np.dtype(f"{image.endian}{kind}{image.bits // 8}")
+
+
 async def _palette(
     reader: _RangeReader,
     endian: str,
@@ -834,7 +931,7 @@ async def _palette(
     samples: int,
     bits: int,
 ) -> tuple[int, ...] | None:
-    """Read the ColorMap of a single-band 8-bit palette TIFF, else None."""
+    """Read the ColorMap of a single-band unsigned 8-bit palette TIFF, else None."""
     if samples != 1 or bits != 8 or _TAG_COLORMAP not in entries:
         return None
     if _TAG_PHOTOMETRIC not in entries:
@@ -904,6 +1001,8 @@ async def _entry_ints(
         fmt = "H"
     elif type_code == 4:
         fmt = "I"
+    elif type_code == 16:
+        fmt = "Q"
     else:
         raise CogUnsupportedError(f"TIFF type {type_code} is not an integer field")
     try:
@@ -940,9 +1039,10 @@ async def _entry_bytes(
     if count > _MAX_FIELD_BYTES // size_of:
         raise CogLimitError("TIFF field is too large")
     size = size_of * count
-    if size <= 4:
+    # The value field is 4 bytes in a classic TIFF and 8 in a BigTIFF.
+    if size <= len(inline):
         return inline[:size]
-    (offset,) = struct.unpack(endian + "I", inline)
+    (offset,) = struct.unpack(endian + ("Q" if len(inline) == 8 else "I"), inline)
     return await reader.read(offset, offset + size - 1)
 
 
@@ -1006,12 +1106,12 @@ def _retry_delay(exc: BaseException, attempt: int) -> float:
 
     ``attempt`` is the 1-based number of the attempt that just failed.
     A parsed finite ``Retry-After`` is used as given, capped. The computed
-    backoff is jittered: about 0.5s, then 1s, then 2s.
+    backoff is jittered: about 0.5s, 1s, 2s, 4s, 8s, then 16s per step.
     """
     header = _retry_after_seconds(exc)
     if header is None:
-        base = _BACKOFF_SECONDS * (2 ** (attempt - 1))
-        return _apply_jitter(min(base, _MAX_BACKOFF_SECONDS))
+        base = _BACKOFF_SECONDS * (2 ** min(attempt - 1, 16))
+        return _apply_jitter(min(base, _MAX_STEP_SECONDS))
     return min(header, _MAX_BACKOFF_SECONDS)
 
 
@@ -1070,7 +1170,7 @@ def _coalesce(spans: list[tuple[int, int]], limit: int) -> list[tuple[int, int]]
 async def _copy_tile(
     reader: _RangeReader,
     image: _Image,
-    out: NDArray[np.uint8] | NDArray[np.uint16],
+    out: CogArray,
     index: int,
     tx: int,
     ty: int,
@@ -1102,20 +1202,96 @@ async def _copy_tile(
 
 
 def _decode_tile(payload: bytes, image: _Image) -> NDArray[np.generic]:
+    """Decompress one tile and undo its predictor.
+
+    Returns an array of shape ``(tile_height, tile_width, samples)``.
+    """
     itemsize = image.bits // 8
     expected = image.tile_width * image.tile_height * image.samples * itemsize
-    raw = payload if image.compression == _COMPRESS_NONE else _inflate_bounded(payload, expected)
+    if image.compression == _COMPRESS_NONE:
+        raw = payload
+    elif image.compression == _COMPRESS_LZW:
+        raw = _lzw_decode_bounded(payload, expected)
+    else:
+        raw = _inflate_bounded(payload, expected)
     if len(raw) < expected:
         raise CogError("tile expanded to fewer bytes than its dimensions")
-    dtype = np.dtype(f"{image.endian}u{itemsize}")
-    cube = np.frombuffer(raw[:expected], dtype=dtype).reshape(
-        image.tile_height, image.tile_width, image.samples
-    )
-    cube = np.array(cube, copy=True)
-    if image.predictor == 2:
-        for col in range(1, image.tile_width):
-            cube[:, col, :] += cube[:, col - 1, :]
-    return cube
+    shape = (image.tile_height, image.tile_width, image.samples)
+    if image.predictor == _PREDICTOR_FLOAT:
+        return _undo_float_predictor(raw[:expected], shape, itemsize)
+    cube = np.frombuffer(raw[:expected], dtype=_sample_dtype(image)).reshape(shape)
+    if image.predictor == _PREDICTOR_HORIZONTAL:
+        # Integer sums wrap modulo 2**bits, which is what the encoder assumed.
+        native = cube.astype(cube.dtype.newbyteorder("="))
+        return np.cumsum(native, axis=1, dtype=native.dtype)
+    return np.array(cube, copy=True)
+
+
+def _undo_float_predictor(
+    raw: bytes, shape: tuple[int, int, int], itemsize: int
+) -> NDArray[np.generic]:
+    """Undo TIFF predictor 3 (Adobe Photoshop TIFF Technical Note 3).
+
+    Each tile row was split into byte planes, most significant byte first,
+    and then differenced byte by byte with a stride of SamplesPerPixel. The
+    plane order is big-endian whatever the file's byte order.
+    """
+    height, width, samples = shape
+    count = width * samples
+    rows = np.frombuffer(raw, dtype=np.uint8).reshape(height, count * itemsize // samples, samples)
+    rows = np.cumsum(rows, axis=1, dtype=np.uint8).reshape(height, itemsize, count)
+    big_endian = np.ascontiguousarray(np.transpose(rows, (0, 2, 1)))
+    values = big_endian.view(np.dtype(f">f{itemsize}")).reshape(height, width, samples)
+    return values.astype(np.dtype(f"=f{itemsize}"))
+
+
+def _lzw_decode_bounded(payload: bytes, expected: int) -> bytes:
+    """Decode one TIFF LZW strip or tile and stop once it passes ``expected``.
+
+    Codes are read most significant bit first. Code 256 resets the table and
+    257 ends the data. Codes start at 9 bits and widen to 10, 11, and 12 one
+    code early, as TIFF 6.0 section 13 specifies.
+    """
+    data = payload + b"\x00\x00\x00"
+    total_bits = len(payload) * 8
+    table: list[bytes] = [bytes((value,)) for value in range(256)] + [b"", b""]
+    out = bytearray()
+    width = 9
+    position = 0
+    previous: bytes | None = None
+    while position + width <= total_bits:
+        byte = position >> 3
+        chunk = (data[byte] << 16) | (data[byte + 1] << 8) | data[byte + 2]
+        code = (chunk >> (24 - (position & 7) - width)) & ((1 << width) - 1)
+        position += width
+        if code == _LZW_EOI:
+            break
+        if code == _LZW_CLEAR:
+            del table[258:]
+            width = 9
+            previous = None
+            continue
+        if code < _LZW_CLEAR or _LZW_EOI < code < len(table):
+            entry = table[code]
+            if previous is not None:
+                table.append(previous + entry[:1])
+        elif code == len(table) and previous is not None:
+            entry = previous + previous[:1]
+            table.append(entry)
+        else:
+            raise CogError("LZW tile has an invalid code")
+        out += entry
+        if len(out) > expected:
+            raise CogLimitError("LZW tile exceeded its dimensions")
+        previous = entry
+        if len(table) >= (1 << _LZW_MAX_BITS):
+            # A conforming encoder sends ClearCode here. Stop growing the table.
+            del table[(1 << _LZW_MAX_BITS) :]
+        elif len(table) + 1 >= (1 << width) and width < _LZW_MAX_BITS:
+            width += 1
+    if len(out) < expected:
+        raise CogError("LZW tile is shorter than its dimensions")
+    return bytes(out)
 
 
 def _inflate_bounded(payload: bytes, expected: int) -> bytes:
