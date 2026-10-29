@@ -338,11 +338,13 @@ def run_data(
     prior_manifest: Mapping[str, Any] | None = None
     if getattr(args, "resume", False):
         try:
-            prior_manifest = _load_pull_manifest(pull_manifest_path(args.out))
+            stored = _load_pull_manifest(pull_manifest_path(args.out))
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
-        if not _same_pull(prior_manifest.get("request"), request):
+        run_sources = set(clients) if clients is not None else set(names)
+        prior_manifest = _resume_view(stored, run_sources, request)
+        if prior_manifest is None:
             print("resume query does not match the pull manifest", file=sys.stderr)
             return 2
         page_cursors = _page_cursors(prior_manifest)
@@ -813,24 +815,17 @@ def _retire_inside(out_dir: Path, path: Path) -> None:
 def _products_for_request(out_dir: Path, source: str, request: PullRequest) -> list[Path]:
     """Return manifest-listed products for this source and this request.
 
-    Files from another date or area, and files the manifest did not list, are
-    not included. A listed path that leaves ``out_dir`` is skipped.
+    Only the row for ``source`` is read, and only when that row's own request
+    is the same window. Files from another date or area, files listed for
+    another source, and files the manifest did not list are not included. A
+    listed path that leaves ``out_dir`` is skipped.
     """
-    manifest_path = pull_manifest_path(out_dir)
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        return []
-    try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return []
-    if not isinstance(payload, dict) or not _same_window(payload.get("request"), request):
+    payload = _read_manifest(out_dir)
+    if payload is None:
         return []
     products: list[Path] = []
-    sources = payload.get("sources")
-    if not isinstance(sources, list):
-        return []
-    for item in sources:
-        if not isinstance(item, dict) or item.get("source") != source:
+    for item in _source_rows(payload):
+        if item["source"] != source or not _same_window(item.get("request"), request):
             continue
         for key in ("saved", "skipped"):
             listed = item.get(key)
@@ -951,32 +946,75 @@ def _write_manifest(
     identity: Mapping[str, Any] | None = None,
     resolutions: Mapping[str, SourceResolution] | None = None,
 ) -> None:
+    """Write this run's sources into ``<out_dir>/manifest.json``.
+
+    The manifest is shared by every pull into ``out_dir``. Each row in
+    ``sources`` carries the ``request`` that produced it, so one directory can
+    hold sources pulled for different windows. A row for a source this run did
+    not search is kept as it is on disk; a row for a source this run searched
+    is replaced (or, on resume, extended from ``prior``). The top-level
+    ``request``, ``polygon``, and ``catalog_bbox`` describe the most recent run.
+    A row without its own ``request`` was written before rows carried one and
+    belongs to the top-level request; it is stamped with it when kept.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     request = catalog.request
+    request_json = request.model_dump(mode="json")
     bbox = request.bbox.as_list()
     prior_sources = _prior_sources(prior)
     identity_sources = _prior_sources(identity)
     checks = resolutions or {}
     sources_payload = [
-        _source_entry(
-            src,
-            report,
-            out_dir,
-            bbox,
-            prior_row=prior_sources.get(src.source),
-            identity_row=identity_sources.get(src.source),
-            resolution=checks.get(src.source, SourceResolution.unchecked()),
+        _stamp_request(
+            _source_entry(
+                src,
+                report,
+                out_dir,
+                bbox,
+                prior_row=prior_sources.get(src.source),
+                identity_row=identity_sources.get(src.source),
+                resolution=checks.get(src.source, SourceResolution.unchecked()),
+            ),
+            request_json,
         )
         for src in catalog.sources
     ]
+    existing = _read_manifest(out_dir)
     payload = {
-        "request": request.model_dump(mode="json"),
+        "request": request_json,
         "polygon": None if request.polygon is None else request.polygon.as_geojson(),
         "catalog_bbox": bbox,
         "catalog_bbox_note": _catalog_bbox_note(request),
-        "sources": sources_payload,
+        "sources": _merge_rows([] if existing is None else _source_rows(existing), sources_payload),
     }
     _write_json_atomic(pull_manifest_path(out_dir), json.dumps(payload, indent=2) + "\n")
+
+
+def _stamp_request(row: dict[str, Any], request_json: object) -> dict[str, Any]:
+    """Return ``row`` with ``request`` placed right after ``source``."""
+    stamped: dict[str, Any] = {"source": row.get("source"), "request": request_json}
+    stamped.update((key, value) for key, value in row.items() if key not in stamped)
+    return stamped
+
+
+def _merge_rows(
+    existing: Sequence[dict[str, Any]], current: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Replace rows for this run's sources and keep every other source's row.
+
+    Order on disk is kept; a source new to the manifest is appended.
+    """
+    fresh = {row["source"]: row for row in current}
+    merged: list[dict[str, Any]] = []
+    placed: set[str] = set()
+    for row in existing:
+        name = row["source"]
+        if name in placed:
+            continue
+        placed.add(name)
+        merged.append(fresh.get(name, row))
+    merged.extend(row for name, row in fresh.items() if name not in placed)
+    return merged
 
 
 def _prior_sources(prior: Mapping[str, Any] | None) -> dict[str, Mapping[str, Any]]:
@@ -992,11 +1030,11 @@ def _prior_sources(prior: Mapping[str, Any] | None) -> dict[str, Mapping[str, An
     return found
 
 
-def _matching_manifest(out_dir: Path, request: PullRequest) -> dict[str, Any] | None:
-    """Return an existing manifest for this same search, if one is readable.
+def _read_manifest(out_dir: Path) -> dict[str, Any] | None:
+    """Return the readable manifest in ``out_dir``, or None.
 
-    A different date, box, or polygon is left alone. A missing or unreadable
-    file does not fail the pull.
+    A missing, symlinked, unreadable, or malformed file is treated as absent
+    so it never fails a pull.
     """
     path = pull_manifest_path(out_dir)
     if path.is_symlink() or not path.is_file():
@@ -1007,9 +1045,62 @@ def _matching_manifest(out_dir: Path, request: PullRequest) -> dict[str, Any] | 
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("sources"), list):
         return None
-    if not _same_pull(payload.get("request"), request):
-        return None
     return payload
+
+
+def _source_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return copies of the source rows, each with its effective ``request``.
+
+    A row that has no ``request`` of its own (the format before rows carried
+    one) inherits the manifest's top-level ``request``. Rows without a string
+    ``source`` are dropped.
+    """
+    rows: list[dict[str, Any]] = []
+    raw = payload.get("sources")
+    if not isinstance(raw, list):
+        return rows
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("source")
+        if not isinstance(name, str) or not name:
+            continue
+        own = item.get("request")
+        rows.append(_stamp_request(item, own if isinstance(own, dict) else payload.get("request")))
+    return rows
+
+
+def _resume_view(
+    payload: Mapping[str, Any], names: set[str], request: PullRequest
+) -> dict[str, Any] | None:
+    """Return the part of a shared manifest that a resume of ``names`` continues.
+
+    Only rows for ``names`` are kept, so other sources in the same directory
+    neither block the resume nor feed it cursors. Returns None when any kept
+    row was written for a different search than ``request``. A requested
+    source with no row is left for ``_resume_mismatch`` to reject.
+    """
+    rows = [row for row in _source_rows(payload) if row["source"] in names]
+    if not rows and not _same_pull(payload.get("request"), request):
+        return None
+    if any(not _same_pull(row.get("request"), request) for row in rows):
+        return None
+    return {"request": request.model_dump(mode="json"), "sources": rows}
+
+
+def _matching_manifest(out_dir: Path, request: PullRequest) -> dict[str, Any] | None:
+    """Return the rows of an existing manifest written for this same search.
+
+    Rows written for a different date, box, or polygon are left out. A
+    missing or unreadable file does not fail the pull.
+    """
+    payload = _read_manifest(out_dir)
+    if payload is None:
+        return None
+    rows = [row for row in _source_rows(payload) if _same_pull(row.get("request"), request)]
+    if not rows:
+        return None
+    return {"request": request.model_dump(mode="json"), "sources": rows}
 
 
 def _held_sources(resolutions: Mapping[str, SourceResolution]) -> set[str]:

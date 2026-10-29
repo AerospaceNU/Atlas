@@ -879,6 +879,7 @@ def test_empty_fldas_window_drops_the_previous_csv(
     assert "no FLDAS granules" in source["failed"][0]["error"]
     assert set(source) == {
         "source",
+        "request",
         "collection",
         "bbox",
         "search_url",

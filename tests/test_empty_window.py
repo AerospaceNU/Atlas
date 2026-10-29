@@ -18,6 +18,7 @@ from atlas.data.base import Asset, BBox, DataPullClient, PullRequest, PullResult
 AOI = BBox(west=-71.12, south=42.32, east=-71.02, north=42.40)
 _MANIFEST_FIELDS = {
     "source",
+    "request",
     "collection",
     "bbox",
     "search_url",
