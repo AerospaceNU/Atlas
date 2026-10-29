@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import ClassVar
@@ -843,3 +845,162 @@ def test_asset_suffix_keeps_image_extensions() -> None:
     assert asset_suffix(Asset(href="https://example.com/a.jpg")) == ".jpg"
     assert asset_suffix(Asset(href="https://example.com/a.jpeg")) == ".jpg"
     assert asset_suffix(Asset(href="https://example.com/a.noext", media_type="image/png")) == ".png"
+
+
+def test_quicklook_is_a_forbidden_asset_name(capsys: pytest.CaptureFixture[str]) -> None:
+    from atlas.cli.download import is_forbidden_asset_name
+
+    assert is_forbidden_asset_name("quicklook")
+    code = main(
+        [
+            "data",
+            "sentinel2",
+            "optical",
+            "--date",
+            "2024-07-01:2024-07-07",
+            "--coords",
+            "0,0,1,1",
+            "--search-only",
+            "--asset",
+            "quicklook",
+        ]
+    )
+    assert code == 2
+    assert "preview/thumbnail" in capsys.readouterr().err
+
+
+def test_asset_on_a_gibs_only_pull_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        [
+            "data",
+            "gibs_modis_truecolor",
+            "browse",
+            "--date",
+            "2024-07-01:2024-07-01",
+            "--coords",
+            "0,0,1,1",
+            "--asset",
+            "red",
+        ]
+    )
+    assert code == 2
+    assert "GIBS or FIRMS" in capsys.readouterr().err
+
+
+class _FlakySearch(FakePullClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = True
+        self.calls = 0
+
+    async def search(self, request: PullRequest) -> PullResult:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("offline")
+        return PullResult(request=request, scenes=[_scene(id="rescued")])
+
+
+def test_resume_retries_a_source_that_failed_without_a_cursor(
+    tmp_path: Path,
+) -> None:
+    client = _FlakySearch()
+    assert run_data(_request_pull_args(tmp_path), clients={"sentinel2": client}) == 1
+    client.fail = False
+    assert run_data(_request_pull_args(tmp_path, "--resume"), clients={"sentinel2": client}) == 0
+    assert client.calls == 2
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"][0]["scene_ids"] == ["rescued"]
+    assert manifest["sources"][0]["error"] is None
+
+
+def test_all_download_failures_exit_1(tmp_path: Path) -> None:
+    scene = _scene(
+        id="broken",
+        assets={
+            "visual": Asset(
+                href="https://example.com/broken.tif",
+                media_type="image/tiff; application=geotiff",
+                roles=["visual"],
+            )
+        },
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="denied")
+
+    args = _pull_args(tmp_path, search_only=False)
+    args.yes = True
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        assert run_data(args, clients={"sentinel2": FakePullClient([scene])}, http=http) == 1
+    finally:
+        asyncio.run(http.aclose())
+
+
+def test_one_saved_scene_and_one_failure_exits_0(tmp_path: Path) -> None:
+    def scene(scene_id: str) -> Scene:
+        return _scene(
+            id=scene_id,
+            assets={
+                "data": Asset(
+                    href=f"https://example.com/{scene_id}.bin",
+                    media_type="application/octet-stream",
+                    roles=["data"],
+                )
+            },
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "broken" in str(request.url):
+            return httpx.Response(403)
+        return httpx.Response(200, content=b"data")
+
+    args = _pull_args(tmp_path, search_only=False)
+    args.yes = True
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        code = run_data(
+            args,
+            clients={"sentinel2": FakePullClient([scene("ok"), scene("broken")])},
+            http=http,
+        )
+    finally:
+        asyncio.run(http.aclose())
+    assert code == 0
+
+
+def test_scene_filename_is_windows_safe_and_bounded() -> None:
+    from atlas.cli.download import _avoid_reserved
+
+    # The "<id>_<key>" scheme never yields a bare reserved name; the helper
+    # still covers one if the scheme changes.
+    assert _avoid_reserved("CON") == "_CON"
+    assert scene_filename("name. ", "data", ".tif").startswith("name_")
+    long_name = scene_filename("x" * 500, "k" * 400, ".tif")
+    assert len(long_name.encode("utf-8")) <= 240
+    assert long_name.endswith(".tif")
+    assert long_name != scene_filename("x" * 500 + "y", "k" * 400, ".tif")
+
+
+def test_replace_with_retry_waits_out_a_sharing_violation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import atlas.cli.fs as fs
+
+    calls: list[int] = []
+    real_replace = os.replace
+
+    def flaky(source: object, target: object) -> None:
+        calls.append(1)
+        if len(calls) < 3:
+            raise PermissionError("busy")
+        real_replace(source, target)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fs.os, "replace", flaky)
+    monkeypatch.setattr(fs.time, "sleep", lambda _delay: None)
+    source = tmp_path / "a"
+    target = tmp_path / "b"
+    source.write_text("x", encoding="utf-8")
+    fs.replace_with_retry(source, target, attempts=3)
+    assert target.read_text(encoding="utf-8") == "x"
+    assert len(calls) == 3

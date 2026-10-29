@@ -618,3 +618,45 @@ def test_geojson_positions_may_carry_altitude() -> None:
     assert Polygon.from_geojson(closed).ring == square
     assert parse_polygon(json.dumps(closed)).ring == square
     assert parse_polygon(json.dumps(opened)).ring == square
+
+
+def test_a_rotated_ring_is_the_same_window() -> None:
+    from atlas.cli.data import _same_pull, _same_window
+
+    request = PullRequest(
+        start_date=date(2024, 7, 1),
+        end_date=date(2024, 7, 3),
+        polygon=Polygon(ring=SQUARE),
+    )
+    stored = request.model_dump(mode="json")
+    rotated = [*SQUARE[1:-1], SQUARE[0], SQUARE[1]]
+    stored["polygon"]["ring"] = rotated
+    assert _same_window(stored, request)
+    assert _same_pull(stored, request)
+
+    stored["polygon"]["ring"] = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+    assert not _same_window(stored, request)
+    assert not _same_pull(stored, request)
+
+
+def test_polygon_pull_warns_that_downloads_use_the_envelope(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = _parse_pull(
+        [
+            "data",
+            "sentinel2",
+            "optical",
+            "--date",
+            "2024-07-01:2024-07-03",
+            "--polygon",
+            "0,0;1,0;1,1;0,1",
+            "--out",
+            str(tmp_path),
+            "--yes",
+        ]
+    )
+    assert run_data(args, clients={"sentinel2": _Recording()}) == 0
+    assert "polygon envelope" in capsys.readouterr().err
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert "envelope" in manifest["download_note"]

@@ -155,7 +155,7 @@ async def test_gibs_blank_or_error_document_is_a_failure_not_a_file(tmp_path: Pa
             assume_yes=True,
         )
 
-    assert code == 0
+    assert code == 1
     assert not list((out / "gibs_modis_truecolor").glob("*.png"))
     failed = _manifest(out)["gibs_modis_truecolor"]["failed"]
     assert isinstance(failed, list)
@@ -201,7 +201,7 @@ async def test_gibs_failed_fetch_retires_another_aois_image(tmp_path: Path) -> N
         out, {"gibs_modis_truecolor": GibsModisTrueColorClient()}, httpx.MockTransport(handler)
     )
 
-    assert code == 0
+    assert code == 1
     assert not earlier.exists()
     assert not earlier_jpg.exists()
     assert earlier.with_name(earlier.name + ".stale").read_bytes() == b"other-aoi"
@@ -232,7 +232,7 @@ async def test_gibs_failure_survives_an_old_image_that_cannot_be_moved(
         out, {"gibs_modis_truecolor": GibsModisTrueColorClient()}, httpx.MockTransport(handler)
     )
 
-    assert code == 0
+    assert code == 1
     failed = _manifest(out)["gibs_modis_truecolor"]["failed"]
     assert isinstance(failed, list)
     assert "older image not moved aside" in str(failed[0]["error"])
@@ -321,7 +321,7 @@ async def test_other_sources_still_refuse_browse_assets(tmp_path: Path) -> None:
     assert not writes_own_output(client)
     code = await _pull(out, {"other": client}, httpx.MockTransport(handler))
 
-    assert code == 0
+    assert code == 1
     assert not (out / "other").exists()
     failed = _manifest(out)["other"]["failed"]
     assert failed == [{"id": "browse-only", "error": "no native-resolution asset"}]

@@ -228,6 +228,14 @@ class StacApiClient(DataPullClient):
         # cookie-cutter window and for sources that only take a box.
         if request.polygon is not None:
             body["intersects"] = request.polygon.as_stac_geometry()
+        elif request.bbox.west > request.bbox.east:
+            # A wrapping bbox in the request body is not portable: some APIs
+            # treat it as invalid and return unrelated items. Two rings say
+            # exactly which sides are wanted.
+            try:
+                body["intersects"] = _wrapping_bbox_geometry(request.bbox)
+            except ValueError:
+                body["bbox"] = request.bbox.as_list()
         else:
             body["bbox"] = request.bbox.as_list()
         if self.include_datetime:
@@ -366,6 +374,28 @@ def _query_is_signed(url: str) -> bool:
         ):
             return True
     return False
+
+
+def _wrapping_bbox_geometry(bbox: BBox) -> dict[str, Any]:
+    """A STAC geometry for a box that crosses the antimeridian.
+
+    The box becomes one rectangle per side of 180. A non-wrapping box is a
+    single Polygon. STAC's ``bbox`` has no portable wrapping convention, so a
+    dateline request is sent as ``intersects`` instead.
+    """
+    rings = [
+        [
+            [part.west, part.south],
+            [part.east, part.south],
+            [part.east, part.north],
+            [part.west, part.north],
+            [part.west, part.south],
+        ]
+        for part in bbox.antimeridian_parts()
+    ]
+    if len(rings) == 1:
+        return {"type": "Polygon", "coordinates": rings[0]}
+    return {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
 
 
 def _next_page_cursor(payload: Mapping[str, Any], search_url: str) -> tuple[str | None, str | None]:

@@ -15,11 +15,12 @@ from typing import Any, TextIO
 from atlas.cli.download import (
     BrowseAssetError,
     _is_geotiff_asset,
-    _nonempty_file,
     asset_suffix,
+    existing_product,
     output_source_dir,
     pick_asset,
     plain_source_name,
+    same_aoi,
     scene_filename,
 )
 from atlas.compile.product import SceneCatalog
@@ -69,12 +70,15 @@ class SourceSize:
         known_bytes: Sum of reported asset sizes. Scenes without a size
             contribute nothing here.
         unknown_scenes: Scenes whose size the catalog did not report.
+        windowed: Scenes read as a COG window. Their catalog size is an upper
+            bound; the bytes transferred are usually much smaller.
     """
 
     source: str
     scene_count: int
     known_bytes: int
     unknown_scenes: int
+    windowed: int = 0
 
     @property
     def bytes_text(self) -> str:
@@ -139,8 +143,13 @@ class PullEstimate:
 
     @property
     def unknown_scenes(self) -> int:
-        """Scenes whose byte size the catalog did not report."""
+        """Scenes whose byte count the catalog does not provide."""
         return sum(item.unknown_scenes for item in self.sources)
+
+    @property
+    def windowed_scenes(self) -> int:
+        """Scenes read as a window, so the catalog size is only an upper bound."""
+        return sum(item.windowed for item in self.sources)
 
     @property
     def bytes_text(self) -> str:
@@ -278,10 +287,11 @@ def estimate_pull(
                 remaining.append(scene)
         if not remaining:
             continue
-        known_bytes, unknown_scenes = _bytes_for_scenes(
+        known_bytes, unknown_scenes, windowed = _bytes_for_scenes(
             remaining,
             asset_name=asset_name,
             force_unknown=src.source in unknown_names,
+            bbox=bbox,
         )
         included.append(
             SourceSize(
@@ -289,6 +299,7 @@ def estimate_pull(
                 scene_count=len(remaining),
                 known_bytes=known_bytes,
                 unknown_scenes=unknown_scenes,
+                windowed=windowed,
             )
         )
     return PullEstimate(
@@ -316,6 +327,11 @@ def render_pull_estimate(estimate: PullEstimate) -> str:
         f"already present: {estimate.already_present}",
         f"quota: {estimate.quota_text}",
     ]
+    if estimate.windowed_scenes:
+        lines.append(
+            f"windowed: {estimate.windowed_scenes} scenes read a smaller window than "
+            "their catalog size"
+        )
     if estimate.sources:
         lines.append("sources:")
         for source in estimate.sources:
@@ -375,27 +391,35 @@ def _bytes_for_scenes(
     *,
     asset_name: str | None,
     force_unknown: bool,
-) -> tuple[int, int]:
-    """Return ``(known_bytes, unknown_scenes)`` for ``scenes``.
+    bbox: BBox | None = None,
+) -> tuple[int, int, int]:
+    """Return ``(known_bytes, unknown_scenes, windowed)`` for ``scenes``.
 
     A scene with no downloadable asset contributes zero known bytes. That is
-    a reported empty transfer, not an unknown size.
+    a reported empty transfer, not an unknown size. A windowed GeoTIFF is
+    counted in ``windowed`` because its catalog size covers the whole granule.
     """
     if force_unknown:
-        return 0, len(scenes)
+        return 0, len(scenes), 0
     known_bytes = 0
     unknown_scenes = 0
+    windowed = 0
     for scene in scenes:
-        size = _selected_size(scene, asset_name)
+        size, is_window = _selected_size(scene, asset_name, bbox)
         if size is None:
             unknown_scenes += 1
         else:
             known_bytes += size
-    return known_bytes, unknown_scenes
+        windowed += int(is_window)
+    return known_bytes, unknown_scenes, windowed
 
 
-def _selected_size(scene: Scene, asset_name: str | None) -> int | None:
-    """Return the selected asset's reported size.
+def _selected_size(
+    scene: Scene,
+    asset_name: str | None,
+    bbox: BBox | None = None,
+) -> tuple[int | None, bool]:
+    """Return the selected asset's reported size and whether it is windowed.
 
     ``0`` when nothing would be downloaded. ``None`` when the asset has no
     catalog size.
@@ -403,10 +427,12 @@ def _selected_size(scene: Scene, asset_name: str | None) -> int | None:
     try:
         picked = pick_asset(scene, asset_name)
     except BrowseAssetError:
-        return 0
+        return 0, False
     if picked is None:
-        return 0
-    return picked[1].size_bytes
+        return 0, False
+    _key, asset = picked
+    windowed = bbox is not None and _is_geotiff_asset(asset)
+    return asset.size_bytes, windowed
 
 
 def _is_tty(stream: TextIO) -> bool:
@@ -468,17 +494,16 @@ def _is_present(
     """True when this scene would not transfer.
 
     A training-table extract does not write the catalog asset, so those scenes
-    stay in the estimate. A GeoTIFF window is read again even when a chip is
-    already on disk.
+    stay in the estimate. A windowed GeoTIFF counts as present only when the
+    chip and its AOI marker match this request, so a chip from another area is
+    not reported as this one.
     """
     if force_unknown:
         return False
     planned = _planned_asset(scene, asset_name)
     if planned is None:
         return False
-    relative, asset = planned
-    if bbox is not None and _is_geotiff_asset(asset):
-        return False
+    relative, asset, key, suffix = planned
     if relative in recorded:
         return True
     if out_dir is None:
@@ -486,11 +511,16 @@ def _is_present(
     dest = output_source_dir(out_dir, scene.source)
     if dest is None:
         return False
-    return _nonempty_file(dest / Path(relative).name)
+    found = existing_product(dest, scene.id, key, suffix)
+    if found is None:
+        return False
+    if bbox is not None and _is_geotiff_asset(asset):
+        return same_aoi(found, bbox)
+    return True
 
 
-def _planned_asset(scene: Scene, asset_name: str | None) -> tuple[str, Asset] | None:
-    """Return the relative path the download would check, and that asset.
+def _planned_asset(scene: Scene, asset_name: str | None) -> tuple[str, Asset, str, str] | None:
+    """Return the planned relative path, asset, key, and suffix.
 
     ``None`` when nothing would be written. The path matches the name
     :func:`atlas.cli.download.download_assets` checks before it fetches.
@@ -502,8 +532,9 @@ def _planned_asset(scene: Scene, asset_name: str | None) -> tuple[str, Asset] | 
     if picked is None or not plain_source_name(scene.source):
         return None
     key, asset = picked
-    name = scene_filename(scene.id, key, asset_suffix(asset))
-    return f"{scene.source}/{name}", asset
+    suffix = asset_suffix(asset)
+    name = scene_filename(scene.id, key, suffix)
+    return f"{scene.source}/{name}", asset, key, suffix
 
 
 def _quotas_for(source_names: Sequence[str]) -> tuple[ProviderQuota, ...]:

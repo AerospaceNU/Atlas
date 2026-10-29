@@ -5,13 +5,23 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any, ClassVar
 
 import httpx
 import pytest
 
-from atlas.cli.data import _products_for_request, add_data_parser, run_data
+from atlas.cli.data import (
+    _manifest_lock,
+    _products_for_request,
+    _write_manifest,
+    add_data_parser,
+    run_data,
+)
+from atlas.cli.download import DownloadReport
+from atlas.compile.product import SceneCatalog, SourceScenes
 from atlas.data.base import BBox, PullRequest, SceneKind
 from atlas.data.stac import StacApiClient
 
@@ -244,3 +254,45 @@ def test_stale_products_follow_each_rows_own_window(tmp_path: Path) -> None:
         tmp_path / "landsat8" / "chip.tif"
     ]
     assert _products_for_request(tmp_path, "landsat8", window_a) == []
+
+
+def test_manifest_lock_serializes_writers(tmp_path: Path) -> None:
+    order: list[str] = []
+
+    def worker(name: str) -> None:
+        with _manifest_lock(tmp_path):
+            order.append(f"{name}-in")
+            time.sleep(0.05)
+            order.append(f"{name}-out")
+
+    threads = [threading.Thread(target=worker, args=(name,)) for name in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert order in (
+        ["a-in", "a-out", "b-in", "b-out"],
+        ["b-in", "b-out", "a-in", "a-out"],
+    )
+
+
+def test_concurrent_source_writes_keep_every_row(tmp_path: Path) -> None:
+    request = _request("2024-07-01", "2024-07-07")
+    names = ["a", "b", "c", "d"]
+    barrier = threading.Barrier(len(names))
+
+    def worker(name: str) -> None:
+        catalog = SceneCatalog(
+            request=request,
+            sources=[SourceScenes(source=name, collection=name)],
+        )
+        barrier.wait()
+        _write_manifest(tmp_path, catalog, DownloadReport())
+
+    threads = [threading.Thread(target=worker, args=(name,)) for name in names]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    manifest = _manifest(tmp_path)
+    assert {row["source"] for row in manifest["sources"]} == set(names)

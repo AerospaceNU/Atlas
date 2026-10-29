@@ -1035,16 +1035,22 @@ class PullResult(BaseModel):
     next_cursor_unavailable: str | None = None
 
     @model_validator(mode="after")
-    def _clip_to_polygon(self) -> Self:
+    def _clip_to_request(self) -> Self:
+        """Keep only scenes that meet the AOI, whichever catalog sent them."""
         polygon = self.request.polygon
-        if polygon is None:
+        if polygon is not None:
+            # Every catalog, STAC or not, is clipped here. The test is footprint
+            # bounding-box overlap (a point-in-ring test for point scenes). Scene
+            # does not carry the catalog footprint geometry, so a box that merely
+            # clips the ring can keep a scene whose outline misses it. Bbox-only
+            # catalogs search the envelope, so scenes outside the ring still arrive.
+            self.scenes = [scene for scene in self.scenes if polygon.overlaps(scene)]
             return self
-        # Every catalog, STAC or not, is clipped here. The test is footprint
-        # bounding-box overlap (a point-in-ring test for point scenes). Scene
-        # does not carry the catalog footprint geometry, so a box that merely
-        # clips the ring can keep a scene whose outline misses it. Bbox-only
-        # catalogs search the envelope, so scenes outside the ring still arrive.
-        self.scenes = [scene for scene in self.scenes if polygon.overlaps(scene)]
+        # A catalog that mishandles a wrapping box (or ignores the area filter)
+        # can return items outside the request. Drop them before they reach the
+        # manifest or the downloader.
+        bbox = self.request.bbox
+        self.scenes = [scene for scene in self.scenes if bbox.intersects(scene.bbox)]
         return self
 
 

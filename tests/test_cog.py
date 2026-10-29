@@ -2040,3 +2040,110 @@ async def test_range_reads_send_headers_and_name_a_login_page() -> None:
         assert seen and set(seen) == {"Bearer t"}
         with pytest.raises(CogRangeError, match=r"needs a login: login\.example\.com"):
             await open_cog(http, "https://login.example.com/granule.tif")
+
+
+def _dateline_built(*, global_raster: bool) -> BuiltCog:
+    if global_raster:
+        return build_cog(
+            _grid(8, 720, dtype=np.uint16),
+            tile=8,
+            origin_x=-180.0,
+            origin_y=10.0,
+            pixel_size_x=0.5,
+            pixel_size_y=0.5,
+        )
+    return build_cog(
+        _grid(8, 40),
+        tile=8,
+        origin_x=170.0,
+        origin_y=10.0,
+        pixel_size_x=0.5,
+        pixel_size_y=0.5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_dateline_aoi_windows_the_side_that_overlaps(tmp_path: Path) -> None:
+    built = _dateline_built(global_raster=False)
+    log = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=175.0, south=0.0, east=-175.0, north=10.0),
+        )
+    outcome = report.outcomes[0]
+    assert outcome.status == "saved", outcome.error
+    assert outcome.path is not None
+    assert log.range_calls()
+    assert len(outcome.path.read_bytes()) < len(built.blob)
+
+
+@pytest.mark.asyncio
+async def test_dateline_aoi_on_a_global_raster_uses_the_whole_file(tmp_path: Path) -> None:
+    # Both edges of a -180..180 raster meet a dateline AOI, so one rectangular
+    # chip cannot describe it. The whole file is the only correct fallback.
+    built = _dateline_built(global_raster=True)
+    log = _RangeLog(built.blob, allow_full=True)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        report = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=BBox(west=175.0, south=0.0, east=-175.0, north=10.0),
+        )
+    outcome = report.outcomes[0]
+    assert outcome.status == "saved", outcome.error
+    assert None in log.calls
+    assert outcome.path is not None and outcome.path.read_bytes() == built.blob
+
+
+@pytest.mark.asyncio
+async def test_windowed_chip_is_reused_only_for_the_same_aoi(tmp_path: Path) -> None:
+    from atlas.cli.download import aoi_path, same_aoi
+
+    built = _geographic()
+    bbox = BBox(west=-9.5, south=8.5, east=-9.0, north=9.0)
+    log = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=log.transport()) as http:
+        first = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=bbox,
+        )
+    chip = first.outcomes[0].path
+    assert first.outcomes[0].status == "saved" and chip is not None
+    assert aoi_path(chip).is_file()
+    assert same_aoi(chip, bbox)
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"a same-AOI chip is not fetched again: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as http:
+        second = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=bbox,
+        )
+    assert second.outcomes[0].status == "skipped"
+    assert second.outcomes[0].path == chip
+
+    other = BBox(west=-9.4, south=8.6, east=-8.9, north=9.1)
+    moved = _RangeLog(built.blob)
+    async with httpx.AsyncClient(transport=moved.transport()) as http:
+        third = await download_assets(
+            [_scene("https://example.com/granule.tif")],
+            tmp_path,
+            http=http,
+            clients={},
+            bbox=other,
+        )
+    assert third.outcomes[0].status == "saved", third.outcomes[0].error
+    assert moved.range_calls()

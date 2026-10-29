@@ -32,8 +32,9 @@ The `atlas` command.
 | `__init__` | Argument routing. No args opens the TUI; `atlas data` and a bare satellite name stay on search. |
 | `catalog` | Source names, kind aliases, and the catalog listing. |
 | `data` | Search: pick sources, run a pull, print scenes. |
-| `download` | Fetch scene assets (previews and thumbnails are refused). Geographic, Web Mercator, and WGS84 UTM COGs are windowed to the request box. |
+| `download` | Fetch scene assets (previews and thumbnails are refused). Geographic, Web Mercator, and WGS84 UTM COGs are windowed to the request box; a chip is reused for the same AOI via a sibling marker. |
 | `progress` | Per-source search progress for the data command. |
+| `fs` | Atomic replace with a short retry for a Windows sharing violation. |
 | `tui` | Find or build the Rust `atlas-tui` binary and replace this process with it. |
 
 ## `compile`
@@ -74,7 +75,7 @@ STAC and related search clients. `search` is the only required method, and it is
 | `maxar_opendata` | Maxar Open Data. |
 | `firms` | NASA FIRMS active-fire detections. `FIRMS_MAP_KEY` comes from the session, the environment, or `~/.atlas/keys`. A missing key names `FIRMS_MAP_KEY` and says to set it with `/key firms` or the env var. A rejected key names the variable and the status. The value is not printed. A dateline box is two area requests. |
 | `gibs` | NASA GIBS browse imagery (true color, night lights, flood, snow, thermal). A dateline box is two WMS GetMap requests. |
-| `goes`, `himawari` | Geostationary imagery. GOES picks a satellite per side of a dateline box. Himawari lists the full-disk slot once when either side meets the disk. |
+| `goes`, `himawari` | Geostationary imagery. GOES picks a satellite and its dated bucket per side of a dateline box (GOES-16/19 East, GOES-15/17/18 West). Himawari lists the full-disk slot once when either side meets the disk. |
 
 ## `models`
 
