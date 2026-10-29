@@ -820,3 +820,19 @@ def test_resume_refuses_a_symlinked_manifest(
     assert run_data(args, clients={"sentinel2": RecordingPullClient()}) == 2
     assert "symlink" in capsys.readouterr().err
     assert outside.read_text(encoding="utf-8") == '{"sources": []}'
+
+
+def test_empty_path_options_are_rejected() -> None:
+    from atlas.cli.data import _path_arg
+
+    with pytest.raises(argparse.ArgumentTypeError, match="must not be empty"):
+        _path_arg("   ")
+
+
+def test_unknown_kind_is_named_before_the_missing_date(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["data", "sentinel2", "bogus"]) == 2
+    err = capsys.readouterr().err
+    assert "Unknown kind" in err
+    assert "--date" not in err

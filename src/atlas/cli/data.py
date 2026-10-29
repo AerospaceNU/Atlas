@@ -120,6 +120,8 @@ def _pull_requested(args: argparse.Namespace) -> bool:
 
 def _path_arg(text: str) -> Path:
     """Argparse type for a filesystem path; a leading ``~`` is expanded."""
+    if not text.strip():
+        raise argparse.ArgumentTypeError("path must not be empty")
     return Path(text).expanduser()
 
 
@@ -351,6 +353,11 @@ def run_data(
             Console(stderr=True, highlight=False).print(str(exc), style="red")
             return 2
         return 0
+    try:
+        names = resolve_sources(args.satellite, args.kind)
+    except CatalogError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if not args.date or not has_area:
         print(
             "data pull requires --date START:END and --coords W,S,E,N or --polygon",
@@ -358,7 +365,6 @@ def run_data(
         )
         return 2
     try:
-        names = resolve_sources(args.satellite, args.kind)
         start, end = parse_date_range(args.date)
         polygon = parse_polygon(polygon_text) if polygon_text else None
         request_body: dict[str, object] = {
@@ -375,7 +381,7 @@ def run_data(
     except ValidationError as exc:
         print(_validation_error(exc, "pull request is invalid"), file=sys.stderr)
         return 2
-    except (CatalogError, ValueError) as exc:
+    except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
     if args.asset and is_forbidden_asset_name(args.asset):
