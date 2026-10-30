@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -524,6 +525,7 @@ def test_exchange_falls_back_on_any_errno_except_enoent(
     assert not (tmp_path / ".ndvi-change.replacing").exists()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="renameat2 is a Linux syscall")
 def test_renameat2_lookup_is_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     source = tmp_path / "source"
     target = tmp_path / "target"

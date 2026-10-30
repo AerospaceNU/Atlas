@@ -234,8 +234,7 @@ class AgentSession:
         if self.workspace is not None:
             session_id = _remember_session(self.workspace, self.model_id)
             artifact_root = project_artifact_dir(self.workspace, session_id)
-            read_root = self.agent.artifacts.read_root
-            self.agent.artifacts = LocalArtifactStore(artifact_root, read_root=read_root)
+            self.agent.artifacts = LocalArtifactStore(self.workspace, artifact_root=artifact_root)
         self.messages = self.agent.opening_messages()
 
     def set_goal(self, text: str) -> None:
@@ -1559,11 +1558,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     model_id = resolve_model(workspace, args.model)
     session_id = _remember_session(workspace, model_id)
-    # Writes stay inside this session's artifact directory so removing the
-    # session removes them and cannot touch the workspace root. Reads may
-    # fall back to the project workspace via the store's read_root.
+    # The workspace is the sandbox root: file tools write the tree the person
+    # pointed the session at, which does not have to be a git checkout. Tool
+    # outputs still land in this session's artifact directory, which lives
+    # inside the workspace, so removing the session removes them.
     artifact_root = project_artifact_dir(workspace, session_id)
-    store = LocalArtifactStore(artifact_root, read_root=workspace)
+    store = LocalArtifactStore(workspace, artifact_root=artifact_root)
     # Home skills are opt-in. The default session sees only the workspace.
     skill_home = home if load_home_skills_enabled(workspace) else None
     skills = load_skills(store, home=skill_home)

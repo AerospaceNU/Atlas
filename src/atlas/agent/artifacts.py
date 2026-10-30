@@ -97,37 +97,61 @@ def _within(base: Path, relative_path: str) -> Path:
 
 
 class LocalArtifactStore:
-    """Constrain an agent's work to one local directory.
+    """Constrain an agent's work to one local directory tree.
 
-    Paths passed through the tool interface are always relative to ``root``
-    (the write sandbox). An optional ``read_root`` widens *reads* to a second
-    tree -- the project workspace -- so an agent can inspect source files and
-    inputs without gaining write access to them. Writes always stay in
-    ``root``, and both roots reject absolute paths and ``..`` escapes.
-    ``read_project_bytes`` reads the project root only: ``read_root`` when one
-    is mounted, otherwise ``root``. A same-named file in the write sandbox
-    does not replace it.
+    ``root`` is the writable working tree. It is whatever directory the person
+    pointed the session at -- a repository, a data folder, or any other tree --
+    and it does not have to be a git checkout. Tool paths are relative to it,
+    and absolute paths and ``..`` escapes are refused, so the root is the
+    boundary rather than the repository.
+
+    ``artifact_root`` is where tool-produced outputs are written. It defaults
+    to ``root`` and sits inside it in a session, so removing the session
+    removes its artifacts and ``relative()`` still reports workspace-relative
+    names.
+
+    ``read_root`` is an optional second tree that reads may fall back to. It
+    exists for callers that keep artifacts outside the working tree; a session
+    at a workspace root does not need it.
     """
 
-    def __init__(self, root: Path, *, read_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        read_root: Path | None = None,
+        artifact_root: Path | None = None,
+    ) -> None:
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.artifact_root = (artifact_root or root).resolve()
+        self.artifact_root.mkdir(parents=True, exist_ok=True)
         self.read_root = read_root.resolve() if read_root is not None else None
 
     def resolve(self, relative_path: str) -> Path:
-        """Resolve a relative path for writing, following symlinks, and reject escapes."""
+        """Resolve a relative path for writing in the working tree."""
         return _within(self.root, relative_path)
 
-    def resolve_read(self, relative_path: str) -> Path:
-        """Resolve a relative path for reading, preferring the write sandbox.
+    def resolve_artifact(self, relative_path: str) -> Path:
+        """Resolve a relative path for writing a tool-produced artifact."""
+        return _within(self.artifact_root, relative_path)
 
-        A path that exists under ``root`` wins. Otherwise, when ``read_root``
-        is set, the same relative path is tried there. A path that exists in
-        neither returns its ``root``-relative form, so the caller's error stays
-        root-relative and never leaks a host path.
+    def resolve_read(self, relative_path: str) -> Path:
+        """Resolve a relative path for reading.
+
+        A path that exists in the working tree wins, then the artifact root,
+        then ``read_root`` when one is mounted. A path that exists in none of
+        them returns its ``root``-relative form, so the caller's error stays
+        workspace-relative and never leaks a host path.
         """
         primary = _within(self.root, relative_path)
-        if primary.exists() or self.read_root is None:
+        if primary.exists():
+            return primary
+        if self.artifact_root != self.root:
+            artifact = _within(self.artifact_root, relative_path)
+            if artifact.exists():
+                return artifact
+        if self.read_root is None:
             return primary
         fallback = _within(self.read_root, relative_path)
         return fallback if fallback.exists() else primary
@@ -199,7 +223,7 @@ class LocalArtifactStore:
     def list_images(self) -> list[ImageInfo]:
         """List readable image files recursively, skipping symlinks and hardlinks that may escape."""
         images: list[ImageInfo] = []
-        for path in sorted(self.root.rglob("*")):
+        for path in sorted(self.artifact_root.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in _IMAGE_SUFFIXES:
                 continue
             try:

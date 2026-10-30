@@ -77,6 +77,9 @@ def test_missing_agents_md_is_silent(tmp_path: Path, caplog: pytest.LogCaptureFi
 
 
 def test_other_filenames_and_nested_files_are_ignored(tmp_path: Path) -> None:
+    (tmp_path / "case-probe").write_text("x", encoding="utf-8")
+    if (tmp_path / "CASE-PROBE").exists():
+        pytest.skip("case-insensitive filesystem cannot hold AGENTS.md and agents.md apart")
     (tmp_path / "AGENTS.md").write_text("honored rule\n", encoding="utf-8")
     for name in ("agents.md", "AGENT.md", "CLAUDE.md", "AGENTS.override.md"):
         (tmp_path / name).write_text(f"ignore {name}\n", encoding="utf-8")
@@ -405,7 +408,7 @@ def test_start_fresh_reloads_the_workspace_file(tmp_path: Path) -> None:
     (store.root / "AGENTS.md").write_text("from sandbox\n", encoding="utf-8")
     session.start_fresh()
 
-    assert session.agent.artifacts.read_root == workspace.resolve()
+    assert session.agent.artifacts.root == workspace.resolve()
     assert session.agent.artifacts.root != store.root
     assert "rule beta" in (session.messages[1].content or "")
     assert "rule alpha" not in (session.messages[1].content or "")
