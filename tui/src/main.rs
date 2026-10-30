@@ -876,6 +876,14 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
     }
     if key.code == KeyCode::Esc && matches!(app.mode, Mode::Compose) && !app.input.starts_with('/')
     {
+        if app.in_flight() {
+            // Stop the turn, keep the conversation. The runtime answers every
+            // pending tool call before it returns, so the next turn is valid.
+            child.send(serde_json::json!({"type": "cancel"}))?;
+            app.transcript
+                .push(tool_note("cancelling after this step..."));
+            return Ok(false);
+        }
         child.shutdown();
         return Ok(true);
     }
@@ -1442,6 +1450,17 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
             "scope": app.scope_root,
             "kind": "sessions"
         })),
+        "/resume" => {
+            let id = text.trim().trim_start_matches("/resume").trim();
+            if id.is_empty() {
+                app.transcript.push(tool_note("usage: /resume <session-id>"));
+                None
+            } else {
+                app.transcript.clear();
+                app.status = Status::Waiting;
+                Some(serde_json::json!({"type": "load_session", "id": id}))
+            }
+        }
         "/artifacts" => Some(serde_json::json!({
             "type": "list",
             "scope": app.scope_root,

@@ -5,6 +5,7 @@ import logging
 import secrets
 import tomllib
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -40,8 +41,14 @@ DEFAULT_MAX_TOOL_CALLS = 256
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
 
 _STOPPED_RESPONSE = "Stopped after reaching the configured tool-use limit."
+_STOPPED_BUDGET = "Stopped after reaching the configured token or spend budget."
+_STOPPED_CANCELLED = "Stopped at your request."
 
-ErrorKind = Literal["validation", "unknown_tool", "tool_failure", "limit"]
+# Tool calls in one assistant turn are independent, so they run concurrently.
+# The cap keeps a model that emits twenty calls from opening twenty shells.
+_MAX_PARALLEL_TOOLS = 4
+
+ErrorKind = Literal["validation", "unknown_tool", "tool_failure", "limit", "cancelled", "budget"]
 
 
 class AgentStep(BaseModel):
@@ -59,6 +66,8 @@ class AgentRun(BaseModel):
     response: str
     steps: list[AgentStep] = Field(default_factory=list)
     stopped_for_limit: bool = False
+    stopped_for_budget: bool = False
+    cancelled: bool = False
     calls: list[ModelCall] = Field(default_factory=list)
 
 
@@ -74,6 +83,47 @@ def _load_agent_config(root: Path) -> dict[str, object]:
     if not isinstance(data, dict):
         raise ValueError("agent.toml must be a table")
     return data
+
+
+def load_optional_limit(
+    root: Path, key: str, *, kind: type[int] | type[float]
+) -> int | float | None:
+    """Read an optional numeric budget from ``.atlas/agent.toml``.
+
+    Args:
+        root: Workspace root that holds ``.atlas/agent.toml``.
+        key: Budget key, such as ``max_tokens`` or ``max_spend_usd``.
+        kind: ``int`` or ``float``; a value of the wrong type is refused.
+
+    Returns:
+        The configured value, or None when the key is absent.
+
+    Raises:
+        ValueError: The key is present but not a positive number of ``kind``.
+    """
+    data = _load_agent_config(root)
+    if key not in data:
+        return None
+    value = data[key]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{key} must be a positive number")
+    if kind is int and not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    if value <= 0:
+        raise ValueError(f"{key} must be greater than zero")
+    return value
+
+
+def load_optional_tokens(root: Path) -> int | None:
+    """Return ``max_tokens`` from ``.atlas/agent.toml``, or None when unset."""
+    value = load_optional_limit(root, "max_tokens", kind=int)
+    return None if value is None else int(value)
+
+
+def load_spend_limit(root: Path) -> float | None:
+    """Return ``max_spend_usd`` from ``.atlas/agent.toml``, or None when unset."""
+    value = load_optional_limit(root, "max_spend_usd", kind=float)
+    return None if value is None else float(value)
 
 
 def load_max_tool_calls(root: Path) -> int:
@@ -146,6 +196,8 @@ class Agent:
         artifacts: LocalArtifactStore,
         *,
         max_tool_calls: int | None = None,
+        max_tokens: int | None = None,
+        max_spend_usd: float | None = None,
         skills: Sequence[Skill] | None = None,
     ) -> None:
         if max_tool_calls is None:
@@ -155,7 +207,13 @@ class Agent:
         self.model = model
         self.tools = tools
         self.artifacts = artifacts
+        if max_tokens is not None and (isinstance(max_tokens, bool) or max_tokens < 1):
+            raise ValueError("max_tokens must be an integer >= 1")
+        if max_spend_usd is not None and max_spend_usd <= 0:
+            raise ValueError("max_spend_usd must be greater than zero")
         self.max_tool_calls = max_tool_calls
+        self.max_tokens = max_tokens
+        self.max_spend_usd = max_spend_usd
         self.skills = list(skills or [])
         self.instruction_nonce = secrets.token_hex(8)
 
@@ -203,13 +261,22 @@ class Agent:
         on_step: Callable[[AgentStep], None] | None = None,
         on_phase: Callable[[str, str | None], None] | None = None,
         on_thought: Callable[[str, float | None], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> AgentRun:
         """Continue ``messages`` in place while the tool-call budget lasts.
 
         The caller owns the history: no user or system message is appended here.
-        Every tool call that fits in the budget runs in order, even after one
-        fails. A call past the budget is recorded as a ``limit`` step and still
-        gets a tool message so every ``tool_call_id`` is answered.
+        Every tool call that fits in the budget runs, even after one fails. A
+        call past the budget is recorded as a ``limit`` step and still gets a
+        tool message so every ``tool_call_id`` is answered.
+
+        ``should_cancel`` is polled between rounds and before a tool batch. When
+        it returns true the turn stops without another model call, and every
+        pending ``tool_call_id`` still gets a ``cancelled`` tool message so the
+        history stays valid for the next turn.
+
+        ``max_tokens`` and ``max_spend_usd`` stop the turn with
+        :data:`_STOPPED_BUDGET` once the running total is at or past the limit.
         """
         steps: list[AgentStep] = []
         calls: list[ModelCall] = []
@@ -220,9 +287,10 @@ class Agent:
                 on_phase(phase, name)
 
         while executed < self.max_tool_calls:
-            # Reasoning stays on unless the model config turns it off. The
-            # request is one blocking call, so this is the whole wait, not a
-            # separate stream of thought tokens.
+            if should_cancel is not None and should_cancel():
+                return AgentRun(
+                    response=_STOPPED_CANCELLED, steps=steps, cancelled=True, calls=calls
+                )
             config = getattr(self.model, "config", None)
             reasoning = True if config is None else bool(getattr(config, "reasoning", True))
             emit("thinking" if reasoning else "working")
@@ -239,8 +307,6 @@ class Agent:
                     reasoning_details=response.reasoning_details,
                 )
             )
-            # The call is blocking, so the thought arrives with the completion,
-            # ahead of this round's tool steps and ahead of the final answer.
             if response.reasoning and on_thought is not None:
                 speed = output_tokens_per_second(
                     response.usage.completion_tokens,
@@ -249,18 +315,32 @@ class Agent:
                 on_thought(response.reasoning, speed)
             if not response.tool_calls:
                 return AgentRun(response=response.content or "", steps=steps, calls=calls)
-            hit_limit = False
-            attached: list[ModelImage] = []
-            image_errors: list[str] = []
+            if should_cancel is not None and should_cancel():
+                return self._stop_cancelled(messages, steps, calls, response.tool_calls)
+            if self._over_budget(calls):
+                return AgentRun(
+                    response=_STOPPED_BUDGET,
+                    steps=steps,
+                    stopped_for_budget=True,
+                    calls=calls,
+                )
+
+            pending: list[ToolCall] = []
+            limited: list[ToolCall] = []
             for call in response.tool_calls:
-                emit("tool_calling", call.name)
                 if executed < self.max_tool_calls:
-                    emit("tool_executing", call.name)
-                    step = self._execute(call)
+                    pending.append(call)
                     executed += 1
                 else:
-                    hit_limit = True
-                    step = AgentStep(call=call, error="tool call limit reached", error_kind="limit")
+                    limited.append(call)
+
+            for call in (*pending, *limited):
+                emit("tool_calling", call.name)
+            results = self._execute_all(pending, on_phase=emit) if pending else []
+
+            attached: list[ModelImage] = []
+            image_errors: list[str] = []
+            for call, step in zip(pending, results, strict=True):
                 images, errors = _ingest_tool_images(step, self.artifacts)
                 if errors and step.error is None:
                     step.error = "\n".join(errors)
@@ -277,6 +357,18 @@ class Agent:
                 image_errors.extend(errors)
                 if on_step is not None:
                     on_step(step)
+            for call in limited:
+                step = AgentStep(call=call, error="tool call limit reached", error_kind="limit")
+                steps.append(step)
+                messages.append(
+                    ChatMessage(
+                        role=Role.TOOL,
+                        tool_call_id=call.id,
+                        content=_tool_message(step),
+                    )
+                )
+                if on_step is not None:
+                    on_step(step)
             if attached or image_errors:
                 messages.append(
                     ChatMessage(
@@ -285,7 +377,7 @@ class Agent:
                         images=attached,
                     )
                 )
-            if executed >= self.max_tool_calls or hit_limit:
+            if executed >= self.max_tool_calls or limited:
                 return AgentRun(
                     response=_STOPPED_RESPONSE,
                     steps=steps,
@@ -298,6 +390,58 @@ class Agent:
             stopped_for_limit=True,
             calls=calls,
         )
+
+    def _over_budget(self, calls: Sequence[ModelCall]) -> bool:
+        """Return true once the running usage reaches a configured budget."""
+        if self.max_tokens is not None:
+            total = sum(call.usage.prompt_tokens + call.usage.completion_tokens for call in calls)
+            if total >= self.max_tokens:
+                return True
+        if self.max_spend_usd is not None:
+            spent = 0.0
+            for call in calls:
+                if call.usage.cost is not None:
+                    spent += call.usage.cost
+            if spent >= self.max_spend_usd:
+                return True
+        return False
+
+    def _execute_all(
+        self,
+        calls: Sequence[ToolCall],
+        *,
+        on_phase: Callable[[str, str | None], None] | None = None,
+    ) -> list[AgentStep]:
+        """Run one round's tool calls concurrently, returning them in order."""
+        if len(calls) <= 1:
+            if calls and on_phase is not None:
+                on_phase("tool_executing", calls[0].name)
+            return [self._execute(call) for call in calls]
+        if on_phase is not None:
+            for call in calls:
+                on_phase("tool_executing", call.name)
+        with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_TOOLS, len(calls))) as pool:
+            return list(pool.map(self._execute, calls))
+
+    def _stop_cancelled(
+        self,
+        messages: list[ChatMessage],
+        steps: list[AgentStep],
+        calls: list[ModelCall],
+        pending: Sequence[ToolCall],
+    ) -> AgentRun:
+        """Answer every unanswered tool call after a cancel, then stop."""
+        for call in pending:
+            step = AgentStep(call=call, error="cancelled by the user", error_kind="cancelled")
+            steps.append(step)
+            messages.append(
+                ChatMessage(
+                    role=Role.TOOL,
+                    tool_call_id=call.id,
+                    content=_tool_message(step),
+                )
+            )
+        return AgentRun(response=_STOPPED_CANCELLED, steps=steps, cancelled=True, calls=calls)
 
     def _execute(self, call: ToolCall) -> AgentStep:
         try:

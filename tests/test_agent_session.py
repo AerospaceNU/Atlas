@@ -793,8 +793,9 @@ def test_degenerate_window_on_a_fresh_session_stays_unavailable(tmp_path: Path) 
 
 
 def test_http_error_keeps_status_and_short_body(tmp_path: Path) -> None:
+    # A rate limit is retried, so the queue holds one response per attempt.
     client = _QueueClient(
-        [{"error": {"message": "slow down"}}],
+        [{"error": {"message": "slow down"}}] * 3,
         status_code=429,
         elapsed_seconds=0.25,
     )

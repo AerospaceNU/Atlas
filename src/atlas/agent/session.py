@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import sys
 import threading
 import uuid
@@ -84,6 +85,8 @@ from atlas.agent.runtime import (
     load_home_skills_enabled,
     load_max_tool_calls,
     load_model,
+    load_optional_tokens,
+    load_spend_limit,
 )
 from atlas.agent.skill_author import normalize_skill_name
 from atlas.agent.skills import Skill, load_skills, register_skill_tool
@@ -161,6 +164,12 @@ class AgentSession:
         self._analysis_request = ""
         self._analysis_steps: list[AnalysisStep] = []
         self._analysis_response = ""
+        # Set by the protocol reader thread. The runtime polls it between
+        # rounds and before a tool batch, so a turn can be stopped without
+        # killing the process that holds the history.
+        self.cancel_event = threading.Event()
+        # Set when this session has a directory under .atlas/sessions.
+        self.session_id: str | None = None
 
     def turn(
         self,
@@ -177,13 +186,18 @@ class AgentSession:
         A path the sandbox rejects is not appended.
         """
         self._require_key()
+        self._cancel_event_clear()
         message = ChatMessage(role=Role.USER, content=request)
         if images:
             message.images = ingest_images(self.agent.artifacts, list(images))
         self._begin_analysis(request)
         self.messages.append(message)
         run = self.agent.advance(
-            self.messages, on_step=on_step, on_phase=on_phase, on_thought=on_thought
+            self.messages,
+            on_step=on_step,
+            on_phase=on_phase,
+            on_thought=on_thought,
+            should_cancel=self.cancel_event.is_set,
         )
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
@@ -202,7 +216,11 @@ class AgentSession:
         if not self.stopped_for_limit:
             raise RuntimeError("Session is not stopped for the tool-call limit")
         run = self.agent.advance(
-            self.messages, on_step=on_step, on_phase=on_phase, on_thought=on_thought
+            self.messages,
+            on_step=on_step,
+            on_phase=on_phase,
+            on_thought=on_thought,
+            should_cancel=self.cancel_event.is_set,
         )
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
@@ -233,6 +251,7 @@ class AgentSession:
         self._clear_analysis()
         if self.workspace is not None:
             session_id = _remember_session(self.workspace, self.model_id)
+            self.session_id = session_id
             artifact_root = project_artifact_dir(self.workspace, session_id)
             self.agent.artifacts = LocalArtifactStore(self.workspace, artifact_root=artifact_root)
         self.messages = self.agent.opening_messages()
@@ -355,6 +374,82 @@ class AgentSession:
         self.messages.append(ChatMessage(role=Role.USER, content=content))
         self.active_skills.append(skill.name)
         return skill
+
+    def save_state(self) -> None:
+        """Write this conversation to ``.atlas/sessions/<id>/state.json``.
+
+        The file holds the model id, the goal, the message history, and the
+        running totals, so reopening the session restores the region, the
+        dates, the earlier results, and the spend. Image bytes and known
+        secrets are removed before the write; a resumed session re-reads
+        artifacts from the workspace instead of carrying base64 again.
+        """
+        if self.workspace is None or self.session_id is None:
+            return
+        directory = project_session_dir(self.workspace, self.session_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        messages = []
+        for message in self.messages:
+            dumped = message.model_dump(mode="json")
+            dumped["images"] = []
+            messages.append(dumped)
+        payload = {
+            "id": self.session_id,
+            "model": self.model_id,
+            "goal": self.goal,
+            "messages": messages,
+            "totals": self.totals.model_dump(mode="json"),
+            "saved": datetime.now(UTC).isoformat(),
+        }
+        text = json.dumps(payload, indent=2)
+        for secret in self.secrets:
+            if secret:
+                text = text.replace(secret, "[redacted]")
+        target = directory / "state.json"
+        temporary = directory / ".state.json.tmp"
+        temporary.write_text(text + "\n", encoding="utf-8")
+        os.replace(temporary, target)
+
+    def load_state(self, session_id: str) -> bool:
+        """Restore a saved conversation into this session.
+
+        Args:
+            session_id: Directory name under ``.atlas/sessions``.
+
+        Returns:
+            True when a saved state was loaded. A missing file leaves the
+            session untouched and returns False.
+
+        Raises:
+            ValueError: The saved state is not valid JSON or does not match
+                the message schema.
+        """
+        if self.workspace is None:
+            return False
+        directory = project_session_dir(self.workspace, session_id)
+        path = directory / "state.json"
+        if not path.is_file():
+            return False
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("saved session must be a JSON object")
+        messages = [ChatMessage.model_validate(item) for item in payload.get("messages", [])]
+        self.session_id = session_id
+        self.messages = messages
+        self.goal = str(payload.get("goal") or "")
+        totals = payload.get("totals")
+        if isinstance(totals, dict):
+            self.totals = SessionTotals.model_validate(totals)
+        model = payload.get("model")
+        if isinstance(model, str) and model.strip():
+            self.model_id = model.strip()
+            self.totals.model = self.model_id
+        artifact_root = project_artifact_dir(self.workspace, session_id)
+        self.agent.artifacts = LocalArtifactStore(self.workspace, artifact_root=artifact_root)
+        return True
+
+    def _cancel_event_clear(self) -> None:
+        self.cancel_event.clear()
 
     def _require_key(self) -> None:
         if self.requires_api_key and not (self.active_key and self.active_key.strip()):
@@ -552,7 +647,13 @@ def serve(
 def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
     """Read the protocol after the session credential map is bound."""
     _write_line(stdout, _ready_event(session), session.secrets)
-    for line in stdin:
+    lines: queue.Queue[str | None] = queue.Queue()
+    reader = threading.Thread(target=_read_protocol, args=(stdin, lines, session), daemon=True)
+    reader.start()
+    while True:
+        line = lines.get()
+        if line is None:
+            break
         stripped = line.strip()
         if not stripped:
             continue
@@ -575,6 +676,9 @@ def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
             continue
         if kind == "resume":
             _handle_resume(session, stdout)
+            continue
+        if kind == "load_session":
+            _handle_load_session(session, stdout, message)
             continue
         if kind == "new":
             _handle_new(session, stdout)
@@ -614,8 +718,33 @@ def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
             {"type": "error", "message": f"Unknown message type: {kind!r}"},
             session.secrets,
         )
+    reader.join(timeout=1)
     _join_catalog_fetch(session)
     return 0
+
+
+def _read_protocol(stdin: IO[str], lines: queue.Queue[str | None], session: AgentSession) -> None:
+    """Forward protocol lines to the session loop and handle cancels inline.
+
+    A ``cancel`` message is consumed here rather than queued, because the
+    session loop is blocked inside a turn when one arrives. Every other line
+    is queued for the loop, including invalid JSON, so its error event still
+    comes from one place.
+    """
+    for line in stdin:
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            message = json.loads(text)
+        except json.JSONDecodeError:
+            lines.put(text)
+            continue
+        if isinstance(message, dict) and message.get("type") == "cancel":
+            session.cancel_event.set()
+            continue
+        lines.put(text)
+    lines.put(None)
 
 
 def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
@@ -645,6 +774,7 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
             session.secrets,
         )
         return
+    session.save_state()
     _write_line(stdout, _done_event(session, run), session.secrets)
 
 
@@ -667,7 +797,47 @@ def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
             session.secrets,
         )
         return
+    session.save_state()
     _write_line(stdout, _done_event(session, run), session.secrets)
+
+
+def _handle_load_session(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
+    """Restore a saved conversation by id and report the restored state."""
+    session_id = message.get("id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        _write_line(
+            stdout,
+            {"type": "error", "message": "session id must be a non-empty string"},
+            session.secrets,
+        )
+        return
+    try:
+        loaded = session.load_state(session_id.strip())
+    except (OSError, ValueError, ValidationError) as exc:
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"Could not reopen session: {exc}"},
+            session.secrets,
+        )
+        return
+    if not loaded:
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"No saved session {session_id.strip()}"},
+            session.secrets,
+        )
+        return
+    _write_line(
+        stdout,
+        {
+            "type": "session_loaded",
+            "id": session.session_id,
+            "goal": session.goal,
+            "messages": len(session.messages),
+            **_status_fields(session),
+        },
+        session.secrets,
+    )
 
 
 def _handle_new(session: AgentSession, stdout: IO[str]) -> None:
@@ -1484,6 +1654,8 @@ def _done_event(session: AgentSession, run: AgentRun) -> dict[str, Any]:
         "type": "done",
         "response": run.response,
         "stopped_for_limit": run.stopped_for_limit,
+        "stopped_for_budget": run.stopped_for_budget,
+        "cancelled": run.cancelled,
     }
     payload.update(_status_fields(session))
     return payload
@@ -1536,6 +1708,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="atlas.agent.session")
     parser.add_argument("--workspace", default=".")
     parser.add_argument("--model", default=None)
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="SESSION_ID",
+        help="Reopen a saved session from .atlas/sessions/<id>/state.json",
+    )
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace).resolve()
@@ -1575,12 +1753,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             model,
             registry,
             store,
-            # The store root is the session artifact directory, which has no
-            # agent.toml. The budget lives in the workspace config.
+            # Budgets live in the workspace .atlas/agent.toml.
             max_tool_calls=load_max_tool_calls(workspace),
+            max_tokens=load_optional_tokens(workspace),
+            max_spend_usd=load_spend_limit(workspace),
             skills=skills,
         )
         session = AgentSession(agent)
+        session.session_id = session_id
+        if args.resume:
+            session.load_state(args.resume)
         session.requires_api_key = True
         session.home = home
         session.workspace = workspace

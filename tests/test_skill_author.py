@@ -708,16 +708,32 @@ def _tool_arguments(**overrides: object) -> dict[str, object]:
 def test_author_skill_tool_does_not_change_the_default_registry() -> None:
     names = [tool.name for tool in default_registry().definitions]
 
-    assert names[:7] == [
+    core = {
         "bash_tool",
         "edit_file",
+        "glob",
+        "grep",
+        "ls",
+        "patch_file",
+        "read_file",
+        "spectral_indices",
+        "web_fetch",
+        "write_file",
+    }
+    assert core <= set(names)
+    assert set(names) - {
+        "bash_tool",
+        "edit_file",
+        "glob",
+        "grep",
+        "ls",
+        "patch_file",
         "read_file",
         "spectral_indices",
         "web_fetch",
         "write_file",
         "list_tools",
-    ]
-    assert set(names[7:]) == {
+    } == {
         "mask_clouds",
         "rgb_change",
         "flood_mask",
