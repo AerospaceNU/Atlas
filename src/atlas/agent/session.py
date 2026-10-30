@@ -1859,6 +1859,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             approval=args.approval or load_approval(workspace),
             skills=skills,
         )
+        from atlas.agent.tools._subagent import SubagentTool
+
+        def build_child(child_store: LocalArtifactStore, allow_writes: bool, budget: int) -> Agent:
+            child_registry = default_registry()
+            register_skill_tool(child_registry, skills)
+            return Agent(
+                model,
+                child_registry,
+                child_store,
+                max_tool_calls=budget,
+                max_tokens=agent.max_tokens,
+                max_spend_usd=None,
+                read_only=not allow_writes,
+                approval=agent.approval,
+                on_permission=agent.on_permission,
+                skills=skills,
+            )
+
+        registry.register(SubagentTool(build_child))
         session = AgentSession(agent)
         session.session_id = session_id
         if args.resume:
