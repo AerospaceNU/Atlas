@@ -101,7 +101,15 @@ struct ChildProcess {
 impl ChildProcess {
     fn spawn(config: &Config) -> Result<Self> {
         let mut child = Command::new("uv")
-            .args(["run", "python", "-m", "atlas.agent", "--workspace"])
+            .args([
+                "run",
+                "python",
+                "-m",
+                "atlas.agent",
+                "--approval",
+                "ask",
+                "--workspace",
+            ])
             .arg(&config.workspace)
             .current_dir(&config.repo)
             .env("PYTHONUNBUFFERED", "1")
@@ -187,6 +195,10 @@ struct App {
     /// Ask the session for the catalog once so the dashboard can show the
     /// active model's context window without opening the picker.
     lookup_context: bool,
+    /// Tool-call id waiting for /allow or /deny.
+    pending_permission: Option<String>,
+    /// Session ids from the last /sessions listing, newest last.
+    session_names: Vec<String>,
     /// Last wrapped row the transcript can scroll to. Updated while drawing.
     scroll_max: u16,
     ticks: u32,
@@ -382,6 +394,8 @@ impl App {
             menu_index: 0,
             scope_root: "project".to_string(),
             lookup_context: false,
+            pending_permission: None,
+            session_names: Vec::new(),
             scroll_max: 0,
             ticks: 0,
             activity: None,
@@ -451,9 +465,12 @@ impl App {
             ServerMessage::Done {
                 response,
                 stopped_for_limit,
+                stopped_for_budget,
+                cancelled,
                 status,
             } => {
                 self.adopt_status(&status);
+                self.pending_permission = None;
                 if !response.is_empty() {
                     let tps =
                         positive_tps(status.tokens_per_second).unwrap_or(self.tokens_per_second);
@@ -462,11 +479,36 @@ impl App {
                 }
                 self.activity = None;
                 self.waiting_from_stopped = false;
+                if cancelled {
+                    self.transcript
+                        .push(tool_note("turn cancelled; the conversation is kept"));
+                }
+                if stopped_for_budget {
+                    self.transcript.push(tool_note(
+                        "stopped at the token or spend budget in .atlas/agent.toml",
+                    ));
+                }
                 self.status = if stopped_for_limit {
                     Status::Stopped
                 } else {
                     Status::Ready
                 };
+            }
+            ServerMessage::PermissionRequest {
+                id,
+                tool,
+                summary,
+                preview,
+            } => {
+                self.pending_permission = Some(id.clone());
+                self.transcript.push(tool_note(format!(
+                    "approval needed [{id}] {tool}: {summary}"
+                )));
+                if !preview.is_empty() {
+                    self.transcript.push(tool_note(preview));
+                }
+                self.transcript
+                    .push(tool_note(format!("/allow {id}  or  /deny {id}")));
             }
             ServerMessage::Error {
                 message,
@@ -562,6 +604,9 @@ impl App {
                 }
             }
             ServerMessage::Listing { scope, kind, names } => {
+                if kind == "sessions" {
+                    self.session_names = names.clone();
+                }
                 let body = if names.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -1450,6 +1495,23 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
             "scope": app.scope_root,
             "kind": "sessions"
         })),
+        "/allow" | "/deny" => {
+            let allow = command == "/allow";
+            let id = parts
+                .next()
+                .map(|value| value.to_string())
+                .or_else(|| app.pending_permission.clone());
+            match id {
+                Some(id) => {
+                    app.pending_permission = None;
+                    Some(serde_json::json!({"type": "permission", "id": id, "allow": allow}))
+                }
+                None => {
+                    app.transcript.push(tool_note("no approval is pending"));
+                    None
+                }
+            }
+        }
         "/undo" => {
             if parts.next().is_some() {
                 app.transcript.push(tool_note("usage: /undo"));
@@ -1462,8 +1524,18 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
         "/resume" => {
             let id = text.trim().trim_start_matches("/resume").trim();
             if id.is_empty() {
-                app.transcript.push(tool_note("usage: /resume <session-id>"));
-                None
+                match app.session_names.last().cloned() {
+                    Some(newest) => {
+                        app.transcript.clear();
+                        app.status = Status::Waiting;
+                        Some(serde_json::json!({"type": "load_session", "id": newest}))
+                    }
+                    None => {
+                        app.transcript
+                            .push(tool_note("/resume needs an id; run /sessions first"));
+                        None
+                    }
+                }
             } else {
                 app.transcript.clear();
                 app.status = Status::Waiting;

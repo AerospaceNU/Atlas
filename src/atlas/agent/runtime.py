@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import secrets
+import time
 import tomllib
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
 from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied, record_denial
+from atlas.agent.audit import record as audit_event
 from atlas.agent.checkpoints import snapshot
 from atlas.agent.contracts import (
     ChatMessage,
@@ -44,6 +47,7 @@ DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
 _STOPPED_RESPONSE = "Stopped after reaching the configured tool-use limit."
 _STOPPED_BUDGET = "Stopped after reaching the configured token or spend budget."
 _STOPPED_CANCELLED = "Stopped at your request."
+_PREVIEW_LIMIT = 4000
 
 # Tool calls in one assistant turn are independent, so they run concurrently.
 # The cap keeps a model that emits twenty calls from opening twenty shells.
@@ -71,6 +75,24 @@ class AgentStep(BaseModel):
     result: ToolResult | None = None
     error: str | None = None
     error_kind: ErrorKind | None = None
+
+
+class PermissionRequest(BaseModel):
+    """One mutating action waiting for a person's approval.
+
+    Attributes:
+        id: The tool-call id, reused as the approval id.
+        tool: Registered tool name.
+        summary: One line a person can decide on.
+        arguments: The model's arguments, for display only.
+        preview: Unified diff or command text, truncated for the transcript.
+    """
+
+    id: str
+    tool: str
+    summary: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    preview: str = ""
 
 
 class AgentRun(BaseModel):
@@ -125,6 +147,19 @@ def load_optional_limit(
     if value <= 0:
         raise ValueError(f"{key} must be greater than zero")
     return value
+
+
+def load_approval(root: Path) -> Literal["allow", "ask", "deny"]:
+    """Return the approval mode from ``.atlas/agent.toml`` (default ``allow``)."""
+    data = _load_agent_config(root)
+    value = data.get("approval", "allow")
+    if value == "allow":
+        return "allow"
+    if value == "ask":
+        return "ask"
+    if value == "deny":
+        return "deny"
+    raise ValueError("approval must be allow, ask, or deny")
 
 
 def load_read_only(root: Path) -> bool:
@@ -221,6 +256,8 @@ class Agent:
         max_tokens: int | None = None,
         max_spend_usd: float | None = None,
         read_only: bool = False,
+        approval: Literal["allow", "ask", "deny"] = "allow",
+        on_permission: Callable[[PermissionRequest], bool] | None = None,
         skills: Sequence[Skill] | None = None,
     ) -> None:
         if max_tool_calls is None:
@@ -238,6 +275,8 @@ class Agent:
         self.max_tokens = max_tokens
         self.max_spend_usd = max_spend_usd
         self.read_only = read_only
+        self.approval = approval
+        self.on_permission = on_permission
         self.skills = list(skills or [])
         self.instruction_nonce = secrets.token_hex(8)
 
@@ -436,14 +475,19 @@ class Agent:
         *,
         on_phase: Callable[[str, str | None], None] | None = None,
     ) -> list[AgentStep]:
-        """Run one round's tool calls concurrently, returning them in order."""
-        if len(calls) <= 1:
-            if calls and on_phase is not None:
-                on_phase("tool_executing", calls[0].name)
-            return [self._execute(call) for call in calls]
+        """Run one round's tool calls, returning them in request order.
+
+        Read-only calls run concurrently. As soon as one call in the round can
+        change the workspace, the whole batch runs in order: two writes to one
+        file, or an edit beside a patch, must not interleave, and a checkpoint
+        taken in parallel with the write it protects is not a checkpoint.
+        """
+        serial = any(call.name in MUTATING_TOOLS for call in calls) or len(calls) <= 1
         if on_phase is not None:
             for call in calls:
                 on_phase("tool_executing", call.name)
+        if serial:
+            return [self._execute(call) for call in calls]
         with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_TOOLS, len(calls))) as pool:
             return list(pool.map(self._execute, calls))
 
@@ -480,13 +524,11 @@ class Agent:
             _LOGGER.exception("Could not checkpoint %s before %s", path, call.name)
 
     def _execute(self, call: ToolCall) -> AgentStep:
-        if self.read_only and call.name in MUTATING_TOOLS:
-            return AgentStep(
-                call=call,
-                error=f"{call.name} is refused: this session is read-only",
-                error_kind="denied",
-            )
+        decision = self._approve(call)
+        if decision is not None:
+            return AgentStep(call=call, error=decision, error_kind="denied")
         self._checkpoint(call)
+        started = time.perf_counter()
         try:
             result = self.tools.execute(call.name, call.arguments, self.artifacts)
         except Exception as exc:
@@ -496,8 +538,108 @@ class Agent:
                     record_denial(self.artifacts, call.name, error)
                 except Exception:
                     _LOGGER.exception("Could not record a sandbox denial for %s", call.name)
+            audit_event(
+                self.artifacts,
+                "tool",
+                tool=call.name,
+                outcome="error",
+                error_kind=_kind(exc),
+                duration_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
             return AgentStep(call=call, error=error, error_kind=_kind(exc))
+        audit_event(
+            self.artifacts,
+            "tool",
+            tool=call.name,
+            outcome="ok",
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
         return AgentStep(call=call, result=result)
+
+    def _approve(self, call: ToolCall) -> str | None:
+        """Return a refusal message, or None when the call may run.
+
+        A read-only session refuses every mutating tool. Otherwise ``deny``
+        refuses them, ``allow`` runs them, and ``ask`` delegates to
+        ``on_permission``. An ``ask`` session with no approver is treated as
+        deny with an explicit message, never as allow.
+        """
+        if call.name not in MUTATING_TOOLS:
+            return None
+        if self.read_only:
+            return f"{call.name} is refused: this session is read-only"
+        if self.approval == "allow":
+            return None
+        if self.approval == "deny":
+            return f"{call.name} is refused: approval mode is deny"
+        if self.on_permission is None:
+            return f"{call.name} needs approval, but no approver is attached"
+        request = PermissionRequest(
+            id=call.id,
+            tool=call.name,
+            summary=_summary(call),
+            arguments=call.arguments,
+            preview=self._preview(call),
+        )
+        if self.on_permission(request):
+            return None
+        return f"{call.name} was not approved"
+
+    def _preview(self, call: ToolCall) -> str:
+        """Return a short, human-readable preview of what the call would change."""
+        if call.name == "bash_tool":
+            command = call.arguments.get("command")
+            return str(command or "")[:_PREVIEW_LIMIT]
+        path = call.arguments.get("path")
+        if not isinstance(path, str) or not path:
+            return ""
+        try:
+            old = self.artifacts.resolve_read(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, SandboxDenied):
+            old = ""
+        new = _preview_text(old, call.arguments)
+        if new is None:
+            return ""
+        diff = list(
+            difflib.unified_diff(
+                old.splitlines(keepends=True),
+                new.splitlines(keepends=True),
+                fromfile=path,
+                tofile=path,
+            )
+        )
+        return "".join(diff)[:_PREVIEW_LIMIT]
+
+
+def _summary(call: ToolCall) -> str:
+    """Return a one-line description of a mutating call for the approver."""
+    if call.name == "bash_tool":
+        return f"run: {str(call.arguments.get('command') or '')[:200]}"
+    path = call.arguments.get("path")
+    return f"{call.name} {path}" if path else call.name
+
+
+def _preview_text(old: str, arguments: dict[str, Any]) -> str | None:
+    """Return the file text this call would produce, or None when unknown."""
+    if "content" in arguments and isinstance(arguments["content"], str):
+        return arguments["content"]
+    edits = arguments.get("edits")
+    if isinstance(edits, list):
+        text = old
+        for edit in edits:
+            if not isinstance(edit, dict):
+                return None
+            find = edit.get("old_string")
+            replace = edit.get("new_string")
+            if not isinstance(find, str) or not isinstance(replace, str):
+                return None
+            text = text.replace(find, replace, -1 if edit.get("replace_all") else 1)
+        return text
+    find = arguments.get("old_string")
+    replace = arguments.get("new_string")
+    if isinstance(find, str) and isinstance(replace, str):
+        return old.replace(find, replace, 1)
+    return None
 
 
 def _kind(exc: Exception) -> ErrorKind:

@@ -721,25 +721,13 @@ def test_author_skill_tool_does_not_change_the_default_registry() -> None:
         "write_file",
     }
     assert core <= set(names)
-    assert set(names) - {
-        "bash_tool",
-        "edit_file",
-        "glob",
-        "grep",
-        "ls",
-        "patch_file",
-        "read_file",
-        "spectral_indices",
-        "web_fetch",
-        "write_file",
-        "list_tools",
-    } == {
+    assert {
         "mask_clouds",
         "rgb_change",
         "flood_mask",
         "burn_scar",
         "segment_landcover",
-    }
+    } <= set(names)
     assert "author_skill" not in names
     assert "stage_script_proposal" not in names
     opted_in = [

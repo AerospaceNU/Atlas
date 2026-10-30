@@ -28,7 +28,15 @@ pub enum ServerMessage {
     Done {
         response: String,
         stopped_for_limit: bool,
+        stopped_for_budget: bool,
+        cancelled: bool,
         status: StatusSnapshot,
+    },
+    PermissionRequest {
+        id: String,
+        tool: String,
+        summary: String,
+        preview: String,
     },
     Error {
         message: String,
@@ -222,8 +230,23 @@ enum RawMessage {
         response: String,
         #[serde(default)]
         stopped_for_limit: bool,
+        #[serde(default)]
+        stopped_for_budget: bool,
+        #[serde(default)]
+        cancelled: bool,
         #[serde(flatten)]
         status: StatusSnapshot,
+    },
+    #[serde(rename = "permission_request")]
+    PermissionRequest {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        tool: String,
+        #[serde(default)]
+        summary: String,
+        #[serde(default)]
+        preview: String,
     },
     #[serde(rename = "error")]
     Error {
@@ -419,11 +442,26 @@ impl From<RawMessage> for ServerMessage {
             RawMessage::Done {
                 response,
                 stopped_for_limit,
+                stopped_for_budget,
+                cancelled,
                 status,
             } => ServerMessage::Done {
                 response,
                 stopped_for_limit,
+                stopped_for_budget,
+                cancelled,
                 status,
+            },
+            RawMessage::PermissionRequest {
+                id,
+                tool,
+                summary,
+                preview,
+            } => ServerMessage::PermissionRequest {
+                id,
+                tool,
+                summary,
+                preview,
             },
             RawMessage::Error {
                 message,

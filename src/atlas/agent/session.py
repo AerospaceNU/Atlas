@@ -29,6 +29,7 @@ from atlas.agent.analysis_skill import (
     successful_steps,
 )
 from atlas.agent.artifacts import LocalArtifactStore
+from atlas.agent.audit import record as audit_event
 from atlas.agent.checkpoints import restore_latest
 from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
 from atlas.agent.images import ingest_images
@@ -83,6 +84,7 @@ from atlas.agent.runtime import (
     AgentRun,
     AgentStep,
     ensure_agent_config,
+    load_approval,
     load_home_skills_enabled,
     load_max_tool_calls,
     load_model,
@@ -172,6 +174,10 @@ class AgentSession:
         self.cancel_event = threading.Event()
         # Set when this session has a directory under .atlas/sessions.
         self.session_id: str | None = None
+        # Approval round-trip. The reader thread fills a slot when a
+        # ``permission`` message arrives; the turn waits on it.
+        self.permission_slots: dict[str, list[object]] = {}
+        self.permission_lock = threading.Lock()
 
     def turn(
         self,
@@ -450,6 +456,52 @@ class AgentSession:
         self.agent.artifacts = LocalArtifactStore(self.workspace, artifact_root=artifact_root)
         return True
 
+    def ask_permission(self, request: Any, emit: Callable[[dict[str, Any]], None]) -> bool:
+        """Ask the interface to approve one mutating call.
+
+        The request is written to the client, then this call blocks until a
+        matching ``permission`` message arrives or :data:`PERMISSION_TIMEOUT`
+        seconds pass. A timeout is a refusal, so an unattended session fails
+        closed.
+
+        Args:
+            request: ``PermissionRequest`` from the runtime.
+            emit: Callback that writes one protocol event.
+
+        Returns:
+            True when the person allowed the call.
+        """
+        slot: list[object] = [threading.Event(), False]
+        with self.permission_lock:
+            self.permission_slots[request.id] = slot
+        emit(
+            {
+                "type": "permission_request",
+                "id": request.id,
+                "tool": request.tool,
+                "summary": request.summary,
+                "preview": request.preview,
+            }
+        )
+        event = slot[0]
+        assert isinstance(event, threading.Event)
+        event.wait(PERMISSION_TIMEOUT)
+        with self.permission_lock:
+            self.permission_slots.pop(request.id, None)
+        return bool(slot[1])
+
+    def resolve_permission(self, request_id: str, allow: bool) -> bool:
+        """Record an approval answer and wake the waiting turn."""
+        with self.permission_lock:
+            slot = self.permission_slots.get(request_id)
+            if slot is None:
+                return False
+            slot[1] = allow
+            event = slot[0]
+            assert isinstance(event, threading.Event)
+            event.set()
+        return True
+
     def _cancel_event_clear(self) -> None:
         self.cancel_event.clear()
 
@@ -466,6 +518,16 @@ class AgentSession:
                 prompt_price=prompt_price,
                 completion_price=completion_price,
                 cache_read_price=cache_read_price,
+            )
+            timing = call.timing
+            audit_event(
+                self.agent.artifacts,
+                "model",
+                model=self.model_id or self.totals.model,
+                http_status=timing.http_status if timing else None,
+                duration_s=timing.elapsed_seconds if timing else None,
+                prompt_tokens=call.usage.prompt_tokens,
+                completion_tokens=call.usage.completion_tokens,
             )
 
     def save_finished_skill(
@@ -585,6 +647,9 @@ class AgentSession:
         self._analysis_response = ""
 
 
+PERMISSION_TIMEOUT = 300.0
+
+
 def _write_line(stdout: IO[str], payload: dict[str, Any], secrets: list[str]) -> None:
     text = json.dumps(_redact_value(payload, secrets), ensure_ascii=False)
     with _STDOUT_LOCK:
@@ -635,6 +700,10 @@ def serve(
     """
     if redact and redact not in session.secrets:
         session.secrets.append(redact)
+    session.agent.on_permission = lambda request: session.ask_permission(
+        request,
+        lambda event: _write_line(stdout, event, session.secrets),
+    )
     bind_session_credentials(session.credential_keys)
     bind_session_secrets(session.secrets)
     quiet_http_client_logs()
@@ -747,6 +816,11 @@ def _read_protocol(stdin: IO[str], lines: queue.Queue[str | None], session: Agen
             continue
         if isinstance(message, dict) and message.get("type") == "cancel":
             session.cancel_event.set()
+            continue
+        if isinstance(message, dict) and message.get("type") == "permission":
+            request_id = message.get("id")
+            if isinstance(request_id, str):
+                session.resolve_permission(request_id, bool(message.get("allow")))
             continue
         lines.put(text)
     lines.put(None)
@@ -1727,6 +1801,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--workspace", default=".")
     parser.add_argument("--model", default=None)
     parser.add_argument(
+        "--approval",
+        default=None,
+        choices=("allow", "ask", "deny"),
+        help="Per-call approval for mutating tools (default: agent.toml, else allow).",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         metavar="SESSION_ID",
@@ -1776,6 +1856,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_tokens=load_optional_tokens(workspace),
             max_spend_usd=load_spend_limit(workspace),
             read_only=load_read_only(workspace),
+            approval=args.approval or load_approval(workspace),
             skills=skills,
         )
         session = AgentSession(agent)
