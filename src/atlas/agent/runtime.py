@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
 
 from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied, record_denial
+from atlas.agent.checkpoints import snapshot
 from atlas.agent.contracts import (
     ChatMessage,
     ModelCall,
@@ -48,7 +49,19 @@ _STOPPED_CANCELLED = "Stopped at your request."
 # The cap keeps a model that emits twenty calls from opening twenty shells.
 _MAX_PARALLEL_TOOLS = 4
 
-ErrorKind = Literal["validation", "unknown_tool", "tool_failure", "limit", "cancelled", "budget"]
+# Tools that change the workspace. A read-only session refuses them, and each
+# one is checkpointed before it runs so /undo can put the file back.
+MUTATING_TOOLS = frozenset({"bash_tool", "edit_file", "patch_file", "write_file"})
+
+ErrorKind = Literal[
+    "validation",
+    "unknown_tool",
+    "tool_failure",
+    "limit",
+    "cancelled",
+    "budget",
+    "denied",
+]
 
 
 class AgentStep(BaseModel):
@@ -111,6 +124,15 @@ def load_optional_limit(
         raise ValueError(f"{key} must be an integer")
     if value <= 0:
         raise ValueError(f"{key} must be greater than zero")
+    return value
+
+
+def load_read_only(root: Path) -> bool:
+    """Return whether ``.atlas/agent.toml`` marks this workspace read-only."""
+    data = _load_agent_config(root)
+    value = data.get("read_only", False)
+    if not isinstance(value, bool):
+        raise ValueError("read_only must be true or false")
     return value
 
 
@@ -198,6 +220,7 @@ class Agent:
         max_tool_calls: int | None = None,
         max_tokens: int | None = None,
         max_spend_usd: float | None = None,
+        read_only: bool = False,
         skills: Sequence[Skill] | None = None,
     ) -> None:
         if max_tool_calls is None:
@@ -214,6 +237,7 @@ class Agent:
         self.max_tool_calls = max_tool_calls
         self.max_tokens = max_tokens
         self.max_spend_usd = max_spend_usd
+        self.read_only = read_only
         self.skills = list(skills or [])
         self.instruction_nonce = secrets.token_hex(8)
 
@@ -443,7 +467,26 @@ class Agent:
             )
         return AgentRun(response=_STOPPED_CANCELLED, steps=steps, cancelled=True, calls=calls)
 
+    def _checkpoint(self, call: ToolCall) -> None:
+        """Snapshot a file a mutating tool is about to change."""
+        if call.name not in MUTATING_TOOLS:
+            return
+        path = call.arguments.get("path")
+        if not isinstance(path, str) or not path:
+            return
+        try:
+            snapshot(self.artifacts, path)
+        except Exception:
+            _LOGGER.exception("Could not checkpoint %s before %s", path, call.name)
+
     def _execute(self, call: ToolCall) -> AgentStep:
+        if self.read_only and call.name in MUTATING_TOOLS:
+            return AgentStep(
+                call=call,
+                error=f"{call.name} is refused: this session is read-only",
+                error_kind="denied",
+            )
+        self._checkpoint(call)
         try:
             result = self.tools.execute(call.name, call.arguments, self.artifacts)
         except Exception as exc:

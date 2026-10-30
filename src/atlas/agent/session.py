@@ -29,6 +29,7 @@ from atlas.agent.analysis_skill import (
     successful_steps,
 )
 from atlas.agent.artifacts import LocalArtifactStore
+from atlas.agent.checkpoints import restore_latest
 from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
 from atlas.agent.images import ingest_images
 from atlas.agent.layout import (
@@ -86,6 +87,7 @@ from atlas.agent.runtime import (
     load_max_tool_calls,
     load_model,
     load_optional_tokens,
+    load_read_only,
     load_spend_limit,
 )
 from atlas.agent.skill_author import normalize_skill_name
@@ -677,6 +679,9 @@ def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
         if kind == "resume":
             _handle_resume(session, stdout)
             continue
+        if kind == "undo":
+            _handle_undo(session, stdout)
+            continue
         if kind == "load_session":
             _handle_load_session(session, stdout, message)
             continue
@@ -799,6 +804,19 @@ def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
         return
     session.save_state()
     _write_line(stdout, _done_event(session, run), session.secrets)
+
+
+def _handle_undo(session: AgentSession, stdout: IO[str]) -> None:
+    """Restore the newest checkpointed file and report which one."""
+    restored = restore_latest(session.agent.artifacts)
+    if restored is None:
+        _write_line(
+            stdout,
+            {"type": "undo", "restored": None, "message": "no checkpoint to restore"},
+            session.secrets,
+        )
+        return
+    _write_line(stdout, {"type": "undo", "restored": restored}, session.secrets)
 
 
 def _handle_load_session(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
@@ -1757,6 +1775,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_tool_calls=load_max_tool_calls(workspace),
             max_tokens=load_optional_tokens(workspace),
             max_spend_usd=load_spend_limit(workspace),
+            read_only=load_read_only(workspace),
             skills=skills,
         )
         session = AgentSession(agent)

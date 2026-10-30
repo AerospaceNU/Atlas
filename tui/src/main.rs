@@ -1450,6 +1450,15 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
             "scope": app.scope_root,
             "kind": "sessions"
         })),
+        "/undo" => {
+            if parts.next().is_some() {
+                app.transcript.push(tool_note("usage: /undo"));
+                None
+            } else {
+                app.transcript.push(tool_note("restoring the newest checkpoint"));
+                Some(serde_json::json!({"type": "undo"}))
+            }
+        }
         "/resume" => {
             let id = text.trim().trim_start_matches("/resume").trim();
             if id.is_empty() {
