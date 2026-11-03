@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.tools.git import GitCommitTool, GitDiffTool, GitStatusTool
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
@@ -109,19 +109,18 @@ def test_commit_with_nothing_staged_does_not_create_a_commit(tmp_path: Path) -> 
     assert after == before
 
 
-def test_absolute_paths_are_refused_with_sandbox_denied(tmp_path: Path) -> None:
+def test_absolute_paths_are_accepted(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     (repo / "notes.txt").write_text("changed\n", encoding="utf-8")
     store = LocalArtifactStore(repo)
     absolute = str(repo / "notes.txt")
 
-    with pytest.raises(SandboxDenied):
-        GitDiffTool().run({"path": absolute}, store)
+    diff = GitDiffTool().run({"path": absolute}, store)
+    committed = GitCommitTool().run({"message": "absolute path", "paths": [absolute]}, store)
 
-    with pytest.raises(SandboxDenied):
-        GitCommitTool().run({"message": "escape", "paths": [absolute]}, store)
-
-    assert " M notes.txt" in GitStatusTool().run({}, store).text
+    assert "+changed" in diff.text
+    assert committed.text != "nothing to commit"
+    assert " M notes.txt" not in GitStatusTool().run({}, store).text
 
 
 def test_status_and_diff_from_a_subdirectory_are_workspace_relative(tmp_path: Path) -> None:

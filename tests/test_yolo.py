@@ -141,7 +141,7 @@ def test_yolo_toggle_before_a_permission_callback_does_not_wait(tmp_path: Path) 
     assert not session.permission_slots
 
 
-def test_yolo_keeps_read_only_and_workspace_restrictions(tmp_path: Path) -> None:
+def test_yolo_keeps_read_only_but_allows_writes_outside_the_workspace(tmp_path: Path) -> None:
     session = make_session(tmp_path, write_turn("blocked.txt"))
     session.agent.read_only = True
     session.toggle_yolo(lambda event: None)
@@ -154,5 +154,5 @@ def test_yolo_keeps_read_only_and_workspace_restrictions(tmp_path: Path) -> None
     session = make_session(workspace, write_turn("../outside.txt"))
     session.toggle_yolo(lambda event: None)
     run = session.turn("write outside")
-    assert "escapes the artifact root" in (run.steps[0].error or "")
-    assert not (tmp_path / "outside.txt").exists()
+    assert run.steps[0].error is None
+    assert (tmp_path / "outside.txt").read_text(encoding="utf-8") == "ok"

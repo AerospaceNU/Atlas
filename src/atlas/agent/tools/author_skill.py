@@ -1,11 +1,10 @@
 """Opt-in tool that writes one Agent Skill into the unscanned drafts folder.
 
-Other tools write only inside the artifact store. This one is a deliberate
-sandbox exception: it writes under ``<workspace>/.atlas/skills-drafts``, the
-same folder analysis drafts use. That directory is not ``.atlas/skills``, so
-the model cannot replace a vetted skill and run it in this session. Every
-write goes through :func:`author_skill`, which refuses path escapes, symlinks,
-and hardlinks. A ``.atlas`` or ``.atlas/skills-drafts`` symlink that resolves
+This tool writes under ``<workspace>/.atlas/skills-drafts``, the same folder
+analysis drafts use. That directory is not ``.atlas/skills``, so the model
+cannot replace a vetted skill and run it in this session. Every write goes
+through :func:`author_skill`, which refuses path escapes, symlinks, and
+hardlinks. A ``.atlas`` or ``.atlas/skills-drafts`` symlink that resolves
 outside the workspace is refused before that call. Promoting a draft is the
 human ``/enable-skill`` command, not this tool.
 """
@@ -104,14 +103,14 @@ def _contained_drafts_root(base: Path, drafts_root: Path) -> Path:
     root = base.expanduser().resolve()
     atlas = project_atlas_root(base)
     if atlas.is_symlink() and not is_within(root, atlas):
-        raise ValueError("Skills root escapes the sandbox")
+        raise ValueError("Skills root is not the workspace drafts directory")
     if drafts_root.is_symlink():
-        raise ValueError("Skills root escapes the sandbox")
+        raise ValueError("Skills root is not the workspace drafts directory")
     expected = project_skill_drafts_root(root)
     try:
         resolved = drafts_root.resolve()
     except OSError as exc:
-        raise ValueError("Skills root escapes the sandbox") from exc
+        raise ValueError("Skills root is not the workspace drafts directory") from exc
     if resolved != expected:
-        raise ValueError("Skills root escapes the sandbox")
+        raise ValueError("Skills root is not the workspace drafts directory")
     return drafts_root

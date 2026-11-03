@@ -64,7 +64,7 @@ def repo_root() -> Path | None:
 
 
 def weights_root() -> Path:
-    """Directory that holds exported weights (not the artifact sandbox).
+    """Directory that holds exported weights (separate from the artifact root).
 
     ``ATLAS_WEIGHTS_DIR`` wins. Otherwise ``<repo>/weights``, then
     :func:`atlas.agent.layout.user_weights_dir` (``~/.atlas/weights``) when

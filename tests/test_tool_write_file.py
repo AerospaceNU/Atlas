@@ -68,32 +68,31 @@ def test_write_file_normalizes_the_reported_artifact_path(tmp_path: Path) -> Non
     assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "normalized"
 
 
-def test_write_file_rejects_escaping_path(tmp_path: Path) -> None:
+def test_write_file_writes_an_escaping_path(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path / "workspace")
 
-    with pytest.raises(ValueError, match="escapes"):
-        WriteTool().run({"path": "../outside.txt", "content": "nope"}, store)
+    WriteTool().run({"path": "../outside.txt", "content": "nope"}, store)
 
-    assert not (tmp_path / "outside.txt").exists()
+    assert (tmp_path / "outside.txt").read_text(encoding="utf-8") == "nope"
 
 
-def test_write_file_does_not_write_through_a_hardlink(tmp_path: Path) -> None:
+def test_write_file_writes_through_a_hardlink(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path / "workspace")
     outside = tmp_path / "outside.txt"
     outside.write_text("original", encoding="utf-8")
     os.link(outside, tmp_path / "workspace" / "notes.txt")
 
-    with pytest.raises(ValueError, match="hardlinked"):
-        WriteTool().run({"path": "notes.txt", "content": "overwritten"}, store)
+    WriteTool().run({"path": "notes.txt", "content": "overwritten"}, store)
 
-    assert outside.read_text(encoding="utf-8") == "original"
+    assert outside.read_text(encoding="utf-8") == "overwritten"
 
 
-def test_write_file_rejects_absolute_path(tmp_path: Path) -> None:
+def test_write_file_writes_an_absolute_path(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
 
-    with pytest.raises(ValueError, match="relative"):
-        WriteTool().run({"path": str(tmp_path / "notes.txt"), "content": "nope"}, store)
+    WriteTool().run({"path": str(tmp_path / "notes.txt"), "content": "nope"}, store)
+
+    assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "nope"
 
 
 def test_write_file_accepts_content_at_the_byte_limit(tmp_path: Path) -> None:

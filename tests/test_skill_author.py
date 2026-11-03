@@ -645,7 +645,7 @@ def test_author_skill_tool_refuses_a_drafts_symlink_to_live_skills(tmp_path: Pat
     (vetted / "SKILL.md").write_text("vetted\n", encoding="utf-8")
     (workspace / ".atlas" / "skills-drafts").symlink_to(skills, target_is_directory=True)
 
-    with pytest.raises(ValueError, match="escapes"):
+    with pytest.raises(ValueError, match="drafts directory"):
         AuthorSkillTool().run(_tool_arguments(), store)
 
     assert (vetted / "SKILL.md").read_text(encoding="utf-8") == "vetted\n"
@@ -658,7 +658,7 @@ def test_author_skill_tool_refuses_a_drafts_symlink_outside_the_workspace(tmp_pa
     outside.mkdir()
     (workspace / ".atlas" / "skills-drafts").symlink_to(outside, target_is_directory=True)
 
-    with pytest.raises(ValueError, match="escapes"):
+    with pytest.raises(ValueError, match="drafts directory"):
         AuthorSkillTool().run(_tool_arguments(), store)
 
     assert not any(outside.rglob("SKILL.md"))
@@ -672,7 +672,7 @@ def test_author_skill_tool_refuses_an_atlas_symlink_outside_the_workspace(tmp_pa
     (workspace / ".atlas").symlink_to(outside, target_is_directory=True)
     store = LocalArtifactStore(tmp_path / "artifacts", read_root=workspace)
 
-    with pytest.raises(ValueError, match="escapes"):
+    with pytest.raises(ValueError, match="drafts directory"):
         AuthorSkillTool().run(_tool_arguments(), store)
 
     assert not any(outside.rglob("SKILL.md"))

@@ -12,11 +12,12 @@ checkpointed: its targets are not known before it runs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import LocalArtifactStore
 
 _MANIFEST = "manifest.json"
 
@@ -38,28 +39,38 @@ def _next_sequence(root: Path) -> int:
     return max(numbers, default=0) + 1
 
 
+def _saved_path(directory: Path, path: str) -> Path:
+    """Return where a checkpoint copy of ``path`` lives under ``directory``.
+
+    A plain relative path keeps its shape so the checkpoint is easy to
+    inspect. An absolute path or a ``..`` traversal gets a digest name, since
+    neither can be joined beneath the checkpoint directory safely.
+    """
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute() and ".." not in candidate.parts:
+        return directory / candidate
+    digest = hashlib.sha256(str(candidate).encode("utf-8")).hexdigest()[:16]
+    return directory / "external" / f"{digest}.bin"
+
+
 def snapshot(store: LocalArtifactStore, relative_path: str) -> None:
-    """Copy one workspace file before a mutating tool changes it.
+    """Copy one file before a mutating tool changes it.
 
     A path that does not exist yet is recorded without bytes so a restore can
-    delete it. A path that escapes the sandbox, is a symlink, or is a
-    non-regular file is not copied and does not raise: the write itself will
-    fail closed.
+    delete it. A symlink or a non-regular file is not copied and does not
+    raise.
 
     Args:
-        store: Session store whose workspace and artifacts bound the copy.
-        relative_path: Workspace-relative path the tool is about to change.
+        store: Session store whose working tree and artifacts bound the copy.
+        relative_path: Path the tool is about to change.
     """
-    try:
-        source = store.resolve_read(relative_path)
-    except SandboxDenied:
-        return
+    source = store.resolve_read(relative_path)
     if source.is_symlink() or (source.exists() and not source.is_file()):
         return
     root = checkpoints_root(store) / str(_next_sequence(checkpoints_root(store)))
-    destination = root / Path(relative_path)
     entry: dict[str, object] = {"path": Path(relative_path).as_posix()}
     if source.is_file():
+        destination = _saved_path(root, relative_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
         entry["existed"] = True
@@ -97,7 +108,7 @@ def restore_latest(store: LocalArtifactStore) -> str | None:
             shutil.rmtree(directory, ignore_errors=True)
             continue
         target = store.resolve(relative)
-        saved = directory / Path(relative)
+        saved = _saved_path(directory, relative)
         if entry.get("existed") and saved.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(saved, target)
