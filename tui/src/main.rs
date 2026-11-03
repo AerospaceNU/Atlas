@@ -1,9 +1,13 @@
 //! Minimal terminal client for the Atlas agent session protocol.
 
+mod approval;
 mod logo;
 mod markdown;
 mod protocol;
 mod theme;
+
+#[cfg(test)]
+mod approval_tests;
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -14,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use approval::PermissionPrompt;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEventKind,
@@ -195,8 +200,8 @@ struct App {
     /// Ask the session for the catalog once so the dashboard can show the
     /// active model's context window without opening the picker.
     lookup_context: bool,
-    /// Tool-call id waiting for /allow or /deny.
-    pending_permission: Option<String>,
+    /// A focused approval prompt, independent of the compose draft.
+    pending_permission: Option<PermissionPrompt>,
     /// Session ids from the last /sessions listing, newest last.
     session_names: Vec<String>,
     /// Last wrapped row the transcript can scroll to. Updated while drawing.
@@ -422,6 +427,7 @@ impl App {
             }
             ServerMessage::Step {
                 name,
+                call_id,
                 ok,
                 arguments,
                 text,
@@ -430,6 +436,13 @@ impl App {
                 artifacts,
                 ..
             } => {
+                if self
+                    .pending_permission
+                    .as_ref()
+                    .is_some_and(|request| request.id == call_id)
+                {
+                    self.pending_permission = None;
+                }
                 let label = if ok { name } else { format!("{name} failed") };
                 let body = tool_body(
                     &arguments,
@@ -500,21 +513,17 @@ impl App {
                 summary,
                 preview,
             } => {
-                self.pending_permission = Some(id.clone());
-                self.transcript.push(tool_note(format!(
-                    "approval needed [{id}] {tool}: {summary}"
-                )));
-                if !preview.is_empty() {
-                    self.transcript.push(tool_note(preview));
-                }
-                self.transcript
-                    .push(tool_note(format!("/allow {id}  or  /deny {id}")));
+                finish_streams(self);
+                self.pending_permission = Some(PermissionPrompt::new(id, tool, summary, preview));
+                self.status = Status::Waiting;
+                self.activity = None;
             }
             ServerMessage::Error {
                 message,
                 status_line,
                 ..
             } => {
+                self.pending_permission = None;
                 self.transcript
                     .push(TranscriptLine::Assistant(StreamText::settled(format!(
                         "error: {message}"
@@ -900,12 +909,22 @@ fn event_loop(
                         return Ok(());
                     }
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => nudge_scroll(app, -3),
-                    MouseEventKind::ScrollDown => nudge_scroll(app, 3),
-                    MouseEventKind::Down(MouseButton::Left) => select_tool_at(app, mouse.row),
-                    _ => {}
-                },
+                Event::Mouse(mouse) => {
+                    if let Some(prompt) = app.pending_permission.as_mut() {
+                        if let Some(allow) = prompt.mouse(mouse) {
+                            send_permission(app, child, allow)?;
+                        }
+                    } else {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => nudge_scroll(app, -3),
+                            MouseEventKind::ScrollDown => nudge_scroll(app, 3),
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                select_tool_at(app, mouse.row)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -918,6 +937,12 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         child.shutdown();
         return Ok(true);
+    }
+    if let Some(prompt) = app.pending_permission.as_mut() {
+        if let Some(allow) = prompt.key(key) {
+            send_permission(app, child, allow)?;
+        }
+        return Ok(false);
     }
     if key.code == KeyCode::Esc && matches!(app.mode, Mode::Compose) && !app.input.starts_with('/')
     {
@@ -951,6 +976,26 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
         }
     }
     Ok(false)
+}
+
+fn send_permission(app: &mut App, child: &mut ChildProcess, allow: bool) -> Result<()> {
+    if let Some(prompt) = app.pending_permission.as_ref() {
+        child.send(serde_json::json!({"type": "permission", "id": prompt.id, "allow": allow}))?;
+        record_permission(app, allow);
+    }
+    Ok(())
+}
+
+fn record_permission(app: &mut App, allow: bool) {
+    if let Some(prompt) = app.pending_permission.take() {
+        let decision = if allow { "Allowed once" } else { "Denied" };
+        app.transcript.push(TranscriptLine::Tool(ToolLine {
+            label: format!("{decision}: {}", prompt.tool),
+            body: prompt.body().lines().map(str::to_string).collect(),
+            expanded: false,
+        }));
+        app.follow = true;
+    }
 }
 
 fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<bool> {
@@ -1466,6 +1511,7 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
                 app.status = Status::Ready;
                 app.waiting_from_stopped = false;
                 app.activity = None;
+                app.pending_permission = None;
                 app.selected = None;
                 app.reveal_selected = false;
                 app.scroll = 0;
@@ -1497,13 +1543,20 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
         })),
         "/allow" | "/deny" => {
             let allow = command == "/allow";
-            let id = parts
-                .next()
-                .map(|value| value.to_string())
-                .or_else(|| app.pending_permission.clone());
+            let id = parts.next().map(|value| value.to_string()).or_else(|| {
+                app.pending_permission
+                    .as_ref()
+                    .map(|prompt| prompt.id.clone())
+            });
             match id {
                 Some(id) => {
-                    app.pending_permission = None;
+                    if app
+                        .pending_permission
+                        .as_ref()
+                        .is_some_and(|prompt| prompt.id == id)
+                    {
+                        record_permission(app, allow);
+                    }
                     Some(serde_json::json!({"type": "permission", "id": id, "allow": allow}))
                 }
                 None => {
@@ -2186,6 +2239,26 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let outer = inset(area, 1, 2);
     if outer.width < 8 || outer.height < 4 {
         render_status(frame, app, outer);
+        return;
+    }
+
+    if let Some(prompt) = app.pending_permission.as_ref() {
+        let status_height = status_block_rows(&dashboard_text(app), outer.width);
+        let prompt_height = prompt.rows(outer.width).min(outer.height);
+        let status_height = status_height.min(outer.height.saturating_sub(prompt_height));
+        let [transcript_area, prompt_area, status_area] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(prompt_height),
+            Constraint::Length(status_height),
+        ])
+        .areas(outer);
+        render_transcript(frame, app, transcript_area);
+        if let Some(prompt) = app.pending_permission.as_mut() {
+            prompt.render(frame, prompt_area);
+        }
+        if status_area.height > 0 {
+            render_status(frame, app, status_area);
+        }
         return;
     }
 
@@ -2911,6 +2984,9 @@ fn strip_model_field(status_line: &str) -> String {
 }
 
 fn status_hint(app: &App) -> String {
+    if app.pending_permission.is_some() {
+        return "Approval applies to this call only".to_string();
+    }
     let mut hint = if !app.session_open {
         "ctrl-c quit".to_string()
     } else if app.status == Status::Stopped {
@@ -2927,6 +3003,9 @@ fn status_hint(app: &App) -> String {
 fn status_label(app: &App) -> (&'static str, Color) {
     if !app.session_open {
         return ("session ended", RED);
+    }
+    if app.pending_permission.is_some() {
+        return ("awaiting approval", YELLOW);
     }
     match app.status {
         Status::Ready => ("ready", GRAY_BRIGHT),
@@ -3005,6 +3084,8 @@ fn note_session_closed(app: &mut App) {
         return;
     }
     app.session_open = false;
+    app.pending_permission = None;
+    app.activity = None;
     let detail = app
         .last_stderr
         .clone()

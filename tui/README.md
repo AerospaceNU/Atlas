@@ -41,10 +41,17 @@ and its files under `<workspace>/.atlas/artifacts/<id>/`. The directory list
 is `docs/atlas-layout.md`.
 
 Keys: `enter` sends the input line, `ctrl-r` resumes a turn that stopped at the
-tool-call limit, `ctrl-c` / `esc` quits. `PageUp` / `PageDown` scroll. `/new`
+tool-call limit, and `ctrl-c` quits. `esc` cancels a running turn, closes a menu,
+or quits when idle. `PageUp` / `PageDown` scroll. `/new`
 starts a fresh conversation and clears the transcript. `/skill <name>` applies
 a workspace skill for the rest of this conversation. The `.atlas` copy wins
 over `.agents` when both exist.
+
+When a tool needs approval, an **Approval required** panel shows the command
+or file preview. Use the arrow keys or `Tab` to choose **Allow once** or **Deny**,
+then press `Enter`. You can also click a choice. **Deny** is selected initially,
+and `Esc` denies the call. Use `PageUp`, `PageDown`, or the mouse wheel to scroll
+a long preview. The panel keeps any message you were composing.
 
 ## Adding a tool
 
