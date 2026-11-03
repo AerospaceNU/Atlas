@@ -15,6 +15,7 @@ use crate::wrap_text;
 pub(super) struct PermissionPrompt {
     pub id: String,
     pub tool: String,
+    pub command: String,
     summary: String,
     preview: String,
     /// Enter must never approve an action merely because the prompt appeared.
@@ -29,6 +30,7 @@ impl PermissionPrompt {
         Self {
             id,
             tool,
+            command: String::new(),
             summary,
             preview,
             allow: false,
@@ -110,16 +112,23 @@ impl PermissionPrompt {
             self.choices.push((row, *allow));
         }
         let scroll_hint = if self.max_scroll > 0 {
-            "Esc deny  PgUp/PgDn scroll"
+            "Esc deny  /yolo  PgUp/PgDn scroll"
         } else {
-            "Esc deny"
+            "Esc deny  /yolo skip approvals"
         };
-        frame.render_widget(
-            Paragraph::new(vec![
+        let hints_text = if self.command.is_empty() {
+            vec![
                 Line::from("↑↓/Tab choose  Enter confirm"),
                 Line::from(scroll_hint),
-            ])
-            .style(Style::default().fg(GRAY)),
+            ]
+        } else {
+            vec![
+                Line::from("Enter toggle YOLO  Esc back"),
+                Line::from(format!("› {}", self.command)),
+            ]
+        };
+        frame.render_widget(
+            Paragraph::new(hints_text).style(Style::default().fg(GRAY)),
             hints,
         );
     }

@@ -8,6 +8,8 @@ mod theme;
 
 #[cfg(test)]
 mod approval_tests;
+#[cfg(test)]
+mod yolo_tests;
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -189,6 +191,7 @@ struct App {
     follow: bool,
     status_line: String,
     model_id: String,
+    yolo_enabled: bool,
     mode: Mode,
     picker_filter: String,
     picker_index: usize,
@@ -392,6 +395,7 @@ impl App {
             follow: true,
             status_line: default_status_line(),
             model_id: String::new(),
+            yolo_enabled: false,
             mode: Mode::Compose,
             picker_filter: String::new(),
             picker_index: 0,
@@ -418,6 +422,17 @@ impl App {
 
     fn apply(&mut self, message: ServerMessage) {
         match message {
+            ServerMessage::Yolo { enabled } => {
+                self.yolo_enabled = enabled;
+                if enabled {
+                    self.pending_permission = None;
+                }
+                self.transcript.push(tool_note(if enabled {
+                    "YOLO on: tool calls run without approval"
+                } else {
+                    "YOLO off: tool calls require approval"
+                }));
+            }
             ServerMessage::Ready { tools, status, .. } => {
                 self.tools = tools.into_iter().map(|tool| tool.name).collect();
                 self.adopt_status(&status);
@@ -720,6 +735,9 @@ impl App {
     }
 
     fn adopt_status(&mut self, status: &protocol::StatusSnapshot) {
+        if let Some(enabled) = status.yolo_enabled {
+            self.yolo_enabled = enabled;
+        }
         if !status.model.is_empty() {
             self.model_id = status.model.clone();
         }
@@ -939,7 +957,12 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
         return Ok(true);
     }
     if let Some(prompt) = app.pending_permission.as_mut() {
-        if let Some(allow) = prompt.key(key) {
+        if !prompt.command.is_empty() || key.code == KeyCode::Char('/') {
+            let toggle = permission_command(prompt, key);
+            if toggle {
+                child.send(serde_json::json!({"type": "yolo"}))?;
+            }
+        } else if let Some(allow) = prompt.key(key) {
             send_permission(app, child, allow)?;
         }
         return Ok(false);
@@ -986,6 +1009,35 @@ fn send_permission(app: &mut App, child: &mut ChildProcess, allow: bool) -> Resu
     Ok(())
 }
 
+fn permission_command(prompt: &mut PermissionPrompt, key: KeyEvent) -> bool {
+    if key.kind != KeyEventKind::Press
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => prompt.command.clear(),
+        KeyCode::Backspace => {
+            prompt.command.pop();
+        }
+        KeyCode::Tab => prompt.command = "/yolo".to_string(),
+        KeyCode::Enter if prompt.command == "/yolo" => {
+            prompt.command.clear();
+            return true;
+        }
+        KeyCode::Char(ch) => {
+            let next = format!("{}{ch}", prompt.command);
+            if "/yolo".starts_with(&next) {
+                prompt.command = next;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 fn record_permission(app: &mut App, allow: bool) {
     if let Some(prompt) = app.pending_permission.take() {
         let decision = if allow { "Allowed once" } else { "Denied" };
@@ -999,6 +1051,11 @@ fn record_permission(app: &mut App, allow: bool) {
 }
 
 fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<bool> {
+    if key.code == KeyCode::Enter && app.session_open && app.input.trim() == "/yolo" {
+        app.input.clear();
+        handle_slash(app, child, "/yolo")?;
+        return Ok(false);
+    }
     let menu_open = !menu_options(&app.input).is_empty();
     match key.code {
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1502,6 +1559,14 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
     let mut parts = text.split_whitespace();
     let command = parts.next().unwrap_or("");
     match command {
+        "/yolo" => {
+            if parts.next().is_some() {
+                app.transcript.push(tool_note("usage: /yolo"));
+                None
+            } else {
+                Some(serde_json::json!({"type": "yolo"}))
+            }
+        }
         "/new" => {
             if parts.next().is_some() {
                 app.transcript.push(tool_note("usage: /new"));
@@ -1763,7 +1828,7 @@ fn key_command(
 
 const PICKER_PAGE: usize = 8;
 /// Slash commands stay on one page so a new command is not clipped off `/`.
-const MENU_PAGE: usize = 12;
+const MENU_PAGE: usize = 13;
 
 /// Slice of the filtered catalog that stays on screen around `index`.
 fn picker_window(len: usize, index: usize, page: usize) -> std::ops::Range<usize> {
@@ -1787,7 +1852,7 @@ struct MenuItem {
 /// Command or fixed-argument options that match `text`, or an empty list when
 /// the menu should stay hidden (free text after a finished command).
 fn menu_options(text: &str) -> Vec<MenuItem> {
-    const COMMANDS: [MenuItem; 12] = [
+    const COMMANDS: [MenuItem; 13] = [
         MenuItem {
             token: "/new",
             description: "Start a fresh conversation",
@@ -1795,6 +1860,10 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
         MenuItem {
             token: "/goal",
             description: "Name what this session is for",
+        },
+        MenuItem {
+            token: "/yolo",
+            description: "Toggle automatic tool approval",
         },
         MenuItem {
             token: "/model",
@@ -2031,7 +2100,7 @@ fn is_finished_command(text: &str) -> bool {
     let trimmed = text.trim_end();
     if matches!(
         trimmed,
-        "/new" | "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy"
+        "/new" | "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy" | "/yolo"
     ) {
         return true;
     }
@@ -2895,6 +2964,15 @@ fn dashboard_pieces(app: &App) -> Vec<DashPiece> {
             style: Style::default().fg(GRAY).bg(BG_BASE),
         },
     ];
+    if app.yolo_enabled {
+        pieces.insert(
+            3,
+            DashPiece {
+                text: "  YOLO on".to_string(),
+                style: Style::default().fg(YELLOW).bg(BG_BASE),
+            },
+        );
+    }
     if !metrics.is_empty() {
         pieces.push(DashPiece {
             text: format!("  {metrics}"),
@@ -3517,6 +3595,7 @@ mod tests {
             vec![
                 "/new",
                 "/goal",
+                "/yolo",
                 "/model",
                 "/copy",
                 "/key",

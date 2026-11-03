@@ -53,6 +53,11 @@ then press `Enter`. You can also click a choice. **Deny** is selected initially,
 and `Esc` denies the call. Use `PageUp`, `PageDown`, or the mouse wheel to scroll
 a long preview. The panel keeps any message you were composing.
 
+Use `/yolo` to toggle automatic approval for this Atlas TUI process. YOLO
+starts off; while it is on, tool calls proceed without per-tool prompts, and
+`/yolo` turns prompting back on. The status row shows `YOLO on` while enabled.
+You can enter `/yolo` at the approval prompt as well.
+
 ## Adding a tool
 
 A new safe tool is a concrete `Tool` subclass in a module directly inside

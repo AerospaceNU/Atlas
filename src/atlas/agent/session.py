@@ -177,7 +177,25 @@ class AgentSession:
         # Approval round-trip. The reader thread fills a slot when a
         # ``permission`` message arrives; the turn waits on it.
         self.permission_slots: dict[str, list[object]] = {}
-        self.permission_lock = threading.Lock()
+        self.permission_lock = threading.RLock()
+
+    @property
+    def yolo_enabled(self) -> bool:
+        """Whether this process skips per-call approval prompts."""
+        return self.agent.approval == "allow"
+
+    def toggle_yolo(self, emit: Callable[[dict[str, Any]], None]) -> None:
+        """Toggle automatic approval and release any pending prompt when enabled."""
+        with self.permission_lock:
+            enabled = not self.yolo_enabled
+            self.agent.approval = "allow" if enabled else "ask"
+            emit({"type": "yolo", "enabled": enabled})
+            if enabled:
+                for slot in self.permission_slots.values():
+                    slot[1] = True
+                    event = slot[0]
+                    assert isinstance(event, threading.Event)
+                    event.set()
 
     def turn(
         self,
@@ -473,16 +491,21 @@ class AgentSession:
         """
         slot: list[object] = [threading.Event(), False]
         with self.permission_lock:
+            # A toggle can arrive after the runtime chose to ask but before
+            # this callback registers its wait. Publish both transitions and
+            # requests under the same lock so the client sees their order.
+            if self.yolo_enabled:
+                return True
             self.permission_slots[request.id] = slot
-        emit(
-            {
-                "type": "permission_request",
-                "id": request.id,
-                "tool": request.tool,
-                "summary": request.summary,
-                "preview": request.preview,
-            }
-        )
+            emit(
+                {
+                    "type": "permission_request",
+                    "id": request.id,
+                    "tool": request.tool,
+                    "summary": request.summary,
+                    "preview": request.preview,
+                }
+            )
         event = slot[0]
         assert isinstance(event, threading.Event)
         event.wait(PERMISSION_TIMEOUT)
@@ -719,7 +742,9 @@ def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
     """Read the protocol after the session credential map is bound."""
     _write_line(stdout, _ready_event(session), session.secrets)
     lines: queue.Queue[str | None] = queue.Queue()
-    reader = threading.Thread(target=_read_protocol, args=(stdin, lines, session), daemon=True)
+    reader = threading.Thread(
+        target=_read_protocol, args=(stdin, lines, session, stdout), daemon=True
+    )
     reader.start()
     while True:
         line = lines.get()
@@ -797,13 +822,14 @@ def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
     return 0
 
 
-def _read_protocol(stdin: IO[str], lines: queue.Queue[str | None], session: AgentSession) -> None:
-    """Forward protocol lines to the session loop and handle cancels inline.
+def _read_protocol(
+    stdin: IO[str], lines: queue.Queue[str | None], session: AgentSession, stdout: IO[str]
+) -> None:
+    """Forward protocol lines and handle turn controls without waiting for a turn.
 
     A ``cancel`` message is consumed here rather than queued, because the
-    session loop is blocked inside a turn when one arrives. Every other line
-    is queued for the loop, including invalid JSON, so its error event still
-    comes from one place.
+    session loop is blocked inside a turn when one arrives. Approval answers
+    and YOLO toggles also run here so a pending prompt can be released.
     """
     for line in stdin:
         text = line.strip()
@@ -821,6 +847,9 @@ def _read_protocol(stdin: IO[str], lines: queue.Queue[str | None], session: Agen
             request_id = message.get("id")
             if isinstance(request_id, str):
                 session.resolve_permission(request_id, bool(message.get("allow")))
+            continue
+        if isinstance(message, dict) and message.get("type") == "yolo":
+            session.toggle_yolo(lambda event: _write_line(stdout, event, session.secrets))
             continue
         lines.put(text)
     lines.put(None)
@@ -1734,6 +1763,7 @@ def _status_fields(session: AgentSession) -> dict[str, Any]:
 def _ready_event(session: AgentSession) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "ready",
+        "yolo_enabled": session.yolo_enabled,
         "tools": [tool.model_dump() for tool in session.agent.tools.definitions],
         "key_set": _key_set(session),
     }
