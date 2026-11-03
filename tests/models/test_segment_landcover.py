@@ -102,7 +102,10 @@ def test_sha256_mismatch_raises(tmp_path: Path, weights_dir: Path) -> None:
         read_weight_bytes(pinned)
 
 
-def test_workspace_path_cannot_escape(tmp_path: Path, weights_dir: Path) -> None:
+def test_workspace_path_may_be_outside_the_workspace(tmp_path: Path, weights_dir: Path) -> None:
     store = LocalArtifactStore(tmp_path / "workspace")
-    with pytest.raises(ValueError, match="escapes"):
-        default_registry().execute("segment_landcover", {"path": "../outside.png"}, store)
+    Image.new("RGB", (32, 24), (245, 245, 245)).save(tmp_path / "outside.png")
+
+    result = default_registry().execute("segment_landcover", {"path": "../outside.png"}, store)
+
+    assert "32x24" in result.text

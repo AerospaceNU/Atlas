@@ -8,10 +8,10 @@ The tool loop over one local artifact directory.
 
 | Module | What it holds |
 |---|---|
-| `artifacts` | The workspace sandbox (`LocalArtifactStore`) and image metadata. Paths stay relative to the store root. |
+| `artifacts` | The working tree and artifact root (`LocalArtifactStore`) plus image metadata. Relative paths resolve against the store root; absolute paths are used as given. |
 | `contracts` | Tool and model types, the tool registry, and discovery of tool classes. |
 | `runtime` | The bounded agent loop: call a tool, record the step, stop at the call budget. A run starts with the system prompt, then project instructions when the workspace root has `AGENTS.md`. |
-| `instructions` | Load `AGENTS.md` from the workspace root. Nested directories are not searched, and a closer file does not win over the root file. The text is delimited project guidance after the system prompt, not part of it. A missing file is silent. An unreadable or malformed file, including a FIFO, is skipped. Loading it cannot add tools or change the sandbox. |
+| `instructions` | Load `AGENTS.md` from the workspace root. Nested directories are not searched, and a closer file does not win over the root file. The text is delimited project guidance after the system prompt, not part of it. A missing file is silent. An unreadable or malformed file, including a FIFO, is skipped. Loading it cannot add tools or change the store roots. |
 | `system_prompt` | The package system prompt (`system_prompt.md`). A workspace file cannot replace it. The text is cached for the life of the process, so an edit applies on the next start. |
 | `layout` | Project `.atlas/` and user `~/.atlas/` paths. `ATLAS_HOME` overrides the user root. The directory list is `docs/atlas-layout.md`. |
 | `session` | A multi-turn conversation on top of that loop, plus the `python -m atlas.agent` entry. New sessions and artifacts are created under the project layout. |

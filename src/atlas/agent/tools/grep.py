@@ -10,7 +10,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 
 
@@ -51,36 +51,31 @@ def _compile(pattern: str, *, fixed_strings: bool, case_sensitive: bool) -> re.P
 
 
 def _iter_files(base: Path) -> Iterator[Path]:
-    """Yield regular files under ``base`` in sorted order, skipping symlinks."""
+    """Yield regular files under ``base`` in sorted order."""
     if base.is_file():
-        if not base.is_symlink():
-            yield base
+        yield base
         return
     for root, dir_names, file_names in os.walk(base, followlinks=False):
         current = Path(root)
-        dir_names[:] = sorted(name for name in dir_names if not (current / name).is_symlink())
+        dir_names[:] = sorted(dir_names)
         for name in sorted(file_names):
             candidate = current / name
-            if candidate.is_symlink() or not candidate.is_file():
-                continue
-            yield candidate
+            if candidate.is_file():
+                yield candidate
 
 
-def _display_path(store: LocalArtifactStore, base: Path, path: Path) -> str:
-    """Return a workspace-relative path without exposing a host path."""
-    try:
-        return store.relative(path)
-    except SandboxDenied:
-        return path.relative_to(base).as_posix()
+def _display_path(store: LocalArtifactStore, path: Path) -> str:
+    """Return a relative path when it sits inside the workspace, else absolute."""
+    return store.relative(path)
 
 
 class GrepTool(Tool):
-    """Search text files in the artifact workspace for a regular expression.
+    """Search text files for a regular expression.
 
     Every path is resolved through :class:`~atlas.agent.artifacts.LocalArtifactStore`,
-    so a search cannot leave the sandbox. Binary files (containing a NUL byte),
-    symlinks, and files above the per-file byte cap are skipped, and the whole
-    scan stops at a wall-clock and input-byte budget.
+    and absolute paths and ``..`` are allowed. Binary files (containing a NUL
+    byte) and files above the per-file byte cap are skipped, and the whole scan
+    stops at a wall-clock and input-byte budget.
     """
 
     name = "grep"
@@ -129,7 +124,7 @@ class GrepTool(Tool):
             scanned += len(data)
             if b"\x00" in data:
                 continue
-            relative = _display_path(store, base, path)
+            relative = _display_path(store, path)
             for number, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
                 if not matcher.search(line):
                     continue

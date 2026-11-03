@@ -1,4 +1,4 @@
-"""Read sandbox image artifacts into vision-model content."""
+"""Read image artifacts into vision-model content."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.contracts import ChatMessage, ModelImage, Role
 
 # Pillow format names the vision model can accept. The suffix is not consulted.
@@ -45,12 +45,13 @@ def ingest_image(store: LocalArtifactStore, relative_path: str) -> ModelImage:
     """Read one image into a model content part.
 
     The path is resolved with :meth:`~atlas.agent.artifacts.LocalArtifactStore.resolve_read`,
-    so a file in the write sandbox wins and a file in the project workspace is
-    still visible. The stored path is relative to whichever root held the file.
+    so a file in the working tree wins and a file in the project workspace is
+    still visible. The stored path is relative to the working tree when the
+    file sits inside it, and absolute otherwise.
 
     Args:
-        store: Sandbox that owns the artifact and the optional read root.
-        relative_path: Image path relative to the write sandbox or the workspace.
+        store: Store that owns the artifact root and the optional read root.
+        relative_path: Image path relative to a root, or an absolute path.
 
     Returns:
         Base64 image bytes whose encoded length is at most ``MAX_IMAGE_BYTES``,
@@ -59,15 +60,15 @@ def ingest_image(store: LocalArtifactStore, relative_path: str) -> ModelImage:
     Raises:
         ValueError: Pillow cannot read the file, its format is unsupported, or
             Pillow rejects it as a decompression bomb.
-        FileNotFoundError: The path is not a file in either root.
-        SandboxDenied: The path escapes a root, is a hardlink, exceeds
-            ``MAX_SOURCE_BYTES``, or cannot be downscaled under ``MAX_IMAGE_BYTES``.
+        FileNotFoundError: The path is not a file.
+        ArtifactError: The file exceeds ``MAX_SOURCE_BYTES`` or cannot be
+            downscaled under ``MAX_IMAGE_BYTES``.
     """
     path = store.resolve_read(relative_path)
     if not path.is_file():
         raise FileNotFoundError(f"Image does not exist: {relative_path}")
     if path.stat().st_size > MAX_SOURCE_BYTES:
-        raise SandboxDenied(f"Image {relative_path} exceeds the {MAX_SOURCE_BYTES} byte read limit")
+        raise ArtifactError(f"Image {relative_path} exceeds the {MAX_SOURCE_BYTES} byte read limit")
     try:
         with Image.open(path) as image:
             try:
@@ -171,10 +172,10 @@ def _shrink(image: Image.Image, fmt: str, relative_path: str) -> bytes:
             return encoded
         width, height = current.size
         if width <= 1 or height <= 1:
-            raise SandboxDenied(f"Image {relative_path} exceeds the {MAX_IMAGE_BYTES} byte limit")
+            raise ArtifactError(f"Image {relative_path} exceeds the {MAX_IMAGE_BYTES} byte limit")
         resized = (max(1, width // 2), max(1, height // 2))
         if resized == (width, height):
-            raise SandboxDenied(f"Image {relative_path} exceeds the {MAX_IMAGE_BYTES} byte limit")
+            raise ArtifactError(f"Image {relative_path} exceeds the {MAX_IMAGE_BYTES} byte limit")
         current = current.resize(resized, Image.Resampling.LANCZOS)
 
 
@@ -196,14 +197,13 @@ def _mark_omitted(message: ChatMessage, omitted: list[ModelImage]) -> None:
 
 
 def _portable_path(store: LocalArtifactStore, resolved: Path) -> str:
-    """Return a root-relative path, never an absolute host path."""
+    """Return a root-relative path when the file sits inside one, else absolute."""
     candidate = resolved.resolve()
-    bases = [store.root]
-    if store.read_root is not None:
-        bases.append(store.read_root)
-    for base in bases:
+    for base in (store.root, store.read_root):
+        if base is None:
+            continue
         try:
             return candidate.relative_to(base.resolve()).as_posix()
         except ValueError:
             continue
-    raise SandboxDenied("Path is outside the artifact root")
+    return candidate.as_posix()

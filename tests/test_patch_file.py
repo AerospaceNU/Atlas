@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.tools.patch_file import PatchFileTool
 
 
@@ -80,17 +80,20 @@ def test_patch_file_replace_all_replaces_every_occurrence(tmp_path: Path) -> Non
     assert target.read_text(encoding="utf-8") == "b b b\n"
 
 
-def test_patch_file_refuses_an_absolute_path(tmp_path: Path) -> None:
+def test_patch_file_accepts_an_absolute_path(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
+    target = tmp_path / "notes.txt"
+    target.write_text("a\n", encoding="utf-8")
 
-    with pytest.raises(SandboxDenied):
-        PatchFileTool().run(
-            {
-                "path": str(tmp_path / "notes.txt"),
-                "edits": [{"old_string": "a", "new_string": "b"}],
-            },
-            store,
-        )
+    PatchFileTool().run(
+        {
+            "path": str(target),
+            "edits": [{"old_string": "a", "new_string": "b"}],
+        },
+        store,
+    )
+
+    assert target.read_text(encoding="utf-8") == "b\n"
 
 
 def test_patch_file_reports_a_workspace_relative_artifact(tmp_path: Path) -> None:

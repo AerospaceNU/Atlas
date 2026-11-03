@@ -25,7 +25,7 @@ def _run(store: LocalArtifactStore, arguments: list[str]) -> subprocess.Complete
 
     ``arguments`` is always an argument list, so no model-supplied string is
     interpreted by a shell. The current directory is the resolved workspace
-    root, keeping every pathspec inside the sandbox.
+    root, so a relative pathspec resolves against it.
     """
     try:
         return subprocess.run(
@@ -173,9 +173,8 @@ class GitStatusTool(Tool):
 class GitDiffTool(Tool):
     """Show a unified diff for the workspace or one workspace-relative path.
 
-    The path is resolved only through :class:`~atlas.agent.artifacts.LocalArtifactStore`,
-    so a diff cannot leave the sandbox. Output is truncated at ``max_bytes``
-    with a visible marker.
+    The path is resolved through :class:`~atlas.agent.artifacts.LocalArtifactStore`.
+    Output is truncated at ``max_bytes`` with a visible marker.
     """
 
     name = "git_diff"
@@ -214,9 +213,8 @@ class GitCommitTool(Tool):
 
     Only ``git add`` and ``git commit`` are run; amend, force, and push are not
     expressible through this tool. Every path is resolved through
-    :class:`~atlas.agent.artifacts.LocalArtifactStore` before staging, so a
-    commit cannot reach outside the sandbox. With nothing staged after the add,
-    no empty commit is created.
+    :class:`~atlas.agent.artifacts.LocalArtifactStore` before staging. With
+    nothing staged after the add, no empty commit is created.
     """
 
     name = "git_commit"

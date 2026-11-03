@@ -127,7 +127,7 @@ class AgentSession:
     the following message. The session keeps a reference to that message and
     does not choose it by matching text. The goal is wrapped in
     ``<session_goal>`` tags. It is session text for later turns. It is not a
-    tool and it does not change either sandbox root. Setting it after a turn
+    tool and it does not change the store roots. Setting it after a turn
     has already run leaves it directly before that turn, so the model sees
     two user messages in a row. Those messages stay separate.
     """
@@ -208,8 +208,8 @@ class AgentSession:
     ) -> AgentRun:
         """Append the user message and advance the shared history one turn.
 
-        ``images`` are paths in the write sandbox or the project workspace.
-        A path the sandbox rejects is not appended.
+        ``images`` are paths the store can resolve, including absolute paths.
+        A path that cannot be read is not appended.
         """
         self._require_key()
         self._cancel_event_clear()
@@ -289,7 +289,7 @@ class AgentSession:
         2,000 characters. The goal is conversation text placed after the
         system prompt and any project instructions, wrapped in
         ``<session_goal>`` tags. It does not register a tool and it does not
-        change either sandbox root.
+        change the store roots.
 
         The goal is the message object this session inserted. A user turn is
         left alone even when its text looks like a goal. Setting the goal
@@ -1864,10 +1864,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     model_id = resolve_model(workspace, args.model)
     session_id = _remember_session(workspace, model_id)
-    # The workspace is the sandbox root: file tools write the tree the person
-    # pointed the session at, which does not have to be a git checkout. Tool
-    # outputs still land in this session's artifact directory, which lives
-    # inside the workspace, so removing the session removes them.
+    # Relative tool paths resolve against the workspace the person pointed the
+    # session at, which does not have to be a git checkout; absolute paths are
+    # allowed. Tool outputs land in this session's artifact directory, inside
+    # the workspace, so removing the session removes them.
     artifact_root = project_artifact_dir(workspace, session_id)
     store = LocalArtifactStore(workspace, artifact_root=artifact_root)
     # Home skills are opt-in. The default session sees only the workspace.
