@@ -231,7 +231,8 @@ def test_from_scene_layers_start_absent_with_common_names_and_sizes() -> None:
     assert c.layers["red"].common_name is None
     assert c.layers["red"].size_bytes == 100
     assert c.layers["B05"].size_bytes is None
-    assert all(layer.availability is Availability.absent for layer in c.layers.values())
+    layers = dict(c.layers)
+    assert all(layer.availability is Availability.absent for layer in layers.values())
     assert not c.has_local_data
 
 
