@@ -64,9 +64,9 @@ class SegmentLandcoverTool(Tool):
         labels_rel = request.labels_path or f"artifacts/{self.name}_labels.png"
         overlay_rel = request.overlay_path or f"artifacts/{self.name}_overlay.png"
         json_rel = request.json_path or f"artifacts/{self.name}.json"
-        labels_path = store.resolve(labels_rel)
-        overlay_path = store.resolve(overlay_rel)
-        json_path = store.resolve(json_rel)
+        labels_path = store.resolve_artifact(labels_rel)
+        overlay_path = store.resolve_artifact(overlay_rel)
+        json_path = store.resolve_artifact(json_rel)
         for path, suffix in (
             (labels_path, ".png"),
             (overlay_path, ".png"),

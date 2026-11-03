@@ -699,8 +699,12 @@ def macos_sandbox_profile(
         "(allow sysctl-read)",
         "(allow mach-lookup)",
         "(allow network*)",
-        f'(allow file-read* file-write* file-ioctl file-exec* (subpath "{_profile_path(workspace)}"))',
+        f'(allow file-read* file-write* file-ioctl (subpath "{_profile_path(workspace)}"))',
         f'(allow file-read* file-write* file-ioctl (subpath "{_profile_path(tmpdir)}"))',
+        # macOS 26 aborts a confined child that cannot read the filesystem
+        # root itself, even when every child path it needs is allowed. The
+        # root is a directory, so this grants no file contents.
+        '(allow file-read* (literal "/"))',
     ]
     system_paths = (
         "/usr",
@@ -716,11 +720,9 @@ def macos_sandbox_profile(
         "/private/etc",
     )
     for system_path in system_paths:
-        lines.append(f'(allow file-read* file-exec* (subpath "{system_path}"))')
+        lines.append(f'(allow file-read* (subpath "{system_path}"))')
     for path in (*key_dirs, *excluded):
-        lines.append(
-            f'(deny file-read* file-write* file-ioctl file-exec* (subpath "{_profile_path(path)}"))'
-        )
+        lines.append(f'(deny file-read* file-write* file-ioctl (subpath "{_profile_path(path)}"))')
     return "\n".join(lines) + "\n"
 
 
