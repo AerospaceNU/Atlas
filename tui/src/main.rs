@@ -3759,6 +3759,8 @@ mod tests {
         app.apply(ServerMessage::Done {
             response: "alpha beta gamma".to_string(),
             stopped_for_limit: false,
+            stopped_for_budget: false,
+            cancelled: false,
             status: StatusSnapshot {
                 tokens_per_second: Some(2.0),
                 ..StatusSnapshot::default()
