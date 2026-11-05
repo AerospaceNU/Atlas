@@ -1777,7 +1777,9 @@ def _done_event(session: AgentSession, run: AgentRun) -> dict[str, Any]:
         "response": run.response,
         "stopped_for_limit": run.stopped_for_limit,
         "stopped_for_budget": run.stopped_for_budget,
+        "stopped_for_context": run.stopped_for_context,
         "cancelled": run.cancelled,
+        "compaction": run.compaction.model_dump(),
     }
     payload.update(_status_fields(session))
     return payload
