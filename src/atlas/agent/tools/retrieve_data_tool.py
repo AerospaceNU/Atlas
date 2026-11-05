@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 from datetime import date
 from math import cos, radians
@@ -116,7 +118,7 @@ class GetDataToolInput(BaseModel):
     )
 
     @model_validator(mode="after")
-    def check_location(self) -> "GetDataToolInput":
+    def check_location(self) -> GetDataToolInput:
         """Checks to make sure that a location has been included, and not both (i.e. lat/long OR BBox, and not both). Returns a value error if so."""
         if (self.latitude is not None and self.longitude is not None) and self.bbox:
             raise ValueError(
@@ -140,18 +142,35 @@ class GetDataToolInput(BaseModel):
         lat_padding = (
             self.radius_km / 111.32
         )  # one degree of latitude is approximately 111.32 km, so we can use that to convert the radius in km to degrees of latitude
-        if abs(self.latitude) != 90.0:  # to avoid division by zero
-            long_padding = lat_padding / cos(radians(self.latitude))
-        else:
-            long_padding = 360.0
+        south = max(-90.0, self.latitude - lat_padding)
+        north = min(90.0, self.latitude + lat_padding)
 
-        # build a bounding box from the coordinates + paddings
-        return BBox(
-            west=max(-180.0, self.longitude - long_padding),
-            south=max(-90.0, self.latitude - lat_padding),
-            east=min(180.0, self.longitude + long_padding),
-            north=min(90.0, self.latitude + lat_padding),
-        )
+        # A radius that reaches a pole covers every longitude. Near a pole, the
+        # approximate longitude padding can also span the entire globe.
+        reaches_pole = self.latitude - lat_padding <= -90.0 or self.latitude + lat_padding >= 90.0
+        if reaches_pole:
+            west, east = -180.0, 180.0
+        else:
+            long_padding = lat_padding / cos(radians(self.latitude))
+            if long_padding >= 180.0:
+                west, east = -180.0, 180.0
+            else:
+                west_edge = self.longitude - long_padding
+                east_edge = self.longitude + long_padding
+
+                # Preserve exact ±180° edges and wrap only values beyond them.
+                west = (
+                    (west_edge + 180.0) % 360.0 - 180.0
+                    if west_edge < -180.0 or west_edge > 180.0
+                    else west_edge
+                )
+                east = (
+                    (east_edge + 180.0) % 360.0 - 180.0
+                    if east_edge < -180.0 or east_edge > 180.0
+                    else east_edge
+                )
+
+        return BBox(west=west, south=south, east=east, north=north)
 
 
 class GetDataTool(Tool):
@@ -191,6 +210,15 @@ class GetDataTool(Tool):
             ]  # identify any unknown sources
             if unknown:
                 raise ValueError(f"Unknown source(s): {unknown}. Known: {sorted(SOURCES)}")
+            mismatched = [
+                name
+                for name in request.sources
+                if SOURCES[name].scene_kind is not request.data_type
+            ]
+            if mismatched:
+                raise ValueError(
+                    f"Source(s) {mismatched} do not provide data type {request.data_type.value}"
+                )
             names = list(request.sources)
         else:
             names = [
@@ -228,8 +256,8 @@ class GetDataTool(Tool):
             ToolResult: The result of the pull operation, including either the download report or the search estimate.
         """
         clients = sources(*names)
-        out_dir = store.resolve("data")  # where to put the data
         try:
+            out_dir = store.resolve("data")
             catalog = await aggregate(pull_request, clients)
 
             if not download:

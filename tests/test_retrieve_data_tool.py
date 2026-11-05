@@ -153,6 +153,57 @@ def test_point_at_a_pole_spans_every_longitude() -> None:
     assert (box.west, box.east, box.north) == (-180.0, 180.0, 90.0)
 
 
+@pytest.mark.parametrize(
+    ("longitude", "points_on_both_sides"),
+    [(179.9, (179.5, -179.5)), (-179.9, (-179.5, 179.5))],
+    ids=["cross-east", "cross-west"],
+)
+def test_point_radius_wraps_across_the_dateline(
+    longitude: float, points_on_both_sides: tuple[float, float]
+) -> None:
+    request = GetDataToolInput.model_validate(
+        {
+            "data_type": "optical",
+            **WINDOW,
+            "latitude": 0.0,
+            "longitude": longitude,
+            "radius_km": 100.0,
+        }
+    )
+
+    box = request.lat_long_to_bbox()
+
+    assert box.west > box.east
+    assert box.contains(points_on_both_sides[0], 0.0)
+    assert box.contains(points_on_both_sides[1], 0.0)
+    assert box.lon_span == pytest.approx(2 * (100.0 / 111.32))
+
+
+@pytest.mark.parametrize("latitude", [89.5, -89.5], ids=["north", "south"])
+def test_radius_reaching_a_pole_spans_every_longitude_and_clips_latitude(
+    latitude: float,
+) -> None:
+    request = GetDataToolInput.model_validate(
+        {
+            "data_type": "optical",
+            **WINDOW,
+            "latitude": latitude,
+            "longitude": 45.0,
+            "radius_km": 100.0,
+        }
+    )
+
+    box = request.lat_long_to_bbox()
+
+    assert (box.west, box.east) == (-180.0, 180.0)
+    if latitude > 0.0:
+        assert box.south > -90.0
+        assert box.north == 90.0
+    else:
+        assert box.south == -90.0
+        assert box.north < 90.0
+
+
 # choosing sources
 
 
@@ -193,8 +244,30 @@ def test_unknown_source_is_a_value_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("data_type", "names"),
+    [
+        ("sar", ["sentinel2"]),
+        ("optical", ["sentinel1"]),
+        ("optical", ["sentinel2", "sentinel1"]),
+    ],
+)
+def test_explicit_sources_must_match_data_type_before_creating_clients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data_type: str, names: list[str]
+) -> None:
+    asked = _use_clients(monkeypatch, {})
+
+    with pytest.raises(ValueError, match="do not provide data type"):
+        GetDataTool().run(
+            {"data_type": data_type, **WINDOW, **BOSTON, "sources": names},
+            LocalArtifactStore(tmp_path),
+        )
+
+    assert asked == []
+
+
+@pytest.mark.parametrize(
     "arguments",
-    [{"data_type": "landsurface"}, {"data_type": "optical", "sources": ["fldas"]}],
+    [{"data_type": "landsurface"}, {"data_type": "landsurface", "sources": ["fldas"]}],
     ids=["landsurface", "named fldas"],
 )
 def test_fldas_is_refused(tmp_path: Path, arguments: dict[str, Any]) -> None:
