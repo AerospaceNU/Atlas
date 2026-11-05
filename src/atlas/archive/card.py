@@ -1,15 +1,3 @@
-"""Compact scene card: one short, citable record per observed scene.
-
-A card says what a scene is, where it was observed, and which of its layers
-exist locally. It never carries pixels, raw STAC metadata, signed URLs, or
-secrets. The index can be rebuilt from source metadata, so ``CARD_VERSION``
-changes whenever a field is added, removed, or reinterpreted.
-
-Availability is recorded per layer, not per scene. Files are stored per asset,
-and a file on disk can be a bbox window of the scene instead of the whole
-asset, so one scene-level flag would misreport both cases.
-"""
-
 from __future__ import annotations
 
 import hashlib

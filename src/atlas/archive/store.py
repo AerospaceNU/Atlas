@@ -1,19 +1,3 @@
-"""Where scene cards are kept, behind an interface.
-
-``CardStore`` is the contract callers use. ``TTLCardStore`` is the first
-implementation: an in-memory store that holds cards for a few minutes so a
-follow-up question can read more of a card without searching again. It is a
-stopgap until the persistent store is chosen. Cards are not written to disk,
-and an expired index id can only be rebuilt by searching again.
-
-A lookup says why a card is missing. ``expired`` means the store once held it
-and no longer does; ``missing`` means it never did. Callers must not present
-either as "no such scene". The store remembers expired ids in a separate,
-larger list (``max_tombstones``). Once that list is full the oldest expired ids
-are forgotten and report ``missing``, so the distinction holds only up to that
-limit.
-"""
-
 from __future__ import annotations
 
 import threading
