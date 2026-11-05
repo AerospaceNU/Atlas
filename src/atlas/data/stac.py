@@ -4,6 +4,7 @@ import json
 import math
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from itertools import pairwise
 from typing import Any, ClassVar, NamedTuple, Self
 from urllib.parse import parse_qsl, urljoin, urlparse
 
@@ -644,6 +645,7 @@ def item_to_scene(
         platform=_stac_platform(props, default_platform),
         instrument=instrument,
         cloud_cover=_stac_cloud_cover(props.get("eo:cloud_cover")),
+        footprint=_stac_footprint(feature) if geometry_kind is GeometryKind.polygon else None,
         assets=assets,
         band_aliases=band_aliases,
         properties=props,
@@ -683,6 +685,54 @@ def _parse_geometry(
             return None
         return bbox, GeometryKind.point, lon, lat
     return None
+
+
+def _stac_footprint(feature: dict[str, Any]) -> list[list[list[float]]] | None:
+    """Exterior rings of a Polygon or MultiPolygon, or None if any ring is unusable.
+
+    Rings that jump more than 180° of longitude between vertices cross the
+    antimeridian; they return None so callers use the (wrapping) bbox instead.
+    """
+    geom = feature.get("geometry")
+    if not isinstance(geom, dict):
+        return None
+    coords = geom.get("coordinates")
+    if geom.get("type") == "Polygon":
+        polygons = [coords]
+    elif geom.get("type") == "MultiPolygon" and isinstance(coords, list):
+        polygons = coords
+    else:
+        return None
+    rings: list[list[list[float]]] = []
+    for polygon in polygons:
+        if not isinstance(polygon, list) or not polygon:
+            return None
+        ring = _ring(polygon[0])
+        if ring is None:
+            return None
+        rings.append(ring)
+    return rings or None
+
+
+def _ring(raw: object) -> list[list[float]] | None:
+    if not isinstance(raw, list) or len(raw) < 4:
+        return None
+    ring: list[list[float]] = []
+    for point in raw:
+        if not isinstance(point, list | tuple) or len(point) < 2:
+            return None
+        try:
+            lon, lat = float(point[0]), float(point[1])
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            return None
+        if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+            return None
+        ring.append([lon, lat])
+    if any(abs(b[0] - a[0]) > 180.0 for a, b in pairwise(ring)):
+        return None
+    return ring
 
 
 def _stac_datetime(raw: object) -> datetime | None:

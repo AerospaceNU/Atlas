@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from atlas.data.base import Asset, BBox, DataPullClient, Scene
+from atlas.data.base import BROWSE_KEYS, Asset, BBox, DataPullClient, Scene, is_browse_asset
 from atlas.data.cog import (
     CogError,
     CogLimitError,
@@ -22,8 +22,6 @@ from atlas.data.cog import (
 )
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
-_BROWSE_KEYS = frozenset({"rendered_preview", "thumbnail", "preview"})
-_BROWSE_ROLES = frozenset({"thumbnail", "overview", "preview", "rendered_preview"})
 _PREFERRED_KEYS = ("visual",)
 _RASTER_SUFFIXES = frozenset(
     {".tif", ".tiff", ".jp2", ".nc", ".hdf", ".h5", ".zip", ".las", ".laz"}
@@ -64,22 +62,9 @@ class DownloadReport:
         return [item for item in self.outcomes if item.source == name]
 
 
-def is_browse_asset(key: str, asset: Asset) -> bool:
-    """True for STAC browse products (previews, thumbnails, JPEG overviews)."""
-    if key.lower() in _BROWSE_KEYS:
-        return True
-    roles = {role.lower() for role in asset.roles}
-    if roles & _BROWSE_ROLES:
-        return True
-    media = (asset.media_type or "").lower()
-    if media.startswith("image/jpeg") or media.startswith("image/jpg"):
-        return True
-    return media.startswith("image/png") and "data" not in roles
-
-
 def is_forbidden_asset_name(name: str) -> bool:
     """True if ``--asset`` names a browse product."""
-    return name.strip().lower() in _BROWSE_KEYS
+    return name.strip().lower() in BROWSE_KEYS
 
 
 def pick_asset(scene: Scene, name: str | None = None) -> tuple[str, Asset] | None:
