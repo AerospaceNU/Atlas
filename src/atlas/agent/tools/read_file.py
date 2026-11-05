@@ -4,7 +4,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 
 
@@ -15,11 +15,11 @@ class ReadFileInput(BaseModel):
 class ReadFileTool(Tool):
     """Read one UTF-8 text file from the artifact workspace.
 
-    Two invariants hold: the path is resolved only through
-    :class:`~atlas.agent.artifacts.LocalArtifactStore`, so it cannot leave the
-    sandbox, and the file is read as text, never executed or imported. Reads
-    prefer the session artifact directory and fall back to the project
-    workspace when one is mounted; writes never touch the fallback.
+    The path is resolved through
+    :class:`~atlas.agent.artifacts.LocalArtifactStore`. Relative paths resolve
+    against the working tree and absolute paths are used as given. The file is
+    read as text, never executed or imported. Reads prefer the session artifact
+    directory and fall back to the project workspace when one is mounted.
     """
 
     name = "read_file"
@@ -35,13 +35,12 @@ class ReadFileTool(Tool):
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request = ReadFileInput.model_validate(arguments)
-        path = store.resolve_read(request.path)
-        if not path.is_file():
-            raise FileNotFoundError(f"File does not exist: {request.path}")
-        if path.stat().st_size > self.max_bytes:
-            raise SandboxDenied(f"File {request.path} exceeds the {self.max_bytes} byte read limit")
         try:
-            text = path.read_text(encoding="utf-8")
+            data = store.read_bytes(request.path, max_bytes=self.max_bytes)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"File does not exist: {request.path}") from exc
+        try:
+            text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         except UnicodeDecodeError as exc:
             raise ValueError(f"File {request.path} is not valid UTF-8") from exc
         return ToolResult(text=text)

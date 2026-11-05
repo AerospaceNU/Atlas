@@ -56,6 +56,13 @@ class BBox(BaseModel):
     east: float = Field(..., ge=-180, le=180)
     north: float = Field(..., ge=-90, le=90)
 
+    @model_validator(mode="after")
+    def _ordered_latitudes(self) -> Self:
+        """Reject an upside-down box, which no catalog or raster read can serve."""
+        if self.south > self.north:
+            raise ValueError("south must be less than or equal to north")
+        return self
+
     @classmethod
     def from_corners(cls, lon1: float, lat1: float, lon2: float, lat2: float) -> Self:
         return cls.enclosing([lon1, lon2], [lat1, lat2])
@@ -206,9 +213,14 @@ _POLE_RING = (
 
 
 def _as_position(value: object) -> tuple[float, float]:
-    if isinstance(value, str) or not isinstance(value, Sequence) or len(value) != 2:
+    """Return ``(lon, lat)`` from a GeoJSON position.
+
+    RFC 7946 allows a position to carry more than two numbers (altitude is
+    the third). Only the first two are used; the ring is a surface AOI.
+    """
+    if isinstance(value, str) or not isinstance(value, Sequence) or len(value) < 2:
         raise ValueError("each position must be lon, lat")
-    lon, lat = value
+    lon, lat = value[0], value[1]
     if isinstance(lon, bool) or isinstance(lat, bool):
         raise ValueError("each position must be lon, lat")
     if not isinstance(lon, int | float) or not isinstance(lat, int | float):
@@ -1023,16 +1035,22 @@ class PullResult(BaseModel):
     next_cursor_unavailable: str | None = None
 
     @model_validator(mode="after")
-    def _clip_to_polygon(self) -> Self:
+    def _clip_to_request(self) -> Self:
+        """Keep only scenes that meet the AOI, whichever catalog sent them."""
         polygon = self.request.polygon
-        if polygon is None:
+        if polygon is not None:
+            # Every catalog, STAC or not, is clipped here. The test is footprint
+            # bounding-box overlap (a point-in-ring test for point scenes). Scene
+            # does not carry the catalog footprint geometry, so a box that merely
+            # clips the ring can keep a scene whose outline misses it. Bbox-only
+            # catalogs search the envelope, so scenes outside the ring still arrive.
+            self.scenes = [scene for scene in self.scenes if polygon.overlaps(scene)]
             return self
-        # Every catalog, STAC or not, is clipped here. The test is footprint
-        # bounding-box overlap (a point-in-ring test for point scenes). Scene
-        # does not carry the catalog footprint geometry, so a box that merely
-        # clips the ring can keep a scene whose outline misses it. Bbox-only
-        # catalogs search the envelope, so scenes outside the ring still arrive.
-        self.scenes = [scene for scene in self.scenes if polygon.overlaps(scene)]
+        # A catalog that mishandles a wrapping box (or ignores the area filter)
+        # can return items outside the request. Drop them before they reach the
+        # manifest or the downloader.
+        bbox = self.request.bbox
+        self.scenes = [scene for scene in self.scenes if bbox.intersects(scene.bbox)]
         return self
 
 
@@ -1060,6 +1078,15 @@ class DataPullClient(ABC):
             An empty page that still carries ``page_cursor``.
         """
         return PullResult(request=request, scenes=[], next_cursor=page_cursor)
+
+    async def download_headers(self, href: str) -> dict[str, str]:
+        """Headers to send when downloading ``href``, such as a bearer token.
+
+        Sources whose assets are public send none. A source that adds a
+        credential must scope it to its own hosts so a redirect or a foreign
+        href never receives it.
+        """
+        return {}
 
     async def resolve_scene_ids(self, scene_ids: Sequence[str]) -> Mapping[str, Scene] | None:
         """Return stored scenes whose ids still exist.

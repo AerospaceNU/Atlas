@@ -12,7 +12,7 @@ import pytest
 from PIL import Image
 from pydantic import BaseModel
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.contracts import (
     ChatMessage,
     ModelResponse,
@@ -137,20 +137,21 @@ def test_ingest_png_jpeg_webp_and_gif(tmp_path: Path) -> None:
         assert "\n" not in image.data
 
 
-def test_ingest_rejects_an_escape_and_a_hardlink(tmp_path: Path) -> None:
+def test_ingest_reads_an_escape_and_a_hardlink(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     store = LocalArtifactStore(workspace)
     outside = tmp_path / "secret.png"
     _save(outside, fmt="PNG")
     os.link(outside, workspace / "linked.png")
 
-    with pytest.raises(SandboxDenied, match="escapes"):
-        ingest_image(store, "../secret.png")
-    with pytest.raises(SandboxDenied, match="hardlinked"):
-        ingest_image(store, "linked.png")
+    escaped = ingest_image(store, "../secret.png")
+    hardlinked = ingest_image(store, "linked.png")
+
+    assert escaped.path == str(outside.resolve())
+    assert hardlinked.path == "linked.png"
 
 
-def test_ingest_rejects_a_workspace_escape_and_a_symlink(tmp_path: Path) -> None:
+def test_ingest_reads_an_escape_and_a_symlink(tmp_path: Path) -> None:
     write_root = tmp_path / "artifacts"
     read_root = tmp_path / "project"
     read_root.mkdir()
@@ -159,10 +160,11 @@ def test_ingest_rejects_a_workspace_escape_and_a_symlink(tmp_path: Path) -> None
     _save(outside, fmt="PNG")
     (read_root / "link.png").symlink_to(outside)
 
-    with pytest.raises(SandboxDenied, match="escapes"):
-        ingest_image(store, "../secret.png")
-    with pytest.raises(SandboxDenied, match="escapes"):
-        ingest_image(store, "link.png")
+    escaped = ingest_image(store, "../secret.png")
+    linked = ingest_image(store, "link.png")
+
+    assert escaped.path == str(outside.resolve())
+    assert linked.path == str(outside.resolve())
 
 
 def test_decompression_bomb_is_a_recorded_tool_failure(
@@ -251,7 +253,7 @@ def test_source_over_the_read_limit_is_rejected_without_reading(
 
     monkeypatch.setattr(Path, "read_bytes", _guarded)
 
-    with pytest.raises(SandboxDenied, match=f"big.png exceeds the {big.stat().st_size - 1} byte"):
+    with pytest.raises(ArtifactError, match=f"big.png exceeds the {big.stat().st_size - 1} byte"):
         ingest_image(store, "big.png")
 
 
@@ -434,14 +436,18 @@ def test_run_ingests_user_images_before_calling_the_model(tmp_path: Path) -> Non
     assert user.images[0].media_type == "image/png"
 
 
-def test_run_does_not_call_the_model_when_the_image_escapes(tmp_path: Path) -> None:
-    model = ScriptedModel([ModelResponse(content="should not run")])
-    agent = Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path))
+def test_run_ingests_an_image_outside_the_workspace(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path / "workspace")
+    outside = tmp_path / "outside.png"
+    _save(outside, fmt="PNG")
+    model = ScriptedModel([ModelResponse(content="outside tile")])
+    agent = Agent(model, ToolRegistry(), store)
 
-    with pytest.raises(SandboxDenied, match="escapes"):
-        agent.run("look", images=["../outside.png"])
+    result = agent.run("look", images=["../outside.png"])
 
-    assert model.requests == []
+    assert result.response == "outside tile"
+    user = model.requests[0][1]
+    assert user.images[0].path == str(outside.resolve())
 
 
 def test_session_turn_sends_user_images_and_keeps_history(tmp_path: Path) -> None:

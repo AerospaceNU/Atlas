@@ -2,7 +2,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 
 
@@ -34,7 +34,7 @@ class WriteTool(Tool):
 
         content_size = len(request.content.encode("utf-8"))
         if content_size > self.max_bytes:
-            raise SandboxDenied(f"Content exceeds the {self.max_bytes} byte write limit")
+            raise ArtifactError(f"Content exceeds the {self.max_bytes} byte write limit")
 
         path.parent.mkdir(
             parents=True, exist_ok=True

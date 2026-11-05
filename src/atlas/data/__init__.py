@@ -87,7 +87,6 @@ from atlas.data.sources.fldas import (
     FldasRequestError,
     TrainingTable,
 )
-from atlas.data.usgs import UsgsLandsatC2L1Client, UsgsLandsatC2L2SrClient
 
 __all__ = [
     "SOURCES",
@@ -166,8 +165,6 @@ __all__ = [
     "Sentinel2Client",
     "SmapL3PassiveClient",
     "TrainingTable",
-    "UsgsLandsatC2L1Client",
-    "UsgsLandsatC2L2SrClient",
     "ViirsVnp09gaClient",
     "all_sources",
     "sources",

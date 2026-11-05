@@ -22,6 +22,20 @@ _START_RE = re.compile(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})")
 GOES_EAST_BUCKET = "noaa-goes19"
 GOES_WEST_BUCKET = "noaa-goes18"
 
+# Operational windows (inclusive) for the public NOAA buckets. A window that
+# spans a handover lists both buckets, so a pull across the change still gets
+# imagery. GOES-19 became GOES-East on 2025-04-07; GOES-18 became GOES-West on
+# 2023-01-04; GOES-17 became operational as GOES-West on 2019-02-12.
+_EAST_WINDOWS: tuple[tuple[str, date, date], ...] = (
+    ("noaa-goes16", date(2017, 12, 18), date(2025, 4, 6)),
+    (GOES_EAST_BUCKET, date(2025, 4, 7), date.max),
+)
+_WEST_WINDOWS: tuple[tuple[str, date, date], ...] = (
+    ("noaa-goes15", date(2012, 1, 1), date(2019, 2, 11)),
+    ("noaa-goes17", date(2019, 2, 12), date(2023, 1, 3)),
+    (GOES_WEST_BUCKET, date(2023, 1, 4), date.max),
+)
+
 # Rough CONUS in WGS84. Outside this, list full-disk MCMIPF instead of CONUS MCMIPC.
 _CONUS = BBox(west=-125.0, south=24.0, east=-66.0, north=50.0)
 _EAST_DISK = BBox(west=-135.0, south=-50.0, east=-15.0, north=50.0)
@@ -68,13 +82,13 @@ class GoesClient(DataPullClient):
         await self.aclose()
 
     async def search(self, request: PullRequest) -> PullResult:
-        targets = _list_targets(request.bbox)
+        targets = _list_targets(request.bbox, request.start_date, request.end_date)
         if not targets:
             return PullResult(request=request, scenes=[])
         hours = set(_hours_in_range(request.start_date, request.end_date))
         merged: dict[str, Scene] = {}
-        for bucket, product in targets:
-            for scene in await _search_product(self._client, request, bucket, product, hours):
+        for bucket, side, product in targets:
+            for scene in await _search_product(self._client, request, bucket, side, product, hours):
                 merged.setdefault(scene.id, scene)
         newest = sorted(merged.values(), key=lambda s: s.datetime)
         if request.limit is not None:
@@ -82,30 +96,52 @@ class GoesClient(DataPullClient):
         return PullResult(request=request, scenes=newest)
 
 
-def _list_targets(bbox: BBox) -> list[tuple[str, str]]:
-    """Bucket and product for each side of ``bbox`` that meets a GOES disk.
+def _list_targets(
+    bbox: BBox,
+    start: date,
+    end: date,
+) -> list[tuple[str, str, str]]:
+    """Bucket, side, and product for each side of ``bbox`` that meets a GOES disk.
 
     A wrapping box is cut first. Sides that miss both disks are skipped, which
-    is an empty result for an AOI outside GOES coverage, not an error.
+    is an empty result for an AOI outside GOES coverage, not an error. A side
+    whose dates have no public bucket is an error: that window is not served,
+    rather than an empty catalog that reads like no imagery.
+
+    Raises:
+        ValueError: The AOI meets a disk but no bucket covers the date window.
     """
-    targets: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    targets: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
     for part in bbox.antimeridian_parts():
-        bucket = _bucket_for_bbox(part)
+        side = _side_for_bbox(part)
         product = _product_for_bbox(part)
-        if not _footprint(bucket, product).intersects(part):
+        if not _footprint(side, product).intersects(part):
             continue
-        pair = (bucket, product)
-        if pair not in seen:
-            seen.add(pair)
-            targets.append(pair)
+        buckets = _buckets_for(side, start, end)
+        if not buckets:
+            raise ValueError(
+                f"GOES has no public {side} bucket for {start.isoformat()}..{end.isoformat()}"
+            )
+        for bucket in buckets:
+            target = (bucket, side, product)
+            if target not in seen:
+                seen.add(target)
+                targets.append(target)
     return targets
+
+
+def _buckets_for(side: str, start: date, end: date) -> list[str]:
+    """Public buckets on ``side`` whose operational window meets the request."""
+    windows = _EAST_WINDOWS if side == "east" else _WEST_WINDOWS
+    return [bucket for bucket, first, last in windows if first <= end and start <= last]
 
 
 async def _search_product(
     client: httpx.AsyncClient,
     request: PullRequest,
     bucket: str,
+    side: str,
     product: str,
     hours: set[tuple[int, int, int]],
 ) -> list[Scene]:
@@ -115,7 +151,7 @@ async def _search_product(
         if request.limit is not None and len(scenes) >= request.limit:
             break
         for key in await list_keys(client, bucket, f"{product}/{year}/{doy:03d}/"):
-            scene = _key_to_scene(bucket, key, product)
+            scene = _key_to_scene(bucket, side, key, product)
             # Keep finished hours only.
             if scene is not None and _hour_key(scene.datetime) in hours:
                 scenes.setdefault(scene.id, scene)
@@ -132,10 +168,11 @@ def _require_unwrapped(bbox: BBox) -> None:
         )
 
 
-def _bucket_for_bbox(bbox: BBox) -> str:
+def _side_for_bbox(bbox: BBox) -> str:
+    """``east`` or ``west`` disk that contains the centre of ``bbox``."""
     _require_unwrapped(bbox)
     lon = (bbox.west + bbox.east) / 2
-    return GOES_EAST_BUCKET if lon >= -105.0 else GOES_WEST_BUCKET
+    return "east" if lon >= -105.0 else "west"
 
 
 def _product_for_bbox(bbox: BBox) -> str:
@@ -171,13 +208,13 @@ def _hour_key(when: datetime) -> tuple[int, int, int]:
     return (when.year, when.timetuple().tm_yday, when.hour)
 
 
-def _footprint(bucket: str, product: str) -> BBox:
+def _footprint(side: str, product: str) -> BBox:
     if product.endswith("C"):
         return _CONUS
-    return _EAST_DISK if bucket == GOES_EAST_BUCKET else _WEST_DISK
+    return _EAST_DISK if side == "east" else _WEST_DISK
 
 
-def _key_to_scene(bucket: str, key: str, product: str) -> Scene | None:
+def _key_to_scene(bucket: str, side: str, key: str, product: str) -> Scene | None:
     match = _START_RE.search(key)
     if match is None:
         return None
@@ -194,9 +231,9 @@ def _key_to_scene(bucket: str, key: str, product: str) -> Scene | None:
         collection=product,
         kind=SceneKind.optical,
         datetime=scene_dt,
-        bbox=_footprint(bucket, product),
+        bbox=_footprint(side, product),
         gsd_m=2000.0,
-        platform="GOES-East" if bucket == GOES_EAST_BUCKET else "GOES-West",
+        platform="GOES-East" if side == "east" else "GOES-West",
         instrument="ABI",
         assets={
             "data": Asset(

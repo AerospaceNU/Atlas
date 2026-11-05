@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted
+Superseded. The sandbox described here was removed on 2026-11-02: file tools
+accept absolute paths, `..`, and symlinks, and `bash_tool` runs unconfined
+with the inherited environment. `shell_guard.py` and the workspace
+`sandbox_audit.log` no longer exist. This record is kept for the history of
+why confinement was tried, not as a description of the current code.
 
 ## Context
 
