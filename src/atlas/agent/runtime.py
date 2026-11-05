@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import re
 import secrets
 import time
 import tomllib
@@ -48,11 +49,16 @@ CHARS_PER_TOKEN = 4
 MAX_CONTEXT_TOKENS = 200_000
 COMPACT_PREVIEW_CHARS = 500
 KEEP_RECENT_MESSAGES = 6
+_COMPACT_TARGET_FRACTION = 0.8
 
 
 _STOPPED_RESPONSE = "Stopped after reaching the configured tool-use limit."
 _STOPPED_BUDGET = "Stopped after reaching the configured token or spend budget."
 _STOPPED_CANCELLED = "Stopped at your request."
+_STOPPED_CONTEXT = (
+    "The current request and required instructions exceed the context limit. "
+    "Shorten the request or start a new conversation."
+)
 _PREVIEW_LIMIT = 4000
 
 # Tool calls in one assistant turn are independent, so they run concurrently.
@@ -101,6 +107,15 @@ class PermissionRequest(BaseModel):
     preview: str = ""
 
 
+class ContextCompaction(BaseModel):
+    """Changes to model context, excluding the original tool results in the run log."""
+
+    occurred: bool = False
+    tokens_reclaimed: int = 0
+    tool_results_shortened: int = 0
+    messages_dropped: int = 0
+
+
 class AgentRun(BaseModel):
     """Final response plus a transparent record of every tool action."""
 
@@ -108,8 +123,10 @@ class AgentRun(BaseModel):
     steps: list[AgentStep] = Field(default_factory=list)
     stopped_for_limit: bool = False
     stopped_for_budget: bool = False
+    stopped_for_context: bool = False
     cancelled: bool = False
     calls: list[ModelCall] = Field(default_factory=list)
+    compaction: ContextCompaction = Field(default_factory=ContextCompaction)
 
 
 def _load_agent_config(root: Path) -> dict[str, object]:
@@ -350,6 +367,8 @@ class Agent:
         steps: list[AgentStep] = []
         calls: list[ModelCall] = []
         executed = 0
+        compaction = ContextCompaction()
+        current_user = _current_user_message(messages)
 
         def emit(phase: str, name: str | None = None) -> None:
             if on_phase is not None:
@@ -358,13 +377,29 @@ class Agent:
         while executed < self.max_tool_calls:
             if should_cancel is not None and should_cancel():
                 return AgentRun(
-                    response=_STOPPED_CANCELLED, steps=steps, cancelled=True, calls=calls
+                    response=_STOPPED_CANCELLED,
+                    steps=steps,
+                    cancelled=True,
+                    calls=calls,
+                    compaction=compaction,
                 )
             config = getattr(self.model, "config", None)
             reasoning = True if config is None else bool(getattr(config, "reasoning", True))
             emit("thinking" if reasoning else "working")
             if _estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
-                _compact(messages)
+                change = _compact(messages, protected_user=current_user)
+                compaction.occurred |= change.occurred
+                compaction.tokens_reclaimed += change.tokens_reclaimed
+                compaction.tool_results_shortened += change.tool_results_shortened
+                compaction.messages_dropped += change.messages_dropped
+                if _estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
+                    return AgentRun(
+                        response=_STOPPED_CONTEXT,
+                        steps=steps,
+                        calls=calls,
+                        stopped_for_context=True,
+                        compaction=compaction,
+                    )
             response = self.model.complete(messages, self.tools.definitions)
             observed = observe_model_call(response)
             if observed is not None:
@@ -385,15 +420,27 @@ class Agent:
                 )
                 on_thought(response.reasoning, speed)
             if not response.tool_calls:
-                return AgentRun(response=response.content or "", steps=steps, calls=calls)
+                return AgentRun(
+                    response=response.content or "", steps=steps, calls=calls, compaction=compaction
+                )
             if should_cancel is not None and should_cancel():
-                return self._stop_cancelled(messages, steps, calls, response.tool_calls)
+                run = self._stop_cancelled(messages, steps, calls, response.tool_calls)
+                run.compaction = compaction
+                return run
             if self._over_budget(calls):
+                self._answer_pending(
+                    messages,
+                    steps,
+                    response.tool_calls,
+                    error="token or spend budget reached",
+                    error_kind="budget",
+                )
                 return AgentRun(
                     response=_STOPPED_BUDGET,
                     steps=steps,
                     stopped_for_budget=True,
                     calls=calls,
+                    compaction=compaction,
                 )
 
             pending: list[ToolCall] = []
@@ -446,6 +493,7 @@ class Agent:
                         role=Role.USER,
                         content="\n".join(image_errors) if image_errors else None,
                         images=attached,
+                        tool_observation=True,
                     )
                 )
             if executed >= self.max_tool_calls or limited:
@@ -454,12 +502,14 @@ class Agent:
                     steps=steps,
                     stopped_for_limit=True,
                     calls=calls,
+                    compaction=compaction,
                 )
         return AgentRun(
             response=_STOPPED_RESPONSE,
             steps=steps,
             stopped_for_limit=True,
             calls=calls,
+            compaction=compaction,
         )
 
     def _over_budget(self, calls: Sequence[ModelCall]) -> bool:
@@ -507,8 +557,23 @@ class Agent:
         pending: Sequence[ToolCall],
     ) -> AgentRun:
         """Answer every unanswered tool call after a cancel, then stop."""
+        self._answer_pending(
+            messages, steps, pending, error="cancelled by the user", error_kind="cancelled"
+        )
+        return AgentRun(response=_STOPPED_CANCELLED, steps=steps, cancelled=True, calls=calls)
+
+    def _answer_pending(
+        self,
+        messages: list[ChatMessage],
+        steps: list[AgentStep],
+        pending: Sequence[ToolCall],
+        *,
+        error: str,
+        error_kind: ErrorKind,
+    ) -> None:
+        """Close unexecuted call/result pairs when a turn stops."""
         for call in pending:
-            step = AgentStep(call=call, error="cancelled by the user", error_kind="cancelled")
+            step = AgentStep(call=call, error=error, error_kind=error_kind)
             steps.append(step)
             messages.append(
                 ChatMessage(
@@ -517,7 +582,6 @@ class Agent:
                     content=_tool_message(step),
                 )
             )
-        return AgentRun(response=_STOPPED_CANCELLED, steps=steps, cancelled=True, calls=calls)
 
     def _checkpoint(self, call: ToolCall) -> None:
         """Snapshot a file a mutating tool is about to change."""
@@ -653,33 +717,133 @@ def _kind(exc: Exception) -> ErrorKind:
     return "tool_failure"
 
 
-def _compact(messages: list[ChatMessage]) -> int:
-    shrunk = 0
-    for index in range(len(messages) - KEEP_RECENT_MESSAGES):
-        if _estimate_tokens(messages) <= MAX_CONTEXT_TOKENS:
-            break
-        message = messages[index]
-        content = message.content or ""
-        if (
-            message.role != Role.TOOL
-            or len(content) <= COMPACT_PREVIEW_CHARS
-            or "[compacted" in content
-        ):
-            continue
-        removed = len(content) - COMPACT_PREVIEW_CHARS
-        marker = f"...[compacted {removed} characters]"
-        messages[index] = message.model_copy(
-            update={"content": content[:COMPACT_PREVIEW_CHARS] + marker}
+def _compact(
+    messages: list[ChatMessage], *, protected_user: ChatMessage | None = None
+) -> ContextCompaction:
+    """Shorten old observations, then drop complete old tool exchanges.
+
+    Keep the opening instructions, every system message, the current user
+    request, and the last six messages. A tool-call batch intersecting those
+    messages is kept whole. Work toward 80% of the trigger to leave headroom.
+    """
+    sizes = [_message_chars(message) for message in messages]
+    total = sum(sizes)
+    before = total // CHARS_PER_TOKEN
+    result = ContextCompaction()
+    if before <= MAX_CONTEXT_TOKENS:
+        return result
+
+    if protected_user is None:
+        protected_user = _current_user_message(messages)
+    groups = _context_groups(messages)
+    prefix_end = next(
+        (index for index, message in enumerate(messages) if message.role is Role.ASSISTANT),
+        len(messages),
+    )
+    recent_start = max(0, len(messages) - KEEP_RECENT_MESSAGES)
+    protected = {
+        index
+        for group in groups
+        if any(
+            index < prefix_end
+            or index >= recent_start
+            or messages[index].role is Role.SYSTEM
+            or messages[index] is protected_user
+            for index in group
         )
-        shrunk += 1
-    return shrunk
+        for index in group
+    }
+    target = int(MAX_CONTEXT_TOKENS * _COMPACT_TARGET_FRACTION) * CHARS_PER_TOKEN
+
+    for index, message in enumerate(messages):
+        if total <= target:
+            break
+        if index in protected or message.role is not Role.TOOL:
+            continue
+        content = _compact_tool_content(message.content or "")
+        shorter = message.model_copy(update={"content": content})
+        size = _message_chars(shorter)
+        if size >= sizes[index]:
+            continue
+        messages[index] = shorter
+        total -= sizes[index] - size
+        sizes[index] = size
+        result.tool_results_shortened += 1
+
+    dropped: set[int] = set()
+    for group in groups:
+        if total <= target:
+            break
+        if any(index in protected for index in group):
+            continue
+        dropped.update(group)
+        total -= sum(sizes[index] for index in group)
+    if dropped:
+        messages[:] = [message for index, message in enumerate(messages) if index not in dropped]
+    result.messages_dropped = len(dropped)
+    result.tokens_reclaimed = before - total // CHARS_PER_TOKEN
+    result.occurred = bool(result.tool_results_shortened or dropped)
+    return result
+
+
+def _context_groups(messages: list[ChatMessage]) -> list[range]:
+    """Group assistant tool calls with all their results, including parallel calls."""
+    groups: list[range] = []
+    start = 0
+    while start < len(messages):
+        message = messages[start]
+        end = start + 1
+        if message.role is Role.ASSISTANT and message.tool_calls:
+            pending = {call.id for call in message.tool_calls}
+            while end < len(messages) and pending:
+                following = messages[end]
+                if following.role is Role.TOOL:
+                    pending.discard(following.tool_call_id or "")
+                end += 1
+            if end < len(messages) and messages[end].tool_observation:
+                end += 1
+        groups.append(range(start, end))
+        start = end
+    return groups
+
+
+def _current_user_message(messages: list[ChatMessage]) -> ChatMessage | None:
+    return next(
+        (m for m in reversed(messages) if m.role is Role.USER and not m.tool_observation), None
+    )
+
+
+def _compact_tool_content(content: str) -> str:
+    """Shorten only result text, preserving JSON, artifacts, and error fields."""
+    try:
+        result = ToolResult.model_validate_json(content)
+    except ValidationError:
+        try:
+            error = json.loads(content)
+        except ValueError:
+            return _compact_text(content)
+        if isinstance(error, dict) and isinstance(error.get("error"), str):
+            error["error"] = _compact_text(error["error"])
+            return json.dumps(error)
+        return content
+    return result.model_copy(update={"text": _compact_text(result.text)}).model_dump_json()
+
+
+def _compact_text(text: str) -> str:
+    if len(text) <= COMPACT_PREVIEW_CHARS or re.fullmatch(
+        r"\.\.\.\[compacted \d+ characters\]", text[COMPACT_PREVIEW_CHARS:]
+    ):
+        return text
+    removed = len(text) - COMPACT_PREVIEW_CHARS
+    return text[:COMPACT_PREVIEW_CHARS] + f"...[compacted {removed} characters]"
+
+
+def _message_chars(message: ChatMessage) -> int:
+    return len(message.model_dump_json(exclude={"images", "tool_observation"}))
 
 
 def _estimate_tokens(messages: list[ChatMessage]) -> int:
-    total = 0
-    for message in messages:
-        total += len(message.model_dump_json(exclude={"images"}))
-    return total // CHARS_PER_TOKEN
+    return sum(_message_chars(message) for message in messages) // CHARS_PER_TOKEN
 
 
 def _tool_message(step: AgentStep) -> str:

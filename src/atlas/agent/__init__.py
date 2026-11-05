@@ -9,13 +9,14 @@ from atlas.agent.contracts import (
     default_registry,
     discover_tool_classes,
 )
-from atlas.agent.runtime import Agent, AgentRun, AgentStep
+from atlas.agent.runtime import Agent, AgentRun, AgentStep, ContextCompaction
 
 __all__ = [
     "Agent",
     "AgentRun",
     "AgentSession",
     "AgentStep",
+    "ContextCompaction",
     "ImageInfo",
     "LocalArtifactStore",
     "Tool",

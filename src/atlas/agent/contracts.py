@@ -67,6 +67,8 @@ class ChatMessage(BaseModel):
     reasoning: str | None = None
     reasoning_details: list[dict[str, Any]] = Field(default_factory=list)
     images: list[ModelImage] = Field(default_factory=list)
+    # Local history metadata, never sent to the model provider.
+    tool_observation: bool = False
 
 
 class TokenUsage(BaseModel):

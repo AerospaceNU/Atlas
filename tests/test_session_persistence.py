@@ -6,12 +6,13 @@ from pathlib import Path
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import (
     ChatMessage,
+    ModelImage,
     ModelResponse,
     Role,
     ToolDefinition,
     ToolRegistry,
 )
-from atlas.agent.runtime import Agent
+from atlas.agent.runtime import Agent, _current_user_message
 from atlas.agent.session import AgentSession
 
 
@@ -87,6 +88,29 @@ def test_load_state_missing_file_leaves_session_untouched(tmp_path: Path) -> Non
 
     assert session.load_state("nope") is False
     assert [m for m in session.messages if m.role != Role.SYSTEM] == []
+
+
+def test_load_state_keeps_tool_observations_distinct_from_user_requests(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    session.messages.extend(
+        [
+            ChatMessage(role=Role.USER, content="Inspect the map."),
+            ChatMessage(
+                role=Role.USER,
+                images=[ModelImage(path="map.png", media_type="image/png", data="AA==")],
+                tool_observation=True,
+            ),
+        ]
+    )
+    session.save_state()
+    reopened = _session(tmp_path)
+
+    assert reopened.load_state("abc123")
+    assert reopened.messages[-1].tool_observation
+    assert reopened.messages[-1].images == []
+    current = _current_user_message(reopened.messages)
+    assert current is not None
+    assert current.content == "Inspect the map."
 
 
 def project_state(session: AgentSession) -> Path:
