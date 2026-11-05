@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from atlas.data.base import PullRequest, Scene
+from atlas.data.base import PullRequest, Scene, SceneKind
 
 
 class SourceScenes(BaseModel):
@@ -78,3 +78,5 @@ class CompiledProduct(BaseModel):
     coverage: dict[str, float] = Field(default_factory=dict)  # AOI fraction, 0..1
     mosaics: list[MosaicResult] = Field(default_factory=list)
     skipped_mosaics: list[MosaicSkip] = Field(default_factory=list)
+    analysis_input: SceneKind | None = None
+    analysis_note: str | None = None

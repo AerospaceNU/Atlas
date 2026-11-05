@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import httpx
@@ -9,9 +10,17 @@ import httpx
 from atlas.compile.aggregate import aggregate
 from atlas.compile.mosaic import build_mosaic
 from atlas.compile.product import CompiledProduct, MosaicResult, MosaicSkip, SourceScenes
-from atlas.compile.select import coverage_fraction, representative_cloud, select
-from atlas.data.base import DataPullClient, PullRequest
+from atlas.compile.select import coverage_fraction, filter_cloud, representative_cloud, select
+from atlas.data.base import DataPullClient, PullRequest, SceneKind
 from atlas.data.planetary_computer import PlanetaryComputerClient
+from atlas.data.registry import sources as create_sources
+
+# Optical counts as clear at or under this cloud cover when the request sets no cap.
+_CLEAR_CLOUD_COVER = 20.0
+# Below this AOI fraction under clear optical, SAR becomes the analysis input.
+MIN_CLEAR_OPTICAL_COVERAGE = 0.5
+# Registry name searched for SAR when the request brought no SAR source.
+_SAR_FALLBACK_SOURCE = "sentinel1"
 
 
 async def consolidate(
@@ -20,8 +29,19 @@ async def consolidate(
     *,
     out_dir: Path | None = None,
     render: bool = True,
+    min_clear_optical_coverage: float = MIN_CLEAR_OPTICAL_COVERAGE,
+    sar_fallback: DataPullClient | None = None,
 ) -> CompiledProduct:
     """Search all sources, select scenes, and (optionally) render mosaics.
+
+    When optical scenes at or under the cloud cap (the request's
+    ``max_cloud_cover``, else 20%) cover less than
+    ``min_clear_optical_coverage`` of the AOI, SAR becomes the analysis input
+    and optical mosaics are skipped for cloud. Optical with no reported cloud
+    counts as clear. SAR sources in ``clients`` are used first; if there are
+    none, Sentinel-1 is searched. With no SAR scenes, optical stays the input.
+    Requested optical sources with no results also qualify for SAR fallback.
+    A request with ``min_cloud_cover`` set is seeking cloud and never falls back.
 
     Args:
         request: The AOI and time window to consolidate.
@@ -30,54 +50,120 @@ async def consolidate(
             Required when ``render`` is true.
         render: Whether to render mosaics. False gives a metadata-only
             consolidation.
+        min_clear_optical_coverage: AOI fraction, 0 to 1, that clear optical
+            must cover before SAR is used instead.
+        sar_fallback: Client searched as ``sentinel1`` for the SAR fallback.
+            None creates Sentinel-1 through the source registry and closes it afterwards.
 
     Returns:
         The consolidated product. Sources selected for render that produced no
         mosaic appear in ``skipped_mosaics`` with a reason.
 
     Raises:
-        ValueError: If ``render`` is true and ``out_dir`` is None.
+        ValueError: If ``render`` is true and ``out_dir`` is None, or the
+            clear-coverage threshold is outside 0 to 1.
     """
     if render and out_dir is None:
         raise ValueError("out_dir is required when render=True")
 
+    if not 0.0 <= min_clear_optical_coverage <= 1.0:
+        raise ValueError("min_clear_optical_coverage must be between 0 and 1")
+
     catalog = await aggregate(request, clients)
+    sources = catalog.ok_sources
+    render_clients: Mapping[str, DataPullClient] = clients
+    analysis_input: SceneKind | None = None
+    note: str | None = None
 
-    scene_ids: dict[str, list[str]] = {}
-    n_scenes: dict[str, int] = {}
-    cloud_cover: dict[str, float | None] = {}
-    coverage: dict[str, float] = {}
-    render_targets: list[tuple[str, SourceScenes]] = []
-
-    for src in catalog.ok_sources:
-        chosen = select(
-            src.scenes,
-            min_cloud=request.min_cloud_cover,
-            max_cloud=request.max_cloud_cover,
+    async with AsyncExitStack() as cleanup:
+        optical = [s for src in sources for s in src.scenes if s.kind is SceneKind.optical]
+        optical_requested = any(
+            client.scene_kind is SceneKind.optical for client in clients.values()
         )
-        if not chosen:
-            continue
-        scene_ids[src.source] = [s.id for s in chosen]
-        n_scenes[src.source] = len(chosen)
-        cloud_cover[src.source] = representative_cloud(chosen)
-        coverage[src.source] = coverage_fraction(chosen, request.bbox)
-        render_targets.append((src.source, src))
+        if optical or optical_requested:
+            if optical:
+                analysis_input = SceneKind.optical
+            max_cloud = (
+                request.max_cloud_cover
+                if request.max_cloud_cover is not None
+                else _CLEAR_CLOUD_COVER
+            )
+            clear = coverage_fraction(filter_cloud(optical, max_cloud), request.bbox)
+            if request.min_cloud_cover is None and clear < min_clear_optical_coverage:
+                if _SAR_FALLBACK_SOURCE not in clients and not _sources_of(sources, SceneKind.sar):
+                    fallback = sar_fallback
+                    if fallback is None:
+                        fallback = create_sources(_SAR_FALLBACK_SOURCE)[_SAR_FALLBACK_SOURCE]
+                        close = getattr(fallback, "aclose", None)
+                        if close is not None:
+                            cleanup.push_async_callback(close)
+                    render_clients = {**clients, _SAR_FALLBACK_SOURCE: fallback}
+                    extra = await aggregate(request, {_SAR_FALLBACK_SOURCE: fallback})
+                    sources = sources + extra.ok_sources
+                sar = _sources_of(sources, SceneKind.sar)
+                if sar:
+                    analysis_input = SceneKind.sar
+                    if optical:
+                        note = (
+                            f"optical skipped for cloud: {clear:.0%} of the AOI has optical at or "
+                            f"under {max_cloud:g}% cloud, below the "
+                            f"{min_clear_optical_coverage:.0%} threshold; using SAR from {', '.join(sar)}"
+                        )
+                    else:
+                        note = (
+                            "optical unavailable: no optical scenes returned (0% clear coverage); "
+                            f"using SAR from {', '.join(sar)}"
+                        )
 
-    mosaics: list[MosaicResult] = []
-    skipped: list[MosaicSkip] = []
-    if render and out_dir is not None:
-        mosaics, skipped = await _render_all(request, clients, render_targets, out_dir)
+        scene_ids: dict[str, list[str]] = {}
+        n_scenes: dict[str, int] = {}
+        cloud_cover: dict[str, float | None] = {}
+        coverage: dict[str, float] = {}
+        render_targets: list[tuple[str, SourceScenes]] = []
+        cloud_skips: list[MosaicSkip] = []
 
-    return CompiledProduct(
-        request=request,
-        sources=list(scene_ids),
-        scene_ids=scene_ids,
-        n_scenes=n_scenes,
-        cloud_cover=cloud_cover,
-        coverage=coverage,
-        mosaics=mosaics,
-        skipped_mosaics=skipped,
-    )
+        for src in sources:
+            chosen = select(
+                src.scenes,
+                min_cloud=request.min_cloud_cover,
+                max_cloud=request.max_cloud_cover,
+            )
+            if not chosen:
+                continue
+            scene_ids[src.source] = [s.id for s in chosen]
+            n_scenes[src.source] = len(chosen)
+            cloud_cover[src.source] = representative_cloud(chosen)
+            coverage[src.source] = coverage_fraction(chosen, request.bbox)
+            if note is not None and any(s.kind is SceneKind.optical for s in src.scenes):
+                cloud_skips.append(
+                    MosaicSkip(source=src.source, collection=src.collection, reason=note)
+                )
+                continue
+            render_targets.append((src.source, src))
+
+        mosaics: list[MosaicResult] = []
+        skipped: list[MosaicSkip] = []
+        if render and out_dir is not None:
+            mosaics, skipped = await _render_all(request, render_clients, render_targets, out_dir)
+            skipped = cloud_skips + skipped
+
+        return CompiledProduct(
+            request=request,
+            sources=list(scene_ids),
+            scene_ids=scene_ids,
+            n_scenes=n_scenes,
+            cloud_cover=cloud_cover,
+            coverage=coverage,
+            mosaics=mosaics,
+            skipped_mosaics=skipped,
+            analysis_input=analysis_input,
+            analysis_note=note,
+        )
+
+
+def _sources_of(sources: list[SourceScenes], kind: SceneKind) -> list[str]:
+    """Names of sources with at least one scene of ``kind``, in order."""
+    return [src.source for src in sources if any(s.kind is kind for s in src.scenes)]
 
 
 async def _render_all(
