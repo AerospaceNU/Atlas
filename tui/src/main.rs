@@ -2,6 +2,8 @@
 
 mod approval;
 mod clipboard;
+mod editor;
+mod history;
 mod logo;
 mod markdown;
 mod protocol;
@@ -10,6 +12,8 @@ mod theme;
 
 #[cfg(test)]
 mod approval_tests;
+#[cfg(test)]
+mod composer_tests;
 #[cfg(test)]
 mod text_interaction_tests;
 #[cfg(test)]
@@ -34,13 +38,15 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use editor::{layout as composer_layout, ComposerEditor};
+use history::PromptHistory;
 use markdown::{render_fitted, Mark, Piece};
 use protocol::{default_status_line, parse_line, status_text, CatalogEntry, ServerMessage};
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use selection::TextSelection;
@@ -189,6 +195,10 @@ struct App {
     tools: Vec<String>,
     transcript: Vec<TranscriptLine>,
     input: String,
+    input_editor: ComposerEditor,
+    prompt_history: PromptHistory,
+    composer_width: usize,
+    menu_dismissed: bool,
     status: Status,
     /// The in-flight request is a resume, so a failure should stay on the limit.
     waiting_from_stopped: bool,
@@ -230,7 +240,7 @@ struct App {
     preview_sha: Option<(String, String)>,
     screen_snapshot: Option<Buffer>,
     text_selection: Option<TextSelection>,
-    clipboard_notice: Option<&'static str>,
+    status_notice: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -397,6 +407,10 @@ impl App {
             tools: Vec::new(),
             transcript: Vec::new(),
             input: String::new(),
+            input_editor: ComposerEditor::default(),
+            prompt_history: PromptHistory::default(),
+            composer_width: 71,
+            menu_dismissed: false,
             status: Status::Ready,
             waiting_from_stopped: false,
             session_open: true,
@@ -425,7 +439,7 @@ impl App {
             preview_sha: None,
             screen_snapshot: None,
             text_selection: None,
-            clipboard_notice: None,
+            status_notice: None,
         }
     }
 
@@ -510,6 +524,7 @@ impl App {
                 cancelled,
                 status,
             } => {
+                self.status_notice = None;
                 self.adopt_status(&status);
                 self.pending_permission = None;
                 if !response.is_empty() {
@@ -551,6 +566,7 @@ impl App {
                 status_line,
                 ..
             } => {
+                self.status_notice = None;
                 self.pending_permission = None;
                 self.transcript
                     .push(TranscriptLine::Assistant(StreamText::settled(format!(
@@ -615,6 +631,7 @@ impl App {
             } => {
                 self.mode = Mode::Compose;
                 self.input.clear();
+                self.input_editor.reset();
                 let note = if scope == "deleted" {
                     if name.is_empty() {
                         "OpenRouter key deleted. OPENROUTER_API_KEY in the environment \
@@ -1003,16 +1020,15 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
         if let Some(text) = read_from_clipboard() {
             apply_paste(app, &text);
         } else {
-            app.clipboard_notice =
-                Some("Clipboard unavailable; use your terminal's paste shortcut");
+            app.status_notice = Some("Clipboard unavailable; use your terminal's paste shortcut");
         }
         return Ok(false);
     }
     if app.text_selection.take().is_some() && key.code == KeyCode::Esc {
-        app.clipboard_notice = None;
+        app.status_notice = None;
         return Ok(false);
     }
-    app.clipboard_notice = None;
+    app.status_notice = None;
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         child.shutdown();
         return Ok(true);
@@ -1028,8 +1044,11 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
         }
         return Ok(false);
     }
-    if key.code == KeyCode::Esc && matches!(app.mode, Mode::Compose) && !app.input.starts_with('/')
-    {
+    if key.code == KeyCode::Esc && app.mode == Mode::Compose {
+        if show_slash_menu(app) {
+            app.menu_dismissed = true;
+            return Ok(false);
+        }
         if app.in_flight() {
             // Stop the turn, keep the conversation. The runtime answers every
             // pending tool call before it returns, so the next turn is valid.
@@ -1038,12 +1057,18 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
                 .push(tool_note("cancelling after this step..."));
             return Ok(false);
         }
+        if !app.input.is_empty() {
+            app.status_notice = Some("Draft kept. Ctrl+C quits.");
+            return Ok(false);
+        }
         child.shutdown();
         return Ok(true);
     }
     if key.code == KeyCode::Esc {
         app.mode = Mode::Compose;
         app.input.clear();
+        app.input_editor.reset();
+        app.menu_dismissed = false;
         return Ok(false);
     }
     let mode = app.mode.clone();
@@ -1112,12 +1137,27 @@ fn record_permission(app: &mut App, allow: bool) {
 }
 
 fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<bool> {
+    let newline = key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+    if newline {
+        app.input_editor.insert(&mut app.input, "\n");
+        draft_edited(app);
+        return Ok(false);
+    }
     if key.code == KeyCode::Enter && app.session_open && app.input.trim() == "/yolo" {
         app.input.clear();
+        app.input_editor.reset();
+        app.prompt_history.edited();
         handle_slash(app, child, "/yolo")?;
         return Ok(false);
     }
-    let menu_open = !menu_options(&app.input).is_empty();
+    if key.code == KeyCode::Enter && app.in_flight() {
+        app.status_notice = Some("Still working; draft kept. Esc stops the turn.");
+        return Ok(false);
+    }
+    let menu_open = show_slash_menu(app);
     match key.code {
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.session_open && app.status == Status::Stopped && !app.in_flight() {
@@ -1137,10 +1177,44 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
         }
         KeyCode::Up if tool_select_modifier(key.modifiers) => select_tool(app, -1),
         KeyCode::Down if tool_select_modifier(key.modifiers) => select_tool(app, 1),
-        KeyCode::Up => nudge_scroll(app, -1),
-        KeyCode::Down => nudge_scroll(app, 1),
+        KeyCode::Up => move_draft_vertical(app, -1),
+        KeyCode::Down => move_draft_vertical(app, 1),
+        KeyCode::Left if !app.input.is_empty() => {
+            if word_modifier(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input_editor.move_word_left(&app.input);
+            } else {
+                app.input_editor.move_left(&app.input);
+            }
+        }
+        KeyCode::Right if !app.input.is_empty() => {
+            if word_modifier(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input_editor.move_word_right(&app.input);
+            } else {
+                app.input_editor.move_right(&app.input);
+            }
+        }
         KeyCode::Left => collapse_selected(app),
         KeyCode::Right => expand_selected(app),
+        KeyCode::Home => app.input_editor.move_home(&app.input),
+        KeyCode::End => app.input_editor.move_end(&app.input),
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.move_home(&app.input)
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.move_end(&app.input)
+        }
+        KeyCode::Char('b') if word_modifier(key.modifiers) => {
+            app.input_editor.move_word_left(&app.input)
+        }
+        KeyCode::Char('f') if word_modifier(key.modifiers) => {
+            app.input_editor.move_word_right(&app.input)
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.move_left(&app.input)
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.move_right(&app.input)
+        }
         KeyCode::Tab if menu_open => {
             if let MenuAction::Complete(prefix, replacement) =
                 menu_action(&app.input, app.menu_index, false)
@@ -1149,12 +1223,19 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
             }
         }
         KeyCode::Enter => {
-            if app.session_open && !app.input.is_empty() && !app.in_flight() {
+            if app.session_open && !app.input.trim().is_empty() && !app.in_flight() {
                 if app.input.starts_with('/') {
                     let text = app.input.clone();
-                    match menu_action(&text, app.menu_index, true) {
+                    let action = if menu_open {
+                        menu_action(&text, app.menu_index, true)
+                    } else {
+                        MenuAction::None
+                    };
+                    match action {
                         MenuAction::Run(run) => {
                             app.input.clear();
+                            app.input_editor.reset();
+                            app.prompt_history.edited();
                             if is_quit_command(&run) {
                                 child.shutdown();
                                 return Ok(true);
@@ -1170,6 +1251,8 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
                             // No rows (unknown command or free text): keep the
                             // existing slash behavior.
                             app.input.clear();
+                            app.input_editor.reset();
+                            app.prompt_history.edited();
                             if is_quit_command(&text) {
                                 child.shutdown();
                                 return Ok(true);
@@ -1181,8 +1264,10 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
                     }
                 } else {
                     let text = std::mem::take(&mut app.input);
+                    app.input_editor.reset();
                     finish_streams(app);
                     child.send(serde_json::json!({"type": "user", "text": text}))?;
+                    app.prompt_history.record(&text);
                     app.transcript.push(TranscriptLine::User(text));
                     app.waiting_from_stopped = false;
                     app.status = Status::Waiting;
@@ -1191,22 +1276,63 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
             }
         }
         KeyCode::Backspace => {
-            rubout(&mut app.input, key.modifiers);
-            app.menu_index = 0;
+            if word_modifier(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input_editor.delete_word_before(&mut app.input);
+            } else {
+                app.input_editor.backspace(&mut app.input);
+            }
+            draft_edited(app);
         }
         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            delete_word_backward(&mut app.input);
-            app.menu_index = 0;
+            app.input_editor.delete_word_before(&mut app.input);
+            draft_edited(app);
+        }
+        KeyCode::Delete => {
+            app.input_editor.delete(&mut app.input);
+            draft_edited(app);
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.clear_before(&mut app.input);
+            draft_edited(app);
+        }
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.clear_after(&mut app.input);
+            draft_edited(app);
         }
         KeyCode::PageUp => nudge_scroll(app, -5),
         KeyCode::PageDown => nudge_scroll(app, 5),
         KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.input.push(ch);
-            app.menu_index = 0;
+            app.input_editor.insert(&mut app.input, &ch.to_string());
+            draft_edited(app);
         }
         _ => {}
     }
     Ok(false)
+}
+
+fn draft_edited(app: &mut App) {
+    app.menu_index = 0;
+    app.menu_dismissed = false;
+    app.prompt_history.edited();
+}
+
+fn move_draft_vertical(app: &mut App, delta: isize) {
+    if app.prompt_history.is_browsing()
+        || !app
+            .input_editor
+            .move_vertical(&app.input, app.composer_width, delta)
+    {
+        let recalled = if delta < 0 {
+            app.prompt_history.older(&app.input)
+        } else {
+            app.prompt_history.newer()
+        };
+        if let Some(text) = recalled {
+            app.input = text;
+            app.input_editor.reset();
+            app.menu_index = 0;
+        }
+    }
 }
 
 fn is_quit_command(text: &str) -> bool {
@@ -1258,7 +1384,7 @@ fn is_paste_key(key: KeyEvent) -> bool {
 }
 
 fn copy_selection(app: &mut App, text: &str) {
-    app.clipboard_notice = Some(if copy_to_clipboard(text) {
+    app.status_notice = Some(if copy_to_clipboard(text) {
         "Selection copied  Ctrl+C copy  Esc clear"
     } else {
         "Copy failed  Ctrl+C retry  Esc clear"
@@ -1267,7 +1393,7 @@ fn copy_selection(app: &mut App, text: &str) {
 
 fn apply_paste(app: &mut App, text: &str) {
     app.text_selection = None;
-    app.clipboard_notice = None;
+    app.status_notice = None;
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let text: String = text
         .chars()
@@ -1281,8 +1407,8 @@ fn apply_paste(app: &mut App, text: &str) {
     }
     match app.mode {
         Mode::Compose => {
-            app.input.push_str(&text);
-            app.menu_index = 0;
+            app.input_editor.insert(&mut app.input, &text);
+            draft_edited(app);
         }
         Mode::Key { .. } => app.input.push_str(text.trim_end_matches('\n')),
         Mode::ModelPicker => app.picker_filter.push_str(text.trim()),
@@ -1302,7 +1428,7 @@ fn selection_mouse(app: &mut App, mouse: MouseEvent) -> SelectionEvent {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             app.text_selection = None;
-            app.clipboard_notice = None;
+            app.status_notice = None;
             // Approval buttons keep their explicit click behavior. All other
             // visible text, including command previews, can be selected.
             if app
@@ -1351,7 +1477,7 @@ fn selection_mouse(app: &mut App, mouse: MouseEvent) -> SelectionEvent {
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             app.text_selection = None;
-            app.clipboard_notice = None;
+            app.status_notice = None;
         }
         _ => {}
     }
@@ -1617,6 +1743,9 @@ fn activity_from(phase: &str, name: Option<&str>) -> Option<Activity> {
 fn apply_completion(app: &mut App, prefix: &str, replacement: &str) {
     if let Some(rest) = app.input.strip_prefix(prefix) {
         app.input = format!("{replacement}{rest}");
+        app.input_editor.reset();
+        app.prompt_history.edited();
+        app.menu_dismissed = false;
     }
     app.menu_index = 0;
 }
@@ -1673,6 +1802,7 @@ fn handle_secret_key(
         KeyCode::Enter => {
             if !app.input.is_empty() {
                 let secret = std::mem::take(&mut app.input);
+                app.input_editor.reset();
                 let mut payload = serde_json::json!({
                     "type": "set_key",
                     "scope": scope,
@@ -2277,7 +2407,7 @@ fn is_finished_command(text: &str) -> bool {
 }
 
 fn menu_rows(app: &App) -> u16 {
-    if app.mode != Mode::Compose {
+    if !show_slash_menu(app) {
         return 0;
     }
     let options = menu_options(&app.input);
@@ -2286,6 +2416,13 @@ fn menu_rows(app: &App) -> u16 {
     }
     let count = options.len().clamp(1, MENU_PAGE) as u16;
     count.saturating_add(1)
+}
+
+fn show_slash_menu(app: &App) -> bool {
+    app.mode == Mode::Compose
+        && !app.menu_dismissed
+        && app.input_editor.position(&app.input) == app.input.len()
+        && !menu_options(&app.input).is_empty()
 }
 
 fn render_menu(frame: &mut Frame, app: &App, area: Rect) {
@@ -2456,14 +2593,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .is_some_and(|selection| selection.area() != frame.area())
     {
         app.text_selection = None;
-        app.clipboard_notice = None;
+        app.status_notice = None;
     }
     if let Some(selection) = app.text_selection.as_ref() {
         selection.paint(frame.buffer_mut());
         let area = inset(frame.area(), 1, 2);
         if area.height > 0 {
             let hint = app
-                .clipboard_notice
+                .status_notice
                 .unwrap_or("Drag to select  Ctrl+C copy  Esc clear");
             let hint_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
             frame.render_widget(ratatui::widgets::Clear, hint_area);
@@ -2483,6 +2620,7 @@ fn draw_content(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Block::default().style(Style::default().bg(BG_BASE)), area);
 
     let outer = inset(area, 1, 2);
+    app.composer_width = composer_text_width(outer.width);
     if outer.width < 8 || outer.height < 4 {
         render_status(frame, app, outer);
         return;
@@ -2576,13 +2714,17 @@ fn inset(area: Rect, vertical: u16, horizontal: u16) -> Rect {
 }
 
 fn composer_rows(app: &App, outer_width: u16) -> u16 {
-    let text_width = outer_width.saturating_sub(4).max(1) as usize;
+    let text_width = composer_text_width(outer_width);
     let body = if app.input.is_empty() {
         1
     } else {
-        wrap_text(&app.input, text_width).len().clamp(1, 5)
+        composer_layout(&app.input, text_width).len().clamp(1, 5)
     };
     (body as u16).saturating_add(2)
+}
+
+fn composer_text_width(outer_width: u16) -> usize {
+    usize::from(outer_width.saturating_sub(5).max(1))
 }
 
 fn render_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -2989,7 +3131,7 @@ fn model_picker_label(
 }
 
 fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
-    if app.mode == Mode::Compose && !menu_options(&app.input).is_empty() {
+    if show_slash_menu(app) {
         render_menu(frame, app, area);
         return;
     }
@@ -3045,9 +3187,7 @@ fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
-    let active = app.session_open
-        && !app.in_flight()
-        && matches!(app.mode, Mode::Compose | Mode::Key { .. });
+    let active = app.session_open && matches!(app.mode, Mode::Compose | Mode::Key { .. });
     let border = if active {
         PROMPT_BORDER_ACTIVE
     } else {
@@ -3058,6 +3198,38 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(BG_BASE).fg(FG));
+    if app.mode == Mode::Compose && !app.input.is_empty() {
+        let width = composer_text_width(area.width);
+        let cursor = app.input_editor.position(&app.input);
+        let cursor_row = app.input_editor.cursor_row(&app.input, width);
+        let lines: Vec<Line> = composer_layout(&app.input, width)
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let mut spans = vec![Span::styled(
+                    if index == 0 { "› " } else { "  " },
+                    Style::default().fg(FG_SECONDARY),
+                )];
+                if index == cursor_row {
+                    let at = cursor.clamp(line.start, line.end);
+                    spans.push(Span::raw(&app.input[line.start..at]));
+                    spans.push(Span::styled("▌", Style::default().fg(MAGENTA)));
+                    spans.push(Span::raw(&app.input[at..line.end]));
+                } else {
+                    spans.push(Span::raw(&app.input[line.start..line.end]));
+                }
+                Line::from(spans)
+            })
+            .collect();
+        let scroll = cursor_row.saturating_sub(usize::from(area.height.saturating_sub(3)));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+            area,
+        );
+        return;
+    }
     let mut spans = vec![Span::styled("› ", Style::default().fg(FG_SECONDARY))];
     match &app.mode {
         Mode::Key { .. } => {
@@ -3071,32 +3243,20 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
         }
         _ => {
             if app.input.is_empty() {
-                spans.push(Span::styled("Message Atlas", Style::default().fg(GRAY)));
+                let placeholder = if app.in_flight() {
+                    "Draft message while Atlas works"
+                } else {
+                    "Message Atlas"
+                };
+                spans.push(Span::styled(placeholder, Style::default().fg(GRAY)));
             } else {
                 spans.push(Span::styled(app.input.as_str(), Style::default().fg(FG)));
                 spans.push(Span::styled("▌", Style::default().fg(MAGENTA)));
             }
         }
     }
-    let text = if app.mode == Mode::Compose && !app.input.is_empty() {
-        Text::from(format!("› {}▌", app.input))
-    } else {
-        Text::from(Line::from(spans))
-    };
-    let scroll = if app.mode == Mode::Compose {
-        let rows = wrap_text(
-            &format!("› {}▌", app.input),
-            usize::from(area.width.saturating_sub(2).max(1)),
-        )
-        .len();
-        u16::try_from(rows.saturating_sub(usize::from(area.height.saturating_sub(2))))
-            .unwrap_or(u16::MAX)
-    } else {
-        0
-    };
-    let input = Paragraph::new(text)
+    let input = Paragraph::new(Line::from(spans))
         .block(block)
-        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(input, area);
 }
@@ -3256,7 +3416,7 @@ fn strip_model_field(status_line: &str) -> String {
 }
 
 fn status_hint(app: &App) -> String {
-    if let Some(notice) = app.clipboard_notice {
+    if let Some(notice) = app.status_notice {
         return notice.to_string();
     }
     if app.pending_permission.is_some() {
@@ -3265,9 +3425,11 @@ fn status_hint(app: &App) -> String {
     let mut hint = if !app.session_open {
         "ctrl-c quit".to_string()
     } else if app.status == Status::Stopped {
-        "enter send  /new /model /skill /key /quit  ctrl-r resume".to_string()
+        "Enter send  Alt+Enter newline  ↑↓ history  Ctrl+R resume".to_string()
+    } else if app.in_flight() {
+        "Draft a message  Esc stop  PgUp/PgDn scroll  / commands".to_string()
     } else {
-        "enter send  /new /model /skill /key /quit".to_string()
+        "Enter send  Alt+Enter newline  ↑↓ history  / commands".to_string()
     };
     if !expandable_tools(app).is_empty() {
         hint.push_str("  ←→ tool");
@@ -3815,7 +3977,7 @@ mod tests {
         let app = App::new();
         assert_eq!(
             status_hint(&app),
-            "enter send  /new /model /skill /key /quit"
+            "Enter send  Alt+Enter newline  ↑↓ history  / commands"
         );
         assert!(!status_hint(&app).contains("/goal"));
     }
@@ -4589,7 +4751,7 @@ mod tests {
             "spend $0.00036",
             "last 15.2 tok/s",
             "1.05M",
-            "enter send",
+            "Enter send",
         ] {
             assert!(flat.contains(field), "missing {field} in:\n{painted}");
         }

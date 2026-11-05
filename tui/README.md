@@ -40,10 +40,16 @@ The agent writes each new session under `<workspace>/.atlas/sessions/<id>/`
 and its files under `<workspace>/.atlas/artifacts/<id>/`. The directory list
 is `docs/atlas-layout.md`.
 
-Keys: `enter` sends the input line, `ctrl-r` resumes a turn that stopped at the
-tool-call limit, and `ctrl-c` copies selected text or quits when nothing is selected.
-`esc` clears a selection, cancels a running turn, closes a menu,
-or quits when idle. `PageUp` / `PageDown` scroll. `/new`
+Keys: `Enter` sends the draft; while a turn is running, it shows feedback and
+keeps the draft without queueing it. `Alt+Enter` inserts a newline (`Shift+Enter`
+works where the terminal supports it). `Left` / `Right` move the cursor, and
+`Home` / `End` move to the line ends. `Ctrl+A` / `Ctrl+E` move to the start / end
+of the current line; `Ctrl+W` deletes the previous word. `Up` / `Down` move
+through draft lines, then recall sent prompts at the boundaries. `PageUp` /
+`PageDown` scroll the transcript. `Shift+Up` / `Shift+Down` select tool rows.
+`Esc` keeps an unfinished ordinary draft; during a running turn it stops the
+turn and keeps the draft. `Ctrl+R` resumes a turn stopped at the tool-call limit,
+and `Ctrl+C` copies selected text or quits when nothing is selected. `/new`
 starts a fresh conversation and clears the transcript. `/skill <name>` applies
 a workspace skill for the rest of this conversation. The `.atlas` copy wins
 over `.agents` when both exist.
