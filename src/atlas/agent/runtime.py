@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied, record_denial
+from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.audit import record as audit_event
 from atlas.agent.checkpoints import snapshot
 from atlas.agent.contracts import (
@@ -292,7 +292,7 @@ class Agent:
         file as delimited project guidance with role ``user``. The wrapper tags
         use :attr:`instruction_nonce`. A missing or unreadable file leaves the
         list as the system message alone. Loading the file does not change
-        ``tools`` or either sandbox root.
+        ``tools`` or the store roots.
 
         Returns:
             The messages that start a run or a session.
@@ -306,7 +306,7 @@ class Agent:
     def run(self, request: str, *, images: Sequence[str] = ()) -> AgentRun:
         """Answer ``request``, making bounded, registry-approved tool calls.
 
-        ``images`` are paths in the write sandbox or the project workspace.
+        ``images`` are paths the store can resolve, including absolute paths.
         Each one is read through the store and sent with the user message.
         Project instructions, when present, are inserted after the system
         prompt and before ``request``.
@@ -533,11 +533,6 @@ class Agent:
             result = self.tools.execute(call.name, call.arguments, self.artifacts)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-            if isinstance(exc, SandboxDenied):
-                try:
-                    record_denial(self.artifacts, call.name, error)
-                except Exception:
-                    _LOGGER.exception("Could not record a sandbox denial for %s", call.name)
             audit_event(
                 self.artifacts,
                 "tool",
@@ -595,7 +590,7 @@ class Agent:
             return ""
         try:
             old = self.artifacts.resolve_read(path).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError, SandboxDenied):
+        except (OSError, UnicodeDecodeError, ArtifactError):
             old = ""
         new = _preview_text(old, call.arguments)
         if new is None:

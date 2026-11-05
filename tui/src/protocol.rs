@@ -38,6 +38,9 @@ pub enum ServerMessage {
         summary: String,
         preview: String,
     },
+    Yolo {
+        enabled: bool,
+    },
     Error {
         message: String,
         http_status: Option<u16>,
@@ -139,6 +142,8 @@ pub struct StatusSnapshot {
     pub status_line: String,
     #[serde(default)]
     pub model: String,
+    #[serde(default)]
+    pub yolo_enabled: Option<bool>,
     #[serde(default)]
     pub context_used: i64,
     #[serde(default)]
@@ -248,6 +253,8 @@ enum RawMessage {
         #[serde(default)]
         preview: String,
     },
+    #[serde(rename = "yolo")]
+    Yolo { enabled: bool },
     #[serde(rename = "error")]
     Error {
         message: String,
@@ -411,6 +418,7 @@ pub fn parse_line(line: &str) -> Result<Option<ServerMessage>, serde_json::Error
 impl From<RawMessage> for ServerMessage {
     fn from(raw: RawMessage) -> Self {
         match raw {
+            RawMessage::Yolo { enabled } => ServerMessage::Yolo { enabled },
             RawMessage::Ready {
                 tools,
                 key_set,

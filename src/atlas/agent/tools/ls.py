@@ -6,7 +6,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 
 
@@ -24,12 +24,9 @@ class LsInput(BaseModel):
     )
 
 
-def _display_path(store: LocalArtifactStore, base: Path, path: Path) -> str:
-    """Return a workspace-relative path without exposing a host path."""
-    try:
-        return store.relative(path)
-    except SandboxDenied:
-        return path.relative_to(base).as_posix()
+def _display_path(store: LocalArtifactStore, path: Path) -> str:
+    """Return a relative path when it sits inside the workspace, else absolute."""
+    return store.relative(path)
 
 
 def _entries(store: LocalArtifactStore, base: Path, *, recursive: bool) -> list[str]:
@@ -37,30 +34,26 @@ def _entries(store: LocalArtifactStore, base: Path, *, recursive: bool) -> list[
     entries: list[str] = []
     if not recursive:
         for child in base.iterdir():
-            if child.is_symlink():
-                continue
-            name = _display_path(store, base, child)
+            name = _display_path(store, child)
             entries.append(f"{name}/" if child.is_dir() else name)
         return sorted(entries)
     for root, dir_names, file_names in os.walk(base, followlinks=False):
         current = Path(root)
-        dir_names[:] = sorted(name for name in dir_names if not (current / name).is_symlink())
+        dir_names[:] = sorted(dir_names)
         for name in dir_names:
-            entries.append(f"{_display_path(store, base, current / name)}/")
+            entries.append(f"{_display_path(store, current / name)}/")
         for name in sorted(file_names):
-            child = current / name
-            if child.is_symlink():
-                continue
-            entries.append(_display_path(store, base, child))
+            entries.append(_display_path(store, current / name))
     return sorted(entries)
 
 
 class LsTool(Tool):
-    """List one directory in the artifact workspace.
+    """List one directory.
 
     The path is resolved through :class:`~atlas.agent.artifacts.LocalArtifactStore`,
-    so it cannot leave the sandbox, and results are workspace-relative names
-    with directories suffixed by ``/``. Symlinks are skipped.
+    and absolute paths and ``..`` are allowed. Results are workspace-relative
+    names when they sit inside the working tree, and absolute names otherwise,
+    with directories suffixed by ``/``.
     """
 
     name = "ls"
@@ -76,8 +69,6 @@ class LsTool(Tool):
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request = LsInput.model_validate(arguments)
-        if ".." in Path(request.path).parts:
-            raise SandboxDenied("Artifact paths must not contain '..'")
         base = store.resolve_read(request.path)
         if not base.exists():
             raise FileNotFoundError(f"Path does not exist: {request.path}")

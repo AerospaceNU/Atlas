@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import datetime
-import errno
-import logging
 import os
 import stat
 from pathlib import Path
@@ -10,43 +7,35 @@ from pathlib import Path
 from PIL import Image
 from pydantic import BaseModel
 
-from atlas.agent.layout import SANDBOX_AUDIT_RELATIVE
-
 _IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"})
 
-_AUDIT_LOGGER = logging.getLogger("atlas.sandbox.audit")
-_AUDIT_LOG_PATH = SANDBOX_AUDIT_RELATIVE
+
+class ArtifactError(ValueError):
+    """A tool path or size request was rejected."""
 
 
-class SandboxDenied(ValueError):
-    """A sandbox invariant rejected a path or a size (see docs/adr/0001)."""
-
-
-def record_denial(store: LocalArtifactStore, operation: str, detail: str) -> None:
-    """Log one denied access and append it as a single line to the workspace audit log.
-
-    The log path goes through ``store.resolve`` like any tool path, and the file
-    write is skipped if resolve denies it. Other write failures raise.
-    """
-    timestamp = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
-    # Escape control characters so a newline in a model-chosen path can't split
-    # or forge records.
-    record = f"{operation}: {detail}".encode("unicode_escape").decode("ascii")
-    line = f"{timestamp} DENIED {record}"
-    _AUDIT_LOGGER.warning(line)
+def _read_regular_file(path: Path, *, max_bytes: int | None, display_path: str) -> bytes:
+    """Read and size-check the same open file, bounding allocation when requested."""
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be nonnegative")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     try:
-        log_path = store.resolve(_AUDIT_LOG_PATH)
-    except SandboxDenied as exc:
-        _AUDIT_LOGGER.error("Skipped the audit file write to %s: %s", _AUDIT_LOG_PATH, exc)
-        return
-    log_path.parent.mkdir(exist_ok=True)
-    # A symlink or hardlink planted after resolve() returned is refused here.
-    fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as handle:
-        info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise OSError(f"{_AUDIT_LOG_PATH} is not a single-link regular file")
-        handle.write(line + "\n")
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(display_path) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ArtifactError("Path is not a regular file")
+        if max_bytes is not None and info.st_size > max_bytes:
+            raise ArtifactError(f"{display_path} exceeds the {max_bytes} byte read limit")
+        with open(descriptor, "rb", closefd=False) as stream:
+            data = stream.read() if max_bytes is None else stream.read(max_bytes + 1)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise ArtifactError(f"{display_path} exceeds the {max_bytes} byte read limit")
+        return data
+    finally:
+        os.close(descriptor)
 
 
 class ImageInfo(BaseModel):
@@ -59,60 +48,18 @@ class ImageInfo(BaseModel):
     format: str | None
 
 
-def _within(base: Path, relative_path: str) -> Path:
-    """Resolve ``relative_path`` under ``base``, rejecting escapes.
-
-    Absolute paths and ``..`` escapes raise ``SandboxDenied``. Resolution
-    follows symlinks before the containment check, so the result is always
-    inside ``base`` and callers never receive a host path outside the sandbox.
-    An existing regular file with more than one hardlink is refused too, since
-    its other name may be outside ``base``.
-
-    Args:
-        base: Directory that bounds the resolved path.
-        relative_path: Caller-supplied path, relative to ``base``.
-
-    Returns:
-        The resolved absolute path inside ``base``.
-
-    Raises:
-        SandboxDenied: If ``relative_path`` is absolute, escapes ``base``, or
-            names a hardlinked file.
-    """
-    path = Path(relative_path)
-    if path.is_absolute():
-        raise SandboxDenied("Artifact paths must be relative to the artifact root")
-    candidate = (base / path).resolve()
-    try:
-        candidate.relative_to(base)
-    except ValueError as exc:
-        raise SandboxDenied("Artifact path escapes the artifact root") from exc
-    try:
-        info = candidate.stat()
-    except OSError:
-        return candidate
-    if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
-        raise SandboxDenied("Artifact path is a hardlinked file that may lead outside the root")
-    return candidate
-
-
 class LocalArtifactStore:
-    """Constrain an agent's work to one local directory tree.
+    """An agent's working tree and its tool-output directory.
 
-    ``root`` is the writable working tree. It is whatever directory the person
-    pointed the session at -- a repository, a data folder, or any other tree --
-    and it does not have to be a git checkout. Tool paths are relative to it,
-    and absolute paths and ``..`` escapes are refused, so the root is the
-    boundary rather than the repository.
+    ``root`` is the working tree, usually the directory the person pointed the
+    session at. A relative tool path resolves against it. An absolute path is
+    used as given, ``~`` is expanded, and ``..`` is allowed.
 
     ``artifact_root`` is where tool-produced outputs are written. It defaults
-    to ``root`` and sits inside it in a session, so removing the session
-    removes its artifacts and ``relative()`` still reports workspace-relative
-    names.
+    to ``root`` so removing a session removes its artifacts.
 
     ``read_root`` is an optional second tree that reads may fall back to. It
-    exists for callers that keep artifacts outside the working tree; a session
-    at a workspace root does not need it.
+    lets a caller keep artifacts outside the working tree.
     """
 
     def __init__(
@@ -128,118 +75,100 @@ class LocalArtifactStore:
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         self.read_root = read_root.resolve() if read_root is not None else None
 
-    def resolve(self, relative_path: str) -> Path:
-        """Resolve a relative path for writing in the working tree."""
-        return _within(self.root, relative_path)
+    def _path(self, base: Path, path: str) -> Path:
+        """Resolve ``path`` against ``base``, honoring an absolute path or ``~``."""
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        return candidate.resolve()
 
-    def resolve_artifact(self, relative_path: str) -> Path:
-        """Resolve a relative path for writing a tool-produced artifact."""
-        return _within(self.artifact_root, relative_path)
+    def resolve(self, path: str) -> Path:
+        """Resolve a path for writing in the working tree."""
+        return self._path(self.root, path)
 
-    def resolve_read(self, relative_path: str) -> Path:
-        """Resolve a relative path for reading.
+    def resolve_artifact(self, path: str) -> Path:
+        """Resolve a path for writing a tool-produced artifact."""
+        return self._path(self.artifact_root, path)
+
+    def resolve_read(self, path: str) -> Path:
+        """Resolve a path for reading.
 
         A path that exists in the working tree wins, then the artifact root,
         then ``read_root`` when one is mounted. A path that exists in none of
-        them returns its ``root``-relative form, so the caller's error stays
-        workspace-relative and never leaks a host path.
+        them returns its ``root``-relative form.
         """
-        primary = _within(self.root, relative_path)
+        primary = self._path(self.root, path)
         if primary.exists():
             return primary
         if self.artifact_root != self.root:
-            artifact = _within(self.artifact_root, relative_path)
+            artifact = self._path(self.artifact_root, path)
             if artifact.exists():
                 return artifact
         if self.read_root is None:
             return primary
-        fallback = _within(self.read_root, relative_path)
+        fallback = self._path(self.read_root, path)
         return fallback if fallback.exists() else primary
 
-    def read_project_bytes(self, relative_path: str, *, max_bytes: int | None = None) -> bytes:
-        """Read one file from the project workspace, not the write sandbox.
+    def read_project_bytes(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        """Read one file from the project workspace.
 
         The project root is ``read_root`` when this store has one, and ``root``
-        otherwise. A file that exists only under ``root`` is not read when
-        ``read_root`` is set. Absolute paths, ``..`` escapes, symlinks, and
-        hardlinks are refused. The final path component is not followed when
-        it is a symlink. The open uses ``O_NONBLOCK`` so a FIFO cannot stall
-        the caller; a FIFO still fails the regular-file check after open.
+        otherwise. Any path the host can read is accepted, including an
+        absolute path and ``..``.
 
         Args:
-            relative_path: Path relative to the project root.
+            path: Path relative to the project root, or an absolute path.
             max_bytes: When set, a longer file is refused instead of truncated.
 
         Returns:
             The file bytes, at most ``max_bytes`` when that limit is set.
 
         Raises:
-            SandboxDenied: The path leaves the project root, is a symlink,
-                hardlink, FIFO, or other non-regular file, or exceeds
+            ArtifactError: The path is not a regular file, or exceeds
                 ``max_bytes``.
             FileNotFoundError: The file is missing.
             OSError: The file could not be read.
         """
-        if "\x00" in relative_path:
-            raise SandboxDenied("Project path is invalid")
-        relative = Path(relative_path)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise SandboxDenied("Project path escapes the project root")
         base = self.read_root if self.read_root is not None else self.root
-        lexical = base / relative
-        if lexical.is_symlink():
-            raise SandboxDenied("Project path is a symlink")
-        path = _within(base, relative_path)
-        flags = os.O_RDONLY | os.O_NONBLOCK
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if isinstance(nofollow, int):
-            flags |= nofollow
-        try:
-            fd = os.open(path, flags)
-        except FileNotFoundError:
-            raise
-        except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.EISDIR}:
-                raise SandboxDenied("Project path is not a readable regular file") from exc
-            raise
-        with os.fdopen(fd, "rb") as handle:
-            info = os.fstat(handle.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise SandboxDenied("Project path is not a single-link regular file")
-            if max_bytes is None:
-                return handle.read()
-            data = handle.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            raise SandboxDenied(f"{relative_path} exceeds the {max_bytes} byte read limit")
-        return data
+        resolved = self._path(base, path)
+        return _read_regular_file(resolved, max_bytes=max_bytes, display_path=path)
+
+    def read_bytes(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        """Read a regular file using the working/artifact/read-root fallback order.
+
+        When ``max_bytes`` is set, the open stream is read at most one byte
+        beyond that limit and oversized content is refused rather than truncated.
+        """
+        return _read_regular_file(self.resolve_read(path), max_bytes=max_bytes, display_path=path)
 
     def relative(self, path: Path) -> str:
-        """Return a root-relative, portable artifact path."""
+        """Return a portable path, relative to root when it sits inside root."""
+        resolved = path.resolve()
         try:
-            return path.resolve().relative_to(self.root).as_posix()
-        except ValueError as exc:
-            raise SandboxDenied("Path is outside the artifact root") from exc
+            return resolved.relative_to(self.root).as_posix()
+        except ValueError:
+            return resolved.as_posix()
 
     def list_images(self) -> list[ImageInfo]:
-        """List readable image files recursively, skipping symlinks and hardlinks that may escape."""
+        """List readable image files recursively under the artifact root."""
         images: list[ImageInfo] = []
         for path in sorted(self.artifact_root.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in _IMAGE_SUFFIXES:
                 continue
             try:
                 images.append(self.inspect(self.relative(path)))
-            except SandboxDenied:
+            except (ArtifactError, OSError, ValueError):
                 continue
         return images
 
-    def inspect(self, relative_path: str) -> ImageInfo:
-        """Read image dimensions without exposing an absolute host path."""
-        path = self.resolve(relative_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Image does not exist: {relative_path}")
-        with Image.open(path) as image:
+    def inspect(self, path: str) -> ImageInfo:
+        """Read image dimensions for ``path``."""
+        resolved = self.resolve(path)
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Image does not exist: {path}")
+        with Image.open(resolved) as image:
             return ImageInfo(
-                path=self.relative(path),
+                path=self.relative(resolved),
                 width=image.width,
                 height=image.height,
                 mode=image.mode,

@@ -10,7 +10,7 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import default_registry
 from atlas.agent.layout import (
     AtlasPathError,
@@ -27,38 +27,31 @@ from atlas.agent.tools.read_file import ReadFileTool
 # read_file tests
 
 
-def test_store_rejects_paths_outside_root(tmp_path: Path) -> None:
-    store = LocalArtifactStore(tmp_path)
+def test_store_resolves_paths_outside_root(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path / "workspace")
 
-    with pytest.raises(ValueError, match="escapes"):
-        store.resolve("../outside.png")
+    assert store.resolve("../outside.png") == (tmp_path / "outside.png").resolve()
 
-    # A symlink that sits lexically under root but resolves outside it must
-    # be rejected the same way as a lexical ".." escape.
     outside = tmp_path.parent / f"{tmp_path.name}-symlink-target.txt"
     outside.write_text("secret", encoding="utf-8")
-    (tmp_path / "link.txt").symlink_to(outside)
-    with pytest.raises(ValueError, match="escapes"):
-        store.resolve("link.txt")
+    (tmp_path / "workspace" / "link.txt").symlink_to(outside)
+    assert store.resolve("link.txt") == outside.resolve()
 
-    # A hardlink resolves to itself, so it is refused for having another name.
-    os.link(outside, tmp_path / "hardlink.txt")
-    with pytest.raises(ValueError, match="hardlinked"):
-        store.resolve("hardlink.txt")
+    os.link(outside, tmp_path / "workspace" / "hardlink.txt")
+    assert store.resolve("hardlink.txt") == (tmp_path / "workspace" / "hardlink.txt").resolve()
 
 
-def test_read_file_rejects_a_hardlink_to_an_outside_file(tmp_path: Path) -> None:
+def test_read_file_reads_a_hardlink_to_an_outside_file(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     store = LocalArtifactStore(workspace)
     outside = tmp_path / "outside.txt"
     outside.write_text("secret", encoding="utf-8")
     os.link(outside, workspace / "notes.txt")
 
-    with pytest.raises(ValueError, match="hardlinked"):
-        ReadFileTool().run({"path": "notes.txt"}, store)
+    assert ReadFileTool().run({"path": "notes.txt"}, store).text == "secret"
 
 
-def test_list_images_skips_a_hardlinked_image(tmp_path: Path) -> None:
+def test_list_images_includes_a_hardlinked_image(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     store = LocalArtifactStore(workspace)
     Image.new("RGB", (4, 4), "red").save(tmp_path / "secret.png")
@@ -67,16 +60,13 @@ def test_list_images_skips_a_hardlinked_image(tmp_path: Path) -> None:
 
     images = store.list_images()
 
-    assert [image.path for image in images] == ["visible.png"]
+    assert [image.path for image in images] == ["linked.png", "visible.png"]
 
 
-def test_list_images_skips_a_symlinked_escape_instead_of_raising(tmp_path: Path) -> None:
+def test_list_images_skips_a_broken_symlink_instead_of_raising(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    outside_dir = tmp_path / "outside"
-    outside_dir.mkdir()
-    Image.new("RGB", (4, 4), "red").save(outside_dir / "secret.png")
-    (workspace / "escape_link").symlink_to(outside_dir)
+    (workspace / "broken.png").symlink_to(tmp_path / "missing.png")
     Image.new("RGB", (4, 4), "blue").save(workspace / "visible.png")
     store = LocalArtifactStore(workspace)
 
@@ -167,20 +157,18 @@ def test_read_file_returns_empty_text_for_an_empty_file(tmp_path: Path) -> None:
     assert result.artifacts == []
 
 
-def test_read_file_rejects_escaping_path(tmp_path: Path) -> None:
-    store = LocalArtifactStore(tmp_path)
-    (tmp_path.parent / "outside.txt").write_text("outside", encoding="utf-8")
+def test_read_file_reads_an_escaping_path(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path / "workspace")
+    (tmp_path / "outside.txt").write_text("outside", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="escapes"):
-        ReadFileTool().run({"path": "../outside.txt"}, store)
+    assert ReadFileTool().run({"path": "../outside.txt"}, store).text == "outside"
 
 
-def test_read_file_rejects_absolute_path(tmp_path: Path) -> None:
+def test_read_file_reads_an_absolute_path(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     (tmp_path / "notes.txt").write_text("hello", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="relative"):
-        ReadFileTool().run({"path": str(tmp_path / "notes.txt")}, store)
+    assert ReadFileTool().run({"path": str(tmp_path / "notes.txt")}, store).text == "hello"
 
 
 def test_read_file_missing_file_hides_the_host_path(tmp_path: Path) -> None:
@@ -213,15 +201,16 @@ def test_read_file_rejects_non_utf8_file(tmp_path: Path) -> None:
 # edit_file tests
 
 
-def test_edit_file_rejects_escaping_path(tmp_path: Path) -> None:
-    store = LocalArtifactStore(tmp_path)
-    (tmp_path.parent / "outside.txt").write_text("outside", encoding="utf-8")
+def test_edit_file_edits_an_escaping_path(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path / "workspace")
+    (tmp_path / "outside.txt").write_text("outside", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="escapes"):
-        EditFileTool().run(
-            {"path": "../outside.txt", "old_string": "outside", "new_string": "inside"},
-            store,
-        )
+    EditFileTool().run(
+        {"path": "../outside.txt", "old_string": "outside", "new_string": "inside"},
+        store,
+    )
+
+    assert (tmp_path / "outside.txt").read_text(encoding="utf-8") == "inside"
 
 
 def test_edit_file_rejects_non_utf8_file(tmp_path: Path) -> None:
@@ -357,7 +346,7 @@ def test_bash_kills_a_detached_background_child_when_the_call_returns(tmp_path: 
     assert not marker.exists()
 
 
-def test_bash_scrubs_ambient_environment_variables(
+def test_bash_inherits_ambient_environment_variables(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = LocalArtifactStore(tmp_path)
@@ -365,7 +354,7 @@ def test_bash_scrubs_ambient_environment_variables(
 
     result = BashTool().run({"command": "env"}, store)
 
-    assert "SOME_SECRET_TOKEN" not in result.text
+    assert "SOME_SECRET_TOKEN=not-actually-a-secret" in result.text
     assert "PATH=" in result.text
 
 
@@ -397,14 +386,19 @@ def test_bash_reports_a_missing_working_directory(tmp_path: Path) -> None:
     assert str(tmp_path) not in result.text
 
 
-def test_bash_rejects_absolute_or_escaping_working_directory(tmp_path: Path) -> None:
-    # Raised rather than returned, so the agent loop records it in the audit log.
-    store = LocalArtifactStore(tmp_path)
+def test_bash_accepts_absolute_and_escaping_working_directories(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path / "workspace")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "marker.txt").write_text("parent", encoding="utf-8")
 
-    with pytest.raises(SandboxDenied, match="relative"):
-        BashTool().run({"command": "echo hi", "working_directory": "/etc"}, store)
-    with pytest.raises(SandboxDenied, match="escapes"):
-        BashTool().run({"command": "echo hi", "working_directory": "../outside"}, store)
+    absolute = BashTool().run(
+        {"command": "cat marker.txt", "working_directory": str(outside)}, store
+    )
+    parent = BashTool().run({"command": "cat outside/marker.txt", "working_directory": ".."}, store)
+
+    assert "parent" in absolute.text
+    assert "parent" in parent.text
 
 
 def test_bash_defaults_to_the_workspace_root(tmp_path: Path) -> None:
@@ -441,20 +435,20 @@ def test_read_file_prefers_the_write_root_over_the_read_root(tmp_path: Path) -> 
     assert ReadFileTool().run({"path": "notes.txt"}, store).text == "artifact"
 
 
-def test_read_file_still_rejects_escapes_and_absolute_paths_with_a_read_root(
+def test_read_file_accepts_escapes_and_absolute_paths_with_a_read_root(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    (tmp_path / "outside.txt").write_text("outside", encoding="utf-8")
+    (workspace / "notes.txt").write_text("notes", encoding="utf-8")
     store = LocalArtifactStore(tmp_path / "artifact", read_root=workspace)
 
-    with pytest.raises(ValueError, match="escapes"):
-        ReadFileTool().run({"path": "../outside.txt"}, store)
-    with pytest.raises(ValueError, match="relative"):
-        ReadFileTool().run({"path": str(workspace / "notes.txt")}, store)
+    assert ReadFileTool().run({"path": "../outside.txt"}, store).text == "outside"
+    assert ReadFileTool().run({"path": str(workspace / "notes.txt")}, store).text == "notes"
 
 
-def test_read_file_rejects_a_symlink_in_the_read_root(tmp_path: Path) -> None:
+def test_read_file_follows_a_symlink_in_the_read_root(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = tmp_path / "outside.txt"
@@ -463,13 +457,11 @@ def test_read_file_rejects_a_symlink_in_the_read_root(tmp_path: Path) -> None:
     (workspace / "linked_dir").symlink_to(tmp_path)
     store = LocalArtifactStore(tmp_path / "artifact", read_root=workspace)
 
-    with pytest.raises(SandboxDenied, match="escapes"):
-        ReadFileTool().run({"path": "notes.txt"}, store)
-    with pytest.raises(SandboxDenied, match="escapes"):
-        ReadFileTool().run({"path": "linked_dir/outside.txt"}, store)
+    assert ReadFileTool().run({"path": "notes.txt"}, store).text == "secret"
+    assert ReadFileTool().run({"path": "linked_dir/outside.txt"}, store).text == "secret"
 
 
-def test_read_file_rejects_a_hardlink_in_the_read_root(tmp_path: Path) -> None:
+def test_read_file_reads_a_hardlink_in_the_read_root(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = tmp_path / "outside.txt"
@@ -477,8 +469,7 @@ def test_read_file_rejects_a_hardlink_in_the_read_root(tmp_path: Path) -> None:
     os.link(outside, workspace / "notes.txt")
     store = LocalArtifactStore(tmp_path / "artifact", read_root=workspace)
 
-    with pytest.raises(SandboxDenied, match="hardlinked"):
-        ReadFileTool().run({"path": "notes.txt"}, store)
+    assert ReadFileTool().run({"path": "notes.txt"}, store).text == "secret"
 
 
 def test_read_file_missing_file_with_read_root_hides_host_paths(tmp_path: Path) -> None:

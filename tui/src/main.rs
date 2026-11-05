@@ -1,9 +1,23 @@
 //! Minimal terminal client for the Atlas agent session protocol.
 
+mod approval;
+mod clipboard;
+mod editor;
+mod history;
 mod logo;
 mod markdown;
 mod protocol;
+mod selection;
 mod theme;
+
+#[cfg(test)]
+mod approval_tests;
+#[cfg(test)]
+mod composer_tests;
+#[cfg(test)]
+mod text_interaction_tests;
+#[cfg(test)]
+mod yolo_tests;
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -14,22 +28,28 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use approval::PermissionPrompt;
+use clipboard::{copy_to_clipboard, read_from_clipboard};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use editor::{layout as composer_layout, ComposerEditor};
+use history::PromptHistory;
 use markdown::{render_fitted, Mark, Piece};
 use protocol::{default_status_line, parse_line, status_text, CatalogEntry, ServerMessage};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use selection::TextSelection;
 use serde_json::Value;
 use theme::{
     BG_BASE, BG_LIGHT, FG, FG_SECONDARY, GRAY, GRAY_BRIGHT, MAGENTA, PROMPT_BORDER,
@@ -175,6 +195,10 @@ struct App {
     tools: Vec<String>,
     transcript: Vec<TranscriptLine>,
     input: String,
+    input_editor: ComposerEditor,
+    prompt_history: PromptHistory,
+    composer_width: usize,
+    menu_dismissed: bool,
     status: Status,
     /// The in-flight request is a resume, so a failure should stay on the limit.
     waiting_from_stopped: bool,
@@ -184,6 +208,7 @@ struct App {
     follow: bool,
     status_line: String,
     model_id: String,
+    yolo_enabled: bool,
     mode: Mode,
     picker_filter: String,
     picker_index: usize,
@@ -195,8 +220,8 @@ struct App {
     /// Ask the session for the catalog once so the dashboard can show the
     /// active model's context window without opening the picker.
     lookup_context: bool,
-    /// Tool-call id waiting for /allow or /deny.
-    pending_permission: Option<String>,
+    /// A focused approval prompt, independent of the compose draft.
+    pending_permission: Option<PermissionPrompt>,
     /// Session ids from the last /sessions listing, newest last.
     session_names: Vec<String>,
     /// Last wrapped row the transcript can scroll to. Updated while drawing.
@@ -213,6 +238,9 @@ struct App {
     tokens_per_second: f64,
     /// Name and full SHA-256 of the draft preview currently on screen.
     preview_sha: Option<(String, String)>,
+    screen_snapshot: Option<Buffer>,
+    text_selection: Option<TextSelection>,
+    status_notice: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -379,6 +407,10 @@ impl App {
             tools: Vec::new(),
             transcript: Vec::new(),
             input: String::new(),
+            input_editor: ComposerEditor::default(),
+            prompt_history: PromptHistory::default(),
+            composer_width: 71,
+            menu_dismissed: false,
             status: Status::Ready,
             waiting_from_stopped: false,
             session_open: true,
@@ -387,6 +419,7 @@ impl App {
             follow: true,
             status_line: default_status_line(),
             model_id: String::new(),
+            yolo_enabled: false,
             mode: Mode::Compose,
             picker_filter: String::new(),
             picker_index: 0,
@@ -404,6 +437,9 @@ impl App {
             tool_hits: Vec::new(),
             tokens_per_second: 0.0,
             preview_sha: None,
+            screen_snapshot: None,
+            text_selection: None,
+            status_notice: None,
         }
     }
 
@@ -413,6 +449,17 @@ impl App {
 
     fn apply(&mut self, message: ServerMessage) {
         match message {
+            ServerMessage::Yolo { enabled } => {
+                self.yolo_enabled = enabled;
+                if enabled {
+                    self.pending_permission = None;
+                }
+                self.transcript.push(tool_note(if enabled {
+                    "YOLO on: tool calls run without approval"
+                } else {
+                    "YOLO off: tool calls require approval"
+                }));
+            }
             ServerMessage::Ready { tools, status, .. } => {
                 self.tools = tools.into_iter().map(|tool| tool.name).collect();
                 self.adopt_status(&status);
@@ -422,6 +469,7 @@ impl App {
             }
             ServerMessage::Step {
                 name,
+                call_id,
                 ok,
                 arguments,
                 text,
@@ -430,6 +478,13 @@ impl App {
                 artifacts,
                 ..
             } => {
+                if self
+                    .pending_permission
+                    .as_ref()
+                    .is_some_and(|request| request.id == call_id)
+                {
+                    self.pending_permission = None;
+                }
                 let label = if ok { name } else { format!("{name} failed") };
                 let body = tool_body(
                     &arguments,
@@ -469,6 +524,7 @@ impl App {
                 cancelled,
                 status,
             } => {
+                self.status_notice = None;
                 self.adopt_status(&status);
                 self.pending_permission = None;
                 if !response.is_empty() {
@@ -500,21 +556,18 @@ impl App {
                 summary,
                 preview,
             } => {
-                self.pending_permission = Some(id.clone());
-                self.transcript.push(tool_note(format!(
-                    "approval needed [{id}] {tool}: {summary}"
-                )));
-                if !preview.is_empty() {
-                    self.transcript.push(tool_note(preview));
-                }
-                self.transcript
-                    .push(tool_note(format!("/allow {id}  or  /deny {id}")));
+                finish_streams(self);
+                self.pending_permission = Some(PermissionPrompt::new(id, tool, summary, preview));
+                self.status = Status::Waiting;
+                self.activity = None;
             }
             ServerMessage::Error {
                 message,
                 status_line,
                 ..
             } => {
+                self.status_notice = None;
+                self.pending_permission = None;
                 self.transcript
                     .push(TranscriptLine::Assistant(StreamText::settled(format!(
                         "error: {message}"
@@ -578,6 +631,7 @@ impl App {
             } => {
                 self.mode = Mode::Compose;
                 self.input.clear();
+                self.input_editor.reset();
                 let note = if scope == "deleted" {
                     if name.is_empty() {
                         "OpenRouter key deleted. OPENROUTER_API_KEY in the environment \
@@ -711,6 +765,9 @@ impl App {
     }
 
     fn adopt_status(&mut self, status: &protocol::StatusSnapshot) {
+        if let Some(enabled) = status.yolo_enabled {
+            self.yolo_enabled = enabled;
+        }
         if !status.model.is_empty() {
             self.model_id = status.model.clone();
         }
@@ -821,7 +878,8 @@ fn enter_ui() -> Result<ratatui::DefaultTerminal> {
         stdout,
         EnterAlternateScreen,
         Clear(ClearType::All),
-        EnableMouseCapture
+        EnableMouseCapture,
+        EnableBracketedPaste
     ) {
         let _ = disable_raw_mode();
         return Err(err).context("atlas-tui needs an interactive terminal");
@@ -836,7 +894,12 @@ fn enter_ui() -> Result<ratatui::DefaultTerminal> {
 }
 
 fn leave_ui() {
-    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
 }
 
@@ -900,12 +963,33 @@ fn event_loop(
                         return Ok(());
                     }
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => nudge_scroll(app, -3),
-                    MouseEventKind::ScrollDown => nudge_scroll(app, 3),
-                    MouseEventKind::Down(MouseButton::Left) => select_tool_at(app, mouse.row),
-                    _ => {}
-                },
+                Event::Mouse(mouse) => {
+                    match selection_mouse(app, mouse) {
+                        SelectionEvent::Handled => continue,
+                        SelectionEvent::Copy(text) => {
+                            copy_selection(app, &text);
+                            continue;
+                        }
+                        SelectionEvent::Pass => {}
+                    }
+                    if let Some(prompt) = app.pending_permission.as_mut() {
+                        if let Some(allow) = prompt.mouse(mouse) {
+                            send_permission(app, child, allow)?;
+                        }
+                    } else {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => nudge_scroll(app, -3),
+                            MouseEventKind::ScrollDown => nudge_scroll(app, 3),
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                select_tool_at(app, mouse.row)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Event::Paste(text) => {
+                    apply_paste(app, &text);
+                }
                 _ => {}
             }
         }
@@ -915,12 +999,56 @@ fn event_loop(
 
 /// Returns `true` when the user asked to quit.
 fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<bool> {
+    if is_copy_key(key) {
+        if let Some(selection) = app
+            .text_selection
+            .as_ref()
+            .filter(|selection| selection.moved())
+        {
+            let text = selection.text();
+            copy_selection(app, &text);
+            return Ok(false);
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            || !key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.code == KeyCode::Insert
+        {
+            return Ok(false);
+        }
+    }
+    if is_paste_key(key) {
+        if let Some(text) = read_from_clipboard() {
+            apply_paste(app, &text);
+        } else {
+            app.status_notice = Some("Clipboard unavailable; use your terminal's paste shortcut");
+        }
+        return Ok(false);
+    }
+    if app.text_selection.take().is_some() && key.code == KeyCode::Esc {
+        app.status_notice = None;
+        return Ok(false);
+    }
+    app.status_notice = None;
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         child.shutdown();
         return Ok(true);
     }
-    if key.code == KeyCode::Esc && matches!(app.mode, Mode::Compose) && !app.input.starts_with('/')
-    {
+    if let Some(prompt) = app.pending_permission.as_mut() {
+        if !prompt.command.is_empty() || key.code == KeyCode::Char('/') {
+            let toggle = permission_command(prompt, key);
+            if toggle {
+                child.send(serde_json::json!({"type": "yolo"}))?;
+            }
+        } else if let Some(allow) = prompt.key(key) {
+            send_permission(app, child, allow)?;
+        }
+        return Ok(false);
+    }
+    if key.code == KeyCode::Esc && app.mode == Mode::Compose {
+        if show_slash_menu(app) {
+            app.menu_dismissed = true;
+            return Ok(false);
+        }
         if app.in_flight() {
             // Stop the turn, keep the conversation. The runtime answers every
             // pending tool call before it returns, so the next turn is valid.
@@ -929,12 +1057,18 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
                 .push(tool_note("cancelling after this step..."));
             return Ok(false);
         }
+        if !app.input.is_empty() {
+            app.status_notice = Some("Draft kept. Ctrl+C quits.");
+            return Ok(false);
+        }
         child.shutdown();
         return Ok(true);
     }
     if key.code == KeyCode::Esc {
         app.mode = Mode::Compose;
         app.input.clear();
+        app.input_editor.reset();
+        app.menu_dismissed = false;
         return Ok(false);
     }
     let mode = app.mode.clone();
@@ -953,8 +1087,77 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
     Ok(false)
 }
 
+fn send_permission(app: &mut App, child: &mut ChildProcess, allow: bool) -> Result<()> {
+    if let Some(prompt) = app.pending_permission.as_ref() {
+        child.send(serde_json::json!({"type": "permission", "id": prompt.id, "allow": allow}))?;
+        record_permission(app, allow);
+    }
+    Ok(())
+}
+
+fn permission_command(prompt: &mut PermissionPrompt, key: KeyEvent) -> bool {
+    if key.kind != KeyEventKind::Press
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => prompt.command.clear(),
+        KeyCode::Backspace => {
+            prompt.command.pop();
+        }
+        KeyCode::Tab => prompt.command = "/yolo".to_string(),
+        KeyCode::Enter if prompt.command == "/yolo" => {
+            prompt.command.clear();
+            return true;
+        }
+        KeyCode::Char(ch) => {
+            let next = format!("{}{ch}", prompt.command);
+            if "/yolo".starts_with(&next) {
+                prompt.command = next;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn record_permission(app: &mut App, allow: bool) {
+    if let Some(prompt) = app.pending_permission.take() {
+        let decision = if allow { "Allowed once" } else { "Denied" };
+        app.transcript.push(TranscriptLine::Tool(ToolLine {
+            label: format!("{decision}: {}", prompt.tool),
+            body: prompt.body().lines().map(str::to_string).collect(),
+            expanded: false,
+        }));
+        app.follow = true;
+    }
+}
+
 fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<bool> {
-    let menu_open = !menu_options(&app.input).is_empty();
+    let newline = key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+    if newline {
+        app.input_editor.insert(&mut app.input, "\n");
+        draft_edited(app);
+        return Ok(false);
+    }
+    if key.code == KeyCode::Enter && app.session_open && app.input.trim() == "/yolo" {
+        app.input.clear();
+        app.input_editor.reset();
+        app.prompt_history.edited();
+        handle_slash(app, child, "/yolo")?;
+        return Ok(false);
+    }
+    if key.code == KeyCode::Enter && app.in_flight() {
+        app.status_notice = Some("Still working; draft kept. Esc stops the turn.");
+        return Ok(false);
+    }
+    let menu_open = show_slash_menu(app);
     match key.code {
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.session_open && app.status == Status::Stopped && !app.in_flight() {
@@ -974,10 +1177,44 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
         }
         KeyCode::Up if tool_select_modifier(key.modifiers) => select_tool(app, -1),
         KeyCode::Down if tool_select_modifier(key.modifiers) => select_tool(app, 1),
-        KeyCode::Up => nudge_scroll(app, -1),
-        KeyCode::Down => nudge_scroll(app, 1),
+        KeyCode::Up => move_draft_vertical(app, -1),
+        KeyCode::Down => move_draft_vertical(app, 1),
+        KeyCode::Left if !app.input.is_empty() => {
+            if word_modifier(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input_editor.move_word_left(&app.input);
+            } else {
+                app.input_editor.move_left(&app.input);
+            }
+        }
+        KeyCode::Right if !app.input.is_empty() => {
+            if word_modifier(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input_editor.move_word_right(&app.input);
+            } else {
+                app.input_editor.move_right(&app.input);
+            }
+        }
         KeyCode::Left => collapse_selected(app),
         KeyCode::Right => expand_selected(app),
+        KeyCode::Home => app.input_editor.move_home(&app.input),
+        KeyCode::End => app.input_editor.move_end(&app.input),
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.move_home(&app.input)
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.move_end(&app.input)
+        }
+        KeyCode::Char('b') if word_modifier(key.modifiers) => {
+            app.input_editor.move_word_left(&app.input)
+        }
+        KeyCode::Char('f') if word_modifier(key.modifiers) => {
+            app.input_editor.move_word_right(&app.input)
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.move_left(&app.input)
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.move_right(&app.input)
+        }
         KeyCode::Tab if menu_open => {
             if let MenuAction::Complete(prefix, replacement) =
                 menu_action(&app.input, app.menu_index, false)
@@ -986,12 +1223,19 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
             }
         }
         KeyCode::Enter => {
-            if app.session_open && !app.input.is_empty() && !app.in_flight() {
+            if app.session_open && !app.input.trim().is_empty() && !app.in_flight() {
                 if app.input.starts_with('/') {
                     let text = app.input.clone();
-                    match menu_action(&text, app.menu_index, true) {
+                    let action = if menu_open {
+                        menu_action(&text, app.menu_index, true)
+                    } else {
+                        MenuAction::None
+                    };
+                    match action {
                         MenuAction::Run(run) => {
                             app.input.clear();
+                            app.input_editor.reset();
+                            app.prompt_history.edited();
                             if is_quit_command(&run) {
                                 child.shutdown();
                                 return Ok(true);
@@ -1007,6 +1251,8 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
                             // No rows (unknown command or free text): keep the
                             // existing slash behavior.
                             app.input.clear();
+                            app.input_editor.reset();
+                            app.prompt_history.edited();
                             if is_quit_command(&text) {
                                 child.shutdown();
                                 return Ok(true);
@@ -1018,8 +1264,10 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
                     }
                 } else {
                     let text = std::mem::take(&mut app.input);
+                    app.input_editor.reset();
                     finish_streams(app);
                     child.send(serde_json::json!({"type": "user", "text": text}))?;
+                    app.prompt_history.record(&text);
                     app.transcript.push(TranscriptLine::User(text));
                     app.waiting_from_stopped = false;
                     app.status = Status::Waiting;
@@ -1028,22 +1276,63 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
             }
         }
         KeyCode::Backspace => {
-            rubout(&mut app.input, key.modifiers);
-            app.menu_index = 0;
+            if word_modifier(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input_editor.delete_word_before(&mut app.input);
+            } else {
+                app.input_editor.backspace(&mut app.input);
+            }
+            draft_edited(app);
         }
         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            delete_word_backward(&mut app.input);
-            app.menu_index = 0;
+            app.input_editor.delete_word_before(&mut app.input);
+            draft_edited(app);
+        }
+        KeyCode::Delete => {
+            app.input_editor.delete(&mut app.input);
+            draft_edited(app);
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.clear_before(&mut app.input);
+            draft_edited(app);
+        }
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input_editor.clear_after(&mut app.input);
+            draft_edited(app);
         }
         KeyCode::PageUp => nudge_scroll(app, -5),
         KeyCode::PageDown => nudge_scroll(app, 5),
         KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.input.push(ch);
-            app.menu_index = 0;
+            app.input_editor.insert(&mut app.input, &ch.to_string());
+            draft_edited(app);
         }
         _ => {}
     }
     Ok(false)
+}
+
+fn draft_edited(app: &mut App) {
+    app.menu_index = 0;
+    app.menu_dismissed = false;
+    app.prompt_history.edited();
+}
+
+fn move_draft_vertical(app: &mut App, delta: isize) {
+    if app.prompt_history.is_browsing()
+        || !app
+            .input_editor
+            .move_vertical(&app.input, app.composer_width, delta)
+    {
+        let recalled = if delta < 0 {
+            app.prompt_history.older(&app.input)
+        } else {
+            app.prompt_history.newer()
+        };
+        if let Some(text) = recalled {
+            app.input = text;
+            app.input_editor.reset();
+            app.menu_index = 0;
+        }
+    }
 }
 
 fn is_quit_command(text: &str) -> bool {
@@ -1078,34 +1367,121 @@ fn last_reply(app: &App) -> Option<&str> {
     })
 }
 
-fn copy_to_clipboard(text: &str) -> bool {
-    for (program, args) in [
-        ("pbcopy", &[][..]),
-        ("wl-copy", &[]),
-        ("xclip", &["-selection", "clipboard"]),
-        ("clip", &[]),
-    ] {
-        let Ok(mut child) = Command::new(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            continue;
-        };
-        let Some(mut stdin) = child.stdin.take() else {
-            continue;
-        };
-        if stdin.write_all(text.as_bytes()).is_err() {
-            continue;
+fn is_copy_key(key: KeyEvent) -> bool {
+    (matches!(key.code, KeyCode::Char('c' | 'C'))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META))
+        || (key.code == KeyCode::Insert && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn is_paste_key(key: KeyEvent) -> bool {
+    (matches!(key.code, KeyCode::Char('v' | 'V'))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META))
+        || (key.code == KeyCode::Insert && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+fn copy_selection(app: &mut App, text: &str) {
+    app.status_notice = Some(if copy_to_clipboard(text) {
+        "Selection copied  Ctrl+C copy  Esc clear"
+    } else {
+        "Copy failed  Ctrl+C retry  Esc clear"
+    });
+}
+
+fn apply_paste(app: &mut App, text: &str) {
+    app.text_selection = None;
+    app.status_notice = None;
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text: String = text
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+        .collect();
+    if let Some(prompt) = app.pending_permission.as_mut() {
+        if text.trim() == "/yolo" {
+            prompt.command = "/yolo".to_string();
         }
-        drop(stdin);
-        if child.wait().map(|status| status.success()).unwrap_or(false) {
-            return true;
-        }
+        return;
     }
-    false
+    match app.mode {
+        Mode::Compose => {
+            app.input_editor.insert(&mut app.input, &text);
+            draft_edited(app);
+        }
+        Mode::Key { .. } => app.input.push_str(text.trim_end_matches('\n')),
+        Mode::ModelPicker => app.picker_filter.push_str(text.trim()),
+        Mode::ModelWait => {}
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SelectionEvent {
+    Pass,
+    Handled,
+    Copy(String),
+}
+
+fn selection_mouse(app: &mut App, mouse: MouseEvent) -> SelectionEvent {
+    let position = Position::new(mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.text_selection = None;
+            app.status_notice = None;
+            // Approval buttons keep their explicit click behavior. All other
+            // visible text, including command previews, can be selected.
+            if app
+                .pending_permission
+                .as_ref()
+                .is_some_and(|prompt| prompt.choice_at(mouse.column, mouse.row).is_some())
+            {
+                return SelectionEvent::Pass;
+            }
+            if let Some(snapshot) = app.screen_snapshot.as_ref() {
+                if snapshot.area.contains(position) {
+                    app.text_selection = Some(TextSelection::new(snapshot.clone(), position));
+                    if app.pending_permission.is_none() {
+                        select_tool_at(app, mouse.row);
+                    }
+                    return SelectionEvent::Handled;
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(selection) = app
+                .text_selection
+                .as_mut()
+                .filter(|selection| selection.dragging)
+            {
+                selection.extend(position);
+                return SelectionEvent::Handled;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(selection) = app
+                .text_selection
+                .as_mut()
+                .filter(|selection| selection.dragging)
+            {
+                selection.finish(position);
+                if selection.moved() {
+                    let text = selection.text();
+                    if !text.trim().is_empty() {
+                        return SelectionEvent::Copy(text);
+                    }
+                }
+                app.text_selection = None;
+                return SelectionEvent::Handled;
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            app.text_selection = None;
+            app.status_notice = None;
+        }
+        _ => {}
+    }
+    SelectionEvent::Pass
 }
 
 fn plain_arrow(modifiers: KeyModifiers) -> bool {
@@ -1367,6 +1743,9 @@ fn activity_from(phase: &str, name: Option<&str>) -> Option<Activity> {
 fn apply_completion(app: &mut App, prefix: &str, replacement: &str) {
     if let Some(rest) = app.input.strip_prefix(prefix) {
         app.input = format!("{replacement}{rest}");
+        app.input_editor.reset();
+        app.prompt_history.edited();
+        app.menu_dismissed = false;
     }
     app.menu_index = 0;
 }
@@ -1423,6 +1802,7 @@ fn handle_secret_key(
         KeyCode::Enter => {
             if !app.input.is_empty() {
                 let secret = std::mem::take(&mut app.input);
+                app.input_editor.reset();
                 let mut payload = serde_json::json!({
                     "type": "set_key",
                     "scope": scope,
@@ -1457,6 +1837,14 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
     let mut parts = text.split_whitespace();
     let command = parts.next().unwrap_or("");
     match command {
+        "/yolo" => {
+            if parts.next().is_some() {
+                app.transcript.push(tool_note("usage: /yolo"));
+                None
+            } else {
+                Some(serde_json::json!({"type": "yolo"}))
+            }
+        }
         "/new" => {
             if parts.next().is_some() {
                 app.transcript.push(tool_note("usage: /new"));
@@ -1466,6 +1854,7 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
                 app.status = Status::Ready;
                 app.waiting_from_stopped = false;
                 app.activity = None;
+                app.pending_permission = None;
                 app.selected = None;
                 app.reveal_selected = false;
                 app.scroll = 0;
@@ -1497,13 +1886,20 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
         })),
         "/allow" | "/deny" => {
             let allow = command == "/allow";
-            let id = parts
-                .next()
-                .map(|value| value.to_string())
-                .or_else(|| app.pending_permission.clone());
+            let id = parts.next().map(|value| value.to_string()).or_else(|| {
+                app.pending_permission
+                    .as_ref()
+                    .map(|prompt| prompt.id.clone())
+            });
             match id {
                 Some(id) => {
-                    app.pending_permission = None;
+                    if app
+                        .pending_permission
+                        .as_ref()
+                        .is_some_and(|prompt| prompt.id == id)
+                    {
+                        record_permission(app, allow);
+                    }
                     Some(serde_json::json!({"type": "permission", "id": id, "allow": allow}))
                 }
                 None => {
@@ -1710,7 +2106,7 @@ fn key_command(
 
 const PICKER_PAGE: usize = 8;
 /// Slash commands stay on one page so a new command is not clipped off `/`.
-const MENU_PAGE: usize = 12;
+const MENU_PAGE: usize = 13;
 
 /// Slice of the filtered catalog that stays on screen around `index`.
 fn picker_window(len: usize, index: usize, page: usize) -> std::ops::Range<usize> {
@@ -1734,7 +2130,7 @@ struct MenuItem {
 /// Command or fixed-argument options that match `text`, or an empty list when
 /// the menu should stay hidden (free text after a finished command).
 fn menu_options(text: &str) -> Vec<MenuItem> {
-    const COMMANDS: [MenuItem; 12] = [
+    const COMMANDS: [MenuItem; 13] = [
         MenuItem {
             token: "/new",
             description: "Start a fresh conversation",
@@ -1742,6 +2138,10 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
         MenuItem {
             token: "/goal",
             description: "Name what this session is for",
+        },
+        MenuItem {
+            token: "/yolo",
+            description: "Toggle automatic tool approval",
         },
         MenuItem {
             token: "/model",
@@ -1978,7 +2378,7 @@ fn is_finished_command(text: &str) -> bool {
     let trimmed = text.trim_end();
     if matches!(
         trimmed,
-        "/new" | "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy"
+        "/new" | "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy" | "/yolo"
     ) {
         return true;
     }
@@ -2007,7 +2407,7 @@ fn is_finished_command(text: &str) -> bool {
 }
 
 fn menu_rows(app: &App) -> u16 {
-    if app.mode != Mode::Compose {
+    if !show_slash_menu(app) {
         return 0;
     }
     let options = menu_options(&app.input);
@@ -2016,6 +2416,13 @@ fn menu_rows(app: &App) -> u16 {
     }
     let count = options.len().clamp(1, MENU_PAGE) as u16;
     count.saturating_add(1)
+}
+
+fn show_slash_menu(app: &App) -> bool {
+    app.mode == Mode::Compose
+        && !app.menu_dismissed
+        && app.input_editor.position(&app.input) == app.input.len()
+        && !menu_options(&app.input).is_empty()
 }
 
 fn render_menu(frame: &mut Frame, app: &App, area: Rect) {
@@ -2180,12 +2587,62 @@ fn wait_for_any_key() {
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
+    if app
+        .text_selection
+        .as_ref()
+        .is_some_and(|selection| selection.area() != frame.area())
+    {
+        app.text_selection = None;
+        app.status_notice = None;
+    }
+    if let Some(selection) = app.text_selection.as_ref() {
+        selection.paint(frame.buffer_mut());
+        let area = inset(frame.area(), 1, 2);
+        if area.height > 0 {
+            let hint = app
+                .status_notice
+                .unwrap_or("Drag to select  Ctrl+C copy  Esc clear");
+            let hint_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+            frame.render_widget(ratatui::widgets::Clear, hint_area);
+            frame.render_widget(
+                Paragraph::new(hint).style(Style::default().fg(FG).bg(BG_BASE)),
+                hint_area,
+            );
+        }
+        return;
+    }
+    draw_content(frame, app);
+    app.screen_snapshot = Some(frame.buffer_mut().clone());
+}
+
+fn draw_content(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG_BASE)), area);
 
     let outer = inset(area, 1, 2);
+    app.composer_width = composer_text_width(outer.width);
     if outer.width < 8 || outer.height < 4 {
         render_status(frame, app, outer);
+        return;
+    }
+
+    if let Some(prompt) = app.pending_permission.as_ref() {
+        let status_height = status_block_rows(&dashboard_text(app), outer.width);
+        let prompt_height = prompt.rows(outer.width).min(outer.height);
+        let status_height = status_height.min(outer.height.saturating_sub(prompt_height));
+        let [transcript_area, prompt_area, status_area] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(prompt_height),
+            Constraint::Length(status_height),
+        ])
+        .areas(outer);
+        render_transcript(frame, app, transcript_area);
+        if let Some(prompt) = app.pending_permission.as_mut() {
+            prompt.render(frame, prompt_area);
+        }
+        if status_area.height > 0 {
+            render_status(frame, app, status_area);
+        }
         return;
     }
 
@@ -2257,13 +2714,17 @@ fn inset(area: Rect, vertical: u16, horizontal: u16) -> Rect {
 }
 
 fn composer_rows(app: &App, outer_width: u16) -> u16 {
-    let text_width = outer_width.saturating_sub(4).max(1) as usize;
+    let text_width = composer_text_width(outer_width);
     let body = if app.input.is_empty() {
         1
     } else {
-        wrap_text(&app.input, text_width).len().clamp(1, 5)
+        composer_layout(&app.input, text_width).len().clamp(1, 5)
     };
     (body as u16).saturating_add(2)
+}
+
+fn composer_text_width(outer_width: u16) -> usize {
+    usize::from(outer_width.saturating_sub(5).max(1))
 }
 
 fn render_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -2670,7 +3131,7 @@ fn model_picker_label(
 }
 
 fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
-    if app.mode == Mode::Compose && !menu_options(&app.input).is_empty() {
+    if show_slash_menu(app) {
         render_menu(frame, app, area);
         return;
     }
@@ -2726,9 +3187,7 @@ fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
-    let active = app.session_open
-        && !app.in_flight()
-        && matches!(app.mode, Mode::Compose | Mode::Key { .. });
+    let active = app.session_open && matches!(app.mode, Mode::Compose | Mode::Key { .. });
     let border = if active {
         PROMPT_BORDER_ACTIVE
     } else {
@@ -2739,6 +3198,38 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(BG_BASE).fg(FG));
+    if app.mode == Mode::Compose && !app.input.is_empty() {
+        let width = composer_text_width(area.width);
+        let cursor = app.input_editor.position(&app.input);
+        let cursor_row = app.input_editor.cursor_row(&app.input, width);
+        let lines: Vec<Line> = composer_layout(&app.input, width)
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let mut spans = vec![Span::styled(
+                    if index == 0 { "› " } else { "  " },
+                    Style::default().fg(FG_SECONDARY),
+                )];
+                if index == cursor_row {
+                    let at = cursor.clamp(line.start, line.end);
+                    spans.push(Span::raw(&app.input[line.start..at]));
+                    spans.push(Span::styled("▌", Style::default().fg(MAGENTA)));
+                    spans.push(Span::raw(&app.input[at..line.end]));
+                } else {
+                    spans.push(Span::raw(&app.input[line.start..line.end]));
+                }
+                Line::from(spans)
+            })
+            .collect();
+        let scroll = cursor_row.saturating_sub(usize::from(area.height.saturating_sub(3)));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+            area,
+        );
+        return;
+    }
     let mut spans = vec![Span::styled("› ", Style::default().fg(FG_SECONDARY))];
     match &app.mode {
         Mode::Key { .. } => {
@@ -2752,7 +3243,12 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
         }
         _ => {
             if app.input.is_empty() {
-                spans.push(Span::styled("Message Atlas", Style::default().fg(GRAY)));
+                let placeholder = if app.in_flight() {
+                    "Draft message while Atlas works"
+                } else {
+                    "Message Atlas"
+                };
+                spans.push(Span::styled(placeholder, Style::default().fg(GRAY)));
             } else {
                 spans.push(Span::styled(app.input.as_str(), Style::default().fg(FG)));
                 spans.push(Span::styled("▌", Style::default().fg(MAGENTA)));
@@ -2822,6 +3318,15 @@ fn dashboard_pieces(app: &App) -> Vec<DashPiece> {
             style: Style::default().fg(GRAY).bg(BG_BASE),
         },
     ];
+    if app.yolo_enabled {
+        pieces.insert(
+            3,
+            DashPiece {
+                text: "  YOLO on".to_string(),
+                style: Style::default().fg(YELLOW).bg(BG_BASE),
+            },
+        );
+    }
     if !metrics.is_empty() {
         pieces.push(DashPiece {
             text: format!("  {metrics}"),
@@ -2911,12 +3416,20 @@ fn strip_model_field(status_line: &str) -> String {
 }
 
 fn status_hint(app: &App) -> String {
+    if let Some(notice) = app.status_notice {
+        return notice.to_string();
+    }
+    if app.pending_permission.is_some() {
+        return "Approval applies to this call only".to_string();
+    }
     let mut hint = if !app.session_open {
         "ctrl-c quit".to_string()
     } else if app.status == Status::Stopped {
-        "enter send  /new /model /skill /key /quit  ctrl-r resume".to_string()
+        "Enter send  Alt+Enter newline  ↑↓ history  Ctrl+R resume".to_string()
+    } else if app.in_flight() {
+        "Draft a message  Esc stop  PgUp/PgDn scroll  / commands".to_string()
     } else {
-        "enter send  /new /model /skill /key /quit".to_string()
+        "Enter send  Alt+Enter newline  ↑↓ history  / commands".to_string()
     };
     if !expandable_tools(app).is_empty() {
         hint.push_str("  ←→ tool");
@@ -2927,6 +3440,9 @@ fn status_hint(app: &App) -> String {
 fn status_label(app: &App) -> (&'static str, Color) {
     if !app.session_open {
         return ("session ended", RED);
+    }
+    if app.pending_permission.is_some() {
+        return ("awaiting approval", YELLOW);
     }
     match app.status {
         Status::Ready => ("ready", GRAY_BRIGHT),
@@ -3005,6 +3521,8 @@ fn note_session_closed(app: &mut App) {
         return;
     }
     app.session_open = false;
+    app.pending_permission = None;
+    app.activity = None;
     let detail = app
         .last_stderr
         .clone()
@@ -3436,6 +3954,7 @@ mod tests {
             vec![
                 "/new",
                 "/goal",
+                "/yolo",
                 "/model",
                 "/copy",
                 "/key",
@@ -3458,7 +3977,7 @@ mod tests {
         let app = App::new();
         assert_eq!(
             status_hint(&app),
-            "enter send  /new /model /skill /key /quit"
+            "Enter send  Alt+Enter newline  ↑↓ history  / commands"
         );
         assert!(!status_hint(&app).contains("/goal"));
     }
@@ -4232,7 +4751,7 @@ mod tests {
             "spend $0.00036",
             "last 15.2 tok/s",
             "1.05M",
-            "enter send",
+            "Enter send",
         ] {
             assert!(flat.contains(field), "missing {field} in:\n{painted}");
         }
