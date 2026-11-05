@@ -301,7 +301,23 @@ def test_from_scene_sensor_fixtures_keep_kind_geometry_and_range() -> None:
 
 def test_from_scene_satellite_can_be_given_explicitly() -> None:
     c = SceneCard.from_scene(scene(source="custom_source"), satellite="Landsat8")
-    assert c.satellite == "Landsat8"
+    assert c.satellite == "landsat8"
+
+
+def test_satellite_has_one_spelling_whether_given_or_registered() -> None:
+    registered = SceneCard.from_scene(scene())
+    for spelling in ("landsat8", "Landsat8", "  LANDSAT8 "):
+        given = SceneCard.from_scene(scene(), satellite=spelling)
+        assert given.satellite == registered.satellite == "landsat8"
+    assert card(satellite=" Landsat8 ").satellite == "landsat8"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_satellite_is_rejected(blank: str) -> None:
+    with pytest.raises(ValueError, match="satellite"):
+        SceneCard.from_scene(scene(), satellite=blank)
+    with pytest.raises(ValidationError, match="satellite"):
+        card(satellite=blank)
 
 
 def test_from_scene_rejects_missing_source_and_unregistered_satellite() -> None:
@@ -315,3 +331,42 @@ def test_from_scene_card_round_trips_and_matches_across_rebuilds() -> None:
     first = SceneCard.from_scene(scene())
     assert SceneCard.from_scene(scene()) == first
     assert SceneCard.model_validate_json(first.model_dump_json()) == first
+
+
+def test_from_scene_reads_processing_version_and_level() -> None:
+    s2 = SceneCard.from_scene(
+        scene(
+            source="sentinel2",
+            properties={"s2:processing_baseline": "05.11", "processing:level": "L2A"},
+        )
+    )
+    assert (s2.processing_version, s2.processing_level) == ("05.11", "L2A")
+    landsat = SceneCard.from_scene(scene(properties={"landsat:collection_number": "02"}))
+    assert (landsat.processing_version, landsat.processing_level) == ("02", None)
+
+
+def test_processing_version_falls_through_blank_and_non_scalar_values() -> None:
+    props = {"s2:processing_baseline": "  ", "landsat:collection_number": ["02"]}
+    c = SceneCard.from_scene(scene(properties={**props, "processing:version": 3}))
+    assert c.processing_version == "3"
+    assert SceneCard.from_scene(scene(properties=props)).processing_version is None
+    assert SceneCard.from_scene(scene()).processing_version is None
+
+
+def test_from_scene_copies_layer_roles_scale_and_offset() -> None:
+    assets = {
+        "B04": Asset(href="https://example.com/b04.tif", roles=["data"], scale=0.0001, offset=-0.1),
+        "SCL": Asset(href="https://example.com/scl.tif", roles=["data", "cloud"]),
+    }
+    c = SceneCard.from_scene(scene(assets=assets, band_aliases={"red": "B04"}))
+    assert c.layers["B04"].roles == ["data"]
+    assert (c.layers["B04"].scale, c.layers["B04"].offset) == (0.0001, -0.1)
+    assert c.layers["SCL"].roles == ["data", "cloud"]
+    assert (c.layers["SCL"].scale, c.layers["SCL"].offset) == (None, None)
+
+
+def test_layer_scale_and_offset_must_be_finite() -> None:
+    with pytest.raises(ValidationError):
+        LayerRef(scale=float("nan"))
+    with pytest.raises(ValidationError):
+        LayerRef(offset=float("inf"))

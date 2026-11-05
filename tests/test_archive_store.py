@@ -177,3 +177,48 @@ def test_list_does_not_renew_cards() -> None:
 def test_invalid_limits_are_rejected(kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         TTLCardStore(**kwargs)
+
+
+def test_expired_ids_stay_expired_past_max_cards() -> None:
+    clock = Clock()
+    store = make_store(clock, max_cards=2)
+    cards = [card(f"S{i}") for i in range(3)]
+    for c in cards:
+        store.put(c)
+    clock.advance(6)
+    # The first was evicted for capacity, the others timed out; none is "missing".
+    for c in cards:
+        assert store.lookup(c.index_id).status is LookupStatus.expired
+    assert store.list() == []
+
+
+def test_many_expired_ids_do_not_flip_the_oldest_to_missing() -> None:
+    clock = Clock()
+    store = make_store(clock, max_cards=2)
+    cards = [card(f"S{i}") for i in range(2 + 1)]
+    store.put_many(cards[:2])
+    clock.advance(6)
+    store.put_many(cards[2:])
+    clock.advance(6)
+    assert [store.lookup(c.index_id).status for c in cards] == [LookupStatus.expired] * 3
+
+
+def test_tombstones_are_bounded_and_oldest_become_missing() -> None:
+    clock = Clock()
+    store = make_store(clock, max_cards=1, max_tombstones=2)
+    cards = [card(f"S{i}") for i in range(4)]
+    for c in cards:
+        store.put(c)
+    statuses = [store.lookup(c.index_id).status for c in cards]
+    # Three are evicted but only two ids are remembered, so the oldest is forgotten.
+    assert statuses == [
+        LookupStatus.missing,
+        LookupStatus.expired,
+        LookupStatus.expired,
+        LookupStatus.found,
+    ]
+
+
+def test_max_tombstones_must_cover_max_cards() -> None:
+    with pytest.raises(ValueError, match="max_tombstones"):
+        TTLCardStore(max_cards=10, max_tombstones=9)

@@ -14,16 +14,26 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from datetime import UTC
 from datetime import datetime as DateTime
 from enum import StrEnum
-from typing import Self
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from atlas.data.base import BBox, GeometryKind, Scene, SceneKind
 
 CARD_VERSION = 1
+
+# STAC property names, in the order they are tried. A converter needs the
+# version: the Sentinel-2 offset depends on the processing baseline.
+_PROCESSING_LEVEL_KEYS = ("processing:level",)
+_PROCESSING_VERSION_KEYS = (
+    "s2:processing_baseline",
+    "landsat:collection_number",
+    "processing:version",
+)
 
 # Kinds that do not measure cloud. Cloud is a real gap, not a non-question, for
 # the rest (optical, thermal, browse), so a missing value there stays unknown.
@@ -107,6 +117,11 @@ class LayerRef(BaseModel):
 
     Attributes:
         common_name: Band alias such as ``nir``, when the catalog maps one.
+        roles: STAC roles exactly as the catalog gave them (``data``, ``cloud``,
+            ``overview``, and so on). They are not mapped to a fixed set, so
+            code that looks for a quality mask must read them, not assume them.
+        scale: Multiplier from the first ``raster:bands`` entry, when published.
+        offset: Additive term from the same entry, when published.
         size_bytes: Full asset size reported by the catalog, when known.
         availability: ``absent``, ``windowed`` (a bbox chip), or ``full``.
         locator: Where the local file is. None exactly when ``absent``.
@@ -116,6 +131,9 @@ class LayerRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     common_name: str | None = None
+    roles: list[str] = Field(default_factory=list)
+    scale: float | None = Field(default=None, allow_inf_nan=False)
+    offset: float | None = Field(default=None, allow_inf_nan=False)
     size_bytes: int | None = Field(default=None, ge=0)
     availability: Availability = Availability.absent
     locator: Locator | None = None
@@ -147,6 +165,18 @@ def make_index_id(source: str, collection: str, provider_id: str) -> str:
         _SEPARATOR.join((source, collection, provider_id)).encode("utf-8")
     ).hexdigest()
     return _INDEX_ID_PREFIX + digest[:_INDEX_ID_HEX]
+
+
+def _first_text(properties: Mapping[str, Any], keys: tuple[str, ...]) -> str | None:
+    """Return the first non-blank scalar among ``keys``, as text."""
+    for key in keys:
+        value = properties.get(key)
+        if isinstance(value, bool) or not isinstance(value, str | int | float):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
 
 
 def _registered_satellite(source: str) -> str:
@@ -207,10 +237,22 @@ class SceneCard(BaseModel):
     bbox: BBox
     geometry_kind: GeometryKind = GeometryKind.bbox
     gsd_m: float | None = Field(default=None, gt=0)
+    processing_level: str | None = None
+    processing_version: str | None = None
     cloud_cover: float | None = Field(default=None, ge=0, le=100)
     cloud_status: CloudStatus = CloudStatus.unknown
     layers: dict[str, LayerRef] = Field(default_factory=dict)
     found_in: list[str] = Field(default_factory=list)
+
+    @field_validator("satellite")
+    @classmethod
+    def _satellite_is_one_spelling(cls, value: str) -> str:
+        # One spelling per family, however the card is built, so grouping and
+        # filtering on satellite never split "Landsat8" from "landsat8".
+        family = value.strip().lower()
+        if not family:
+            raise ValueError("satellite must not be blank")
+        return family
 
     @field_validator("datetime", "start_datetime", "end_datetime")
     @classmethod
@@ -249,10 +291,11 @@ class SceneCard(BaseModel):
                 must be set, as ``item_to_scene`` does for registered sources.
             satellite: Platform family. Defaults to the ``satellite`` class
                 attribute of the client registered under ``scene.source``.
+                Either way it is stripped and lowercased on the card.
 
         Raises:
-            ValueError: If ``scene.source`` is empty, or ``satellite`` is not
-                given and the source has none registered.
+            ValueError: If ``scene.source`` is empty, ``satellite`` is blank, or
+                ``satellite`` is not given and the source has none registered.
         """
         if not scene.source:
             raise ValueError("scene has no source, so its card cannot be indexed")
@@ -270,7 +313,13 @@ class SceneCard(BaseModel):
         for alias, key in sorted(scene.band_aliases.items(), reverse=True):
             common_names[key] = alias
         layers = {
-            key: LayerRef(common_name=common_names.get(key), size_bytes=asset.size_bytes)
+            key: LayerRef(
+                common_name=common_names.get(key),
+                roles=list(asset.roles),
+                scale=asset.scale,
+                offset=asset.offset,
+                size_bytes=asset.size_bytes,
+            )
             for key, asset in scene.assets.items()
         }
 
@@ -289,6 +338,8 @@ class SceneCard(BaseModel):
             bbox=scene.bbox,
             geometry_kind=scene.geometry_kind,
             gsd_m=scene.gsd_m,
+            processing_level=_first_text(scene.properties, _PROCESSING_LEVEL_KEYS),
+            processing_version=_first_text(scene.properties, _PROCESSING_VERSION_KEYS),
             cloud_cover=scene.cloud_cover,
             cloud_status=cloud_status,
             layers=layers,

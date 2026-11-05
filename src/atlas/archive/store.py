@@ -8,7 +8,10 @@ and an expired index id can only be rebuilt by searching again.
 
 A lookup says why a card is missing. ``expired`` means the store once held it
 and no longer does; ``missing`` means it never did. Callers must not present
-either as "no such scene".
+either as "no such scene". The store remembers expired ids in a separate,
+larger list (``max_tombstones``). Once that list is full the oldest expired ids
+are forgotten and report ``missing``, so the distinction holds only up to that
+limit.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from atlas.archive.card import SceneCard
 DEFAULT_TTL = timedelta(minutes=5)
 DEFAULT_MAX_AGE = timedelta(minutes=30)
 DEFAULT_MAX_CARDS = 1000
+DEFAULT_MAX_TOMBSTONES = 100_000
 
 
 class LookupStatus(StrEnum):
@@ -84,7 +88,9 @@ class TTLCardStore:
         ttl: How long a card lives without being read.
         max_age: Hard limit on a card's life, however often it is read.
         max_cards: Most cards held at once.
-        clock: Seconds from a monotonic source. Tests pass a fake.
+        max_tombstones: Most expired ids remembered so they report ``expired``. Past
+            this, the oldest are forgotten and report ``missing``. At least
+            ``max_cards``.        clock: Seconds from a monotonic source. Tests pass a fake.
 
     Raises:
         ValueError: If a limit is not positive, or ``max_age`` is below ``ttl``.
@@ -96,6 +102,7 @@ class TTLCardStore:
         *,
         max_age: timedelta = DEFAULT_MAX_AGE,
         max_cards: int = DEFAULT_MAX_CARDS,
+        max_tombstones: int = DEFAULT_MAX_TOMBSTONES,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if ttl <= timedelta(0):
@@ -104,9 +111,12 @@ class TTLCardStore:
             raise ValueError("max_age must be at least ttl")
         if max_cards < 1:
             raise ValueError("max_cards must be at least 1")
+        if max_tombstones < max_cards:
+            raise ValueError("max_tombstones must be at least max_cards")
         self._ttl = ttl.total_seconds()
         self._max_age = max_age.total_seconds()
         self._max_cards = max_cards
+        self._max_tombstones = max_tombstones
         self._clock = clock
         self._entries: OrderedDict[str, _Entry] = OrderedDict()
         # Ids once held, so a lookup can say "expired" instead of "missing".
@@ -161,5 +171,5 @@ class TTLCardStore:
     def _drop(self, index_id: str) -> None:
         del self._entries[index_id]
         self._gone[index_id] = None
-        while len(self._gone) > self._max_cards:
+        while len(self._gone) > self._max_tombstones:
             self._gone.popitem(last=False)
