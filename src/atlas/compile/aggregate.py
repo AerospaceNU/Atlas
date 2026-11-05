@@ -6,6 +6,7 @@ import random
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 
 from atlas.compile.product import SceneCatalog, SourceScenes
 from atlas.data.base import DataPullClient, PullRequest, PullResult, Scene
@@ -167,6 +168,7 @@ def _cursor_was_rejected(exc: BaseException) -> bool:
 
 
 def _stamp_source(name: str, collection: str, search_url: str, result: PullResult) -> SourceScenes:
+    catalog = catalog_name(name, search_url)
     stamped: list[Scene] = []
     for scene in result.scenes:
         updates: dict[str, str] = {}
@@ -174,6 +176,8 @@ def _stamp_source(name: str, collection: str, search_url: str, result: PullResul
             updates["source"] = name
         if not scene.collection and collection:
             updates["collection"] = collection
+        if not scene.catalog:
+            updates["catalog"] = catalog
         stamped.append(scene.model_copy(update=updates) if updates else scene)
     return SourceScenes(
         source=name,
@@ -183,6 +187,15 @@ def _stamp_source(name: str, collection: str, search_url: str, result: PullResul
         next_cursor_unavailable=result.next_cursor_unavailable,
         search_url=search_url,
     )
+
+
+def catalog_name(name: str, search_url: str) -> str:
+    """Name the catalog a source reads: its STAC host, else the registry key.
+
+    Registry sources that read the same STAC collection (landsat8, landsat9)
+    share a catalog, so one item keeps one identity whichever source found it.
+    """
+    return urlparse(search_url).netloc or name
 
 
 def _failed_source(

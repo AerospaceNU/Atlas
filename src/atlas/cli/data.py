@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -72,6 +73,7 @@ from atlas.data.sources.fldas import (
     split_variables,
 )
 from atlas.data.stac import encode_page_cursor
+from atlas.index import IndexEntry, IndexVersionError, SceneIndex
 
 _EXAMPLE = (
     "atlas data sentinel2 optical --date 2024-07-01:2024-07-07 "
@@ -620,8 +622,11 @@ async def execute_pull(
             identity=identity,
             resolutions=resolutions,
         )
+        index_note = _record_index(out_dir, catalog, report, live_clients)
         reporter.close()
         _print_run_summary(catalog, report, search_only=search_only)
+        if index_note:
+            Console(stderr=True, highlight=False).print(index_note)
         for src in catalog.sources:
             for line in resolution_lines(
                 src.source, resolutions.get(src.source, SourceResolution.unchecked())
@@ -1500,6 +1505,42 @@ def _as_list(value: object) -> list[object]:
 
 def _as_dicts(value: object) -> list[dict[str, Any]]:
     return [item for item in _as_list(value) if isinstance(item, dict)]
+
+
+def _record_index(
+    out_dir: Path,
+    catalog: SceneCatalog,
+    report: DownloadReport,
+    clients: Mapping[str, DataPullClient],
+) -> str:
+    """Add this pull's scenes to ``<out>/index.sqlite``; return a summary line.
+
+    The manifest is the pull's record of what happened, so an index failure is
+    reported here and never changes the exit code.
+    """
+    saved = {
+        (item.source, item.scene_id): item.path
+        for item in report.outcomes
+        if item.status in {"saved", "skipped"} and item.path is not None
+    }
+    entries = [
+        IndexEntry(scene=scene, source=src.source, local_path=saved.get((src.source, scene.id)))
+        for src in catalog.sources
+        if src.error is None and not isinstance(clients.get(src.source), FldasClient)
+        for scene in src.scenes
+    ]
+    if not entries:
+        return ""
+    try:
+        with SceneIndex.at(out_dir) as index:
+            stats = index.upsert(entries)
+            where = index.path
+    except (sqlite3.Error, OSError, ValueError, IndexVersionError) as exc:
+        return f"[yellow]scene index not updated: {type(exc).__name__}: {exc}[/yellow]"
+    line = f"[dim]scene index {where}: {stats.added} new, {stats.updated} refreshed"
+    if stats.skipped_request_footprint:
+        line += f", {stats.skipped_request_footprint} request-footprint products not indexed"
+    return line + "[/dim]"
 
 
 def _print_run_summary(
