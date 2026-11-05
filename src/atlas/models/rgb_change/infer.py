@@ -153,8 +153,8 @@ class RgbChangeTool(Tool):
         after_path = store.resolve_read(request.after)
         heatmap_rel = request.heatmap_path or f"artifacts/{self.name}_heatmap.npy"
         json_rel = request.json_path or f"artifacts/{self.name}.json"
-        heatmap_path = store.resolve(heatmap_rel)
-        json_path = store.resolve(json_rel)
+        heatmap_path = store.resolve_artifact(heatmap_rel)
+        json_path = store.resolve_artifact(json_rel)
         if heatmap_path.suffix.lower() != ".npy":
             raise ValueError("heatmap output must end in .npy")
         if json_path.suffix.lower() != ".json":

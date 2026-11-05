@@ -11,7 +11,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.contracts import default_registry
 from atlas.agent.tools.web_fetch import (
     WebFetchTool,
@@ -244,7 +244,7 @@ def test_rejects_non_public_address_literals(tmp_path: Path, url: str) -> None:
         called = True
         return _html("never returned")
 
-    with pytest.raises(SandboxDenied) as exc:
+    with pytest.raises(ArtifactError) as exc:
         _tool(handle).run({"url": url}, store)
 
     assert called is False
@@ -284,7 +284,7 @@ def test_rejects_names_that_resolve_to_a_non_public_address(
         called = True
         return _html("never returned")
 
-    with pytest.raises(SandboxDenied) as exc:
+    with pytest.raises(ArtifactError) as exc:
         _tool(handle).run({"url": url}, store)
 
     assert called is False

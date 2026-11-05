@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import ClassVar
@@ -12,7 +14,13 @@ import pytest
 from atlas.cli import _attach_negative_option_values, _inject_data_command, main
 from atlas.cli.catalog import CatalogError, format_catalog, list_satellites, resolve_sources
 from atlas.cli.data import add_data_parser, parse_coords, parse_date_range, run_data
-from atlas.cli.download import BrowseAssetError, download_assets, pick_asset, scene_filename
+from atlas.cli.download import (
+    BrowseAssetError,
+    asset_suffix,
+    download_assets,
+    pick_asset,
+    scene_filename,
+)
 from atlas.data.base import Asset, BBox, DataPullClient, PullRequest, PullResult, Scene, SceneKind
 from atlas.data.registry import SOURCES
 
@@ -197,6 +205,70 @@ def test_pick_asset_alias_cannot_smuggle_a_browse_asset() -> None:
         pick_asset(scene, "red")
 
 
+def test_pick_asset_default_skips_qa_and_mask_layers() -> None:
+    tif = "image/tiff; application=geotiff; profile=cloud-optimized"
+    # Planetary Computer Landsat C2 L2 lists the ST QA band first.
+    landsat = _scene(
+        assets={
+            "qa": Asset(href="https://example.com/qa.tif", media_type=tif, roles=["data"]),
+            "blue": Asset(
+                href="https://example.com/blue.tif", media_type=tif, roles=["data", "reflectance"]
+            ),
+            "red": Asset(
+                href="https://example.com/red.tif", media_type=tif, roles=["data", "reflectance"]
+            ),
+        },
+        band_aliases={"red": "red"},
+    )
+    assert pick_asset(landsat) == ("red", landsat.assets["red"])
+    # Digital Earth Australia lists a cloud mask first and publishes no band metadata.
+    dea = _scene(
+        assets={
+            "oa_fmask": Asset(href="https://example.com/fmask.tif", media_type=tif, roles=["data"]),
+            "nbart_red": Asset(href="https://example.com/red.tif", media_type=tif, roles=["data"]),
+        }
+    )
+    assert pick_asset(dea) == ("nbart_red", dea.assets["nbart_red"])
+    only_qa = _scene(
+        assets={"qa": Asset(href="https://example.com/qa.tif", media_type=tif, roles=["data"])}
+    )
+    assert pick_asset(only_qa) == ("qa", only_qa.assets["qa"])
+
+
+def test_asset_suffix_keeps_the_inner_extension_of_a_compressed_file() -> None:
+    himawari = Asset(
+        href="https://noaa-himawari9.s3.amazonaws.com/x/HS_H09_B01_FLDK_R10_S0310.DAT.bz2",
+        media_type="application/octet-stream",
+    )
+    assert asset_suffix(himawari) == ".dat.bz2"
+    assert asset_suffix(Asset(href="https://example.com/a.gz")) == ".gz"
+
+
+async def test_download_assets_sends_client_download_headers(tmp_path: Path) -> None:
+    seen: list[str | None] = []
+
+    class TokenClient(FakePullClient):
+        async def download_headers(self, href: str) -> dict[str, str]:
+            return {"Authorization": "Bearer t"} if href.startswith("https://data.") else {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(
+            200, content=b"\x89HDF", headers={"content-type": "application/x-hdf"}
+        )
+
+    scene = _scene(
+        id="granule",
+        assets={"data": Asset(href="https://data.example.gov/g.hdf", roles=["data"])},
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        report = await download_assets(
+            [scene], tmp_path, http=http, clients={"sentinel2": TokenClient()}
+        )
+    assert report.outcomes[0].status == "saved"
+    assert seen == ["Bearer t"]
+
+
 def test_resolve_satellite_kind() -> None:
     assert resolve_sources("sentinel2", "optical") == ["sentinel2"]
     assert resolve_sources("s2", "l2a") == ["sentinel2"]
@@ -332,7 +404,10 @@ async def test_download_assets_writes_raw_bytes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_download_assets_isolates_sign_timeout(tmp_path: Path) -> None:
+async def test_download_assets_isolates_sign_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("atlas.cli.download._sign_delay", lambda *_args: 0.0)
     payload = b"II*\x00ok"
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -561,3 +636,371 @@ def test_inverted_cloud_bounds_exit_2(tmp_path: Path, capsys: pytest.CaptureFixt
     args = _request_pull_args(tmp_path, "--min-cloud-cover", "80", "--max-cloud-cover", "20")
     assert run_data(args, clients={"sentinel2": RecordingPullClient()}) == 2
     assert "min_cloud_cover" in capsys.readouterr().err
+
+
+def test_polygon_alone_infers_the_only_kind(tmp_path: Path) -> None:
+    client = RecordingPullClient()
+    args = _parse_pull_args(
+        [
+            "data",
+            "sentinel2",
+            "--date",
+            "2024-07-01:2024-07-07",
+            "--polygon",
+            "0,0;1,0;1,1;0,1",
+            "--out",
+            str(tmp_path),
+            "--search-only",
+        ]
+    )
+    assert args.kind is None
+    assert run_data(args, clients={"sentinel2": client}) == 0
+    request = client.requests[0]
+    assert request.polygon is not None
+    assert request.polygon.contains(0.5, 0.5)
+
+
+def test_pull_options_without_a_satellite_exit_2(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["data", "--date", "2024-07-01:2024-07-07", "--coords", "0,0,1,1"])
+    assert code == 2
+    assert "requires a satellite" in capsys.readouterr().err
+
+
+def test_several_kinds_without_a_kind_exit_2(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["data", "modis", "--date", "2024-07-01:2024-07-07", "--coords", "0,0,1,1"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "several kinds" in err
+    assert "optical" in err
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--limit", "0"], "between 1 and 1000"),
+        (["--limit", "1001"], "between 1 and 1000"),
+        (["--limit", "many"], "must be an integer"),
+        (["--concurrency", "0"], "at least 1"),
+    ],
+)
+def test_bounded_options_exit_2(
+    extra: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "data",
+                "sentinel2",
+                "optical",
+                "--date",
+                "2024-07-01:2024-07-07",
+                "--coords",
+                "0,0,1,1",
+                "--search-only",
+                *extra,
+            ]
+        )
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_inverted_latitudes_are_rejected() -> None:
+    with pytest.raises(ValueError, match="south must be less than or equal to north"):
+        parse_coords("0,40,1,30")
+
+
+def test_zero_area_coords_are_rejected() -> None:
+    with pytest.raises(ValueError, match="span more than one longitude"):
+        parse_coords("1,0,1,1")
+    with pytest.raises(ValueError, match="span more than one latitude"):
+        parse_coords("0,1,1,1")
+
+
+def test_non_numeric_coords_name_the_arguments() -> None:
+    with pytest.raises(ValueError, match="four numbers"):
+        parse_coords("a,b,c,d")
+
+
+def test_output_path_that_is_a_file_exits_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "not-a-dir"
+    target.write_text("x", encoding="utf-8")
+    args = _pull_args(target, search_only=True)
+    assert run_data(args, clients={"sentinel2": FakePullClient()}) == 2
+    assert "output directory" in capsys.readouterr().err
+
+
+def test_table_options_without_fldas_exit_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = _request_pull_args(tmp_path, "--table", str(tmp_path / "table.csv"))
+    assert run_data(args, clients={"sentinel2": RecordingPullClient()}) == 2
+    assert "--table" in capsys.readouterr().err
+
+
+def test_all_lists_the_catalog(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["all"]) == 0
+    out = capsys.readouterr().out
+    assert "satellites" in out
+    assert "sentinel2" in out
+
+
+def test_all_list_shows_sources_in_a_tree(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["data", "all", "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "alos_palsar" in out
+    assert "firms_viirs" in out
+
+
+def test_all_with_a_kind_narrows_the_list(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["data", "all", "optical", "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "sentinel2" in out
+    assert "alos_fnf" not in out
+
+
+def test_hyphenated_registry_key_is_listed(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["hls-sentinel"]) == 0
+    assert "hls_sentinel" in capsys.readouterr().out
+
+
+def test_directory_fsync_is_best_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from atlas.cli import data as data_cli
+
+    def refuse(*_args: object, **_kwargs: object) -> int:
+        raise OSError("directory fsync is not supported")
+
+    monkeypatch.setattr(data_cli.os, "open", refuse)
+    data_cli._fsync_directory(tmp_path)
+
+
+def test_directory_fsync_is_skipped_off_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from atlas.cli import data as data_cli
+
+    called: list[object] = []
+    monkeypatch.setattr(data_cli.os, "name", "nt")
+    monkeypatch.setattr(data_cli.os, "open", lambda *args, **kwargs: called.append(args))
+    data_cli._fsync_directory(tmp_path)
+    assert called == []
+
+
+def test_own_output_sources_report_unknown_bytes() -> None:
+    from atlas.cli.data import _unknown_byte_sources
+    from atlas.data.firms import FirmsClient
+    from atlas.data.gibs import GibsModisTrueColorClient
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _r: httpx.Response(200)))
+    gibs = GibsModisTrueColorClient(client=http)
+    firms = FirmsClient(map_key="k", client=http)
+    try:
+        unknown = _unknown_byte_sources(
+            {"gibs": gibs, "firms": firms, "sentinel2": FakePullClient()}, False
+        )
+    finally:
+        asyncio.run(http.aclose())
+    assert unknown == frozenset({"gibs", "firms"})
+
+
+def test_path_options_expand_a_leading_tilde() -> None:
+    from atlas.cli.data import _path_arg
+
+    assert _path_arg("~/atlas/data") == Path.home() / "atlas" / "data"
+    assert _path_arg("relative/dir") == Path("relative/dir")
+
+
+def test_resume_refuses_a_symlinked_manifest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"sources": []}', encoding="utf-8")
+    link = tmp_path / "manifest.json"
+    link.symlink_to(outside)
+    args = _request_pull_args(tmp_path, "--resume")
+    assert run_data(args, clients={"sentinel2": RecordingPullClient()}) == 2
+    assert "symlink" in capsys.readouterr().err
+    assert outside.read_text(encoding="utf-8") == '{"sources": []}'
+
+
+def test_empty_path_options_are_rejected() -> None:
+    from atlas.cli.data import _path_arg
+
+    with pytest.raises(argparse.ArgumentTypeError, match="must not be empty"):
+        _path_arg("   ")
+
+
+def test_unknown_kind_is_named_before_the_missing_date(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["data", "sentinel2", "bogus"]) == 2
+    err = capsys.readouterr().err
+    assert "Unknown kind" in err
+    assert "--date" not in err
+
+
+def test_asset_suffix_keeps_image_extensions() -> None:
+    assert asset_suffix(Asset(href="https://example.com/a.png", media_type="image/png")) == ".png"
+    assert asset_suffix(Asset(href="https://example.com/a.jpg")) == ".jpg"
+    assert asset_suffix(Asset(href="https://example.com/a.jpeg")) == ".jpg"
+    assert asset_suffix(Asset(href="https://example.com/a.noext", media_type="image/png")) == ".png"
+
+
+def test_quicklook_is_a_forbidden_asset_name(capsys: pytest.CaptureFixture[str]) -> None:
+    from atlas.cli.download import is_forbidden_asset_name
+
+    assert is_forbidden_asset_name("quicklook")
+    code = main(
+        [
+            "data",
+            "sentinel2",
+            "optical",
+            "--date",
+            "2024-07-01:2024-07-07",
+            "--coords",
+            "0,0,1,1",
+            "--search-only",
+            "--asset",
+            "quicklook",
+        ]
+    )
+    assert code == 2
+    assert "preview/thumbnail" in capsys.readouterr().err
+
+
+def test_asset_on_a_gibs_only_pull_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        [
+            "data",
+            "gibs_modis_truecolor",
+            "browse",
+            "--date",
+            "2024-07-01:2024-07-01",
+            "--coords",
+            "0,0,1,1",
+            "--asset",
+            "red",
+        ]
+    )
+    assert code == 2
+    assert "GIBS or FIRMS" in capsys.readouterr().err
+
+
+class _FlakySearch(FakePullClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = True
+        self.calls = 0
+
+    async def search(self, request: PullRequest) -> PullResult:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("offline")
+        return PullResult(request=request, scenes=[_scene(id="rescued")])
+
+
+def test_resume_retries_a_source_that_failed_without_a_cursor(
+    tmp_path: Path,
+) -> None:
+    client = _FlakySearch()
+    assert run_data(_request_pull_args(tmp_path), clients={"sentinel2": client}) == 1
+    client.fail = False
+    assert run_data(_request_pull_args(tmp_path, "--resume"), clients={"sentinel2": client}) == 0
+    assert client.calls == 2
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"][0]["scene_ids"] == ["rescued"]
+    assert manifest["sources"][0]["error"] is None
+
+
+def test_all_download_failures_exit_1(tmp_path: Path) -> None:
+    scene = _scene(
+        id="broken",
+        assets={
+            "visual": Asset(
+                href="https://example.com/broken.tif",
+                media_type="image/tiff; application=geotiff",
+                roles=["visual"],
+            )
+        },
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="denied")
+
+    args = _pull_args(tmp_path, search_only=False)
+    args.yes = True
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        assert run_data(args, clients={"sentinel2": FakePullClient([scene])}, http=http) == 1
+    finally:
+        asyncio.run(http.aclose())
+
+
+def test_one_saved_scene_and_one_failure_exits_0(tmp_path: Path) -> None:
+    def scene(scene_id: str) -> Scene:
+        return _scene(
+            id=scene_id,
+            assets={
+                "data": Asset(
+                    href=f"https://example.com/{scene_id}.bin",
+                    media_type="application/octet-stream",
+                    roles=["data"],
+                )
+            },
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "broken" in str(request.url):
+            return httpx.Response(403)
+        return httpx.Response(200, content=b"data")
+
+    args = _pull_args(tmp_path, search_only=False)
+    args.yes = True
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        code = run_data(
+            args,
+            clients={"sentinel2": FakePullClient([scene("ok"), scene("broken")])},
+            http=http,
+        )
+    finally:
+        asyncio.run(http.aclose())
+    assert code == 0
+
+
+def test_scene_filename_is_windows_safe_and_bounded() -> None:
+    from atlas.cli.download import _avoid_reserved
+
+    # The "<id>_<key>" scheme never yields a bare reserved name; the helper
+    # still covers one if the scheme changes.
+    assert _avoid_reserved("CON") == "_CON"
+    assert scene_filename("name. ", "data", ".tif").startswith("name_")
+    long_name = scene_filename("x" * 500, "k" * 400, ".tif")
+    assert len(long_name.encode("utf-8")) <= 240
+    assert long_name.endswith(".tif")
+    assert long_name != scene_filename("x" * 500 + "y", "k" * 400, ".tif")
+
+
+def test_replace_with_retry_waits_out_a_sharing_violation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import atlas.cli.fs as fs
+
+    calls: list[int] = []
+    real_replace = os.replace
+
+    def flaky(source: object, target: object) -> None:
+        calls.append(1)
+        if len(calls) < 3:
+            raise PermissionError("busy")
+        real_replace(source, target)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fs.os, "replace", flaky)
+    monkeypatch.setattr(fs.time, "sleep", lambda _delay: None)
+    source = tmp_path / "a"
+    target = tmp_path / "b"
+    source.write_text("x", encoding="utf-8")
+    fs.replace_with_retry(source, target, attempts=3)
+    assert target.read_text(encoding="utf-8") == "x"
+    assert len(calls) == 3

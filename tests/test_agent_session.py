@@ -188,9 +188,15 @@ def test_start_fresh_moves_writes_but_keeps_reads(tmp_path: Path) -> None:
     session.start_fresh()
 
     artifacts = session.agent.artifacts
-    assert artifacts.root != previous
-    assert artifacts.root.parent == (workspace / ".atlas" / "artifacts").resolve()
-    assert artifacts.read_root == read_root
+    assert artifacts.root == workspace.resolve()
+    assert artifacts.artifact_root != previous
+    assert artifacts.artifact_root.parent == (workspace / ".atlas" / "artifacts").resolve()
+
+    from atlas.agent.tools.write_file import WriteTool
+
+    result = WriteTool().run({"path": "src/app.py", "content": "print(1)\n"}, artifacts)
+    assert result.artifacts == ["src/app.py"]
+    assert (workspace / "src" / "app.py").read_text(encoding="utf-8") == "print(1)\n"
 
 
 def test_stopped_for_limit_and_resume_budget(tmp_path: Path) -> None:
@@ -787,8 +793,9 @@ def test_degenerate_window_on_a_fresh_session_stays_unavailable(tmp_path: Path) 
 
 
 def test_http_error_keeps_status_and_short_body(tmp_path: Path) -> None:
+    # A rate limit is retried, so the queue holds one response per attempt.
     client = _QueueClient(
-        [{"error": {"message": "slow down"}}],
+        [{"error": {"message": "slow down"}}] * 3,
         status_code=429,
         elapsed_seconds=0.25,
     )
@@ -1734,13 +1741,15 @@ def test_main_writes_tools_into_the_session_artifact_dir(
         session_id = next(
             path.parent.name for path in sessions.glob("*/meta.json") if path.parent.name != "other"
         )
-        note = workspace / ".atlas" / "artifacts" / session_id / "note.txt"
-        artifact_dir = note.parent
+        note = workspace / "note.txt"
+        artifact_dir = workspace / ".atlas" / "artifacts" / session_id
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        produced = artifact_dir / "mask.json"
+        produced.write_text("{}", encoding="utf-8")
 
         protocol.push('{"type":"user","text":"save a note"}')
         _wait_until(lambda: note.is_file(), f"tool did not write {note}: {stdout.text()}")
         assert note.read_text(encoding="utf-8") == "from-main"
-        assert not (workspace / "note.txt").exists()
         assert str(note.resolve()) not in stdout.text()
 
         protocol.push(
@@ -1867,9 +1876,8 @@ def test_main_uses_the_workspace_tool_budget(
             lambda: any(sessions.glob("*/meta.json")),
             f"main did not create a session: {stdout.text()}",
         )
-        session_id = next(path.parent.name for path in sessions.glob("*/meta.json"))
-        note = workspace / ".atlas" / "artifacts" / session_id / "note.txt"
-        other = workspace / ".atlas" / "artifacts" / session_id / "other.txt"
+        note = workspace / "note.txt"
+        other = workspace / "other.txt"
         protocol.push('{"type":"user","text":"write two files"}')
         _wait_until(
             lambda: "stopped_for_limit" in stdout.text(),

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 
 if TYPE_CHECKING:
@@ -463,13 +463,13 @@ class RSICCTool(Tool):
                 f"Unsupported image type {path.suffix}. Supported types: {', '.join(supported)}"
             )
         if path.stat().st_size > RSICCTool.max_bytes:
-            raise SandboxDenied(
+            raise ArtifactError(
                 f"Image {relative} exceeds the {RSICCTool.max_bytes} byte read limit"
             )
         return path.read_bytes(), mime_type
 
     def _needs_escalation(self, report: ChangeReport) -> bool:
-        retryable = set(report.quality_flags) - _NON_RETRYABLE_FLAGS
+        retryable = {flag for flag in report.quality_flags if flag not in _NON_RETRYABLE_FLAGS}
         return report.confidence < self.min_confidence or bool(retryable)
 
     @staticmethod

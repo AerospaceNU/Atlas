@@ -62,7 +62,6 @@ async def _search(name: str, request: PullRequest) -> PullResult:
         ("esa_worldcover", _req(BOSTON, date(2000, 1, 1), today)),
         ("pc_modis_14a1", _req(BOSTON, *days60)),
         ("goes_cmi", _req(LOS_ANGELES, today - timedelta(days=2), today, limit=3)),
-        ("usgs_landsat_l2_sr", _req(BOSTON, *days60)),
         ("gedi", _req(NEW_ENGLAND, date(2024, 7, 1), date(2024, 8, 1))),
         ("icesat2_atl03", _req(NEW_ENGLAND, date(2024, 7, 1), date(2024, 8, 1))),
         ("smap_l3", _req(BOSTON, *days60)),

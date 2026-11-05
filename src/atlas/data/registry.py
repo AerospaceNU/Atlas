@@ -70,7 +70,6 @@ from atlas.data.pc_more import (
 from atlas.data.sentinel1 import Sentinel1Client
 from atlas.data.sentinel2 import Sentinel2Client
 from atlas.data.sources.fldas import FldasClient
-from atlas.data.usgs import UsgsLandsatC2L1Client, UsgsLandsatC2L2SrClient
 
 # Registry of known satellite data sources by stable name. The consolidation
 # layer iterates this to fan out a search across every source.
@@ -102,8 +101,6 @@ SOURCES: dict[str, type[DataPullClient]] = {
     "mrms_qpe_24h": NoaaMrmsQpe24hClient,
     "earthsearch_sentinel1_grd": EarthSearchSentinel1GrdClient,
     "earthsearch_sentinel2_l2a": EarthSearchSentinel2L2aClient,
-    "usgs_landsat_l1": UsgsLandsatC2L1Client,
-    "usgs_landsat_l2_sr": UsgsLandsatC2L2SrClient,
     "cdse_sentinel3_olci": CdseSentinel3OlciClient,
     "cdse_sentinel3_slstr_lst": CdseSentinel3SlstrLstClient,
     "cdse_sentinel3_slstr_frp": CdseSentinel3SlstrFrpClient,

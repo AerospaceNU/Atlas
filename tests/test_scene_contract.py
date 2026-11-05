@@ -122,6 +122,41 @@ def test_item_to_scene_keeps_3d_bbox_with_polygon() -> None:
     assert scene.geometry_kind is GeometryKind.polygon
 
 
+def test_item_to_scene_wraps_longitudes_past_180() -> None:
+    # GOES-18 full disk on Planetary Computer publishes west=-218.299.
+    feature = {
+        "id": "OR_ABI-L2-F-M6_G18",
+        "bbox": [-218.299, -81.33, -55.70, 81.33],
+        "geometry": {"type": "Polygon", "coordinates": []},
+        "properties": {"datetime": "2026-09-24T23:50:21Z"},
+    }
+    scene = item_to_scene(feature)
+    assert scene is not None
+    assert scene.bbox.west == pytest.approx(141.701)
+    assert scene.bbox.east == pytest.approx(-55.70)
+
+
+def test_item_to_scene_uses_the_regional_endpoint_for_deafrica() -> None:
+    feature = {
+        "id": "s2",
+        "bbox": [36.7, -1.4, 36.9, -1.2],
+        "geometry": {"type": "Polygon", "coordinates": []},
+        "properties": {"datetime": "2026-06-01T00:00:00Z"},
+        "assets": {
+            "visual": {"href": "s3://deafrica-sentinel-2/sentinel-s2-l2a-cogs/TCI.tif"},
+            "other": {"href": "s3://dea-public-data/baseline/red.tif"},
+        },
+    }
+    scene = item_to_scene(feature)
+    assert scene is not None
+    assert scene.assets["visual"].href == (
+        "https://deafrica-sentinel-2.s3.af-south-1.amazonaws.com/sentinel-s2-l2a-cogs/TCI.tif"
+    )
+    assert scene.assets["other"].href == (
+        "https://dea-public-data.s3.amazonaws.com/baseline/red.tif"
+    )
+
+
 def test_item_to_scene_unreadable_bbox_falls_back_to_point() -> None:
     feature = {
         "id": "pt",

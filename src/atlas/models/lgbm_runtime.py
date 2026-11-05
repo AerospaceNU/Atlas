@@ -126,8 +126,8 @@ class LightGBMTool(Tool):
         request = SegmentInput.model_validate(arguments)
         mask_rel = request.mask_path or f"artifacts/{self.name}_mask.png"
         json_rel = request.json_path or f"artifacts/{self.name}.json"
-        mask_path = store.resolve(mask_rel)
-        json_path = store.resolve(json_rel)
+        mask_path = store.resolve_artifact(mask_rel)
+        json_path = store.resolve_artifact(json_rel)
         if mask_path.suffix.lower() != ".png":
             raise ValueError("mask output must end in .png")
         if json_path.suffix.lower() != ".json":

@@ -28,7 +28,18 @@ pub enum ServerMessage {
     Done {
         response: String,
         stopped_for_limit: bool,
+        stopped_for_budget: bool,
+        cancelled: bool,
         status: StatusSnapshot,
+    },
+    PermissionRequest {
+        id: String,
+        tool: String,
+        summary: String,
+        preview: String,
+    },
+    Yolo {
+        enabled: bool,
     },
     Error {
         message: String,
@@ -132,6 +143,8 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub model: String,
     #[serde(default)]
+    pub yolo_enabled: Option<bool>,
+    #[serde(default)]
     pub context_used: i64,
     #[serde(default)]
     pub context_limit: Option<i64>,
@@ -222,9 +235,26 @@ enum RawMessage {
         response: String,
         #[serde(default)]
         stopped_for_limit: bool,
+        #[serde(default)]
+        stopped_for_budget: bool,
+        #[serde(default)]
+        cancelled: bool,
         #[serde(flatten)]
         status: StatusSnapshot,
     },
+    #[serde(rename = "permission_request")]
+    PermissionRequest {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        tool: String,
+        #[serde(default)]
+        summary: String,
+        #[serde(default)]
+        preview: String,
+    },
+    #[serde(rename = "yolo")]
+    Yolo { enabled: bool },
     #[serde(rename = "error")]
     Error {
         message: String,
@@ -388,6 +418,7 @@ pub fn parse_line(line: &str) -> Result<Option<ServerMessage>, serde_json::Error
 impl From<RawMessage> for ServerMessage {
     fn from(raw: RawMessage) -> Self {
         match raw {
+            RawMessage::Yolo { enabled } => ServerMessage::Yolo { enabled },
             RawMessage::Ready {
                 tools,
                 key_set,
@@ -419,11 +450,26 @@ impl From<RawMessage> for ServerMessage {
             RawMessage::Done {
                 response,
                 stopped_for_limit,
+                stopped_for_budget,
+                cancelled,
                 status,
             } => ServerMessage::Done {
                 response,
                 stopped_for_limit,
+                stopped_for_budget,
+                cancelled,
                 status,
+            },
+            RawMessage::PermissionRequest {
+                id,
+                tool,
+                summary,
+                preview,
+            } => ServerMessage::PermissionRequest {
+                id,
+                tool,
+                summary,
+                preview,
             },
             RawMessage::Error {
                 message,
