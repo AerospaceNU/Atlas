@@ -368,7 +368,7 @@ def _skill_bases(store: LocalArtifactStore, home: Path | None) -> list[tuple[Pat
             bases.append((atlas, user_skills_root(), SKILLS_DIR_NAME, "~/.atlas/"))
         else:
             bases.append((resolved, user_skills_root(resolved), ATLAS_SKILLS_RELATIVE, "~/"))
-    workspace = store.read_root
+    workspace = store.read_root if store.read_root is not None else store.root
     if workspace is not None:
         bases.append((workspace, project_agents_skills_dir(workspace), AGENTS_SKILLS_RELATIVE, ""))
         bases.append((workspace, project_skills_root(workspace), ATLAS_SKILLS_RELATIVE, ""))
@@ -376,10 +376,12 @@ def _skill_bases(store: LocalArtifactStore, home: Path | None) -> list[tuple[Pat
 
 
 def _project_artifact_root(store: LocalArtifactStore) -> Path | None:
-    """Return ``<workspace>/.atlas/artifacts``, or None when there is no workspace."""
-    if store.read_root is None:
-        return None
-    return project_artifacts_dir(store.read_root)
+    """Return the project artifact directory, or None when there is none."""
+    if store.read_root is not None:
+        return project_artifacts_dir(store.read_root)
+    if store.artifact_root != store.root:
+        return store.artifact_root.parent
+    return None
 
 
 def _under_project_artifacts(artifact_root: Path | None, path: Path) -> bool:

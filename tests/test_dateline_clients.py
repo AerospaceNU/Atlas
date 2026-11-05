@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
@@ -11,11 +11,12 @@ import httpx
 import pytest
 
 from atlas.compile.aggregate import aggregate
-from atlas.data.base import BBox, PullRequest
+from atlas.data.base import BBox, PullRequest, PullResult, Scene
 from atlas.data.firms import FirmsClient
 from atlas.data.gibs import GibsModisTrueColorClient
 from atlas.data.goes import GOES_EAST_BUCKET, GOES_WEST_BUCKET, GoesClient
 from atlas.data.himawari import HIMAWARI_BUCKET, HimawariClient
+from atlas.data.sentinel2 import Sentinel2Client
 
 # Fiji. west > east means the box crosses 180°.
 DATELINE = BBox(west=178.0, south=-18.0, east=-178.0, north=-16.0)
@@ -255,7 +256,21 @@ async def test_firms_error_document_is_a_source_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_firms_unpublished_day_is_still_skipped() -> None:
+async def test_firms_unpublished_side_is_skipped_when_the_other_answers() -> None:
+    fake = FirmsFake(
+        {
+            "178.0,-18.0,180.0,-16.0": (400, "Invalid date"),
+            "-180.0,-18.0,-178.0,-16.0": (200, _hotspot(-179.0)),
+        }
+    )
+    async with FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, fake)) as client:
+        result = await client.search(_request(DATELINE))
+    assert len(result.scenes) == 1
+    assert len(fake.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_firms_every_request_rejected_is_a_source_error() -> None:
     fake = FirmsFake(
         {
             "178.0,-18.0,180.0,-16.0": (400, "Invalid date"),
@@ -263,9 +278,29 @@ async def test_firms_unpublished_day_is_still_skipped() -> None:
         }
     )
     async with FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, fake)) as client:
+        with pytest.raises(ValueError, match="rejected all 2 area request"):
+            await client.search(_request(DATELINE))
+    assert len(fake.calls) == 2
+    catalog = await aggregate(
+        _request(DATELINE),
+        {"firms_viirs": FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, fake))},
+    )
+    assert catalog.sources[0].error is not None
+    assert "abc" not in catalog.sources[0].error
+
+
+@pytest.mark.asyncio
+async def test_firms_header_only_csv_is_still_an_empty_window() -> None:
+    header = "latitude,longitude,acq_date,acq_time\n"
+    fake = FirmsFake(
+        {
+            "178.0,-18.0,180.0,-16.0": (200, header),
+            "-180.0,-18.0,-178.0,-16.0": (400, "Invalid date"),
+        }
+    )
+    async with FirmsClient(map_key="abc", client=cast(httpx.AsyncClient, fake)) as client:
         result = await client.search(_request(DATELINE))
     assert result.scenes == []
-    assert len(fake.calls) == 2
 
 
 class _RowPerRequest(FakeAsyncClient):
@@ -288,7 +323,7 @@ async def test_firms_limit_stops_before_later_date_chunks() -> None:
     window = PullRequest(
         start_date=date(2024, 6, 1),
         end_date=date(2024, 7, 1),
-        bbox=BBox(west=-71.12, south=42.32, east=-71.02, north=42.40),
+        bbox=BBox(west=170.0, south=-18.0, east=180.0, north=-16.0),
         limit=1,
     )
     fake = _RowPerRequest()
@@ -396,3 +431,57 @@ async def test_himawari_dateline_listing_failure_is_a_source_error() -> None:
     )
     assert catalog.sources[0].scenes == []
     assert catalog.sources[0].error == "500 Internal Server Error"
+
+
+def test_pull_result_drops_a_scene_outside_the_request_bbox() -> None:
+    request = PullRequest(start_date=DAY, end_date=DAY, bbox=DATELINE, limit=5)
+    when = datetime(2024, 7, 1, tzinfo=UTC)
+    inside = Scene(
+        id="inside",
+        datetime=when,
+        bbox=BBox(west=179.0, south=-18.0, east=180.0, north=-16.0),
+        platform="x",
+    )
+    outside = Scene(
+        id="outside",
+        datetime=when,
+        bbox=BBox(west=161.0, south=-16.4, east=162.0, north=-15.4),
+        platform="x",
+    )
+    result = PullResult(request=request, scenes=[inside, outside])
+    assert [scene.id for scene in result.scenes] == ["inside"]
+
+
+@pytest.mark.asyncio
+async def test_stac_wrapping_bbox_is_sent_as_a_multipolygon() -> None:
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"features": [], "links": []}
+
+    class _Fake:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def post(self, _url: str, **kwargs: Any) -> _Response:
+            self.calls.append(kwargs["json"])
+            return _Response()
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = _Fake()
+    request = PullRequest(start_date=DAY, end_date=DAY, bbox=DATELINE, limit=5)
+    client = Sentinel2Client(client=cast(httpx.AsyncClient, fake))
+    try:
+        await client.search(request)
+    finally:
+        await client.aclose()
+    body = fake.calls[0]
+    assert "bbox" not in body
+    assert body["intersects"]["type"] == "MultiPolygon"
+    assert len(body["intersects"]["coordinates"]) == 2

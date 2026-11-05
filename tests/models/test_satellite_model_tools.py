@@ -215,7 +215,7 @@ def test_burn_mask_requires_red_dominance_and_minimum_luma() -> None:
     assert int(burn_mask(brown).min()) == 1
 
 
-def test_mask_output_must_be_png_and_cannot_escape(tmp_path: Path) -> None:
+def test_mask_output_must_be_png(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path / "workspace")
     _save(store, "tile.png", _solid(256, (245, 245, 245)))
 
@@ -225,18 +225,13 @@ def test_mask_output_must_be_png_and_cannot_escape(tmp_path: Path) -> None:
             {"path": "tile.png", "mask_path": "artifacts/mask.txt"},
             store,
         )
-    with pytest.raises(ValueError, match="escapes"):
-        default_registry().execute(
-            "burn_scar",
-            {"path": "../outside.png"},
-            store,
-        )
-    with pytest.raises(ValueError, match="escapes"):
-        default_registry().execute(
-            "flood_mask",
-            {"path": "tile.png", "json_path": "../out.json"},
-            store,
-        )
+    absolute = tmp_path / "out.json"
+    default_registry().execute(
+        "flood_mask",
+        {"path": "tile.png", "json_path": str(absolute)},
+        store,
+    )
+    assert absolute.is_file()
 
 
 def test_rgb_change_half_image_heatmap_and_polygon(tmp_path: Path) -> None:
@@ -378,7 +373,7 @@ def test_pixel_cap_rejects_oversized_rasters(
         rgb_heatmap(before, before.copy())
 
 
-def test_rgb_change_rejects_mismatched_shapes_and_escapes(tmp_path: Path) -> None:
+def test_rgb_change_rejects_mismatched_shapes_and_bad_output(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path / "workspace")
     _save(store, "before.png", _solid(32, (0, 0, 0)))
     _save(store, "after.png", _solid(16, (255, 255, 255)))
@@ -387,12 +382,6 @@ def test_rgb_change_rejects_mismatched_shapes_and_escapes(tmp_path: Path) -> Non
         default_registry().execute(
             "rgb_change",
             {"before": "before.png", "after": "after.png"},
-            store,
-        )
-    with pytest.raises(ValueError, match="escapes"):
-        default_registry().execute(
-            "rgb_change",
-            {"before": "../outside.png", "after": "after.png"},
             store,
         )
     with pytest.raises(ValueError, match="npy"):

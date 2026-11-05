@@ -16,7 +16,7 @@ import httpcore
 import httpx
 from pydantic import BaseModel, Field
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 from atlas.agent.instructions import _neutralize_untrusted_instructions
 
@@ -92,10 +92,10 @@ class WebFetchTool(Tool):
     per-session untrusted tags. It is not executed, imported, or written
     to the workspace.
 
-    ``trust`` is ``default``. ``bash_tool`` can already reach the network,
-    as recorded in ``docs/adr/0001-sandbox-model.md``. Fetching a page is
-    the case that ADR's "Revisit when" clause names. The page is labeled
-    untrusted data. The shell's file sandbox does not cover this fetch.
+    ``trust`` is ``default``. ``bash_tool`` can already reach the network.
+    The page is labeled untrusted data. This guard is about the destination
+    address, not the workspace: it refuses a non-public host so a page cannot
+    be used to probe the local machine.
     """
 
     name = "web_fetch"
@@ -126,8 +126,8 @@ class WebFetchTool(Tool):
         return WebFetchInput
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
-        # ``store`` is unused on purpose: this tool resolves no workspace paths,
-        # so it cannot widen the file sandbox. The signature is the Tool contract.
+        # ``store`` is unused on purpose: this tool resolves no workspace paths.
+        # The signature is the Tool contract.
         request = WebFetchInput.model_validate(arguments)
         deadline = _now() + request.timeout
         pinned_url, host_header, sni_hostname = _destination(request.url, deadline, request.timeout)
@@ -353,7 +353,7 @@ def _destination(url: str, deadline: float, timeout: int) -> tuple[str, str, str
     Raises:
         ValueError: The URL is not an absolute HTTP(S) URL without credentials,
             or its host does not resolve.
-        SandboxDenied: An address for the host is not public.
+        ArtifactError: An address for the host is not public.
         httpx.TimeoutException: Resolution did not finish before ``deadline``.
     """
     parts = urlsplit(url)
@@ -371,7 +371,7 @@ def _destination(url: str, deadline: float, timeout: int) -> tuple[str, str, str
     else:
         addresses = _resolve(hostname, _port(parts), deadline, timeout, url)
     if any(_is_blocked(address) for address in addresses):
-        raise SandboxDenied(f"Refusing to fetch the non-public host {hostname!r}")
+        raise ArtifactError(f"Refusing to fetch the non-public host {hostname!r}")
     ip = str(_unmap(addresses[0]))
     return _pinned_url(parts, ip), _host_header(hostname, parts.port), hostname
 

@@ -220,11 +220,24 @@ class StacApiClient(DataPullClient):
     def _search_body(self, request: PullRequest, *, token: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {
             "collections": [self.collection],
-            "bbox": request.bbox.as_list(),
             "limit": request.limit,
         }
+        # STAC Item Search treats bbox and intersects as mutually exclusive.
+        # Sending both is rejected (HTTP 400) by compliant APIs, so the ring
+        # wins when there is one; the envelope stays on the request for the
+        # cookie-cutter window and for sources that only take a box.
         if request.polygon is not None:
             body["intersects"] = request.polygon.as_stac_geometry()
+        elif request.bbox.west > request.bbox.east:
+            # A wrapping bbox in the request body is not portable: some APIs
+            # treat it as invalid and return unrelated items. Two rings say
+            # exactly which sides are wanted.
+            try:
+                body["intersects"] = _wrapping_bbox_geometry(request.bbox)
+            except ValueError:
+                body["bbox"] = request.bbox.as_list()
+        else:
+            body["bbox"] = request.bbox.as_list()
         if self.include_datetime:
             body["datetime"] = (
                 f"{request.start_date.isoformat()}T00:00:00Z/"
@@ -361,6 +374,28 @@ def _query_is_signed(url: str) -> bool:
         ):
             return True
     return False
+
+
+def _wrapping_bbox_geometry(bbox: BBox) -> dict[str, Any]:
+    """A STAC geometry for a box that crosses the antimeridian.
+
+    The box becomes one rectangle per side of 180. A non-wrapping box is a
+    single Polygon. STAC's ``bbox`` has no portable wrapping convention, so a
+    dateline request is sent as ``intersects`` instead.
+    """
+    rings = [
+        [
+            [part.west, part.south],
+            [part.east, part.south],
+            [part.east, part.north],
+            [part.west, part.north],
+            [part.west, part.south],
+        ]
+        for part in bbox.antimeridian_parts()
+    ]
+    if len(rings) == 1:
+        return {"type": "Polygon", "coordinates": rings[0]}
+    return {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
 
 
 def _next_page_cursor(payload: Mapping[str, Any], search_url: str) -> tuple[str | None, str | None]:
@@ -528,6 +563,10 @@ def _call_from_object(
         posted = search_body(request)
         if body:
             posted.update(body)
+        # A server-provided next-link body can repeat the original box even
+        # when this search used a ring. bbox and intersects are exclusive.
+        if "intersects" in posted:
+            posted.pop("bbox", None)
         return _CursorCall("POST", url, posted)
     if body is None:
         return _CursorCall("POST", url, {})
@@ -599,7 +638,7 @@ def item_to_scene(
             roles = spec.get("roles")
             scale, offset = _raster_calibration(spec.get("raster:bands"))
             asset = Asset.try_new(
-                href=_http_href(spec["href"]),
+                href=_asset_href(spec),
                 media_type=spec.get("type") if isinstance(spec.get("type"), str) else None,
                 title=spec.get("title") if isinstance(spec.get("title"), str) else None,
                 roles=list(roles) if isinstance(roles, list) else [],
@@ -704,14 +743,27 @@ def _stac_bbox(feature: dict[str, Any]) -> BBox | None:
     # A 6-number bbox is [west, south, floor, east, north, ceiling].
     half = len(bbox_list) // 2
     try:
+        west, east = float(bbox_list[0]), float(bbox_list[half])
+        # GOES-West full disk publishes west=-218.3. Wrap past +/-180 so the box
+        # crosses the antimeridian instead of failing validation.
+        if east - west >= 360.0:
+            west, east = -180.0, 180.0
+        else:
+            west, east = _wrap_longitude(west), _wrap_longitude(east)
         return BBox.try_new(
-            west=float(bbox_list[0]),
+            west=west,
             south=float(bbox_list[1]),
-            east=float(bbox_list[half]),
+            east=east,
             north=float(bbox_list[half + 1]),
         )
     except (TypeError, ValueError):
         return None
+
+
+def _wrap_longitude(lon: float) -> float:
+    if -180.0 <= lon <= 180.0:
+        return lon
+    return ((lon + 180.0) % 360.0) - 180.0
 
 
 def _stac_cloud_cover(raw: object) -> float | None:
@@ -729,6 +781,26 @@ def _stac_cloud_cover(raw: object) -> float | None:
     return min(max(value, 0.0), 100.0)
 
 
+# Digital Earth Africa buckets live in af-south-1, an opt-in region.
+_OPT_IN_BUCKET_REGIONS: tuple[tuple[str, str], ...] = (("deafrica-", "af-south-1"),)
+
+
+def _asset_href(spec: dict[str, Any]) -> str:
+    """Primary href, or its ``alternate.https`` href when the primary is S3.
+
+    CDSE lists ``s3://eodata/...`` first. That bucket needs CDSE S3 keys, while
+    the https alternate is the OData download that takes a bearer token.
+    """
+    href = str(spec["href"])
+    alternate = spec.get("alternate")
+    if href.startswith("s3://") and isinstance(alternate, dict):
+        https = alternate.get("https")
+        alt = https.get("href") if isinstance(https, dict) else None
+        if isinstance(alt, str) and alt.startswith("https://"):
+            return alt
+    return _http_href(href)
+
+
 def _http_href(href: str) -> str:
     """Expose S3 object URLs over HTTPS so callers can fetch without an s3 client."""
     if not href.startswith("s3://"):
@@ -737,6 +809,10 @@ def _http_href(href: str) -> str:
     bucket, _, key = rest.partition("/")
     if not bucket or not key:
         return href
+    # Buckets in an opt-in region answer the global endpoint with HTTP 400.
+    for prefix, region in _OPT_IN_BUCKET_REGIONS:
+        if bucket.startswith(prefix):
+            return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
     return f"https://{bucket}.s3.amazonaws.com/{key}"
 
 

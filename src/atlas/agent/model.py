@@ -29,6 +29,12 @@ from atlas.agent.images import apply_image_budget
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 _ERROR_BODY_LIMIT = 180
+# Transient provider failures worth another attempt: rate limits, gateway
+# hiccups, and timeouts. Everything else (bad request, auth, billing) is final.
+_RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+_MAX_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 0.5
+_RETRY_BACKOFF = 2.0
 _CATALOG_PAGE_LIMIT = 20
 _CATALOG_TIME_LIMIT = 15.0
 _CATALOG_CACHE_SECONDS = 30.0
@@ -125,7 +131,7 @@ class OpenRouterModel:
         # while chunks are still arriving.
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
-        response, timing = self._complete(payload)
+        response, timing = self._complete_with_retry(payload)
         try:
             message = response["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -171,6 +177,39 @@ class OpenRouterModel:
                 return _read_completion(resp, started)
         resp = self._client.post(OPENROUTER_URL, headers=headers, json=payload)
         return _read_completion(resp, started)
+
+    def _complete_with_retry(self, payload: dict[str, Any]) -> tuple[dict[str, Any], CallTiming]:
+        """Retry a transient provider failure, then give up.
+
+        A rate limit, a gateway error, a timeout, or a transport failure is
+        not a reason to end the turn: the same request is sent again, at most
+        :data:`_MAX_ATTEMPTS` times, doubling the wait between attempts.
+        Every other failure is final on the first response.
+
+        Args:
+            payload: The chat-completions request body.
+
+        Returns:
+            The parsed completion body and its timing.
+
+        Raises:
+            OpenRouterHTTPError: A non-retryable status, or the last attempt.
+            httpx.TimeoutException: The last attempt timed out.
+            httpx.TransportError: The last attempt could not reach the host.
+        """
+        delay = _RETRY_BASE_DELAY
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                return self._complete(payload)
+            except OpenRouterHTTPError as exc:
+                if exc.status_code not in _RETRY_STATUS or attempt == _MAX_ATTEMPTS:
+                    raise
+            except (httpx.TimeoutException, httpx.TransportError):
+                if attempt == _MAX_ATTEMPTS:
+                    raise
+            time.sleep(delay)
+            delay *= _RETRY_BACKOFF
+        raise AssertionError("retry loop ended without a result")
 
 
 def _chunk_timeout(seconds: float) -> httpx.Timeout:

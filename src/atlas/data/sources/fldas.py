@@ -197,7 +197,7 @@ def parse_points_csv(path: Path) -> list[tuple[float, float]]:
         FldasRequestError: if the file is unreadable, headerless, or malformed.
     """
     try:
-        with path.open(newline="", encoding="utf-8") as handle:
+        with path.open(newline="", encoding="utf-8-sig") as handle:
             rows = [row for row in csv.reader(handle) if any(cell.strip() for cell in row)]
     except OSError as exc:
         raise FldasRequestError(f"cannot read points file {path}: {exc}") from exc
@@ -354,9 +354,12 @@ class FldasClient(DataPullClient):
         if points is not None and not points:
             raise FldasRequestError("no points to extract; the points file had no rows")
         if points is not None:
+            area = "polygon" if request.polygon is not None else "bbox"
             for lon, lat in points:
-                if not request.bbox.contains(lon, lat):
-                    raise FldasRequestError(f"point ({lon}, {lat}) is outside the request bbox")
+                if not request.bbox.contains(lon, lat) or (
+                    request.polygon is not None and not request.polygon.contains(lon, lat)
+                ):
+                    raise FldasRequestError(f"point ({lon}, {lat}) is outside the request {area}")
         if not self._token:
             raise FldasAuthError(MISSING_TOKEN_MESSAGE)
 

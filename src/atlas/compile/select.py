@@ -34,9 +34,8 @@ def dedup(scenes: list[Scene]) -> list[Scene]:
     """Remove duplicate scenes by id, preserving order.
 
     Matching is id-only, not source-plus-id. Catalogs that serve the same
-    observation under their own ids (Landsat via Planetary Computer,
-    LandsatLook and HLS; MODIS and GOES via two backends each) survive as
-    separate entries.
+    observation under their own ids (Landsat via Planetary Computer and
+    HLS; MODIS and GOES via two backends each) survive as separate entries.
 
     Args:
         scenes: Scenes to filter, in the order they should be kept.

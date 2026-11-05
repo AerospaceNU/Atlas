@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import importlib
 import json
 import os
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from atlas.cli.catalog import (
     render_satellite,
     render_satellite_tree,
     resolve_sources,
+    satellite_kinds,
 )
 from atlas.cli.download import (
     BrowseAssetError,
@@ -46,11 +48,17 @@ from atlas.cli.download import (
     retire_product,
 )
 from atlas.cli.estimate import confirm_download, estimate_pull, render_pull_estimate
+from atlas.cli.fs import replace_with_retry
 from atlas.cli.progress import ProgressReporter, pick_reporter
+from atlas.cli.source_outputs import (
+    write_source_outputs,
+    writes_own_output,
+    writes_own_output_type,
+)
 from atlas.compile.aggregate import aggregate
 from atlas.compile.product import SceneCatalog, SourceScenes
 from atlas.data.base import BBox, DataPullClient, Polygon, PullRequest, Scene
-from atlas.data.registry import sources
+from atlas.data.registry import SOURCES, sources
 from atlas.data.scene_identity import (
     SourceResolution,
     StoredScene,
@@ -77,13 +85,84 @@ _EXAMPLE = (
     "atlas data sentinel2 optical --date 2024-07-01:2024-07-07 "
     "--coords -71.12,42.32,-71.02,42.40\n"
     "  atlas data sentinel2 optical --date 2024-07-01:2024-07-07 "
-    "--polygon -71.12,42.32;-71.02,42.32;-71.02,42.40;-71.12,42.40\n"
+    "--polygon '-71.12,42.32;-71.02,42.32;-71.02,42.40;-71.12,42.40'\n"
     "  atlas data fldas landsurface --date 2020-01-01:2020-01-31 "
     "--coords -71.2,42.2,-70.9,42.5 --out .atlas/data/fldas"
 )
 _EXTRACT_HINT = "FLDAS table extraction runs alone; pass only the fldas source"
+_TABLE_OPTIONS_HINT = "--table, --variables, and --points apply only to the fldas source"
+_SEARCH_ONLY_TABLE_WARNING = (
+    "warning: --search-only writes no FLDAS table; --table, --variables, and --points are ignored"
+)
 _TABLE_NAME = "fldas.csv"
 _EMPTY_WINDOW = "requested window is empty"
+_MANIFEST_LOCK_NAME = ".manifest.json.lock"
+_PULL_OPTIONS = (
+    "date",
+    "coords",
+    "polygon",
+    "resume",
+    "asset",
+    "table",
+    "variables",
+    "points",
+    "search_only",
+    "yes",
+    "min_cloud_cover",
+    "max_cloud_cover",
+)
+
+
+def _pull_requested(args: argparse.Namespace) -> bool:
+    """True when an option asks for a pull rather than a listing."""
+    for name in _PULL_OPTIONS:
+        value = getattr(args, name, None)
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif isinstance(value, bool):
+            if value:
+                return True
+        elif value is not None:
+            return True
+    return False
+
+
+def _path_arg(text: str) -> Path:
+    """Argparse type for a filesystem path; a leading ``~`` is expanded."""
+    if not text.strip():
+        raise argparse.ArgumentTypeError("path must not be empty")
+    return Path(text).expanduser()
+
+
+def _bounded_int(low: int, high: int, label: str) -> Callable[[str], int]:
+    """Argparse type for a whole number in ``[low, high]`` with a clean message."""
+
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer") from None
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"{label} must be between {low} and {high}")
+        return value
+
+    return parse
+
+
+def _at_least(low: int, label: str) -> Callable[[str], int]:
+    """Argparse type for a whole number of at least ``low``."""
+
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer") from None
+        if value < low:
+            raise argparse.ArgumentTypeError(f"{label} must be at least {low}")
+        return value
+
+    return parse
 
 
 def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -101,7 +180,9 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
             "or listed in a resume manifest are left out of that estimate. "
             "The download starts only after confirmation, or when --yes is passed. "
             "Without a terminal, --yes is required. Remaining quota is included "
-            "when a provider publishes it; otherwise the estimate says quota is not readable."
+            "when a provider publishes it; otherwise the estimate says quota is not readable. "
+            "A saved 16-bit, signed, float, or multiband GeoTIFF that viewers show dark gets "
+            "a contrast-stretched <stem>.preview.png beside it; the data file is unchanged."
         ),
         epilog=f"example:\n  {_EXAMPLE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -139,11 +220,16 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     data.add_argument(
         "--out",
-        type=Path,
+        type=_path_arg,
         default=project_data_dir(),
         help="Output directory (default: .atlas/data)",
     )
-    data.add_argument("--limit", type=int, default=100, help="Max scenes per source (1-1000)")
+    data.add_argument(
+        "--limit",
+        type=_bounded_int(1, 1000, "--limit"),
+        default=100,
+        help="Max scenes per source (1-1000)",
+    )
     data.add_argument(
         "--min-cloud-cover",
         type=float,
@@ -158,9 +244,9 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     data.add_argument(
         "--concurrency",
-        type=int,
+        type=_at_least(1, "--concurrency"),
         default=8,
-        help="Max parallel preview downloads",
+        help="Max parallel preview downloads (at least 1)",
     )
     data.add_argument(
         "--search-only",
@@ -189,13 +275,14 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         default=None,
         help=(
             "Band name (red, nir) or asset key to download; band names win over a "
-            "literal key of the same name. Default: visual COG, then data. "
+            "literal key of the same name. Default: visual COG, then the red band, then "
+            "an imagery band; QA, mask, and angle layers are skipped. "
             "Previews/thumbnails are rejected."
         ),
     )
     data.add_argument(
         "--table",
-        type=Path,
+        type=_path_arg,
         default=None,
         help="Training-table CSV path for extract sources (default: <out>/fldas.csv)",
     )
@@ -209,7 +296,7 @@ def add_data_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     data.add_argument(
         "--points",
-        type=Path,
+        type=_path_arg,
         default=None,
         help="CSV of points with a header (longitude/latitude, lon/lat, or x/y)",
     )
@@ -225,11 +312,19 @@ def run_data(
     """Dispatch ``atlas data``: list catalog, list one satellite, or pull.
 
     Returns:
-        Process exit code (0 ok, 1 all sources failed, 2 usage).
+        Process exit code (0 ok, 1 all sources failed or no download was saved,
+        2 usage).
     """
     load_repo_env()
     console = Console(highlight=False)
+    pull_intent = _pull_requested(args)
     if args.satellite is None:
+        if pull_intent:
+            print(
+                "data pull requires a satellite; run 'atlas data' to list them",
+                file=sys.stderr,
+            )
+            return 2
         render_catalog(console)
         return 0
     if args.list_catalog:
@@ -239,28 +334,48 @@ def run_data(
             Console(stderr=True, highlight=False).print(str(exc), style="red")
             return 2
         return 0
-    if args.kind is None and args.date and args.coords:
+    polygon_text = getattr(args, "polygon", None)
+    has_area = bool(args.coords or polygon_text)
+    if args.kind is None and (args.date or has_area):
         try:
-            args.kind = only_kind(args.satellite)
+            inferred = only_kind(args.satellite)
         except CatalogError as exc:
             Console(stderr=True, highlight=False).print(str(exc), style="red")
             return 2
+        if inferred is None:
+            kinds = ", ".join(kind.value for kind in satellite_kinds(args.satellite))
+            print(
+                f"satellite {args.satellite!r} has several kinds ({kinds}); pass one as the "
+                f"second argument, for example: atlas data {args.satellite} <kind> --date ...",
+                file=sys.stderr,
+            )
+            return 2
+        args.kind = inferred
     if args.kind is None:
+        if pull_intent:
+            print(
+                "data pull requires --date START:END and --coords W,S,E,N or --polygon",
+                file=sys.stderr,
+            )
+            return 2
         try:
             render_satellite(console, args.satellite)
         except CatalogError as exc:
             Console(stderr=True, highlight=False).print(str(exc), style="red")
             return 2
         return 0
-    polygon_text = getattr(args, "polygon", None)
-    if not args.date or not (args.coords or polygon_text):
+    try:
+        names = resolve_sources(args.satellite, args.kind)
+    except CatalogError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not args.date or not has_area:
         print(
             "data pull requires --date START:END and --coords W,S,E,N or --polygon",
             file=sys.stderr,
         )
         return 2
     try:
-        names = resolve_sources(args.satellite, args.kind)
         start, end = parse_date_range(args.date)
         polygon = parse_polygon(polygon_text) if polygon_text else None
         request_body: dict[str, object] = {
@@ -274,12 +389,21 @@ def run_data(
         if args.coords:
             request_body["bbox"] = parse_coords(args.coords)
         request = PullRequest.model_validate(request_body)
-    except (CatalogError, ValueError) as exc:
+    except ValidationError as exc:
+        print(_validation_error(exc, "pull request is invalid"), file=sys.stderr)
+        return 2
+    except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
     if args.asset and is_forbidden_asset_name(args.asset):
         print(
             f"{args.asset!r} is a preview/thumbnail and cannot be downloaded",
+            file=sys.stderr,
+        )
+        return 2
+    if args.asset and all(writes_own_output_type(SOURCES[name]) for name in names):
+        print(
+            "--asset does not apply to GIBS or FIRMS; they write a WMS image or a detection table",
             file=sys.stderr,
         )
         return 2
@@ -292,11 +416,13 @@ def run_data(
     fldas_only = extracting and len(names) == 1
     variables = None
     points = None
-    if (
-        extracting
-        and not fldas_only
-        and any(getattr(args, flag, None) is not None for flag in ("table", "variables", "points"))
-    ):
+    table_options = any(
+        getattr(args, flag, None) is not None for flag in ("table", "variables", "points")
+    )
+    if table_options and not extracting:
+        print(_TABLE_OPTIONS_HINT, file=sys.stderr)
+        return 2
+    if extracting and not fldas_only and table_options:
         print(_EXTRACT_HINT, file=sys.stderr)
         return 2
     if fldas_only:
@@ -313,16 +439,19 @@ def run_data(
                 file=sys.stderr,
             )
             return 2
-        try:
-            raw_variables = getattr(args, "variables", None)
-            raw_points = getattr(args, "points", None)
-            if raw_variables is not None:
-                variables = resolve_variables(split_variables(raw_variables))
-            if raw_points is not None:
-                points = parse_points_csv(raw_points)
-        except FldasRequestError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
+        if args.search_only and table_options:
+            print(_SEARCH_ONLY_TABLE_WARNING, file=sys.stderr)
+        else:
+            try:
+                raw_variables = getattr(args, "variables", None)
+                raw_points = getattr(args, "points", None)
+                if raw_variables is not None:
+                    variables = resolve_variables(split_variables(raw_variables))
+                if raw_points is not None:
+                    points = parse_points_csv(raw_points)
+            except FldasRequestError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
     if (
         fldas_only
         and not args.search_only
@@ -337,11 +466,13 @@ def run_data(
     prior_manifest: Mapping[str, Any] | None = None
     if getattr(args, "resume", False):
         try:
-            prior_manifest = _load_pull_manifest(pull_manifest_path(args.out))
+            stored = _load_pull_manifest(pull_manifest_path(args.out))
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
-        if not _same_pull(prior_manifest.get("request"), request):
+        run_sources = set(clients) if clients is not None else set(names)
+        prior_manifest = _resume_view(stored, run_sources, request)
+        if prior_manifest is None:
             print("resume query does not match the pull manifest", file=sys.stderr)
             return 2
         page_cursors = _page_cursors(prior_manifest)
@@ -382,12 +513,31 @@ def parse_date_range(text: str) -> tuple[date, date]:
 
 
 def parse_coords(text: str) -> BBox:
-    """Parse ``west,south,east,north`` into a ``BBox``."""
+    """Parse ``west,south,east,north`` into a ``BBox``.
+
+    A zero-width or zero-height box is rejected: it cannot overlap a raster
+    window or a catalog item, so it is almost always a typo. A box with west
+    greater than east still means a box across the antimeridian.
+
+    Raises:
+        ValueError: The text is not four numbers, the latitudes are inverted,
+            or the box has no area.
+    """
     parts = [item.strip() for item in text.split(",")]
     if len(parts) != 4:
         raise ValueError("coords must be west,south,east,north")
-    west, south, east, north = (float(item) for item in parts)
-    return BBox(west=west, south=south, east=east, north=north)
+    try:
+        west, south, east, north = (float(item) for item in parts)
+    except ValueError:
+        raise ValueError("coords must be four numbers: west,south,east,north") from None
+    if east == west:
+        raise ValueError("coords must span more than one longitude (west must not equal east)")
+    if south == north:
+        raise ValueError("coords must span more than one latitude (south must not equal north)")
+    try:
+        return BBox(west=west, south=south, east=east, north=north)
+    except ValidationError as exc:
+        raise ValueError(_validation_error(exc)) from None
 
 
 def parse_polygon(text: str) -> Polygon:
@@ -418,9 +568,9 @@ def parse_polygon(text: str) -> Polygon:
             payload = payload.get("geometry")
         try:
             if isinstance(payload, dict):
-                return Polygon.from_geojson(payload)
+                return Polygon.from_geojson(_closed_geojson(payload))
             if isinstance(payload, list):
-                return Polygon(ring=payload)
+                return Polygon(ring=_closed_ring(payload))
         except ValidationError as exc:
             raise ValueError(_polygon_error(exc)) from exc
         raise ValueError("polygon JSON must be a Polygon or a ring")
@@ -442,9 +592,50 @@ def parse_polygon(text: str) -> Polygon:
         raise ValueError(_polygon_error(exc)) from exc
 
 
-def _polygon_error(exc: ValidationError) -> str:
+def _validation_error(exc: ValidationError, fallback: str = "value is invalid") -> str:
+    """One-line text for a Pydantic error, without the URL-laden default block."""
     messages = [error["msg"].removeprefix("Value error, ") for error in exc.errors()]
-    return "; ".join(messages) if messages else "polygon is invalid"
+    return "; ".join(messages) if messages else fallback
+
+
+def _polygon_error(exc: ValidationError) -> str:
+    return _validation_error(exc, "polygon is invalid")
+
+
+def _same_json_position(left: object, right: object) -> bool:
+    """True when two GeoJSON positions name the same point (altitude ignored)."""
+    return (
+        isinstance(left, list)
+        and isinstance(right, list)
+        and len(left) >= 2
+        and len(right) >= 2
+        and left[:2] == right[:2]
+    )
+
+
+def _closed_ring(ring: list[Any]) -> list[Any]:
+    """Append the first position to an open JSON ring so the AOI is closed.
+
+    The semicolon form already closes its ring. A GeoJSON Polygon is expected
+    to be closed by its producer, but the CLI accepts an open one too, as the
+    ``--polygon`` help says. A closing position that differs only in altitude
+    already closes the surface ring.
+    """
+    if not ring:
+        return ring
+    if not _same_json_position(ring[0], ring[-1]):
+        return [*ring, ring[0]]
+    return ring
+
+
+def _closed_geojson(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a Polygon geometry with its exterior ring closed."""
+    coordinates = payload.get("coordinates")
+    if payload.get("type") != "Polygon" or not isinstance(coordinates, list) or not coordinates:
+        return payload
+    closed = [*coordinates]
+    closed[0] = _closed_ring(coordinates[0]) if isinstance(coordinates[0], list) else closed[0]
+    return {**payload, "coordinates": closed}
 
 
 async def execute_pull(
@@ -501,11 +692,30 @@ async def execute_pull(
         http if http is not None else httpx.AsyncClient(timeout=300.0, follow_redirects=True)
     )
     try:
+        trouble = _prepare_output_dir(out_dir)
+        if trouble is not None:
+            print(trouble, file=sys.stderr)
+            return 2
+        if request.polygon is not None and not search_only:
+            print(
+                "warning: downloads use the polygon envelope; pixels outside the ring "
+                "can be included",
+                file=sys.stderr,
+            )
         if prior_manifest is not None:
             mismatch = _resume_mismatch(prior_manifest, live_clients)
             if mismatch is not None:
                 print(mismatch, file=sys.stderr)
                 return 2
+        if page_cursors is not None:
+            # An extract source (FLDAS) has no page cursor. Marking it
+            # "finished" would skip it forever, so a resume after
+            # --search-only could never write its table. Search it again.
+            page_cursors = {
+                name: value
+                for name, value in page_cursors.items()
+                if not isinstance(live_clients.get(name), FldasClient)
+            }
         unavailable = _unavailable_cursors(prior_manifest) if prior_manifest is not None else None
         if unavailable:
             for name in sorted(unavailable):
@@ -551,6 +761,7 @@ async def execute_pull(
         report = DownloadReport()
         table_failed = False
         table_usage = False
+        attempted = 0
         if not search_only:
             to_pull = [
                 scene
@@ -558,6 +769,11 @@ async def execute_pull(
                 if src.error is None and not isinstance(live_clients[src.source], FldasClient)
                 for scene in src.scenes
             ]
+            # GIBS images and FIRMS detection tables are written by their own
+            # module; browse assets stay forbidden in download_assets.
+            own_output = [s for s in to_pull if writes_own_output(live_clients.get(s.source))]
+            to_pull = [s for s in to_pull if not writes_own_output(live_clients.get(s.source))]
+            attempted = len(to_pull) + len(own_output)
             for src in catalog.sources:
                 if src.error is None:
                     reporter.source_pull(src.source, saved=0, total=len(src.scenes))
@@ -577,6 +793,18 @@ async def execute_pull(
             except BrowseAssetError as exc:
                 print(str(exc), file=sys.stderr)
                 return 2
+            report.outcomes.extend(
+                await write_source_outputs(
+                    own_output,
+                    out_dir,
+                    http=live_http,
+                    clients=live_clients,
+                    concurrency=concurrency,
+                    on_progress=lambda name, n_saved, total: reporter.source_pull(
+                        name, saved=n_saved, total=total
+                    ),
+                )
+            )
             if extract_tables:
                 for src in catalog.sources:
                     client = live_clients.get(src.source)
@@ -612,14 +840,18 @@ async def execute_pull(
         )
         for src in catalog.sources:
             reporter.source_done(src.source)
-        _write_manifest(
-            out_dir,
-            catalog,
-            report,
-            prior=prior_manifest,
-            identity=identity,
-            resolutions=resolutions,
-        )
+        try:
+            _write_manifest(
+                out_dir,
+                catalog,
+                report,
+                prior=prior_manifest,
+                identity=identity,
+                resolutions=resolutions,
+            )
+        except OSError as exc:
+            print(f"cannot write the pull manifest in {out_dir}: {exc}", file=sys.stderr)
+            return 1
         reporter.close()
         _print_run_summary(catalog, report, search_only=search_only)
         for src in catalog.sources:
@@ -628,6 +860,18 @@ async def execute_pull(
             ):
                 print(line, file=sys.stderr)
         if catalog.sources and all(src.error for src in catalog.sources):
+            return 1
+        # A pull that attempted downloads and saved nothing did not do its job,
+        # even when every search worked. A window failure has no attempted
+        # scene and stays a recorded note with exit 0.
+        downloaded = [
+            item for item in report.outcomes if not item.scene_id.endswith(("-window", "-table"))
+        ]
+        if (
+            not search_only
+            and attempted > 0
+            and not any(item.status in {"saved", "skipped"} for item in downloaded)
+        ):
             return 1
         # Usage and auth failures change the exit code only for a FLDAS-only pull.
         # A mixed catalog pull keeps the existing rule: search success exits 0,
@@ -648,19 +892,32 @@ async def execute_pull(
             await _aclose_all(live_clients)
 
 
+def _prepare_output_dir(out_dir: Path) -> str | None:
+    """Create ``out_dir`` for a pull; return an error line when it cannot hold one."""
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return f"cannot use output directory {out_dir}: {exc}"
+    if not out_dir.is_dir():
+        return f"output path is not a directory: {out_dir}"
+    return None
+
+
 def _unknown_byte_sources(
     clients: Mapping[str, DataPullClient],
     extract_tables: bool,
 ) -> frozenset[str]:
     """Return sources whose download size is not a catalog asset size.
 
-    A training-table extract reads a subset of each granule. The asset's
-    ``file:size``, when one exists, is not the table, so the estimate leaves
-    those bytes unknown.
+    A training-table extract reads a subset of each granule, and GIBS and
+    FIRMS write a rendered image or a detection table instead of the catalog
+    asset. The asset's ``file:size``, when one exists, is not the bytes the
+    pull transfers, so the estimate leaves those sources unknown.
     """
-    if not extract_tables:
-        return frozenset()
-    return frozenset(name for name, client in clients.items() if isinstance(client, FldasClient))
+    unknown = {name for name, client in clients.items() if writes_own_output(client)}
+    if extract_tables:
+        unknown.update(name for name, client in clients.items() if isinstance(client, FldasClient))
+    return frozenset(unknown)
 
 
 async def _extract_table(
@@ -812,24 +1069,17 @@ def _retire_inside(out_dir: Path, path: Path) -> None:
 def _products_for_request(out_dir: Path, source: str, request: PullRequest) -> list[Path]:
     """Return manifest-listed products for this source and this request.
 
-    Files from another date or area, and files the manifest did not list, are
-    not included. A listed path that leaves ``out_dir`` is skipped.
+    Only the row for ``source`` is read, and only when that row's own request
+    is the same window. Files from another date or area, files listed for
+    another source, and files the manifest did not list are not included. A
+    listed path that leaves ``out_dir`` is skipped.
     """
-    manifest_path = pull_manifest_path(out_dir)
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        return []
-    try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return []
-    if not isinstance(payload, dict) or not _same_window(payload.get("request"), request):
+    payload = _read_manifest(out_dir)
+    if payload is None:
         return []
     products: list[Path] = []
-    sources = payload.get("sources")
-    if not isinstance(sources, list):
-        return []
-    for item in sources:
-        if not isinstance(item, dict) or item.get("source") != source:
+    for item in _source_rows(payload):
+        if item["source"] != source or not _same_window(item.get("request"), request):
             continue
         for key in ("saved", "skipped"):
             listed = item.get(key)
@@ -856,8 +1106,13 @@ def _same_window(previous: object, request: PullRequest) -> bool:
     current = request.bbox.model_dump(mode="json")
     if any(bbox.get(key) != current[key] for key in ("west", "south", "east", "north")):
         return False
+    previous_polygon = previous.get("polygon")
     current_polygon = None if request.polygon is None else request.polygon.model_dump(mode="json")
-    return previous.get("polygon") == current_polygon
+    if previous_polygon is None or current_polygon is None:
+        return previous_polygon is current_polygon
+    left = _stored_polygon_signature(previous_polygon)
+    right = _stored_polygon_signature(current_polygon)
+    return left is not None and left == right
 
 
 def _listed_product(out_dir: Path, source: str, rel: object) -> Path | None:
@@ -875,12 +1130,27 @@ def _listed_product(out_dir: Path, source: str, rel: object) -> Path | None:
 
 def _catalog_bbox_note(request: PullRequest) -> str:
     if request.polygon is None:
+        if request.bbox.west > request.bbox.east:
+            return (
+                "A box across the antimeridian was sent to STAC catalogs as two rings. "
+                "Catalogs that only accept a box were cut at 180 degrees."
+            )
         return "Every catalog was searched with this bounding box."
     return (
         "Catalogs that only accept a bounding box were searched with this box. "
         "The polygon is the area of interest. Scenes from every source are filtered "
         "to it by footprint bounding-box overlap; point scenes must fall inside the ring. "
         "A scene stores that box, not the full footprint outline."
+    )
+
+
+def _download_note(request: PullRequest) -> str | None:
+    """Explain that a polygon pull writes the envelope, not a clipped ring."""
+    if request.polygon is None:
+        return None
+    return (
+        "Downloads use the polygon envelope: a WMS image or a windowed raster covers "
+        "the box, so pixels outside the ring can be included."
     )
 
 
@@ -896,6 +1166,8 @@ def _load_pull_manifest(path: Path) -> dict[str, Any]:
     Raises:
         ValueError: The file is missing or has no source list.
     """
+    if path.is_symlink():
+        raise ValueError(f"pull manifest at {path} is a symlink; cannot resume")
     if not path.is_file():
         raise ValueError(f"no pull manifest at {path}; cannot resume")
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -919,14 +1191,66 @@ def _same_pull(stored: object, request: PullRequest) -> bool:
         previous.start_date == request.start_date
         and previous.end_date == request.end_date
         and previous.bbox == request.bbox
-        and previous.polygon == request.polygon
+        and _same_polygon(previous.polygon, request.polygon)
         and previous.min_cloud_cover == request.min_cloud_cover
         and previous.max_cloud_cover == request.max_cloud_cover
     )
 
 
+def _same_polygon(previous: Polygon | None, current: Polygon | None) -> bool:
+    """True when two rings describe the same surface, ignoring the start vertex."""
+    if previous is None or current is None:
+        return previous is current
+    left = _ring_signature(previous.ring)
+    right = _ring_signature(current.ring)
+    return left is not None and left == right
+
+
+def _ring_signature(ring: object) -> tuple[tuple[float, float], ...] | None:
+    """Canonical closed ring: start at the smallest position, altitude dropped."""
+    if not isinstance(ring, Sequence) or isinstance(ring, str | bytes):
+        return None
+    points: list[tuple[float, float]] = []
+    for item in ring:
+        if not isinstance(item, Sequence) or isinstance(item, str | bytes) or len(item) < 2:
+            return None
+        lon, lat = item[0], item[1]
+        if isinstance(lon, bool) or isinstance(lat, bool):
+            return None
+        if not isinstance(lon, int | float) or not isinstance(lat, int | float):
+            return None
+        points.append((float(lon), float(lat)))
+    if points and points[0] == points[-1]:
+        points = points[:-1]
+    if not points:
+        return None
+    start = min(range(len(points)), key=lambda index: points[index])
+    rotated = points[start:] + points[:start]
+    return (*rotated, rotated[0])
+
+
+def _stored_polygon_signature(value: object) -> tuple[tuple[float, float], ...] | None:
+    """Ring signature from a stored request polygon (``ring`` or GeoJSON)."""
+    if not isinstance(value, dict):
+        return None
+    ring = value.get("ring")
+    if isinstance(ring, list):
+        return _ring_signature(ring)
+    coordinates = value.get("coordinates")
+    if isinstance(coordinates, list) and coordinates:
+        return _ring_signature(coordinates[0])
+    return None
+
+
 def _page_cursors(payload: Mapping[str, Any]) -> dict[str, str | None]:
-    """Return each source's stored next-page cursor, including explicit nulls."""
+    """Return each source's stored next-page cursor, including explicit nulls.
+
+    A row whose search failed and stored no cursor is left out of the map, so
+    a resume searches it from page one instead of treating the failure as a
+    finished source. A row whose next page was signed and deliberately not
+    stored stays in the map, so resume repeats the warning rather than
+    repeating page one.
+    """
     cursors: dict[str, str | None] = {}
     sources = payload.get("sources")
     if not isinstance(sources, list):
@@ -937,8 +1261,28 @@ def _page_cursors(payload: Mapping[str, Any]) -> dict[str, str | None]:
         name = item.get("source")
         if not isinstance(name, str) or not name:
             continue
-        cursors[name] = _wire_cursor(item.get("next_cursor"))
+        cursor = _wire_cursor(item.get("next_cursor"))
+        if cursor is None and _failed_without_cursor(item):
+            continue
+        cursors[name] = cursor
     return cursors
+
+
+def _failed_without_cursor(row: Mapping[str, Any]) -> bool:
+    """True when a row records a failed search, no cursor, and no signed link.
+
+    Such a source is retried from page one by a resume. A signed next link
+    that was deliberately not stored has no error and is left as recorded.
+    """
+    error = row.get("error")
+    if not isinstance(error, str) or not error.strip():
+        return False
+    if row.get("cursor_rejected") is True:
+        # The cursor was rejected and cleared on purpose; a resume must not
+        # silently start over. A pull without --resume starts at page one.
+        return False
+    reason = row.get("next_cursor_unavailable")
+    return not (isinstance(reason, str) and reason.strip())
 
 
 def _write_manifest(
@@ -950,32 +1294,82 @@ def _write_manifest(
     identity: Mapping[str, Any] | None = None,
     resolutions: Mapping[str, SourceResolution] | None = None,
 ) -> None:
+    """Write this run's sources into ``<out_dir>/manifest.json``.
+
+    The manifest is shared by every pull into ``out_dir``. Each row in
+    ``sources`` carries the ``request`` that produced it, so one directory can
+    hold sources pulled for different windows. A row for a source this run did
+    not search is kept as it is on disk; a row for a source this run searched
+    is replaced (or, on resume, extended from ``prior``). The top-level
+    ``request``, ``polygon``, and ``catalog_bbox`` describe the most recent run.
+    A row without its own ``request`` was written before rows carried one and
+    belongs to the top-level request; it is stamped with it when kept.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     request = catalog.request
+    request_json = request.model_dump(mode="json")
     bbox = request.bbox.as_list()
     prior_sources = _prior_sources(prior)
     identity_sources = _prior_sources(identity)
     checks = resolutions or {}
     sources_payload = [
-        _source_entry(
-            src,
-            report,
-            out_dir,
-            bbox,
-            prior_row=prior_sources.get(src.source),
-            identity_row=identity_sources.get(src.source),
-            resolution=checks.get(src.source, SourceResolution.unchecked()),
+        _stamp_request(
+            _source_entry(
+                src,
+                report,
+                out_dir,
+                bbox,
+                prior_row=prior_sources.get(src.source),
+                identity_row=identity_sources.get(src.source),
+                resolution=checks.get(src.source, SourceResolution.unchecked()),
+            ),
+            request_json,
         )
         for src in catalog.sources
     ]
-    payload = {
-        "request": request.model_dump(mode="json"),
-        "polygon": None if request.polygon is None else request.polygon.as_geojson(),
-        "catalog_bbox": bbox,
-        "catalog_bbox_note": _catalog_bbox_note(request),
-        "sources": sources_payload,
-    }
-    _write_json_atomic(pull_manifest_path(out_dir), json.dumps(payload, indent=2) + "\n")
+    # The read, merge, and replace are one critical section. Two pulls into
+    # the same directory would otherwise read the same file and each write
+    # only its own row, dropping the other source.
+    with _manifest_lock(out_dir):
+        existing = _read_manifest(out_dir)
+        payload = {
+            "request": request_json,
+            "polygon": None if request.polygon is None else request.polygon.as_geojson(),
+            "catalog_bbox": bbox,
+            "catalog_bbox_note": _catalog_bbox_note(request),
+            "download_note": _download_note(request),
+            "sources": _merge_rows(
+                [] if existing is None else _source_rows(existing), sources_payload
+            ),
+        }
+        _write_json_atomic(pull_manifest_path(out_dir), json.dumps(payload, indent=2) + "\n")
+
+
+def _stamp_request(row: dict[str, Any], request_json: object) -> dict[str, Any]:
+    """Return ``row`` with ``request`` placed right after ``source``."""
+    stamped: dict[str, Any] = {"source": row.get("source"), "request": request_json}
+    stamped.update((key, value) for key, value in row.items() if key not in stamped)
+    return stamped
+
+
+def _merge_rows(
+    existing: Sequence[dict[str, Any]], current: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Replace rows for this run's sources and keep every other source's row.
+
+    Order on disk is kept; a source new to the manifest is appended.
+    """
+    fresh = {row["source"]: row for row in current}
+    merged: list[dict[str, Any]] = []
+    placed: set[str] = set()
+    for row in existing:
+        name = row["source"]
+        if name in placed:
+            continue
+        placed.add(name)
+        merged.append(fresh.get(name, row))
+    merged.extend(row for name, row in fresh.items() if name not in placed)
+    return merged
 
 
 def _prior_sources(prior: Mapping[str, Any] | None) -> dict[str, Mapping[str, Any]]:
@@ -991,11 +1385,11 @@ def _prior_sources(prior: Mapping[str, Any] | None) -> dict[str, Mapping[str, An
     return found
 
 
-def _matching_manifest(out_dir: Path, request: PullRequest) -> dict[str, Any] | None:
-    """Return an existing manifest for this same search, if one is readable.
+def _read_manifest(out_dir: Path) -> dict[str, Any] | None:
+    """Return the readable manifest in ``out_dir``, or None.
 
-    A different date, box, or polygon is left alone. A missing or unreadable
-    file does not fail the pull.
+    A missing, symlinked, unreadable, or malformed file is treated as absent
+    so it never fails a pull.
     """
     path = pull_manifest_path(out_dir)
     if path.is_symlink() or not path.is_file():
@@ -1006,9 +1400,62 @@ def _matching_manifest(out_dir: Path, request: PullRequest) -> dict[str, Any] | 
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("sources"), list):
         return None
-    if not _same_pull(payload.get("request"), request):
-        return None
     return payload
+
+
+def _source_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return copies of the source rows, each with its effective ``request``.
+
+    A row that has no ``request`` of its own (the format before rows carried
+    one) inherits the manifest's top-level ``request``. Rows without a string
+    ``source`` are dropped.
+    """
+    rows: list[dict[str, Any]] = []
+    raw = payload.get("sources")
+    if not isinstance(raw, list):
+        return rows
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("source")
+        if not isinstance(name, str) or not name:
+            continue
+        own = item.get("request")
+        rows.append(_stamp_request(item, own if isinstance(own, dict) else payload.get("request")))
+    return rows
+
+
+def _resume_view(
+    payload: Mapping[str, Any], names: set[str], request: PullRequest
+) -> dict[str, Any] | None:
+    """Return the part of a shared manifest that a resume of ``names`` continues.
+
+    Only rows for ``names`` are kept, so other sources in the same directory
+    neither block the resume nor feed it cursors. Returns None when any kept
+    row was written for a different search than ``request``. A requested
+    source with no row is left for ``_resume_mismatch`` to reject.
+    """
+    rows = [row for row in _source_rows(payload) if row["source"] in names]
+    if not rows and not _same_pull(payload.get("request"), request):
+        return None
+    if any(not _same_pull(row.get("request"), request) for row in rows):
+        return None
+    return {"request": request.model_dump(mode="json"), "sources": rows}
+
+
+def _matching_manifest(out_dir: Path, request: PullRequest) -> dict[str, Any] | None:
+    """Return the rows of an existing manifest written for this same search.
+
+    Rows written for a different date, box, or polygon are left out. A
+    missing or unreadable file does not fail the pull.
+    """
+    payload = _read_manifest(out_dir)
+    if payload is None:
+        return None
+    rows = [row for row in _source_rows(payload) if _same_pull(row.get("request"), request)]
+    if not rows:
+        return None
+    return {"request": request.model_dump(mode="json"), "sources": rows}
 
 
 def _held_sources(resolutions: Mapping[str, SourceResolution]) -> set[str]:
@@ -1123,7 +1570,7 @@ def _source_entry(
             if src.next_cursor_unavailable
             else None,
             "error": src.error,
-            "_cursor_rejected": src.cursor_rejected,
+            "cursor_rejected": bool(src.cursor_rejected),
             "n_scenes": len(src.scenes),
             "scene_ids": [scene.id for scene in src.scenes],
             "saved": [
@@ -1140,6 +1587,11 @@ def _source_entry(
                 {"id": item.scene_id, "error": item.error}
                 for item in report.for_source(src.source)
                 if item.status in {"failed", "no_asset"}
+            ],
+            "previews": [
+                _rel(out_dir, item.preview)
+                for item in report.for_source(src.source)
+                if item.preview is not None
             ],
             "windows": [
                 {
@@ -1347,10 +1799,23 @@ def _unavailable_cursors(payload: Mapping[str, Any]) -> dict[str, str]:
 
 
 def _fsync_directory(directory: Path) -> None:
-    """Flush the directory entry written by ``os.replace``."""
-    fd = os.open(directory, os.O_RDONLY)
+    """Flush the directory entry written by ``os.replace`` when the OS allows it.
+
+    Opening a directory and calling ``fsync`` is POSIX. Windows does not
+    support it, and some filesystems reject it, so this is best effort. The
+    manifest file itself is fsynced before the replace.
+    """
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError:
+        return
     try:
         os.fsync(fd)
+    except OSError:
+        return
     finally:
         os.close(fd)
 
@@ -1390,6 +1855,51 @@ def _sweep_manifest_temps(directory: Path) -> None:
             leftover.unlink()
 
 
+@contextlib.contextmanager
+def _manifest_lock(directory: Path) -> Iterator[None]:
+    """Hold an exclusive lock for one manifest read-merge-write.
+
+    The lock file is permanent; the OS lock, not its existence, serializes
+    writers. POSIX uses ``flock``. Windows has no ``flock``, so it locks one
+    byte with ``msvcrt`` and waits for the holder to release it.
+    """
+    path = directory / _MANIFEST_LOCK_NAME
+    if os.name == "posix":
+        import fcntl
+
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        return
+
+    msvcrt = importlib.import_module("msvcrt")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    try:
+        for _ in range(600):
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise OSError(f"timed out waiting for the pull manifest lock: {path}")
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)
+
+
 def _write_json_atomic(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` via an exclusive temp file, fsync, and ``os.replace``.
 
@@ -1412,7 +1922,7 @@ def _write_json_atomic(path: Path, text: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp, _manifest_file_mode())
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
         _fsync_directory(directory)
     except Exception:
         if tmp.exists():
@@ -1428,7 +1938,7 @@ def _merge_source(current: dict[str, Any], prior: Mapping[str, Any] | None) -> d
     next resume can try the same page again. A rejected cursor is cleared
     instead of being copied back.
     """
-    rejected = bool(current.pop("_cursor_rejected", False))
+    rejected = bool(current.get("cursor_rejected", False))
     if prior is None:
         return current
     if current.get("error"):
@@ -1439,6 +1949,7 @@ def _merge_source(current: dict[str, Any], prior: Mapping[str, Any] | None) -> d
         kept["skipped"] = _extend_str(prior.get("skipped"), [])
         kept["failed"] = _merge_failed(prior.get("failed"), [])
         kept["windows"] = _merge_windows(prior.get("windows"), [])
+        kept["previews"] = _extend_str(prior.get("previews"), [])
         if rejected:
             kept["next_cursor"] = None
         elif not _cursor_present(current.get("next_cursor")):
@@ -1446,12 +1957,14 @@ def _merge_source(current: dict[str, Any], prior: Mapping[str, Any] | None) -> d
         return kept
     scene_ids = _extend_str(prior.get("scene_ids"), current.get("scene_ids"))
     merged = dict(current)
+    merged["cursor_rejected"] = False
     merged["scene_ids"] = scene_ids
     merged["n_scenes"] = len(scene_ids)
     merged["saved"] = _extend_str(prior.get("saved"), current.get("saved"))
     merged["skipped"] = _extend_str(prior.get("skipped"), current.get("skipped"))
     merged["failed"] = _merge_failed(prior.get("failed"), current.get("failed"))
     merged["windows"] = _merge_windows(prior.get("windows"), current.get("windows"))
+    merged["previews"] = _extend_str(prior.get("previews"), current.get("previews"))
     return merged
 
 
@@ -1518,6 +2031,7 @@ def _print_run_summary(
     table.add_column("SKIPPED", justify="right")
     table.add_column("FAILED", justify="right")
     failure_lines: list[str] = []
+    preview_lines: list[str] = []
     for src in catalog.sources:
         items = report.for_source(src.source)
         n_saved = sum(1 for item in items if item.status == "saved")
@@ -1537,12 +2051,18 @@ def _print_run_summary(
         elif src.next_cursor_unavailable:
             failure_lines.append(_unavailable_warning(src.source, src.next_cursor_unavailable))
         for item in items:
-            if item.error:
-                failure_lines.append(f"{src.source} {item.scene_id}: {item.error}")
+            # A failure is always listed, even one recorded without text.
+            if item.error or item.status in {"failed", "no_asset"}:
+                detail = item.error or f"{item.status} (no error detail recorded)"
+                failure_lines.append(f"{src.source} {item.scene_id}: {detail}")
+            if item.preview_error:
+                preview_lines.append(f"{src.source} {item.scene_id}: {item.preview_error}")
     console.print()
     console.print(table)
     for line in failure_lines:
         console.print(f"[red]{line}[/red]")
+    for line in preview_lines:
+        console.print(f"[yellow]{line}[/yellow]")
 
 
 def _rel(out_dir: Path, path: Path) -> str:

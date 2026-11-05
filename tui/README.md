@@ -40,11 +40,37 @@ The agent writes each new session under `<workspace>/.atlas/sessions/<id>/`
 and its files under `<workspace>/.atlas/artifacts/<id>/`. The directory list
 is `docs/atlas-layout.md`.
 
-Keys: `enter` sends the input line, `ctrl-r` resumes a turn that stopped at the
-tool-call limit, `ctrl-c` / `esc` quits. `PageUp` / `PageDown` scroll. `/new`
+Keys: `Enter` sends the draft; while a turn is running, it shows feedback and
+keeps the draft without queueing it. `Alt+Enter` inserts a newline (`Shift+Enter`
+works where the terminal supports it). `Left` / `Right` move the cursor, and
+`Home` / `End` move to the line ends. `Ctrl+A` / `Ctrl+E` move to the start / end
+of the current line; `Ctrl+W` deletes the previous word. `Up` / `Down` move
+through draft lines, then recall sent prompts at the boundaries. `PageUp` /
+`PageDown` scroll the transcript. `Shift+Up` / `Shift+Down` select tool rows.
+`Esc` keeps an unfinished ordinary draft; during a running turn it stops the
+turn and keeps the draft. `Ctrl+R` resumes a turn stopped at the tool-call limit,
+and `Ctrl+C` copies selected text or quits when nothing is selected. `/new`
 starts a fresh conversation and clears the transcript. `/skill <name>` applies
 a workspace skill for the rest of this conversation. The `.atlas` copy wins
 over `.agents` when both exist.
+
+Drag across visible text to select it. Releasing the mouse copies the selection
+to the clipboard; `Ctrl+C` copies it again. The agent keeps running while the
+selected view stays still. Press `Esc` to clear the selection and show the latest
+output. Paste into the composer with your terminal's paste shortcut (`Cmd+V` on
+macOS), `Ctrl+V`, or `Shift+Insert`. Multiline text stays in the composer until
+you press `Enter`. `/copy` copies the last assistant reply.
+
+When a tool needs approval, an **Approval required** panel shows the command
+or file preview. Use the arrow keys or `Tab` to choose **Allow once** or **Deny**,
+then press `Enter`. You can also click a choice. **Deny** is selected initially,
+and `Esc` denies the call. Use `PageUp`, `PageDown`, or the mouse wheel to scroll
+a long preview. The panel keeps any message you were composing.
+
+Use `/yolo` to toggle automatic approval for this Atlas TUI process. YOLO
+starts off; while it is on, tool calls proceed without per-tool prompts, and
+`/yolo` turns prompting back on. The status row shows `YOLO on` while enabled.
+You can enter `/yolo` at the approval prompt as well.
 
 ## Adding a tool
 

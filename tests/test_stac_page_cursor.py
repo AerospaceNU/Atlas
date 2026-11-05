@@ -26,7 +26,6 @@ from atlas.data.earth_search import EarthSearchSentinel1GrdClient
 from atlas.data.inpe import Cbers4MuxClient
 from atlas.data.sentinel2 import Sentinel2Client
 from atlas.data.stac import StacApiClient
-from atlas.data.usgs import UsgsLandsatC2L1Client
 
 SEARCH = "https://stac.example/search"
 SQUARE = "0,0;1,0;1,1;0,1"
@@ -642,7 +641,6 @@ _CATALOG_LINKS: list[tuple[type[StacApiClient], dict[str, Any], str]] = [
         {"method": "POST", "merge": True, "body": {"token": "cdse-page"}},
         "merge",
     ),
-    (UsgsLandsatC2L1Client, {"method": "GET", "href": "?page=2"}, "get"),
     (GediL2AClient, {"method": "GET", "href": "?page=2"}, "get"),
     (IceSat2Atl03Client, {"method": "GET", "href": "?page=2"}, "get"),
     (Cbers4MuxClient, {"method": "POST", "merge": True, "body": {"page": 2}}, "merge"),
@@ -659,7 +657,6 @@ _CATALOG_LINKS: list[tuple[type[StacApiClient], dict[str, Any], str]] = [
         "planetary-computer",
         "earth-search",
         "cdse",
-        "usgs",
         "cmr-lpcloud",
         "cmr-nsidc",
         "inpe",

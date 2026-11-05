@@ -15,7 +15,7 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.contracts import build_registry, default_registry
 from atlas.agent.tools.rsicc_tool import (
     ChangeReport,
@@ -395,15 +395,15 @@ def test_missing_image_raises_without_calling_gemini(tmp_path: Path, gemini: _Fa
     assert gemini.models.calls == []
 
 
-def test_path_outside_the_workspace_is_rejected(tmp_path: Path, gemini: _FakeGemini) -> None:
+def test_path_outside_the_workspace_is_read(tmp_path: Path, gemini: _FakeGemini) -> None:
     store = LocalArtifactStore(tmp_path / "workspace")
     _save(_rgb(8, 8), tmp_path / "outside.png")
     inside = _save(_rgb(8, 8), tmp_path / "workspace" / "inside.png")
 
-    with pytest.raises(ValueError, match="escapes the artifact root"):
-        RSICCTool().run({"image1": "../outside.png", "image2": inside}, store)
+    result = RSICCTool().run({"image1": "../outside.png", "image2": inside}, store)
 
-    assert gemini.models.calls == []
+    assert json.loads(result.text)["report"]["change_types"] == ["water"]
+    assert len(gemini.models.calls) == 1
 
 
 def test_missing_api_key_raises(
@@ -457,7 +457,7 @@ def test_oversized_image_is_rejected_without_reading(
 
     monkeypatch.setattr(Path, "read_bytes", _guarded)
 
-    with pytest.raises(SandboxDenied, match=f"big.png exceeds the {RSICCTool.max_bytes} byte"):
+    with pytest.raises(ArtifactError, match=f"big.png exceeds the {RSICCTool.max_bytes} byte"):
         RSICCTool().run({"image1": "big.png", "image2": small}, store)
 
     assert gemini.models.calls == []

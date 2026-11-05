@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from atlas.agent.artifacts import LocalArtifactStore, SandboxDenied
+from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import default_registry
 from atlas.agent.tools.spectral_indices import SpectralIndicesTool
 from atlas.data.indices import compute_indices
@@ -173,10 +173,14 @@ def test_tool_rejects_an_oversized_input(tmp_path: Path, monkeypatch: pytest.Mon
         )
 
 
-def test_tool_rejects_a_path_outside_the_workspace(tmp_path: Path) -> None:
-    store = LocalArtifactStore(tmp_path)
-    with pytest.raises(SandboxDenied):
-        SpectralIndicesTool().run(
-            {"red": "../red.npy", "nir": "nir.npy"},
-            store,
-        )
+def test_tool_reads_a_path_outside_the_workspace(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path / "workspace")
+    _save(tmp_path, "red.npy", [0.1])
+    _save(store.root, "nir.npy", [0.4])
+
+    result = SpectralIndicesTool().run(
+        {"red": "../red.npy", "nir": "nir.npy"},
+        store,
+    )
+
+    assert result.artifacts

@@ -18,7 +18,7 @@ _PROMPT_FILENAME = "system_prompt.md"
 _REQUIRED_RULES = (
     "You are Atlas, a local workspace assistant.",
     "Only use tools on the supplied registry.",
-    "Tool paths are relative to the workspace: writes go to the artifact workspace, and reads may also resolve files in the project workspace.",
+    "Tool paths may be relative to the workspace or absolute. Absolute paths, parent directories, and files outside the workspace are allowed.",
     "Never execute workspace files.",
     "A draft tool is not executable.",
     "A skill draft in .atlas/skills-drafts is not an enabled skill: do not call use_skill on it or run it until it has been enabled.",

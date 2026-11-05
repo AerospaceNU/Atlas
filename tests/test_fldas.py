@@ -794,7 +794,7 @@ def test_mixed_catalog_pull_still_writes_the_fldas_table(tmp_path: Path) -> None
     finally:
         asyncio.run(fldas.aclose())
         asyncio.run(http.aclose())
-    assert code == 0
+    assert code == 1
     assert (tmp_path / "fldas.csv").exists()
     # A GeoTIFF whose server ignores Range is failed, not fetched a second time.
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
@@ -879,6 +879,7 @@ def test_empty_fldas_window_drops_the_previous_csv(
     assert "no FLDAS granules" in source["failed"][0]["error"]
     assert set(source) == {
         "source",
+        "request",
         "collection",
         "bbox",
         "search_url",
@@ -886,6 +887,7 @@ def test_empty_fldas_window_drops_the_previous_csv(
         "next_cursor_unavailable",
         "note",
         "error",
+        "cursor_rejected",
         "n_scenes",
         "scene_ids",
         "scenes",
@@ -895,6 +897,7 @@ def test_empty_fldas_window_drops_the_previous_csv(
         "skipped",
         "failed",
         "windows",
+        "previews",
     }
     assert not table.exists()
     assert (
@@ -1216,3 +1219,79 @@ async def test_live_fldas_cmr_search_january_2020() -> None:
     scene = result.scenes[0]
     assert scene.assets["opendap"].href.startswith("https://")
     assert scene.bbox.south <= 42.2 <= scene.bbox.north
+
+
+def test_parse_points_csv_accepts_a_utf8_bom(tmp_path: Path) -> None:
+    path = tmp_path / "bom.csv"
+    path.write_text("longitude,latitude\n-71.18,42.22\n", encoding="utf-8-sig")
+    assert parse_points_csv(path) == [(-71.18, 42.22)]
+
+
+def test_resume_does_not_retire_the_training_table(tmp_path: Path) -> None:
+    """An extract source has no page cursor, so a resume searches it again.
+
+    The table from the first run must not be moved aside by the rewrite.
+    """
+    fake = FakeFldas()
+    client = _FakeFldasSource(fake, token="token")
+    try:
+        assert run_data(_pull_args(tmp_path), clients={"fldas": client}) == 0
+        table = tmp_path / "fldas.csv"
+        before = table.read_text(encoding="utf-8")
+        assert run_data(_pull_args(tmp_path, resume=True), clients={"fldas": client}) == 0
+    finally:
+        asyncio.run(client.aclose())
+    assert table.read_text(encoding="utf-8") == before
+    assert not table.with_name(table.name + ".stale").exists()
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"][0]["saved"] == ["fldas.csv"]
+    assert manifest["sources"][0]["failed"] == []
+
+
+def test_resume_after_search_only_writes_the_table(tmp_path: Path) -> None:
+    fake = FakeFldas()
+    client = _FakeFldasSource(fake, token="token")
+    try:
+        assert run_data(_pull_args(tmp_path, search_only=True), clients={"fldas": client}) == 0
+        assert not (tmp_path / "fldas.csv").exists()
+        assert run_data(_pull_args(tmp_path, resume=True), clients={"fldas": client}) == 0
+    finally:
+        asyncio.run(client.aclose())
+    assert (tmp_path / "fldas.csv").is_file()
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"][0]["saved"] == ["fldas.csv"]
+
+
+@pytest.mark.asyncio
+async def test_points_outside_the_polygon_are_rejected() -> None:
+    from atlas.data.base import Polygon
+
+    polygon = Polygon(ring=[(0.0, 0.0), (10.0, 0.0), (0.0, 10.0), (0.0, 0.0)])
+    request = PullRequest(
+        start_date=date(2020, 1, 1),
+        end_date=date(2020, 1, 31),
+        bbox=BBox(west=0.0, south=0.0, east=10.0, north=10.0),
+        polygon=polygon,
+    )
+    client = FldasClient(token="t")
+    try:
+        with pytest.raises(FldasRequestError, match="outside the request polygon"):
+            await client.extract_training_table(request, [_scene()], points=[(9.0, 9.0)])
+    finally:
+        await client.aclose()
+
+
+def test_search_only_warns_that_table_options_are_ignored(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeFldas()
+    client = _FakeFldasSource(fake, token="token")
+    table = tmp_path / "custom.csv"
+    args = _pull_args(tmp_path, search_only=True, variables="Nope_tavg", table=table)
+    try:
+        assert run_data(args, clients={"fldas": client}) == 0
+    finally:
+        asyncio.run(client.aclose())
+    assert "--search-only writes no FLDAS table" in capsys.readouterr().err
+    assert not table.exists()
+    assert fake.queries == []
