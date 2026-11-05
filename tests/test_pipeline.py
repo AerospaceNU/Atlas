@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
 import httpx
 import pytest
@@ -40,6 +41,7 @@ class NonPlanetaryClient(DataPullClient):
     """A source that searches fine but cannot be mosaic-rendered."""
 
     collection = "MODIS_Terra_CorrectedReflectance_TrueColor"
+    scene_kind: ClassVar[SceneKind] = SceneKind.browse
 
     async def search(self, request: PullRequest) -> PullResult:
         return PullResult(request=request, scenes=[_scene("gibs:2024-07-01")])
@@ -47,6 +49,8 @@ class NonPlanetaryClient(DataPullClient):
 
 class OfflinePlanetaryClient(Sentinel2Client):
     """A renderable Planetary Computer client whose search is offline."""
+
+    scene_kind: ClassVar[SceneKind] = SceneKind.browse
 
     def __init__(self) -> None:
         super().__init__(client=cast(httpx.AsyncClient, FakeHttpClient()))
@@ -167,6 +171,149 @@ async def test_cloudy_optical_falls_back_to_sentinel1() -> None:
     assert product.scene_ids == {"sentinel2": ["S2A"], "sentinel1": ["S1A"]}
 
 
+@pytest.mark.asyncio
+async def test_empty_optical_search_falls_back_after_cloud_filtering() -> None:
+    sar = FixedClient(_kind_scene("S1A", SceneKind.sar, None))
+    request = _window().model_copy(update={"max_cloud_cover": 20.0})
+
+    product = await consolidate(
+        request, {"sentinel2": FixedClient()}, render=False, sar_fallback=sar
+    )
+
+    assert sar.searches == 1
+    assert product.analysis_input is SceneKind.sar
+    assert product.scene_ids == {"sentinel1": ["S1A"]}
+    assert "0%" in (product.analysis_note or "")
+    assert "optical unavailable" in (product.analysis_note or "")
+
+
+@pytest.mark.asyncio
+async def test_failed_optical_search_uses_sar_without_claiming_cloud_was_observed() -> None:
+    class FailedOptical(FixedClient):
+        async def search(self, request: PullRequest) -> PullResult:
+            raise RuntimeError("offline source unavailable")
+
+    sar = FixedClient(_kind_scene("S1A", SceneKind.sar, None))
+    product = await consolidate(
+        _window(), {"sentinel2": FailedOptical()}, render=False, sar_fallback=sar
+    )
+
+    assert sar.searches == 1
+    assert product.analysis_input is SceneKind.sar
+    assert "optical unavailable" in (product.analysis_note or "")
+    assert "skipped for cloud" not in (product.analysis_note or "")
+
+
+@pytest.mark.parametrize("has_optical", [False, True])
+@pytest.mark.asyncio
+async def test_no_sar_results_do_not_claim_a_fallback(has_optical: bool) -> None:
+    scenes = [_kind_scene("S2A", SceneKind.optical, 95)] if has_optical else []
+    product = await consolidate(
+        _window(), {"sentinel2": FixedClient(*scenes)}, render=False, sar_fallback=FixedClient()
+    )
+
+    assert product.analysis_input is (SceneKind.optical if has_optical else None)
+    assert product.analysis_note is None
+    assert product.scene_ids == ({"sentinel2": ["S2A"]} if has_optical else {})
+
+
+@pytest.mark.asyncio
+async def test_exactly_half_clear_coverage_does_not_fall_back() -> None:
+    half = AOI.model_copy(update={"east": (AOI.west + AOI.east) / 2})
+    optical = _kind_scene("S2A", SceneKind.optical, 20).model_copy(update={"bbox": half})
+    sar = FixedClient(_kind_scene("unused", SceneKind.sar, None))
+
+    product = await consolidate(
+        _window(), {"sentinel2": FixedClient(optical)}, render=False, sar_fallback=sar
+    )
+
+    assert product.coverage["sentinel2"] == pytest.approx(0.5)
+    assert sar.searches == 0
+    assert product.analysis_input is SceneKind.optical
+
+
+@pytest.mark.parametrize(("cap", "fallback_searches"), [(20.0, 1), (30.0, 0)])
+@pytest.mark.asyncio
+async def test_requested_cloud_cap_controls_clear_optical_coverage(
+    cap: float, fallback_searches: int
+) -> None:
+    sar = FixedClient(_kind_scene("S1A", SceneKind.sar, None))
+    request = _window().model_copy(update={"max_cloud_cover": cap})
+
+    product = await consolidate(
+        request,
+        {"sentinel2": FixedClient(_kind_scene("S2A", SceneKind.optical, 25))},
+        render=False,
+        sar_fallback=sar,
+    )
+
+    assert sar.searches == fallback_searches
+    assert product.analysis_input is (SceneKind.sar if fallback_searches else SceneKind.optical)
+
+
+@pytest.mark.asyncio
+async def test_empty_cloud_seeking_search_never_falls_back() -> None:
+    sar = FixedClient(_kind_scene("S1A", SceneKind.sar, None))
+    product = await consolidate(
+        _window(min_cloud_cover=80),
+        {"sentinel2": FixedClient()},
+        render=False,
+        sar_fallback=sar,
+    )
+
+    assert sar.searches == 0
+    assert product.analysis_input is None
+
+
+@pytest.mark.asyncio
+async def test_sar_only_empty_search_does_not_add_a_fallback() -> None:
+    class EmptySar(FixedClient):
+        scene_kind: ClassVar[SceneKind] = SceneKind.sar
+
+    sar = FixedClient(_kind_scene("unused", SceneKind.sar, None))
+    product = await consolidate(
+        _window(), {"sentinel1": EmptySar()}, render=False, sar_fallback=sar
+    )
+
+    assert sar.searches == 0
+    assert product.scene_ids == {}
+
+
+@pytest.mark.parametrize("cancel_search", [False, True])
+@pytest.mark.asyncio
+async def test_registry_fallback_is_closed_even_when_search_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, cancel_search: bool
+) -> None:
+    class OwnedSar(FixedClient):
+        closed = False
+
+        async def search(self, request: PullRequest) -> PullResult:
+            if cancel_search:
+                raise asyncio.CancelledError
+            return await super().search(request)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    sar = OwnedSar(_kind_scene("S1A", SceneKind.sar, None))
+    requested: list[tuple[str, ...]] = []
+
+    def factory(*names: str) -> dict[str, DataPullClient]:
+        requested.append(names)
+        return {"sentinel1": sar}
+
+    monkeypatch.setattr("atlas.compile.pipeline.create_sources", factory)
+    if cancel_search:
+        with pytest.raises(asyncio.CancelledError):
+            await consolidate(_window(), {"sentinel2": FixedClient()}, render=False)
+    else:
+        product = await consolidate(_window(), {"sentinel2": FixedClient()}, render=False)
+        assert product.analysis_input is SceneKind.sar
+
+    assert requested == [("sentinel1",)]
+    assert sar.closed
+
+
 @pytest.mark.parametrize("cloud", [5.0, None])
 @pytest.mark.asyncio
 async def test_clear_or_unknown_optical_stays_the_input(cloud: float | None) -> None:
@@ -239,6 +386,8 @@ async def test_fallback_skips_optical_mosaic_for_cloud(
             return PullResult(request=request, scenes=[_kind_scene("S1A", SceneKind.sar, None)])
 
     class CloudySentinel2(OfflinePlanetaryClient):
+        scene_kind: ClassVar[SceneKind] = SceneKind.optical
+
         async def search(self, request: PullRequest) -> PullResult:
             return PullResult(request=request, scenes=[_kind_scene("S2A", SceneKind.optical, 99)])
 
