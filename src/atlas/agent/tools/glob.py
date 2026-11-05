@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob as glob_module
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -57,13 +58,15 @@ class GlobTool(Tool):
             raise FileNotFoundError(f"Path does not exist: {request.path}")
 
         pattern = os.path.expanduser(request.pattern)
-        if not Path(pattern).is_absolute():
-            pattern = str(base / pattern)
-        matches = [
-            store.relative(Path(name))
-            for name in glob_module.glob(pattern, recursive=True)
-            if Path(name).exists()
-        ]
+        path_pattern = Path(pattern)
+        candidate_paths: Iterable[str]
+        if path_pattern.is_absolute():
+            candidate_paths = glob_module.glob(pattern, recursive=True)
+        elif ".." in path_pattern.parts:
+            candidate_paths = glob_module.glob(str(base / pattern), recursive=True)
+        else:
+            candidate_paths = (str(path) for path in base.rglob(pattern))
+        matches = [store.relative(Path(name)) for name in candidate_paths if Path(name).exists()]
         matches.sort()
 
         overflow = len(matches) - request.max_results

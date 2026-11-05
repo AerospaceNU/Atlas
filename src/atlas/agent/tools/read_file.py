@@ -4,7 +4,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
-from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
+from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 
 
@@ -35,13 +35,12 @@ class ReadFileTool(Tool):
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request = ReadFileInput.model_validate(arguments)
-        path = store.resolve_read(request.path)
-        if not path.is_file():
-            raise FileNotFoundError(f"File does not exist: {request.path}")
-        if path.stat().st_size > self.max_bytes:
-            raise ArtifactError(f"File {request.path} exceeds the {self.max_bytes} byte read limit")
         try:
-            text = path.read_text(encoding="utf-8")
+            data = store.read_bytes(request.path, max_bytes=self.max_bytes)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"File does not exist: {request.path}") from exc
+        try:
+            text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         except UnicodeDecodeError as exc:
             raise ValueError(f"File {request.path} is not valid UTF-8") from exc
         return ToolResult(text=text)

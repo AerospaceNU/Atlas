@@ -75,6 +75,48 @@ def test_glob_matches_nested_files(tmp_path: Path) -> None:
     assert str(tmp_path) not in result.text
 
 
+def test_glob_matches_nested_files_without_recursive_wildcard(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path / "a.py").write_text("a\n", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "b.py").write_text("b\n", encoding="utf-8")
+    deep = sub / "deep"
+    deep.mkdir()
+    (deep / "c.py").write_text("c\n", encoding="utf-8")
+
+    result = GlobTool().run({"pattern": "*.py"}, store)
+
+    assert result.text.splitlines() == ["a.py", "sub/b.py", "sub/deep/c.py"]
+
+
+def test_glob_searches_recursively_from_the_requested_path(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "b.py").write_text("b\n", encoding="utf-8")
+    deep = sub / "deep"
+    deep.mkdir()
+    (deep / "c.py").write_text("c\n", encoding="utf-8")
+    (tmp_path / "outside.py").write_text("outside\n", encoding="utf-8")
+
+    result = GlobTool().run({"pattern": "*.py", "path": "sub"}, store)
+
+    assert result.text.splitlines() == ["sub/b.py", "sub/deep/c.py"]
+
+
+def test_glob_absolute_pattern_keeps_its_explicit_depth(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path / "workspace")
+    (tmp_path / "root.py").write_text("root\n", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "nested.py").write_text("nested\n", encoding="utf-8")
+
+    result = GlobTool().run({"pattern": str(tmp_path / "*.py")}, store)
+
+    assert result.text.splitlines() == [str(tmp_path / "root.py")]
+
+
 def test_glob_matches_a_parent_traversal_pattern(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path / "workspace")
     (tmp_path / "outside.py").write_text("x\n", encoding="utf-8")

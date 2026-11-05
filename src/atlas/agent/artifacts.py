@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 from PIL import Image
@@ -10,6 +12,30 @@ _IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".
 
 class ArtifactError(ValueError):
     """A tool path or size request was rejected."""
+
+
+def _read_regular_file(path: Path, *, max_bytes: int | None, display_path: str) -> bytes:
+    """Read and size-check the same open file, bounding allocation when requested."""
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be nonnegative")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(display_path) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ArtifactError("Path is not a regular file")
+        if max_bytes is not None and info.st_size > max_bytes:
+            raise ArtifactError(f"{display_path} exceeds the {max_bytes} byte read limit")
+        with open(descriptor, "rb", closefd=False) as stream:
+            data = stream.read() if max_bytes is None else stream.read(max_bytes + 1)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise ArtifactError(f"{display_path} exceeds the {max_bytes} byte read limit")
+        return data
+    finally:
+        os.close(descriptor)
 
 
 class ImageInfo(BaseModel):
@@ -105,13 +131,15 @@ class LocalArtifactStore:
         """
         base = self.read_root if self.read_root is not None else self.root
         resolved = self._path(base, path)
-        if not resolved.exists():
-            raise FileNotFoundError(path)
-        if not resolved.is_file():
-            raise ArtifactError("Project path is not a regular file")
-        if max_bytes is not None and resolved.stat().st_size > max_bytes:
-            raise ArtifactError(f"{path} exceeds the {max_bytes} byte read limit")
-        return resolved.read_bytes()
+        return _read_regular_file(resolved, max_bytes=max_bytes, display_path=path)
+
+    def read_bytes(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        """Read a regular file using the working/artifact/read-root fallback order.
+
+        When ``max_bytes`` is set, the open stream is read at most one byte
+        beyond that limit and oversized content is refused rather than truncated.
+        """
+        return _read_regular_file(self.resolve_read(path), max_bytes=max_bytes, display_path=path)
 
     def relative(self, path: Path) -> str:
         """Return a portable path, relative to root when it sits inside root."""
