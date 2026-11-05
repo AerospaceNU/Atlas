@@ -41,11 +41,19 @@ and its files under `<workspace>/.atlas/artifacts/<id>/`. The directory list
 is `docs/atlas-layout.md`.
 
 Keys: `enter` sends the input line, `ctrl-r` resumes a turn that stopped at the
-tool-call limit, and `ctrl-c` quits. `esc` cancels a running turn, closes a menu,
+tool-call limit, and `ctrl-c` copies selected text or quits when nothing is selected.
+`esc` clears a selection, cancels a running turn, closes a menu,
 or quits when idle. `PageUp` / `PageDown` scroll. `/new`
 starts a fresh conversation and clears the transcript. `/skill <name>` applies
 a workspace skill for the rest of this conversation. The `.atlas` copy wins
 over `.agents` when both exist.
+
+Drag across visible text to select it. Releasing the mouse copies the selection
+to the clipboard; `Ctrl+C` copies it again. The agent keeps running while the
+selected view stays still. Press `Esc` to clear the selection and show the latest
+output. Paste into the composer with your terminal's paste shortcut (`Cmd+V` on
+macOS), `Ctrl+V`, or `Shift+Insert`. Multiline text stays in the composer until
+you press `Enter`. `/copy` copies the last assistant reply.
 
 When a tool needs approval, an **Approval required** panel shows the command
 or file preview. Use the arrow keys or `Tab` to choose **Allow once** or **Deny**,

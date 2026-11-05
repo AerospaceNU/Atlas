@@ -1,13 +1,17 @@
 //! Minimal terminal client for the Atlas agent session protocol.
 
 mod approval;
+mod clipboard;
 mod logo;
 mod markdown;
 mod protocol;
+mod selection;
 mod theme;
 
 #[cfg(test)]
 mod approval_tests;
+#[cfg(test)]
+mod text_interaction_tests;
 #[cfg(test)]
 mod yolo_tests;
 
@@ -21,9 +25,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use approval::PermissionPrompt;
+use clipboard::{copy_to_clipboard, read_from_clipboard};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -32,11 +37,13 @@ use crossterm::terminal::{
 use markdown::{render_fitted, Mark, Piece};
 use protocol::{default_status_line, parse_line, status_text, CatalogEntry, ServerMessage};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use selection::TextSelection;
 use serde_json::Value;
 use theme::{
     BG_BASE, BG_LIGHT, FG, FG_SECONDARY, GRAY, GRAY_BRIGHT, MAGENTA, PROMPT_BORDER,
@@ -221,6 +228,9 @@ struct App {
     tokens_per_second: f64,
     /// Name and full SHA-256 of the draft preview currently on screen.
     preview_sha: Option<(String, String)>,
+    screen_snapshot: Option<Buffer>,
+    text_selection: Option<TextSelection>,
+    clipboard_notice: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -413,6 +423,9 @@ impl App {
             tool_hits: Vec::new(),
             tokens_per_second: 0.0,
             preview_sha: None,
+            screen_snapshot: None,
+            text_selection: None,
+            clipboard_notice: None,
         }
     }
 
@@ -848,7 +861,8 @@ fn enter_ui() -> Result<ratatui::DefaultTerminal> {
         stdout,
         EnterAlternateScreen,
         Clear(ClearType::All),
-        EnableMouseCapture
+        EnableMouseCapture,
+        EnableBracketedPaste
     ) {
         let _ = disable_raw_mode();
         return Err(err).context("atlas-tui needs an interactive terminal");
@@ -863,7 +877,12 @@ fn enter_ui() -> Result<ratatui::DefaultTerminal> {
 }
 
 fn leave_ui() {
-    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
 }
 
@@ -928,6 +947,14 @@ fn event_loop(
                     }
                 }
                 Event::Mouse(mouse) => {
+                    match selection_mouse(app, mouse) {
+                        SelectionEvent::Handled => continue,
+                        SelectionEvent::Copy(text) => {
+                            copy_selection(app, &text);
+                            continue;
+                        }
+                        SelectionEvent::Pass => {}
+                    }
                     if let Some(prompt) = app.pending_permission.as_mut() {
                         if let Some(allow) = prompt.mouse(mouse) {
                             send_permission(app, child, allow)?;
@@ -943,6 +970,9 @@ fn event_loop(
                         }
                     }
                 }
+                Event::Paste(text) => {
+                    apply_paste(app, &text);
+                }
                 _ => {}
             }
         }
@@ -952,6 +982,37 @@ fn event_loop(
 
 /// Returns `true` when the user asked to quit.
 fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<bool> {
+    if is_copy_key(key) {
+        if let Some(selection) = app
+            .text_selection
+            .as_ref()
+            .filter(|selection| selection.moved())
+        {
+            let text = selection.text();
+            copy_selection(app, &text);
+            return Ok(false);
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            || !key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.code == KeyCode::Insert
+        {
+            return Ok(false);
+        }
+    }
+    if is_paste_key(key) {
+        if let Some(text) = read_from_clipboard() {
+            apply_paste(app, &text);
+        } else {
+            app.clipboard_notice =
+                Some("Clipboard unavailable; use your terminal's paste shortcut");
+        }
+        return Ok(false);
+    }
+    if app.text_selection.take().is_some() && key.code == KeyCode::Esc {
+        app.clipboard_notice = None;
+        return Ok(false);
+    }
+    app.clipboard_notice = None;
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         child.shutdown();
         return Ok(true);
@@ -1180,34 +1241,121 @@ fn last_reply(app: &App) -> Option<&str> {
     })
 }
 
-fn copy_to_clipboard(text: &str) -> bool {
-    for (program, args) in [
-        ("pbcopy", &[][..]),
-        ("wl-copy", &[]),
-        ("xclip", &["-selection", "clipboard"]),
-        ("clip", &[]),
-    ] {
-        let Ok(mut child) = Command::new(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            continue;
-        };
-        let Some(mut stdin) = child.stdin.take() else {
-            continue;
-        };
-        if stdin.write_all(text.as_bytes()).is_err() {
-            continue;
+fn is_copy_key(key: KeyEvent) -> bool {
+    (matches!(key.code, KeyCode::Char('c' | 'C'))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META))
+        || (key.code == KeyCode::Insert && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn is_paste_key(key: KeyEvent) -> bool {
+    (matches!(key.code, KeyCode::Char('v' | 'V'))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META))
+        || (key.code == KeyCode::Insert && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+fn copy_selection(app: &mut App, text: &str) {
+    app.clipboard_notice = Some(if copy_to_clipboard(text) {
+        "Selection copied  Ctrl+C copy  Esc clear"
+    } else {
+        "Copy failed  Ctrl+C retry  Esc clear"
+    });
+}
+
+fn apply_paste(app: &mut App, text: &str) {
+    app.text_selection = None;
+    app.clipboard_notice = None;
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text: String = text
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+        .collect();
+    if let Some(prompt) = app.pending_permission.as_mut() {
+        if text.trim() == "/yolo" {
+            prompt.command = "/yolo".to_string();
         }
-        drop(stdin);
-        if child.wait().map(|status| status.success()).unwrap_or(false) {
-            return true;
-        }
+        return;
     }
-    false
+    match app.mode {
+        Mode::Compose => {
+            app.input.push_str(&text);
+            app.menu_index = 0;
+        }
+        Mode::Key { .. } => app.input.push_str(text.trim_end_matches('\n')),
+        Mode::ModelPicker => app.picker_filter.push_str(text.trim()),
+        Mode::ModelWait => {}
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SelectionEvent {
+    Pass,
+    Handled,
+    Copy(String),
+}
+
+fn selection_mouse(app: &mut App, mouse: MouseEvent) -> SelectionEvent {
+    let position = Position::new(mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.text_selection = None;
+            app.clipboard_notice = None;
+            // Approval buttons keep their explicit click behavior. All other
+            // visible text, including command previews, can be selected.
+            if app
+                .pending_permission
+                .as_ref()
+                .is_some_and(|prompt| prompt.choice_at(mouse.column, mouse.row).is_some())
+            {
+                return SelectionEvent::Pass;
+            }
+            if let Some(snapshot) = app.screen_snapshot.as_ref() {
+                if snapshot.area.contains(position) {
+                    app.text_selection = Some(TextSelection::new(snapshot.clone(), position));
+                    if app.pending_permission.is_none() {
+                        select_tool_at(app, mouse.row);
+                    }
+                    return SelectionEvent::Handled;
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(selection) = app
+                .text_selection
+                .as_mut()
+                .filter(|selection| selection.dragging)
+            {
+                selection.extend(position);
+                return SelectionEvent::Handled;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(selection) = app
+                .text_selection
+                .as_mut()
+                .filter(|selection| selection.dragging)
+            {
+                selection.finish(position);
+                if selection.moved() {
+                    let text = selection.text();
+                    if !text.trim().is_empty() {
+                        return SelectionEvent::Copy(text);
+                    }
+                }
+                app.text_selection = None;
+                return SelectionEvent::Handled;
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            app.text_selection = None;
+            app.clipboard_notice = None;
+        }
+        _ => {}
+    }
+    SelectionEvent::Pass
 }
 
 fn plain_arrow(modifiers: KeyModifiers) -> bool {
@@ -2302,6 +2450,35 @@ fn wait_for_any_key() {
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
+    if app
+        .text_selection
+        .as_ref()
+        .is_some_and(|selection| selection.area() != frame.area())
+    {
+        app.text_selection = None;
+        app.clipboard_notice = None;
+    }
+    if let Some(selection) = app.text_selection.as_ref() {
+        selection.paint(frame.buffer_mut());
+        let area = inset(frame.area(), 1, 2);
+        if area.height > 0 {
+            let hint = app
+                .clipboard_notice
+                .unwrap_or("Drag to select  Ctrl+C copy  Esc clear");
+            let hint_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+            frame.render_widget(ratatui::widgets::Clear, hint_area);
+            frame.render_widget(
+                Paragraph::new(hint).style(Style::default().fg(FG).bg(BG_BASE)),
+                hint_area,
+            );
+        }
+        return;
+    }
+    draw_content(frame, app);
+    app.screen_snapshot = Some(frame.buffer_mut().clone());
+}
+
+fn draw_content(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG_BASE)), area);
 
@@ -2901,8 +3078,25 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
-    let input = Paragraph::new(Line::from(spans))
+    let text = if app.mode == Mode::Compose && !app.input.is_empty() {
+        Text::from(format!("› {}▌", app.input))
+    } else {
+        Text::from(Line::from(spans))
+    };
+    let scroll = if app.mode == Mode::Compose {
+        let rows = wrap_text(
+            &format!("› {}▌", app.input),
+            usize::from(area.width.saturating_sub(2).max(1)),
+        )
+        .len();
+        u16::try_from(rows.saturating_sub(usize::from(area.height.saturating_sub(2))))
+            .unwrap_or(u16::MAX)
+    } else {
+        0
+    };
+    let input = Paragraph::new(text)
         .block(block)
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(input, area);
 }
@@ -3062,6 +3256,9 @@ fn strip_model_field(status_line: &str) -> String {
 }
 
 fn status_hint(app: &App) -> String {
+    if let Some(notice) = app.clipboard_notice {
+        return notice.to_string();
+    }
     if app.pending_permission.is_some() {
         return "Approval applies to this call only".to_string();
     }

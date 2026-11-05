@@ -164,16 +164,17 @@ impl PermissionPrompt {
                 self.scroll = self.scroll.saturating_add(3).min(self.max_scroll);
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                return self.choices.iter().find_map(|(rect, allow)| {
-                    (mouse.column >= rect.x
-                        && mouse.column < rect.right()
-                        && mouse.row >= rect.y
-                        && mouse.row < rect.bottom())
-                    .then_some(*allow)
-                });
+                return self.choice_at(mouse.column, mouse.row);
             }
             _ => {}
         }
         None
+    }
+
+    pub fn choice_at(&self, column: u16, row: u16) -> Option<bool> {
+        self.choices.iter().find_map(|(rect, allow)| {
+            (column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom())
+                .then_some(*allow)
+        })
     }
 }
