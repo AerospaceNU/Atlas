@@ -716,6 +716,7 @@ def test_author_skill_tool_does_not_change_the_default_registry() -> None:
         "ls",
         "patch_file",
         "read_file",
+        "get_satellite_data",
         "spectral_indices",
         "web_fetch",
         "write_file",
