@@ -1137,11 +1137,7 @@ fn record_permission(app: &mut App, allow: bool) {
 }
 
 fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<bool> {
-    let newline = key.code == KeyCode::Enter
-        && key
-            .modifiers
-            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
-    if newline {
+    if is_newline_key(key) {
         app.input_editor.insert(&mut app.input, "\n");
         draft_edited(app);
         return Ok(false);
@@ -1365,6 +1361,21 @@ fn last_reply(app: &App) -> Option<&str> {
         TranscriptLine::Assistant(stream) if !stream.text.is_empty() => Some(stream.text.as_str()),
         _ => None,
     })
+}
+
+/// Ctrl+J inserts a newline, as do Shift or Alt with Enter.
+///
+/// Both crossterm backends report Ctrl+J as `Char('j')` with CONTROL: the unix
+/// parser leaves `\n` on the Ctrl+letter arm while raw mode is on, and the
+/// Windows parser maps a control code back to the key's normal character. The
+/// Enter key arrives as `KeyCode::Enter`, so newline stays distinct from send.
+fn is_newline_key(key: KeyEvent) -> bool {
+    (key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
+        || (matches!(key.code, KeyCode::Char('j' | 'J'))
+            && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 fn is_copy_key(key: KeyEvent) -> bool {
