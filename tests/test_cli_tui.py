@@ -35,7 +35,7 @@ from atlas.cli import main
 from atlas.cli.tui import TuiLaunchError, ensure_tui_binary, launch_tui
 
 
-def test_status_line_shows_context_tokens_spend_and_speed() -> None:
+def test_status_line_shows_context_spend_and_speed() -> None:
     text = format_tui_status(
         SessionTotals(
             model="example/model",
@@ -54,7 +54,7 @@ def test_status_line_shows_context_tokens_spend_and_speed() -> None:
     )
 
     assert "context 12/128K" in text
-    assert "tokens 16 (prompt 12 completion 4)" in text
+    assert "tokens" not in text
     assert "cached" not in text
     assert "reasoning" not in text
     assert "spend $0.02" in text
@@ -337,26 +337,6 @@ def test_unpriced_call_hides_a_partial_total() -> None:
     assert "spend unknown" in format_tui_status(totals)
 
 
-def test_cached_and_reasoning_tokens_join_the_status_line() -> None:
-    totals = SessionTotals()
-    apply_call(
-        totals,
-        ModelCall(
-            usage=TokenUsage(
-                prompt_tokens=12,
-                completion_tokens=4,
-                total_tokens=16,
-                cached_tokens=8,
-                reasoning_tokens=3,
-                cost=0.02,
-            ),
-        ),
-    )
-
-    text = format_tui_status(totals)
-    assert "tokens 16 (prompt 12 completion 4 cached 8 reasoning 3)" in text
-
-
 def test_token_counts_use_three_sigfigs_in_k_m_and_b() -> None:
     assert format_token_count(355) == "355"
     assert format_token_count(380) == "380"
@@ -377,7 +357,7 @@ def test_token_counts_use_three_sigfigs_in_k_m_and_b() -> None:
         )
     )
     assert "context 355/1.05M" in text
-    assert "tokens 380 (prompt 355 completion 25)" in text
+    assert "tokens" not in text
 
 
 def test_bare_atlas_opens_the_tui(monkeypatch: pytest.MonkeyPatch) -> None:
