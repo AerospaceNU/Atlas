@@ -67,7 +67,7 @@ _MAX_PARALLEL_TOOLS = 4
 
 # Tools that change the workspace. A read-only session refuses them, and each
 # one is checkpointed before it runs so /undo can put the file back.
-MUTATING_TOOLS = frozenset({"bash_tool", "edit_file", "patch_file", "write_file"})
+MUTATING_TOOLS = frozenset({"apply_patch", "bash_tool", "edit_file", "patch_file", "write_file"})
 
 ErrorKind = Literal[
     "validation",
@@ -657,6 +657,9 @@ class Agent:
         if call.name == "bash_tool":
             command = call.arguments.get("command")
             return str(command or "")[:_PREVIEW_LIMIT]
+        patch = call.arguments.get("patch")
+        if isinstance(patch, str):
+            return patch[:_PREVIEW_LIMIT]
         path = call.arguments.get("path")
         if not isinstance(path, str) or not path:
             return ""
