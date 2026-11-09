@@ -14,6 +14,7 @@ pub const GRAY: Color = Color::Rgb(108, 108, 108);
 pub const GRAY_BRIGHT: Color = Color::Rgb(120, 120, 120);
 pub const MAGENTA: Color = Color::Rgb(187, 154, 247);
 pub const YELLOW: Color = Color::Rgb(224, 175, 104);
+pub const GREEN: Color = Color::Rgb(158, 206, 106);
 pub const RED: Color = Color::Rgb(247, 118, 142);
 pub const PROMPT_BORDER: Color = Color::Rgb(50, 50, 55);
 pub const PROMPT_BORDER_ACTIVE: Color = Color::Rgb(80, 80, 88);

@@ -57,6 +57,7 @@ fn done(app: &mut App) {
         stopped_for_limit: false,
         stopped_for_budget: false,
         cancelled: false,
+        compaction: Default::default(),
         status: StatusSnapshot::default(),
     });
 }

@@ -9,6 +9,7 @@ import time
 import tomllib
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -60,6 +61,8 @@ _STOPPED_CONTEXT = (
     "Shorten the request or start a new conversation."
 )
 _PREVIEW_LIMIT = 4000
+_DIGEST_HEADER = "Context digest (earlier turns)"
+_DIGEST_LIMIT_CHARS = 2000
 
 # Tool calls in one assistant turn are independent, so they run concurrently.
 # The cap keeps a model that emits twenty calls from opening twenty shells.
@@ -67,7 +70,7 @@ _MAX_PARALLEL_TOOLS = 4
 
 # Tools that change the workspace. A read-only session refuses them, and each
 # one is checkpointed before it runs so /undo can put the file back.
-MUTATING_TOOLS = frozenset({"bash_tool", "edit_file", "patch_file", "write_file"})
+MUTATING_TOOLS = frozenset({"apply_patch", "bash_tool", "edit_file", "patch_file", "write_file"})
 
 ErrorKind = Literal[
     "validation",
@@ -114,6 +117,8 @@ class ContextCompaction(BaseModel):
     tokens_reclaimed: int = 0
     tool_results_shortened: int = 0
     messages_dropped: int = 0
+    digest_inserted: bool = False
+    digest_chars: int = 0
 
 
 class AgentRun(BaseModel):
@@ -387,11 +392,13 @@ class Agent:
             reasoning = True if config is None else bool(getattr(config, "reasoning", True))
             emit("thinking" if reasoning else "working")
             if _estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
-                change = _compact(messages, protected_user=current_user)
+                change = _compact(messages, protected_user=current_user, root=self.artifacts.root)
                 compaction.occurred |= change.occurred
                 compaction.tokens_reclaimed += change.tokens_reclaimed
                 compaction.tool_results_shortened += change.tool_results_shortened
                 compaction.messages_dropped += change.messages_dropped
+                compaction.digest_inserted |= change.digest_inserted
+                compaction.digest_chars = max(compaction.digest_chars, change.digest_chars)
                 if _estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
                     return AgentRun(
                         response=_STOPPED_CONTEXT,
@@ -657,6 +664,9 @@ class Agent:
         if call.name == "bash_tool":
             command = call.arguments.get("command")
             return str(command or "")[:_PREVIEW_LIMIT]
+        patch = call.arguments.get("patch")
+        if isinstance(patch, str):
+            return patch[:_PREVIEW_LIMIT]
         path = call.arguments.get("path")
         if not isinstance(path, str) or not path:
             return ""
@@ -717,14 +727,35 @@ def _kind(exc: Exception) -> ErrorKind:
     return "tool_failure"
 
 
+@dataclass
+class _Digest:
+    """What the model still needs from tool exchanges that left the context."""
+
+    dropped: int = 0
+    files: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    plan: list[str] = field(default_factory=list)
+
+
+def _is_digest(message: ChatMessage) -> bool:
+    """Return whether ``message`` is the rolling context digest."""
+    return message.role is Role.SYSTEM and (message.content or "").startswith(_DIGEST_HEADER)
+
+
 def _compact(
-    messages: list[ChatMessage], *, protected_user: ChatMessage | None = None
+    messages: list[ChatMessage],
+    *,
+    protected_user: ChatMessage | None = None,
+    root: Path | None = None,
 ) -> ContextCompaction:
-    """Shorten old observations, then drop complete old tool exchanges.
+    """Shorten observations, then replace dropped tool exchanges with a digest.
 
     Keep the opening instructions, every system message, the current user
     request, and the last six messages. A tool-call batch intersecting those
-    messages is kept whole. Work toward 80% of the trigger to leave headroom.
+    messages is kept whole. Dropped exchanges are folded into one protected
+    system digest so later turns keep the files, commands, errors, and plan.
+    Work toward 80% of the trigger to leave headroom.
     """
     sizes = [_message_chars(message) for message in messages]
     total = sum(sizes)
@@ -741,6 +772,9 @@ def _compact(
         len(messages),
     )
     recent_start = max(0, len(messages) - KEEP_RECENT_MESSAGES)
+    digest_index = next(
+        (index for index, message in enumerate(messages) if _is_digest(message)), None
+    )
     protected = {
         index
         for group in groups
@@ -753,6 +787,8 @@ def _compact(
         )
         for index in group
     }
+    if digest_index is not None:
+        protected.add(digest_index)
     target = int(MAX_CONTEXT_TOKENS * _COMPACT_TARGET_FRACTION) * CHARS_PER_TOKEN
 
     for index, message in enumerate(messages):
@@ -770,20 +806,222 @@ def _compact(
         sizes[index] = size
         result.tool_results_shortened += 1
 
-    dropped: set[int] = set()
+    dropped_indexes: list[int] = []
     for group in groups:
         if total <= target:
             break
         if any(index in protected for index in group):
             continue
-        dropped.update(group)
+        dropped_indexes.extend(group)
         total -= sum(sizes[index] for index in group)
-    if dropped:
-        messages[:] = [message for index, message in enumerate(messages) if index not in dropped]
-    result.messages_dropped = len(dropped)
-    result.tokens_reclaimed = before - total // CHARS_PER_TOKEN
-    result.occurred = bool(result.tool_results_shortened or dropped)
+    if dropped_indexes:
+        digest = _collect_digest(messages, dropped_indexes, root)
+        if digest_index is not None:
+            digest = _merge_digest(_parse_digest(messages[digest_index].content or ""), digest)
+        _trim_digest(digest)
+        content = _render_digest(digest)
+        dropped_ids = {id(messages[index]) for index in dropped_indexes}
+        digest_message = ChatMessage(role=Role.SYSTEM, content=content)
+        if digest_index is not None:
+            messages[digest_index] = digest_message
+        else:
+            messages.insert(min(dropped_indexes), digest_message)
+        messages[:] = [message for message in messages if id(message) not in dropped_ids]
+        result.messages_dropped = len(dropped_indexes)
+        result.digest_inserted = True
+        result.digest_chars = len(content)
+    final_total = sum(_message_chars(message) for message in messages)
+    result.tokens_reclaimed = before - final_total // CHARS_PER_TOKEN
+    result.occurred = bool(result.tool_results_shortened or dropped_indexes)
     return result
+
+
+def _collect_digest(
+    messages: list[ChatMessage], indexes: Sequence[int], root: Path | None
+) -> _Digest:
+    """Summarise the dropped messages without re-reading their full text."""
+    calls = {call.id: call for message in messages for call in message.tool_calls}
+    digest = _Digest(dropped=len(indexes))
+    files: list[str] = []
+    commands: list[str] = []
+    errors: list[str] = []
+    for index in indexes:
+        message = messages[index]
+        for tool_call in message.tool_calls:
+            _add_argument_paths(tool_call.arguments, files)
+        if message.role is not Role.TOOL:
+            continue
+        current_call = calls.get(message.tool_call_id or "")
+        name = current_call.name if current_call is not None else "tool"
+        content = message.content or ""
+        try:
+            result = ToolResult.model_validate_json(content)
+        except ValidationError:
+            error = _json_error(content)
+            if error is not None:
+                kind, detail = error
+                errors.append(f"{kind}: {detail}")
+            continue
+        for artifact in result.artifacts:
+            files.append(artifact)
+        command = _command_summary(current_call, result.text, name)
+        if command:
+            commands.append(command)
+    if root is not None:
+        digest.plan = _plan_lines(root)
+    digest.files = _unique(files)[:24]
+    digest.commands = _unique(commands)[-12:]
+    digest.errors = _unique(errors)[-12:]
+    return digest
+
+
+def _add_argument_paths(arguments: dict[str, Any], files: list[str]) -> None:
+    """Collect file paths mentioned by one tool call."""
+    path = arguments.get("path")
+    if isinstance(path, str) and path.strip():
+        files.append(path.strip())
+    patch = arguments.get("patch")
+    if isinstance(patch, str):
+        for line in patch.splitlines():
+            if not line.startswith("+++ "):
+                continue
+            candidate = line[4:].split("\t", 1)[0].strip().strip('"')
+            if candidate.startswith(("a/", "b/")):
+                candidate = candidate[2:]
+            if candidate and candidate != "/dev/null":
+                files.append(candidate)
+    targets = arguments.get("files")
+    if isinstance(targets, list):
+        for target in targets:
+            if isinstance(target, dict) and isinstance(target.get("path"), str):
+                files.append(target["path"])
+
+
+def _json_error(content: str) -> tuple[str, str] | None:
+    """Return the error kind and first line from a tool error payload."""
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), str):
+        return None
+    kind = payload.get("error_kind")
+    label = kind if isinstance(kind, str) else "error"
+    return label, payload["error"].splitlines()[0][:160] if payload["error"] else ""
+
+
+def _command_summary(call: ToolCall | None, text: str, name: str) -> str:
+    """Return ``command -> exit N`` for a tool result that ran something."""
+    command = ""
+    if call is not None:
+        raw = call.arguments.get("command")
+        if isinstance(raw, str):
+            command = raw
+        elif isinstance(raw, list) and all(isinstance(part, str) for part in raw):
+            command = " ".join(raw)
+    exit_code: str | None = None
+    for line in text.splitlines():
+        if not command and line.startswith("command: "):
+            command = line[len("command: ") :].strip()
+        if line.startswith("exit_code: "):
+            exit_code = line[len("exit_code: ") :].strip()
+            break
+    if exit_code is None:
+        return ""
+    label = (command or name).replace("\n", " ").strip()
+    return f"{label[:120]} -> exit {exit_code}"
+
+
+def _plan_lines(root: Path) -> list[str]:
+    """Read the session plan, if one exists, as compact status lines."""
+    try:
+        data = json.loads((root / ".atlas" / "plan.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    marks = {"completed": "x", "in_progress": "~", "pending": " "}
+    lines: list[str] = []
+    for item in items[:12]:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        status = item.get("status")
+        mark = marks.get(status, "?") if isinstance(status, str) else "?"
+        if isinstance(text, str):
+            lines.append(f"[{mark}] {text[:80]}")
+    return lines
+
+
+def _unique(values: Sequence[str]) -> list[str]:
+    """Return values in first-seen order without duplicates."""
+    seen: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.append(value)
+    return seen
+
+
+def _merge_digest(existing: _Digest, new: _Digest) -> _Digest:
+    """Roll a new digest into the one already in the history."""
+    merged = _Digest(dropped=existing.dropped + new.dropped)
+    limits = {"files": 24, "commands": 12, "errors": 12, "plan": 12}
+    for name, limit in limits.items():
+        combined = _unique([*getattr(existing, name), *getattr(new, name)])
+        setattr(merged, name, combined[-limit:])
+    return merged
+
+
+def _render_digest(digest: _Digest) -> str:
+    """Render the digest as a compact system message."""
+    lines = [f"{_DIGEST_HEADER}: {digest.dropped} messages compacted"]
+    if digest.files:
+        lines.append("Files: " + ", ".join(digest.files))
+    if digest.commands:
+        lines.append("Commands:")
+        lines.extend(f"  {command}" for command in digest.commands)
+    if digest.errors:
+        lines.append("Errors:")
+        lines.extend(f"  {error}" for error in digest.errors)
+    if digest.plan:
+        lines.append("Plan:")
+        lines.extend(f"  {item}" for item in digest.plan)
+    return "\n".join(lines)
+
+
+def _trim_digest(digest: _Digest) -> None:
+    """Drop digest entries until the rendered message fits its hard cap."""
+    while len(_render_digest(digest)) > _DIGEST_LIMIT_CHARS:
+        groups = [digest.files, digest.commands, digest.errors, digest.plan]
+        largest = max(groups, key=len)
+        if not largest:
+            return
+        largest.pop()
+
+
+def _parse_digest(text: str) -> _Digest:
+    """Read a digest already in the history so it can be rolled forward."""
+    digest = _Digest()
+    section: list[str] | None = None
+    for line in text.splitlines():
+        if line.startswith(_DIGEST_HEADER):
+            match = re.search(r"(\d+) messages compacted", line)
+            if match is not None:
+                digest.dropped = int(match.group(1))
+        elif line.startswith("Files: "):
+            digest.files = [
+                part.strip() for part in line[len("Files: ") :].split(",") if part.strip()
+            ]
+        elif line == "Commands:":
+            section = digest.commands
+        elif line == "Errors:":
+            section = digest.errors
+        elif line == "Plan:":
+            section = digest.plan
+        elif section is not None and line.startswith("  "):
+            section.append(line.strip())
+    return digest
 
 
 def _context_groups(messages: list[ChatMessage]) -> list[range]:
@@ -829,13 +1067,21 @@ def _compact_tool_content(content: str) -> str:
     return result.model_copy(update={"text": _compact_text(result.text)}).model_dump_json()
 
 
+_COMPACT_MARKER_RE = re.compile(r"\n\.\.\.\[\d+ characters compacted\]\.\.\.\n")
+
+
 def _compact_text(text: str) -> str:
-    if len(text) <= COMPACT_PREVIEW_CHARS or re.fullmatch(
-        r"\.\.\.\[compacted \d+ characters\]", text[COMPACT_PREVIEW_CHARS:]
-    ):
+    """Keep the head and tail of long text, eliding the middle with a marker.
+
+    The marker makes repeated compaction idempotent, so a second pass cannot
+    shave the tail that the first pass preserved.
+    """
+    if len(text) <= COMPACT_PREVIEW_CHARS or _COMPACT_MARKER_RE.search(text):
         return text
-    removed = len(text) - COMPACT_PREVIEW_CHARS
-    return text[:COMPACT_PREVIEW_CHARS] + f"...[compacted {removed} characters]"
+    head = COMPACT_PREVIEW_CHARS // 2
+    tail = COMPACT_PREVIEW_CHARS - head
+    removed = len(text) - head - tail
+    return f"{text[:head]}\n...[{removed} characters compacted]...\n{text[-tail:]}"
 
 
 def _message_chars(message: ChatMessage) -> int:

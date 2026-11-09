@@ -52,7 +52,7 @@ use ratatui::Frame;
 use selection::TextSelection;
 use serde_json::Value;
 use theme::{
-    BG_BASE, BG_LIGHT, FG, FG_SECONDARY, GRAY, GRAY_BRIGHT, MAGENTA, PROMPT_BORDER,
+    BG_BASE, BG_LIGHT, FG, FG_SECONDARY, GRAY, GRAY_BRIGHT, GREEN, MAGENTA, PROMPT_BORDER,
     PROMPT_BORDER_ACTIVE, RED, YELLOW,
 };
 
@@ -188,6 +188,7 @@ enum Mode {
     Compose,
     ModelWait,
     ModelPicker,
+    Help,
     Key { scope: String, name: String },
 }
 
@@ -210,6 +211,8 @@ struct App {
     model_id: String,
     yolo_enabled: bool,
     mode: Mode,
+    /// First visible help row while the help panel is open.
+    help_scroll: u16,
     picker_filter: String,
     picker_index: usize,
     picker_models: Vec<CatalogEntry>,
@@ -258,10 +261,14 @@ struct ToolHit {
 }
 
 struct ToolLine {
+    /// Registered tool name, or empty for a plain status note.
+    name: String,
     label: String,
     /// Structured lines shown while the row is expanded. Empty rows stay one line.
     body: Vec<String>,
     expanded: bool,
+    /// The call reported an error, so its body is painted as a failure.
+    failed: bool,
 }
 
 struct ThoughtLine {
@@ -323,9 +330,11 @@ enum TranscriptLine {
 
 fn tool_note(label: impl Into<String>) -> TranscriptLine {
     TranscriptLine::Tool(ToolLine {
+        name: String::new(),
         label: label.into(),
         body: Vec::new(),
         expanded: false,
+        failed: false,
     })
 }
 
@@ -421,6 +430,7 @@ impl App {
             model_id: String::new(),
             yolo_enabled: false,
             mode: Mode::Compose,
+            help_scroll: 0,
             picker_filter: String::new(),
             picker_index: 0,
             picker_models: Vec::new(),
@@ -485,7 +495,11 @@ impl App {
                 {
                     self.pending_permission = None;
                 }
-                let label = if ok { name } else { format!("{name} failed") };
+                let label = if ok {
+                    name.clone()
+                } else {
+                    format!("{name} failed")
+                };
                 let body = tool_body(
                     &arguments,
                     text.as_deref(),
@@ -494,9 +508,11 @@ impl App {
                     &artifacts,
                 );
                 self.transcript.push(TranscriptLine::Tool(ToolLine {
+                    name,
                     label,
                     body,
                     expanded: false,
+                    failed: !ok,
                 }));
                 self.selected = Some(self.transcript.len() - 1);
             }
@@ -522,6 +538,7 @@ impl App {
                 stopped_for_limit,
                 stopped_for_budget,
                 cancelled,
+                compaction,
                 status,
             } => {
                 self.status_notice = None;
@@ -543,6 +560,9 @@ impl App {
                     self.transcript.push(tool_note(
                         "stopped at the token or spend budget in .atlas/agent.toml",
                     ));
+                }
+                if let Some(notice) = compaction.notice() {
+                    self.transcript.push(tool_note(notice));
                 }
                 self.status = if stopped_for_limit {
                     Status::Stopped
@@ -612,8 +632,7 @@ impl App {
                         self.picker_index = 0;
                         self.mode = Mode::ModelPicker;
                         let count = self.filtered_models().len();
-                        self.transcript
-                            .push(tool_note(format!("models: {count}")));
+                        self.transcript.push(tool_note(format!("models: {count}")));
                     }
                 }
             }
@@ -1033,6 +1052,22 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
         child.shutdown();
         return Ok(true);
     }
+    if app.mode == Mode::Help {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Compose,
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.help_scroll = app.help_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.help_scroll = app.help_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
+            KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(10),
+            KeyCode::Home => app.help_scroll = 0,
+            _ => {}
+        }
+        return Ok(false);
+    }
     if let Some(prompt) = app.pending_permission.as_mut() {
         if !prompt.command.is_empty() || key.code == KeyCode::Char('/') {
             let toggle = permission_command(prompt, key);
@@ -1074,6 +1109,7 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
     let mode = app.mode.clone();
     match mode {
         Mode::ModelPicker => handle_picker_key(app, child, key)?,
+        Mode::Help => {}
         Mode::Key { scope, name } => {
             handle_secret_key(app, child, key, &scope, &name)?;
         }
@@ -1128,9 +1164,11 @@ fn record_permission(app: &mut App, allow: bool) {
     if let Some(prompt) = app.pending_permission.take() {
         let decision = if allow { "Allowed once" } else { "Denied" };
         app.transcript.push(TranscriptLine::Tool(ToolLine {
+            name: prompt.tool.clone(),
             label: format!("{decision}: {}", prompt.tool),
             body: prompt.body().lines().map(str::to_string).collect(),
             expanded: false,
+            failed: !allow,
         }));
         app.follow = true;
     }
@@ -1423,7 +1461,7 @@ fn apply_paste(app: &mut App, text: &str) {
         }
         Mode::Key { .. } => app.input.push_str(text.trim_end_matches('\n')),
         Mode::ModelPicker => app.picker_filter.push_str(text.trim()),
-        Mode::ModelWait => {}
+        Mode::ModelWait | Mode::Help => {}
     }
 }
 
@@ -1875,6 +1913,15 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
             }
         }
         "/goal" => goal_command(app, text),
+        "/help" => {
+            if parts.next().is_some() {
+                app.transcript.push(tool_note("usage: /help"));
+            } else {
+                app.help_scroll = 0;
+                app.mode = Mode::Help;
+            }
+            None
+        }
         "/model" => {
             let query = text.trim().trim_start_matches("/model").trim();
             app.picker_filter = query.to_string();
@@ -1924,7 +1971,8 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
                 app.transcript.push(tool_note("usage: /undo"));
                 None
             } else {
-                app.transcript.push(tool_note("restoring the newest checkpoint"));
+                app.transcript
+                    .push(tool_note("restoring the newest checkpoint"));
                 Some(serde_json::json!({"type": "undo"}))
             }
         }
@@ -1975,8 +2023,7 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
         "/save-skill" => {
             let name = parts.next().unwrap_or("");
             if name.is_empty() || parts.next().is_some() {
-                app.transcript
-                    .push(tool_note("usage: /save-skill <name>"));
+                app.transcript.push(tool_note("usage: /save-skill <name>"));
                 None
             } else {
                 Some(serde_json::json!({
@@ -2117,7 +2164,7 @@ fn key_command(
 
 const PICKER_PAGE: usize = 8;
 /// Slash commands stay on one page so a new command is not clipped off `/`.
-const MENU_PAGE: usize = 13;
+const MENU_PAGE: usize = 14;
 
 /// Slice of the filtered catalog that stays on screen around `index`.
 fn picker_window(len: usize, index: usize, page: usize) -> std::ops::Range<usize> {
@@ -2138,63 +2185,69 @@ struct MenuItem {
     description: &'static str,
 }
 
+/// Slash commands offered in the menu and the help panel.
+const COMMANDS: [MenuItem; 14] = [
+    MenuItem {
+        token: "/new",
+        description: "Start a fresh conversation",
+    },
+    MenuItem {
+        token: "/help",
+        description: "Show commands, keys, and tools",
+    },
+    MenuItem {
+        token: "/goal",
+        description: "Name what this session is for",
+    },
+    MenuItem {
+        token: "/yolo",
+        description: "Toggle automatic tool approval",
+    },
+    MenuItem {
+        token: "/model",
+        description: "Choose a model",
+    },
+    MenuItem {
+        token: "/copy",
+        description: "Copy the last reply",
+    },
+    MenuItem {
+        token: "/key",
+        description: "Set an API key",
+    },
+    MenuItem {
+        token: "/skill",
+        description: "Use a skill in this session",
+    },
+    MenuItem {
+        token: "/sessions",
+        description: "List sessions",
+    },
+    MenuItem {
+        token: "/artifacts",
+        description: "List artifacts",
+    },
+    MenuItem {
+        token: "/quit",
+        description: "Quit Atlas",
+    },
+    MenuItem {
+        token: "/exit",
+        description: "Quit Atlas",
+    },
+    MenuItem {
+        token: "/save-skill",
+        description: "Save the finished analysis as a skill",
+    },
+    MenuItem {
+        token: "/enable-skill",
+        description: "Enable a saved skill draft",
+    },
+];
+
 /// Command or fixed-argument options that match `text`, or an empty list when
 /// the menu should stay hidden (free text after a finished command).
 fn menu_options(text: &str) -> Vec<MenuItem> {
-    const COMMANDS: [MenuItem; 13] = [
-        MenuItem {
-            token: "/new",
-            description: "Start a fresh conversation",
-        },
-        MenuItem {
-            token: "/goal",
-            description: "Name what this session is for",
-        },
-        MenuItem {
-            token: "/yolo",
-            description: "Toggle automatic tool approval",
-        },
-        MenuItem {
-            token: "/model",
-            description: "Choose a model",
-        },
-        MenuItem {
-            token: "/copy",
-            description: "Copy the last reply",
-        },
-        MenuItem {
-            token: "/key",
-            description: "Set an API key",
-        },
-        MenuItem {
-            token: "/skill",
-            description: "Use a skill in this session",
-        },
-        MenuItem {
-            token: "/sessions",
-            description: "List sessions",
-        },
-        MenuItem {
-            token: "/artifacts",
-            description: "List artifacts",
-        },
-        MenuItem {
-            token: "/quit",
-            description: "Quit Atlas",
-        },
-        MenuItem {
-            token: "/exit",
-            description: "Quit Atlas",
-        },
-        MenuItem {
-            token: "/save-skill",
-            description: "Save the finished analysis as a skill",
-        },
-        MenuItem {
-            token: "/enable-skill",
-            description: "Enable a saved skill draft",
-        },
-    ];
     if !text.starts_with('/') {
         return Vec::new();
     }
@@ -2219,7 +2272,7 @@ fn menu_options(text: &str) -> Vec<MenuItem> {
     }
 
     match command {
-        "/model" | "/goal" => Vec::new(),
+        "/model" | "/goal" | "/help" => Vec::new(),
         "/sessions" | "/artifacts" | "/save-skill" | "/enable-skill" => Vec::new(),
         "/key" => key_menu(&rest),
         _ => Vec::new(),
@@ -2597,6 +2650,104 @@ fn wait_for_any_key() {
     let _ = stdin.read_line(&mut buffer);
 }
 
+/// Content for the `/help` panel: commands, keys, and loaded tools.
+fn help_lines(app: &App) -> Vec<String> {
+    let mut lines = vec!["Commands".to_string()];
+    for command in COMMANDS {
+        lines.push(format!("  {:<14} {}", command.token, command.description));
+    }
+    lines.push(String::new());
+    lines.push("Keys".to_string());
+    let keys = [
+        ("Enter", "send the draft"),
+        ("Alt+Enter", "insert a newline"),
+        ("↑ / ↓", "move through prompt history"),
+        ("← / →", "select and expand a tool row"),
+        ("PgUp / PgDn", "scroll the transcript"),
+        ("Esc", "stop the turn, or close this panel"),
+        ("Ctrl+R", "resume the newest session"),
+        ("Ctrl+C", "copy a selection, or quit"),
+        ("/", "open the command menu"),
+    ];
+    for (key, description) in keys {
+        lines.push(format!("  {key:<14} {description}"));
+    }
+    lines.push(String::new());
+    lines.push("Tools".to_string());
+    if app.tools.is_empty() {
+        lines.push("  (none registered yet)".to_string());
+    } else {
+        for tool in &app.tools {
+            lines.push(format!("  {tool}"));
+        }
+    }
+    lines
+}
+
+fn render_help(frame: &mut Frame, app: &mut App, area: Rect) {
+    frame.render_widget(Block::default().style(Style::default().bg(BG_BASE)), area);
+    let inner = Rect {
+        x: area.x.saturating_add(2),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width < 8 || inner.height < 3 {
+        return;
+    }
+    let mut rows: Vec<String> = Vec::new();
+    for line in help_lines(app) {
+        let wrapped = wrap_text(&line, inner.width as usize);
+        if wrapped.is_empty() {
+            rows.push(String::new());
+        } else {
+            rows.extend(wrapped);
+        }
+    }
+    let visible_rows = usize::from(inner.height.saturating_sub(2));
+    let max_scroll = u16::try_from(rows.len().saturating_sub(visible_rows)).unwrap_or(u16::MAX);
+    app.help_scroll = app.help_scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "Help",
+            Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+    let shown: Vec<Line> = rows
+        .iter()
+        .skip(app.help_scroll as usize)
+        .take(visible_rows)
+        .map(|row| Line::from(row.as_str()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(shown).style(Style::default().fg(FG_SECONDARY).bg(BG_BASE)),
+        Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(1),
+            width: inner.width,
+            height: u16::try_from(visible_rows).unwrap_or(u16::MAX),
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "Esc close  ↑↓ scroll  / commands",
+            Style::default().fg(GRAY).bg(BG_BASE),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(inner.height).saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        },
+    );
+}
+
 fn draw(frame: &mut Frame, app: &mut App) {
     if app
         .text_selection
@@ -2634,6 +2785,11 @@ fn draw_content(frame: &mut Frame, app: &mut App) {
     app.composer_width = composer_text_width(outer.width);
     if outer.width < 8 || outer.height < 4 {
         render_status(frame, app, outer);
+        return;
+    }
+
+    if app.mode == Mode::Help {
+        render_help(frame, app, outer);
         return;
     }
 
@@ -2920,12 +3076,20 @@ fn transcript_rows(app: &App, width: usize) -> Vec<Painted> {
                 };
                 push_wrapped(&mut rows, &tool.label, content_width, kind, hit, true);
                 if tool.expanded {
+                    let mut in_error = false;
                     for line in &tool.body {
                         let section = !line.starts_with("  ");
+                        if section {
+                            in_error = tool.failed && line.trim() == "error";
+                        }
                         let kind = if section {
-                            RowKind::ToolSection
+                            if in_error {
+                                RowKind::ToolError
+                            } else {
+                                RowKind::ToolSection
+                            }
                         } else {
-                            RowKind::ToolBody
+                            tool_body_kind(&tool.name, tool.failed, line, in_error)
                         };
                         push_wrapped(&mut rows, line, content_width, kind, hit, false);
                     }
@@ -2977,6 +3141,61 @@ enum RowKind {
     ThoughtBody,
     ToolSection,
     ToolBody,
+    ToolAdd,
+    ToolRemove,
+    ToolHunk,
+    ToolExitOk,
+    ToolExitFail,
+    ToolError,
+    ToolErrorLine,
+}
+
+/// Tools whose result is a diff, so added and removed lines can be coloured.
+fn is_diff_tool(name: &str) -> bool {
+    matches!(name, "edit_file" | "patch_file" | "apply_patch")
+}
+
+/// Tools whose result reports an explicit exit code.
+fn is_exit_tool(name: &str) -> bool {
+    matches!(name, "bash_tool" | "run_tests")
+}
+
+/// Return whether an ``exit_code:`` line reports success.
+fn exit_code_ok(text: &str) -> Option<bool> {
+    let rest = text.strip_prefix("exit_code:")?.trim();
+    Some(rest == "0")
+}
+
+/// Pick the row style for one expanded tool body line.
+fn tool_body_kind(name: &str, failed: bool, line: &str, in_error: bool) -> RowKind {
+    let trimmed = line.trim_start();
+    if in_error {
+        return RowKind::ToolErrorLine;
+    }
+    if is_diff_tool(name) {
+        if trimmed.starts_with("@@") {
+            return RowKind::ToolHunk;
+        }
+        if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+            return RowKind::ToolAdd;
+        }
+        if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+            return RowKind::ToolRemove;
+        }
+    }
+    if is_exit_tool(name) {
+        if let Some(ok) = exit_code_ok(trimmed) {
+            return if ok {
+                RowKind::ToolExitOk
+            } else {
+                RowKind::ToolExitFail
+            };
+        }
+    }
+    if failed && trimmed.starts_with("kind:") {
+        return RowKind::ToolErrorLine;
+    }
+    RowKind::ToolBody
 }
 
 fn paint_row(frame: &mut Frame, area: Rect, row: &PaintedRow) {
@@ -3025,6 +3244,13 @@ fn paint_row(frame: &mut Frame, area: Rect, row: &PaintedRow) {
         RowKind::ThoughtBody => (BG_BASE, "  ", FG_SECONDARY, true),
         RowKind::ToolSection => (BG_BASE, "  ", GRAY_BRIGHT, false),
         RowKind::ToolBody => (BG_BASE, "  ", FG_SECONDARY, false),
+        RowKind::ToolAdd => (BG_BASE, "  ", GREEN, false),
+        RowKind::ToolRemove => (BG_BASE, "  ", RED, false),
+        RowKind::ToolHunk => (BG_BASE, "  ", MAGENTA, false),
+        RowKind::ToolExitOk => (BG_BASE, "  ", GREEN, false),
+        RowKind::ToolExitFail => (BG_BASE, "  ", RED, false),
+        RowKind::ToolError => (BG_BASE, "  ", RED, false),
+        RowKind::ToolErrorLine => (BG_BASE, "  ", RED, false),
     };
     frame.render_widget(
         Block::default().style(Style::default().bg(background)),
@@ -3138,7 +3364,10 @@ fn model_picker_label(
     } else {
         "  no tools"
     };
-    format!("{mark} {}  ctx {context}  {input}  {output}{tools}", model.id)
+    format!(
+        "{mark} {}  ctx {context}  {input}  {output}{tools}",
+        model.id
+    )
 }
 
 fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
@@ -3547,11 +3776,10 @@ fn note_session_closed(app: &mut App) {
 mod tests {
     use super::{
         advance_streams, collapse_selected, dashboard_text, delete_word_backward, draw,
-        expand_selected, finish_streams, format_context, is_finished_command, menu_action,
-        menu_options,
-        nudge_scroll, picker_selection, price_per_million, select_tool, select_tool_at,
-        slash_outcome, status_hint, wrap_text, Activity, App, MenuAction, Mode, Status, StreamText,
-        ToolHit, TranscriptLine,
+        expand_selected, finish_streams, format_context, help_lines, is_finished_command,
+        menu_action, menu_options, nudge_scroll, picker_selection, price_per_million, select_tool,
+        select_tool_at, slash_outcome, status_hint, tool_body_kind, wrap_text, Activity, App,
+        MenuAction, Mode, RowKind, Status, StreamText, ToolHit, TranscriptLine,
     };
     use crate::logo::logo_size;
     use crate::protocol::{CatalogEntry, ResourcePreview, ServerMessage, StatusSnapshot};
@@ -3964,6 +4192,7 @@ mod tests {
             tokens,
             vec![
                 "/new",
+                "/help",
                 "/goal",
                 "/yolo",
                 "/model",
@@ -4062,12 +4291,16 @@ mod tests {
             confirmed["expected_sha256"],
             "abcd1234ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         );
-        assert!(is_finished_command("/enable-skill coast-check confirm abcd1234"));
-        let mismatched =
-            slash_outcome(&mut app, "/enable-skill coast-check confirm 00000000").expect("mismatch");
+        assert!(is_finished_command(
+            "/enable-skill coast-check confirm abcd1234"
+        ));
+        let mismatched = slash_outcome(&mut app, "/enable-skill coast-check confirm 00000000")
+            .expect("mismatch");
         assert_eq!(mismatched["expected_sha256"], "00000000");
         assert!(!is_finished_command("/enable-skill coast-check confirm"));
-        assert!(!is_finished_command("/enable-skill coast-check confirm abcd"));
+        assert!(!is_finished_command(
+            "/enable-skill coast-check confirm abcd"
+        ));
         assert!(!is_finished_command(
             "/enable-skill coast-check confirm abcd1234 extra"
         ));
@@ -4081,7 +4314,10 @@ mod tests {
         // belongs with the earlier commands so it can sit after /key.
         assert!(tokens.ends_with(&["/save-skill", "/enable-skill"]));
         if let Some(skill) = tokens.iter().position(|token| *token == "/skill") {
-            let save = tokens.iter().position(|token| *token == "/save-skill").unwrap();
+            let save = tokens
+                .iter()
+                .position(|token| *token == "/save-skill")
+                .unwrap();
             assert!(skill < save);
         }
     }
@@ -4140,9 +4376,10 @@ mod tests {
     fn slash_menu_lists_every_command() {
         let mut app = App::new();
         app.input = "/".to_string();
-        let painted = screen(&mut app, 80, 24);
+        let painted = screen(&mut app, 80, 40);
         for name in [
             "/new",
+            "/help",
             "/goal",
             "/model",
             "/copy",
@@ -4291,6 +4528,7 @@ mod tests {
             stopped_for_limit: false,
             stopped_for_budget: false,
             cancelled: false,
+            compaction: Default::default(),
             status: StatusSnapshot {
                 tokens_per_second: Some(2.0),
                 ..StatusSnapshot::default()
@@ -4532,9 +4770,7 @@ mod tests {
         let text = tool_text(&app);
         assert!(text.contains("FIRMS_MAP_KEY key deleted"), "{text}");
         assert!(
-            text.contains(
-                "FIRMS_MAP_KEY in the environment will still be used on the next launch"
-            ),
+            text.contains("FIRMS_MAP_KEY in the environment will still be used on the next launch"),
             "{text}"
         );
     }
@@ -4798,5 +5034,92 @@ mod tests {
             !painted.contains("model-0"),
             "hidden first row was painted:\n{painted}"
         );
+    }
+
+    #[test]
+    fn help_lists_commands_keys_and_registered_tools() {
+        let mut app = App::new();
+        app.tools = vec!["read_file".to_string(), "apply_patch".to_string()];
+
+        let text = help_lines(&app).join("\n");
+
+        assert!(text.contains("/help"));
+        assert!(text.contains("Ctrl+R"));
+        assert!(text.contains("read_file"));
+        assert!(text.contains("apply_patch"));
+    }
+
+    #[test]
+    fn slash_help_opens_the_help_panel() {
+        let mut app = App::new();
+
+        let payload = slash_outcome(&mut app, "/help");
+
+        assert!(payload.is_none());
+        assert_eq!(app.mode, Mode::Help);
+    }
+
+    #[test]
+    fn compaction_notice_reports_what_changed() {
+        let mut app = App::new();
+        app.apply(ServerMessage::Done {
+            response: String::new(),
+            stopped_for_limit: false,
+            stopped_for_budget: false,
+            cancelled: false,
+            compaction: crate::protocol::Compaction {
+                occurred: true,
+                tokens_reclaimed: 12_345,
+                tool_results_shortened: 7,
+                messages_dropped: 40,
+                digest_inserted: true,
+                digest_chars: 900,
+            },
+            status: StatusSnapshot::default(),
+        });
+
+        let text = tool_text(&app);
+        assert!(text.contains("context compacted"));
+        assert!(text.contains("12345 tokens reclaimed"));
+        assert!(text.contains("40 messages dropped"));
+        assert!(text.contains("7 tool results shortened"));
+        assert!(text.contains("digest kept (900 chars)"));
+    }
+
+    #[test]
+    fn tool_body_colours_diffs_exit_codes_and_errors() {
+        assert!(matches!(
+            tool_body_kind("apply_patch", false, "  +added", false),
+            RowKind::ToolAdd
+        ));
+        assert!(matches!(
+            tool_body_kind("apply_patch", false, "  -removed", false),
+            RowKind::ToolRemove
+        ));
+        assert!(matches!(
+            tool_body_kind("apply_patch", false, "  @@ -1 +1 @@", false),
+            RowKind::ToolHunk
+        ));
+        assert!(matches!(
+            tool_body_kind("bash_tool", false, "  exit_code: 0", false),
+            RowKind::ToolExitOk
+        ));
+        assert!(matches!(
+            tool_body_kind("run_tests", false, "  exit_code: 1", false),
+            RowKind::ToolExitFail
+        ));
+        assert!(matches!(
+            tool_body_kind("read_file", true, "  kind: validation", true),
+            RowKind::ToolErrorLine
+        ));
+        assert!(matches!(
+            tool_body_kind("read_file", false, "  plain", false),
+            RowKind::ToolBody
+        ));
+    }
+
+    #[test]
+    fn a_compaction_notice_is_not_shown_for_an_empty_change() {
+        assert_eq!(crate::protocol::Compaction::default().notice(), None);
     }
 }

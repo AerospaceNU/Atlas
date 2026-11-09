@@ -503,12 +503,12 @@ def parse_date_range(text: str) -> tuple[date, date]:
     raw = text.strip()
     sep = next((item for item in (":", "/", ",") if item in raw), None)
     if sep is None:
-        raise ValueError("date must be START:END (ISO dates)")
+        raise ValueError("date must be START:END (ISO dates), e.g. 2024-07-01:2024-07-07")
     left, right = raw.split(sep, 1)
     start = date.fromisoformat(left.strip())
     end = date.fromisoformat(right.strip())
     if end < start:
-        raise ValueError("end date must be on or after start date")
+        raise ValueError(f"end date {end} is before start date {start}; swap them")
     return start, end
 
 
@@ -525,11 +525,13 @@ def parse_coords(text: str) -> BBox:
     """
     parts = [item.strip() for item in text.split(",")]
     if len(parts) != 4:
-        raise ValueError("coords must be west,south,east,north")
+        raise ValueError("coords must be west,south,east,north, e.g. -71.12,42.32,-71.02,42.40")
     try:
         west, south, east, north = (float(item) for item in parts)
     except ValueError:
-        raise ValueError("coords must be four numbers: west,south,east,north") from None
+        raise ValueError(
+            "coords must be four numbers: west,south,east,north, e.g. -71.12,42.32,-71.02,42.40"
+        ) from None
     if east == west:
         raise ValueError("coords must span more than one longitude (west must not equal east)")
     if south == north:
@@ -579,11 +581,17 @@ def parse_polygon(text: str) -> Polygon:
     for part in parts:
         bits = [item.strip() for item in part.split(",")]
         if len(bits) != 2:
-            raise ValueError("polygon pairs must be lon,lat separated by semicolons")
+            raise ValueError(
+                "polygon pairs must be lon,lat separated by semicolons, "
+                "e.g. '-71.12,42.32;-71.02,42.32;-71.02,42.40'"
+            )
         try:
             ring.append((float(bits[0]), float(bits[1])))
         except ValueError as exc:
-            raise ValueError("polygon pairs must be lon,lat separated by semicolons") from exc
+            raise ValueError(
+                "polygon pairs must be lon,lat separated by semicolons, "
+                "e.g. '-71.12,42.32;-71.02,42.32;-71.02,42.40'"
+            ) from exc
     if len(ring) >= 1 and (len(ring) == 1 or ring[0] != ring[-1]):
         ring.append(ring[0])
     try:

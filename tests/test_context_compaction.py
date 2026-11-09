@@ -80,9 +80,14 @@ def test_ingest_truncates_only_model_text_and_preserves_original_result() -> Non
 
 
 def test_clearing_preserves_escaped_json_and_error_metadata() -> None:
-    content = ToolResult(text='"line\n' * 1000, artifacts=["a.tif", "b.json"]).model_dump_json()
+    original = '"line\n' * 1000
+    content = ToolResult(text=original, artifacts=["a.tif", "b.json"]).model_dump_json()
     visible = ToolResult.model_validate_json(runtime._compact_tool_content(content))
-    assert visible.text.startswith(('"line\n' * 1000)[: runtime.COMPACT_PREVIEW_CHARS])
+    head = runtime.COMPACT_PREVIEW_CHARS // 2
+    tail = runtime.COMPACT_PREVIEW_CHARS - head
+    assert visible.text.startswith(original[:head])
+    assert visible.text.endswith(original[-tail:])
+    assert "characters compacted" in visible.text
     assert visible.artifacts == ["a.tif", "b.json"]
     assert runtime._compact_tool_content(visible.model_dump_json()) == visible.model_dump_json()
 
@@ -92,8 +97,19 @@ def test_clearing_preserves_escaped_json_and_error_metadata() -> None:
         )
     )
     assert error["error_kind"] == "validation"
-    assert error["error"].endswith("characters]")
-    assert runtime._compact_tool_content("legacy error " * 1000).endswith("characters]")
+    assert "characters compacted" in error["error"]
+    assert "characters compacted" in runtime._compact_tool_content("legacy error " * 1000)
+
+
+def test_compact_text_is_idempotent_and_keeps_both_ends() -> None:
+    original = "HEAD" + "x" * 5000 + "TAIL"
+
+    once = runtime._compact_text(original)
+
+    assert once.startswith("HEAD")
+    assert once.endswith("TAIL")
+    assert "characters compacted" in once
+    assert runtime._compact_text(once) == once
 
 
 def test_parallel_tool_batch_crossing_recent_boundary_is_preserved_whole(
@@ -213,3 +229,130 @@ def test_tool_images_are_marked_as_observations_for_resume(tmp_path: Path) -> No
     assert messages[-1].images
     assert runtime._current_user_message(messages) is messages[0]
     assert runtime._context_groups(messages)[-1] == range(1, 4)
+
+
+def _exchange(index: int) -> list[ChatMessage]:
+    """One assistant tool call plus a large observation, sized to force drops."""
+    call = ToolCall(
+        id=f"c{index}",
+        name="run_tests",
+        arguments={"command": ["pytest", "-q"]},
+    )
+    result = ToolResult(
+        text=f"command: pytest -q\nexit_code: 1\n{'x' * runtime.MAX_TOOL_RESULT_CHARS}",
+        artifacts=[f"out{index}.txt"],
+    )
+    return [
+        ChatMessage(role=Role.ASSISTANT, tool_calls=[call]),
+        ChatMessage(role=Role.TOOL, tool_call_id=call.id, content=result.model_dump_json()),
+    ]
+
+
+def _digest_text(messages: list[ChatMessage]) -> str:
+    digests = [message for message in messages if runtime._is_digest(message)]
+    assert len(digests) == 1
+    return digests[0].content or ""
+
+
+def test_compaction_replaces_dropped_exchanges_with_a_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runtime, "MAX_CONTEXT_TOKENS", 6000)
+    plan_dir = tmp_path / ".atlas"
+    plan_dir.mkdir()
+    (plan_dir / "plan.json").write_text(
+        json.dumps({"items": [{"text": "ship tools", "status": "in_progress"}]}),
+        encoding="utf-8",
+    )
+    messages = [
+        ChatMessage(role=Role.SYSTEM, content="system instructions"),
+        ChatMessage(role=Role.USER, content="do the work"),
+    ]
+    for index in range(80):
+        messages.extend(_exchange(index))
+    messages.append(ChatMessage(role=Role.USER, content="now summarise"))
+
+    result = _compact(messages, root=tmp_path)
+
+    assert result.occurred
+    assert result.digest_inserted
+    assert result.messages_dropped > 0
+    body = _digest_text(messages)
+    assert "messages compacted" in body
+    assert "pytest -q -> exit 1" in body
+    assert "out0.txt" in body
+    assert "Files:" in body
+    assert "[~] ship tools" in body
+    _assert_paired(messages)
+
+
+def test_digest_rolls_forward_instead_of_stacking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runtime, "MAX_CONTEXT_TOKENS", 6000)
+    messages = [
+        ChatMessage(role=Role.SYSTEM, content="system instructions"),
+        ChatMessage(role=Role.USER, content="do the work"),
+    ]
+    for index in range(60):
+        messages.extend(_exchange(index))
+
+    _compact(messages)
+    first = _digest_text(messages)
+    first_count = int(first.split(": ", 1)[1].split(" ", 1)[0])
+    assert first_count > 0
+
+    for index in range(60, 120):
+        messages.extend(_exchange(index))
+    messages.append(ChatMessage(role=Role.USER, content="continue"))
+
+    _compact(messages)
+
+    second = _digest_text(messages)
+    second_count = int(second.split(": ", 1)[1].split(" ", 1)[0])
+    assert second_count > first_count
+    _assert_paired(messages)
+
+
+def test_default_trigger_elides_a_history_sized_for_the_constant() -> None:
+    messages = _history(300)
+    assert _estimate_tokens(messages) > runtime.MAX_CONTEXT_TOKENS
+
+    result = _compact(messages)
+
+    assert result.occurred
+    assert result.tool_results_shortened > 0
+    assert _estimate_tokens(messages) <= runtime.MAX_CONTEXT_TOKENS
+    _assert_paired(messages)
+
+
+def test_digest_is_bounded_and_keeps_protected_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runtime, "MAX_CONTEXT_TOKENS", 6000)
+    messages = [
+        ChatMessage(role=Role.SYSTEM, content="system instructions"),
+        ChatMessage(role=Role.USER, content="original request"),
+    ]
+    for index in range(120):
+        exchange_result = _exchange(index)
+        exchange_result[1] = exchange_result[1].model_copy(
+            update={
+                "content": ToolResult(
+                    text=f"path/file_{index}.py was edited many times\n{'y' * 4000}",
+                    artifacts=[f"artifact_{index}.txt"],
+                ).model_dump_json()
+            }
+        )
+        messages.extend(exchange_result)
+    current = ChatMessage(role=Role.USER, content="keep this request")
+    messages.append(current)
+
+    _compact(messages, protected_user=current)
+
+    body = _digest_text(messages)
+    assert len(body) <= runtime._DIGEST_LIMIT_CHARS
+    assert messages[0].content == "system instructions"
+    assert any(message is current for message in messages)
+    assert messages[-1] is current
+    _assert_paired(messages)
