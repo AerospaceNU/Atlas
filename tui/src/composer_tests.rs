@@ -1,4 +1,6 @@
-use super::{apply_paste, draw, handle_key, show_slash_menu, App, ChildProcess, Status};
+use super::{
+    apply_paste, draw, handle_key, is_newline_key, show_slash_menu, App, ChildProcess, Status,
+};
 use crate::protocol::{ServerMessage, StatusSnapshot};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, Terminal};
@@ -164,6 +166,56 @@ fn alt_enter_inserts_a_newline_and_vertical_arrows_edit_multiline_drafts() {
     assert_eq!(app.input, "firstX\nsecond");
     let painted = screen(&mut app, 60, 22);
     assert!(painted.contains("firstX▌"), "{painted}");
+    assert!(painted.contains("second"), "{painted}");
+}
+
+#[test]
+fn ctrl_j_is_a_newline_key_and_enter_alone_is_not() {
+    assert!(is_newline_key(KeyEvent::new(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL
+    )));
+    assert!(is_newline_key(KeyEvent::new(
+        KeyCode::Char('J'),
+        KeyModifiers::CONTROL
+    )));
+    assert!(is_newline_key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::ALT
+    )));
+    assert!(is_newline_key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::SHIFT
+    )));
+    assert!(!is_newline_key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE
+    )));
+    assert!(!is_newline_key(KeyEvent::new(
+        KeyCode::Char('j'),
+        KeyModifiers::NONE
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_j_inserts_a_newline_instead_of_sending_the_draft() {
+    let (mut child, rx) = sink();
+    let mut app = App::new();
+    apply_paste(&mut app, "first");
+    key(
+        &mut app,
+        &mut child,
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL,
+    );
+    apply_paste(&mut app, "second");
+    assert!(rx.try_recv().is_err());
+    // Ctrl+J is not text: the character arm drops control-modified keys, so
+    // before this binding the chord silently did nothing at all.
+    assert_eq!(app.input, "first\nsecond");
+    let painted = screen(&mut app, 60, 22);
+    assert!(painted.contains("first"), "{painted}");
     assert!(painted.contains("second"), "{painted}");
 }
 
