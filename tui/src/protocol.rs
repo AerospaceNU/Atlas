@@ -3,6 +3,49 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+/// Changes the runtime made to the model context for the finished turn.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Compaction {
+    #[serde(default)]
+    pub occurred: bool,
+    #[serde(default)]
+    pub tokens_reclaimed: i64,
+    #[serde(default)]
+    pub tool_results_shortened: i64,
+    #[serde(default)]
+    pub messages_dropped: i64,
+    #[serde(default)]
+    pub digest_inserted: bool,
+    #[serde(default)]
+    pub digest_chars: i64,
+}
+
+impl Compaction {
+    /// One transcript line for a turn that compacted its context.
+    pub fn notice(&self) -> Option<String> {
+        if !self.occurred {
+            return None;
+        }
+        let mut parts = vec![format!(
+            "context compacted: {} tokens reclaimed",
+            self.tokens_reclaimed
+        )];
+        if self.messages_dropped > 0 {
+            parts.push(format!("{} messages dropped", self.messages_dropped));
+        }
+        if self.tool_results_shortened > 0 {
+            parts.push(format!(
+                "{} tool results shortened",
+                self.tool_results_shortened
+            ));
+        }
+        if self.digest_inserted {
+            parts.push(format!("digest kept ({} chars)", self.digest_chars));
+        }
+        Some(parts.join(", "))
+    }
+}
+
 /// A single server -> client message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerMessage {
@@ -30,6 +73,7 @@ pub enum ServerMessage {
         stopped_for_limit: bool,
         stopped_for_budget: bool,
         cancelled: bool,
+        compaction: Compaction,
         status: StatusSnapshot,
     },
     PermissionRequest {
@@ -239,6 +283,8 @@ enum RawMessage {
         stopped_for_budget: bool,
         #[serde(default)]
         cancelled: bool,
+        #[serde(default)]
+        compaction: Compaction,
         #[serde(flatten)]
         status: StatusSnapshot,
     },
@@ -452,12 +498,14 @@ impl From<RawMessage> for ServerMessage {
                 stopped_for_limit,
                 stopped_for_budget,
                 cancelled,
+                compaction,
                 status,
             } => ServerMessage::Done {
                 response,
                 stopped_for_limit,
                 stopped_for_budget,
                 cancelled,
+                compaction,
                 status,
             },
             RawMessage::PermissionRequest {
@@ -680,7 +728,8 @@ mod tests {
 
     #[test]
     fn parses_goal() {
-        let line = r#"{"type":"goal","text":"map the flood","cleared":false,"message":"map the flood"}"#;
+        let line =
+            r#"{"type":"goal","text":"map the flood","cleared":false,"message":"map the flood"}"#;
         match parse_line(line).unwrap() {
             Some(ServerMessage::Goal {
                 text,
@@ -743,6 +792,25 @@ mod tests {
             }) => {
                 assert_eq!(response, "hello");
                 assert!(!stopped_for_limit);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_compaction_in_done() {
+        let line = r#"{"type":"done","response":"hi","compaction":{"occurred":true,"tokens_reclaimed":123,"tool_results_shortened":2,"messages_dropped":4,"digest_inserted":true,"digest_chars":80}}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::Done { compaction, .. }) => {
+                assert!(compaction.occurred);
+                assert_eq!(compaction.tokens_reclaimed, 123);
+                assert_eq!(compaction.tool_results_shortened, 2);
+                assert_eq!(compaction.messages_dropped, 4);
+                assert!(compaction.digest_inserted);
+                assert!(compaction
+                    .notice()
+                    .unwrap()
+                    .contains("123 tokens reclaimed"));
             }
             other => panic!("unexpected: {other:?}"),
         }

@@ -191,6 +191,7 @@ fn completed_or_failed_turns_remove_stale_approval_prompts() {
             stopped_for_limit: false,
             stopped_for_budget: false,
             cancelled: true,
+            compaction: Default::default(),
             status: StatusSnapshot::default(),
         },
         ServerMessage::Error {
