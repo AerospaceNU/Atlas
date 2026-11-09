@@ -716,7 +716,8 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     assert done[1]["context_used"] == 20
     assert done[1]["tokens_per_second"] == 15.0
     line = done[1]["status_line"]
-    assert "tokens 38 (prompt 30 completion 8)" in line
+    assert "context 20/unknown" in line
+    assert "tokens" not in line
     assert "last 15.0 tok/s" in line
     assert "http" not in line
     assert "latency" not in line
@@ -891,7 +892,7 @@ def test_catalog_fills_the_active_model_context_on_the_dashboard(tmp_path: Path)
     assert session.totals.context_limit == 1_048_576
     line = events[1]["status_line"]
     assert "context 355/1.05M" in line
-    assert "tokens 380 (prompt 355 completion 25)" in line
+    assert "tokens" not in line
 
 
 def test_session_key_overrides_the_user_key_and_is_not_stored_in_the_project(
@@ -1478,8 +1479,8 @@ def test_omitted_cost_uses_catalog_prices_and_token_details(tmp_path: Path) -> N
     assert "spend ~$0.003" in done["status_line"]
     assert "spend $0.003" not in done["status_line"]
     assert "spend unknown" not in done["status_line"]
-    assert "cached 800" in done["status_line"]
-    assert "reasoning 40" in done["status_line"]
+    assert "cached" not in done["status_line"]
+    assert "reasoning" not in done["status_line"]
     assert done["tokens_per_second"] == 250.0
     assert "last 250.0 tok/s" in done["status_line"]
     assert "test-key" not in json.dumps(events)

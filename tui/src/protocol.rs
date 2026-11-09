@@ -607,7 +607,7 @@ impl From<RawMessage> for ServerMessage {
 /// The words match `format_tui_status` for an empty session so the first
 /// frame is never a blank status row.
 pub fn default_status_line() -> String {
-    "model unset  context 0/unknown  tokens 0  spend $0  last n/a tok/s".to_string()
+    "model unset  context 0/unknown  spend $0  last n/a tok/s".to_string()
 }
 
 pub fn status_text(status: &StatusSnapshot) -> String {
@@ -775,7 +775,7 @@ mod tests {
     fn default_status_is_not_blank() {
         let text = default_status_line();
         assert!(text.contains("context 0/unknown"));
-        assert!(text.contains("tokens 0"));
+        assert!(!text.contains("tokens"));
         assert!(!text.contains("prompt"));
         assert!(!text.contains("completion"));
         assert!(text.contains("spend $0"));

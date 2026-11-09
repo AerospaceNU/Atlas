@@ -219,39 +219,24 @@ def format_token_count(value: int) -> str:
 
 
 def format_tui_status(totals: SessionTotals) -> str:
-    """One status line: model, context window, tokens, spend, and output speed.
+    """One status line: model, context window, spend, and output speed.
 
-    Prompt and completion counts are written beside the total once either is
-    non-zero. Cached and reasoning counts are added only when they are
-    non-zero. An empty session leaves those words off so the first frame
-    matches the TUI default line. A session with no token-using calls shows
-    ``spend $0``. An unpriced call shows ``spend unknown``. A catalog
-    estimate shows ``spend ~$...`` so it is not mistaken for a provider
-    cost. The speed is the latest call, labeled ``last``, and is ``n/a``
-    until one is measured from the first token.
+    A session with no token-using calls shows ``spend $0``. An unpriced call
+    shows ``spend unknown``. A catalog estimate shows ``spend ~$...`` so it is
+    not mistaken for a provider cost. The speed is the latest call, labeled
+    ``last``, and is ``n/a`` until one is measured from the first token.
+
+    Token counts are deliberately absent: they accumulate without bound and
+    crowded the bar on a narrow terminal. ``SessionTotals`` still carries them
+    for the cost math and the protocol, and the context window is what the bar
+    reports.
     """
     limit = "unknown" if totals.context_limit is None else format_token_count(totals.context_limit)
     model = totals.model or "unset"
     return (
         f"model {model}  context {format_token_count(totals.context_used)}/{limit}  "
-        f"tokens {_token_field(totals)}  "
         f"spend {_spend_label(totals)}  {_speed_label(totals.tokens_per_second)}"
     )
-
-
-def _token_field(totals: SessionTotals) -> str:
-    total = format_token_count(totals.total_tokens)
-    details: list[str] = []
-    if totals.prompt_tokens or totals.completion_tokens:
-        details.append(f"prompt {format_token_count(totals.prompt_tokens)}")
-        details.append(f"completion {format_token_count(totals.completion_tokens)}")
-    if totals.cached_tokens:
-        details.append(f"cached {format_token_count(totals.cached_tokens)}")
-    if totals.reasoning_tokens:
-        details.append(f"reasoning {format_token_count(totals.reasoning_tokens)}")
-    if not details:
-        return total
-    return f"{total} ({' '.join(details)})"
 
 
 def _round_sig3(value: int) -> int:
