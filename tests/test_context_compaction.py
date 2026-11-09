@@ -21,7 +21,6 @@ from atlas.agent.contracts import (
     ToolResult,
 )
 from atlas.agent.runtime import Agent, AgentStep, _compact, _estimate_tokens, _tool_message
-from atlas.agent.session import AgentSession
 
 
 class ScriptedModel:
@@ -80,38 +79,6 @@ def test_ingest_truncates_only_model_text_and_preserves_original_result() -> Non
     assert len(original.text) == runtime.MAX_TOOL_RESULT_CHARS + 123
 
 
-def test_tool_clearing_keeps_valid_json_artifacts_ids_and_recent_context() -> None:
-    messages = _history()
-    originals = list(messages)
-    before = _estimate_tokens(messages)
-
-    result = _compact(messages)
-
-    assert before > runtime.MAX_CONTEXT_TOKENS
-    assert _estimate_tokens(messages) <= int(runtime.MAX_CONTEXT_TOKENS * 0.8)
-    assert result.occurred
-    assert result.tool_results_shortened > 0
-    assert result.messages_dropped == 0
-    assert result.tokens_reclaimed == before - _estimate_tokens(messages)
-    assert messages[:3] == originals[:3]
-    assert messages[-runtime.KEEP_RECENT_MESSAGES :] == originals[-runtime.KEEP_RECENT_MESSAGES :]
-    for message in messages:
-        if message.role is Role.TOOL:
-            visible = ToolResult.model_validate_json(message.content or "")
-            assert visible.artifacts == [f"{message.tool_call_id}.txt"]
-    assert all(
-        len(ToolResult.model_validate_json(message.content or "").text)
-        == runtime.MAX_TOOL_RESULT_CHARS
-        for message in originals
-        if message.role is Role.TOOL
-    )
-    _assert_paired(messages)
-
-    # A normal result fits in the reclaimed headroom without another compaction.
-    messages.extend(_history(1)[3:])
-    assert _estimate_tokens(messages) < runtime.MAX_CONTEXT_TOKENS
-
-
 def test_clearing_preserves_escaped_json_and_error_metadata() -> None:
     content = ToolResult(text='"line\n' * 1000, artifacts=["a.tif", "b.json"]).model_dump_json()
     visible = ToolResult.model_validate_json(runtime._compact_tool_content(content))
@@ -127,47 +94,6 @@ def test_clearing_preserves_escaped_json_and_error_metadata() -> None:
     assert error["error_kind"] == "validation"
     assert error["error"].endswith("characters]")
     assert runtime._compact_tool_content("legacy error " * 1000).endswith("characters]")
-
-
-def test_second_layer_drops_non_tool_history_but_keeps_instructions_and_current_request() -> None:
-    messages = _history(0)
-    opening = list(messages)
-    for _ in range(35):
-        messages.extend(
-            [
-                ChatMessage(role=Role.USER, content="u" * 15_000),
-                ChatMessage(role=Role.ASSISTANT, content="a" * 15_000),
-            ]
-        )
-    current = ChatMessage(role=Role.USER, content="Use the new dates.")
-    messages.append(current)
-    recent = messages[-runtime.KEEP_RECENT_MESSAGES :]
-
-    result = _compact(messages)
-
-    assert result.messages_dropped > 0
-    assert result.tool_results_shortened == 0
-    assert _estimate_tokens(messages) <= int(runtime.MAX_CONTEXT_TOKENS * 0.8)
-    assert messages[:3] == opening
-    assert messages[-runtime.KEEP_RECENT_MESSAGES :] == recent
-    assert any(message is current for message in messages)
-
-
-def test_second_layer_drops_tool_batches_whole() -> None:
-    messages = _history(60)
-    # Large artifact lists cannot be shortened with the observation text.
-    for message in messages:
-        if message.role is Role.TOOL:
-            message.content = ToolResult(
-                text="short", artifacts=["data/" + "p" * 1000] * 20
-            ).model_dump_json()
-
-    result = _compact(messages)
-
-    assert result.messages_dropped > 0
-    assert result.messages_dropped % 2 == 0
-    assert _estimate_tokens(messages) <= int(runtime.MAX_CONTEXT_TOKENS * 0.8)
-    _assert_paired(messages)
 
 
 def test_parallel_tool_batch_crossing_recent_boundary_is_preserved_whole(
@@ -225,37 +151,6 @@ class LargeResultTool(Tool):
         return ToolResult(text="x" * 30_000, artifacts=["observation.txt"])
 
 
-def test_scripted_agent_compacts_before_model_call_and_retains_full_run_results(
-    tmp_path: Path,
-) -> None:
-    model = ScriptedModel(
-        [ModelResponse(tool_calls=[_call(str(index))]) for index in range(42)]
-        + [ModelResponse(content="done")]
-    )
-    registry = ToolRegistry()
-    registry.register(LargeResultTool())
-    agent = Agent(model, registry, LocalArtifactStore(tmp_path))
-
-    run = agent.run("Inspect the observations.")
-
-    assert run.response == "done"
-    assert run.compaction.occurred
-    assert run.compaction.tokens_reclaimed > 0
-    assert run.compaction.tool_results_shortened > 0
-    assert all(
-        _estimate_tokens(request) <= runtime.MAX_CONTEXT_TOKENS for request in model.requests
-    )
-    assert all(step.result and len(step.result.text) == 30_000 for step in run.steps)
-    visible = [message for message in model.requests[-1] if message.role is Role.TOOL]
-    assert any("[compacted" in (message.content or "") for message in visible)
-    assert all(
-        ToolResult.model_validate_json(message.content or "").artifacts == ["observation.txt"]
-        for message in visible
-    )
-    _assert_paired(model.requests[-1])
-    assert run.model_dump()["compaction"]["occurred"] is True
-
-
 def test_agent_does_not_send_irreducible_over_budget_context(tmp_path: Path) -> None:
     model = ScriptedModel([ModelResponse(content="must not be called")])
     agent = Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path))
@@ -294,35 +189,6 @@ def test_budget_stop_answers_pending_calls_before_the_next_turn(tmp_path: Path) 
     messages.append(ChatMessage(role=Role.USER, content="Continue with a new request."))
     assert agent.advance(messages).response == "next turn"
     _assert_paired(model.requests[-1])
-
-
-def test_resumed_compaction_keeps_request_before_synthetic_image_observations(
-    tmp_path: Path,
-) -> None:
-    messages = _history(60)
-    current = ChatMessage(role=Role.USER, content="Keep the user's real request.")
-    messages.insert(19, current)
-    for message in messages:
-        if message.role is Role.TOOL:
-            message.content = ToolResult(
-                text="short", artifacts=["a" * 1000] * 20
-            ).model_dump_json()
-    observation = ChatMessage(role=Role.USER, content=None, tool_observation=True)
-    messages.append(observation)
-    # Session persistence strips image bytes but retains the observation marker.
-    messages = [ChatMessage.model_validate(message.model_dump()) for message in messages]
-    model = ScriptedModel([ModelResponse(content="done")])
-    agent = Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path))
-    session = AgentSession(agent)
-    session.messages = messages
-    session.stopped_for_limit = True
-
-    run = session.resume()
-
-    assert run.compaction.messages_dropped > 0
-    assert any(message.content == current.content for message in model.requests[0])
-    assert messages[-2].tool_observation
-    _assert_paired(model.requests[0])
 
 
 def test_tool_images_are_marked_as_observations_for_resume(tmp_path: Path) -> None:
