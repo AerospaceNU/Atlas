@@ -38,6 +38,7 @@ The first launch builds `tui/target/release/atlas-tui` and can take a few
 minutes; later launches reuse it and rebuild only after Rust sources change.
 
 Enter sends a line. `/` opens commands. `/new` starts a fresh conversation.
+`/help` lists the commands, key bindings, and tools registered in the session.
 `/skill <name>` applies a skill from `.atlas/skills/<name>/SKILL.md` for the
 rest of the conversation. `/quit` and `/exit` leave Atlas.
 
