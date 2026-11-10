@@ -13,8 +13,17 @@ from pydantic import ValidationError
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import default_registry
 from atlas.agent.tools.retrieve_data_tool import GetDataTool, GetDataToolInput
+from atlas.archive import Availability, LookupStatus, SceneIndex, make_index_id
 from atlas.cli.download import DownloadOutcome, DownloadReport
-from atlas.data.base import BBox, DataPullClient, PullRequest, PullResult, Scene, SceneKind
+from atlas.data.base import (
+    Asset,
+    BBox,
+    DataPullClient,
+    PullRequest,
+    PullResult,
+    Scene,
+    SceneKind,
+)
 from atlas.data.registry import SOURCES
 
 AOI = BBox(west=-71.12, south=42.32, east=-71.02, north=42.40)
@@ -442,3 +451,60 @@ def test_clients_are_closed_when_the_download_fails(
             LocalArtifactStore(tmp_path),
         )
     assert client.closed
+
+
+# scene index
+
+
+def test_search_records_scenes_and_lists_their_index_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakePullClient([_scene(id="clear", collection="sentinel-2-l2a", cloud_cover=12.4)])
+    _use_clients(monkeypatch, {"sentinel2": client})
+    _no_download(monkeypatch)
+    store = LocalArtifactStore(tmp_path)
+
+    result = GetDataTool().run(
+        {"data_type": "optical", **WINDOW, **BOSTON, "sources": ["sentinel2"]}, store
+    )
+
+    index_id = make_index_id("sentinel2", "sentinel-2-l2a", "clear")
+    assert f"sentinel2 clear 2024-07-01 cloud 12% {index_id}" in result.text
+    assert "scene index data/index.sqlite: 1 new, 0 refreshed" in result.text
+    with SceneIndex.at(store.resolve("data")) as index:
+        assert index.lookup(index_id).status is LookupStatus.found
+
+
+def test_download_records_the_saved_layer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scene = _scene(
+        id="a",
+        collection="sentinel-2-l2a",
+        assets={"visual": Asset(href="https://example.com/visual.tif", roles=["visual"])},
+    )
+    _use_clients(monkeypatch, {"sentinel2": FakePullClient([scene])})
+
+    async def fake_download(scenes: list[Scene], out: Path, **_kwargs: Any) -> DownloadReport:
+        path = out / "sentinel2" / "a_visual.tif"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"tif")
+        outcome = DownloadOutcome(
+            source="sentinel2", scene_id="a", status="saved", path=path, asset="visual"
+        )
+        return DownloadReport(outcomes=[outcome])
+
+    monkeypatch.setattr(f"{MODULE}.download_assets", fake_download)
+    store = LocalArtifactStore(tmp_path)
+
+    result = GetDataTool().run(
+        {"data_type": "optical", **WINDOW, **BOSTON, "sources": ["sentinel2"], "download": True},
+        store,
+    )
+
+    assert "scene index data/index.sqlite: 1 new, 0 refreshed" in result.text
+    index_id = make_index_id("sentinel2", "sentinel-2-l2a", "a")
+    with SceneIndex.at(store.resolve("data")) as index:
+        card = index.lookup(index_id, workspace=tmp_path).card
+    assert card is not None
+    layer = card.layers["visual"]
+    assert layer.availability is Availability.full
+    assert layer.locator is not None and layer.locator.key == "data/sentinel2/a_visual.tif"

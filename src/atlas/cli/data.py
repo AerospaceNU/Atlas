@@ -49,6 +49,7 @@ from atlas.cli.download import (
 )
 from atlas.cli.estimate import confirm_download, estimate_pull, render_pull_estimate
 from atlas.cli.fs import replace_with_retry
+from atlas.cli.indexing import index_pull
 from atlas.cli.progress import ProgressReporter, pick_reporter
 from atlas.cli.source_outputs import (
     write_source_outputs,
@@ -860,8 +861,12 @@ async def execute_pull(
         except OSError as exc:
             print(f"cannot write the pull manifest in {out_dir}: {exc}", file=sys.stderr)
             return 1
+        indexed = index_pull(out_dir, catalog, report, live_clients)
         reporter.close()
         _print_run_summary(catalog, report, search_only=search_only)
+        if indexed is not None:
+            style = "yellow" if indexed.error else "dim"
+            Console(stderr=True, highlight=False).print(indexed.describe(), style=style)
         for src in catalog.sources:
             for line in resolution_lines(
                 src.source, resolutions.get(src.source, SourceResolution.unchecked())

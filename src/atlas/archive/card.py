@@ -2,17 +2,28 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import UTC
 from datetime import datetime as DateTime
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Any, Self
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from atlas.data.base import BBox, GeometryKind, Scene, SceneKind
+from atlas.data.base import Asset, BBox, GeometryKind, Scene, SceneKind, is_browse_asset
 
 CARD_VERSION = 1
+
+# Keeps a card small enough that dozens fit in a model context. Sentinel-2 and
+# Landsat keep every image layer; a scene with more keeps its common bands and
+# local layers first and counts the rest in ``layers_omitted``.
+MAX_CARD_LAYERS = 24
+
+# Assets that are not imagery: metadata documents and tile endpoints.
+_NON_LAYER_ROLES = frozenset({"metadata", "tiles"})
+_NON_LAYER_SUFFIXES = frozenset({".xml", ".json", ".html", ".txt"})
 
 # STAC property names, in the order they are tried. A converter needs the
 # version: the Sentinel-2 offset depends on the processing baseline.
@@ -59,11 +70,16 @@ class CloudStatus(StrEnum):
 
 
 class Availability(StrEnum):
-    """Local state of one layer: not stored, a bbox chip, or the whole asset."""
+    """Local state of one layer: not stored, a bbox chip, the whole asset, or gone.
+
+    ``missing`` means a chip or full file was recorded but is no longer on
+    disk. It keeps the locator so the gap can be explained or re-downloaded.
+    """
 
     absent = "absent"
     windowed = "windowed"
     full = "full"
+    missing = "missing"
 
 
 class Locator(BaseModel):
@@ -111,9 +127,11 @@ class LayerRef(BaseModel):
         scale: Multiplier from the first ``raster:bands`` entry, when published.
         offset: Additive term from the same entry, when published.
         size_bytes: Full asset size reported by the catalog, when known.
-        availability: ``absent``, ``windowed`` (a bbox chip), or ``full``.
+        availability: ``absent``, ``windowed`` (a bbox chip), ``full``, or
+            ``missing`` (recorded locally, but the file is gone).
         locator: Where the local file is. None exactly when ``absent``.
-        window: Footprint of the chip. Set exactly when ``windowed``.
+        window: Footprint of the chip. Set when ``windowed``, never when
+            ``full``, and kept on a ``missing`` chip.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -204,7 +222,10 @@ class SceneCard(BaseModel):
         gsd_m: Ground sample distance in metres, when known.
         cloud_cover: Percent cloud, only when ``cloud_status`` is ``value``.
         cloud_status: Why ``cloud_cover`` is or is not a number.
-        layers: Assets by catalog asset key.
+        layers: Image layers by catalog asset key, at most ``MAX_CARD_LAYERS``.
+            ``from_scene`` leaves out previews, metadata documents, and tile
+            endpoints.
+        layers_omitted: Image layers left off to respect the cap.
         found_in: Every source that returned this observation.
     """
 
@@ -229,7 +250,8 @@ class SceneCard(BaseModel):
     processing_version: str | None = None
     cloud_cover: float | None = Field(default=None, ge=0, le=100)
     cloud_status: CloudStatus = CloudStatus.unknown
-    layers: dict[str, LayerRef] = Field(default_factory=dict)
+    layers: dict[str, LayerRef] = Field(default_factory=dict, max_length=MAX_CARD_LAYERS)
+    layers_omitted: int = Field(default=0, ge=0)
     found_in: list[str] = Field(default_factory=list)
 
     @field_validator("satellite")
@@ -268,11 +290,19 @@ class SceneCard(BaseModel):
         return self
 
     @classmethod
-    def from_scene(cls, scene: Scene, *, satellite: str | None = None) -> Self:
+    def from_scene(
+        cls,
+        scene: Scene,
+        *,
+        satellite: str | None = None,
+        keep: Collection[str] = (),
+    ) -> Self:
         """Build the card for a scene a client just returned.
 
         Every layer starts ``absent``: a scene found in search has no local
-        data until a download records one.
+        data until a download records one. Only image layers are listed:
+        common bands first, then ``keep``, then the rest by key, up to
+        ``MAX_CARD_LAYERS``.
 
         Args:
             scene: Scene from a registered client. ``source`` and ``collection``
@@ -280,6 +310,8 @@ class SceneCard(BaseModel):
             satellite: Platform family. Defaults to the ``satellite`` class
                 attribute of the client registered under ``scene.source``.
                 Either way it is stripped and lowercased on the card.
+            keep: Asset keys that must survive the cap, such as layers that
+                are already local.
 
         Raises:
             ValueError: If ``scene.source`` is empty, ``satellite`` is blank, or
@@ -300,15 +332,18 @@ class SceneCard(BaseModel):
         common_names: dict[str, str] = {}
         for alias, key in sorted(scene.band_aliases.items(), reverse=True):
             common_names[key] = alias
+        imagery = {key for key, asset in scene.assets.items() if is_layer_asset(key, asset)}
+        first = [key for key in (*scene.band_aliases.values(), *keep) if key in imagery]
+        ordered = list(dict.fromkeys(first)) + sorted(imagery.difference(first))
         layers = {
             key: LayerRef(
                 common_name=common_names.get(key),
-                roles=list(asset.roles),
-                scale=asset.scale,
-                offset=asset.offset,
-                size_bytes=asset.size_bytes,
+                roles=list(scene.assets[key].roles),
+                scale=scene.assets[key].scale,
+                offset=scene.assets[key].offset,
+                size_bytes=scene.assets[key].size_bytes,
             )
-            for key, asset in scene.assets.items()
+            for key in ordered[:MAX_CARD_LAYERS]
         }
 
         return cls(
@@ -331,6 +366,7 @@ class SceneCard(BaseModel):
             cloud_cover=scene.cloud_cover,
             cloud_status=cloud_status,
             layers=layers,
+            layers_omitted=max(0, len(ordered) - MAX_CARD_LAYERS),
         )
 
     @property
@@ -338,4 +374,19 @@ class SceneCard(BaseModel):
         """Whether any layer exists locally, as a chip or in full."""
         # dict() keeps Pylint from reading the Field() default as the attribute.
         layers = dict(self.layers)
-        return any(layer.availability is not Availability.absent for layer in layers.values())
+        return any(
+            layer.availability in {Availability.windowed, Availability.full}
+            for layer in layers.values()
+        )
+
+
+def is_layer_asset(key: str, asset: Asset) -> bool:
+    """True for image layers; false for previews, metadata documents, and tile endpoints."""
+    if is_browse_asset(key, asset):
+        return False
+    if {role.lower() for role in asset.roles} & _NON_LAYER_ROLES:
+        return False
+    media = (asset.media_type or "").lower()
+    if media.startswith("text/") or any(word in media for word in ("xml", "json", "html")):
+        return False
+    return PurePosixPath(urlsplit(asset.href).path).suffix.lower() not in _NON_LAYER_SUFFIXES

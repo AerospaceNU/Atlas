@@ -7,14 +7,16 @@ from collections.abc import Sequence
 from atlas.cli.catalog import is_known_target
 from atlas.cli.data import add_data_parser, run_data
 from atlas.cli.indices import add_indices_parser, run_indices
+from atlas.cli.scenes import add_scenes_parser, run_scenes
 
-_ROOT = frozenset({"data", "indices", "-h", "--help"})
+_ROOT = frozenset({"data", "indices", "scenes", "-h", "--help"})
 _TUI_FLAGS = frozenset({"--workspace", "--repo"})
 _HELP = """examples:
   atlas                          open the agent TUI
   atlas data                     list satellites
   atlas sentinel2 optical ...    search one collection
   atlas indices --red red.npy --nir nir.npy --out indices
+  atlas scenes --coords ... --date ...   query indexed scenes offline
 """
 
 
@@ -46,11 +48,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="group")
     add_data_parser(sub)
     add_indices_parser(sub)
+    add_scenes_parser(sub)
     args = parser.parse_args(tokens)
     if getattr(args, "_atlas_cmd", None) == "data":
         return run_data(args)
     if getattr(args, "_atlas_cmd", None) == "indices":
         return run_indices(args)
+    if getattr(args, "_atlas_cmd", None) == "scenes":
+        return run_scenes(args)
     parser.print_help()
     return 0
 

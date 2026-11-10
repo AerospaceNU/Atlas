@@ -14,6 +14,9 @@ import numpy as np
 from numpy.typing import NDArray
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+BROWSE_KEYS = frozenset({"rendered_preview", "thumbnail", "preview", "quicklook", "browse"})
+BROWSE_ROLES = frozenset({"thumbnail", "overview", "preview", "rendered_preview"})
+
 
 class SceneKind(StrEnum):
     optical = "optical"
@@ -978,6 +981,19 @@ class Asset(BaseModel):
             return None
 
 
+def is_browse_asset(key: str, asset: Asset) -> bool:
+    """True for STAC browse products (previews, thumbnails, JPEG overviews)."""
+    if key.lower() in BROWSE_KEYS:
+        return True
+    roles = {role.lower() for role in asset.roles}
+    if roles & BROWSE_ROLES:
+        return True
+    media = (asset.media_type or "").lower()
+    if media.startswith("image/jpeg") or media.startswith("image/jpg"):
+        return True
+    return media.startswith("image/png") and "data" not in roles
+
+
 class Scene(BaseModel):
     id: str
     source: str = ""
@@ -995,6 +1011,9 @@ class Scene(BaseModel):
     instrument: str | None = None
     cloud_cover: float | None = Field(default=None, ge=0, le=100)
     footprint_is_request: bool = False
+    # Exterior rings of the item's Polygon/MultiPolygon as [lon, lat] pairs.
+    # None when the geometry is not a usable polygon; callers fall back to bbox.
+    footprint: list[list[list[float]]] | None = None
     assets: dict[str, Asset] = Field(default_factory=dict)
     # Common band name to a key in `assets`. Catalogs name the same band
     # differently: S30 NIR is B8A, L30 NIR is B05.
