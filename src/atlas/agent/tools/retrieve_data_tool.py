@@ -10,8 +10,9 @@ from pydantic import BaseModel, Field, model_validator
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
-from atlas.cli.download import download_assets
+from atlas.cli.download import DownloadReport, download_assets
 from atlas.cli.estimate import estimate_pull, render_pull_estimate
+from atlas.cli.indexing import PullIndexSummary, index_pull
 from atlas.compile import aggregate
 from atlas.data.base import BBox, PullRequest, SceneKind
 from atlas.data.registry import SOURCES, sources
@@ -133,44 +134,54 @@ class GetDataToolInput(BaseModel):
 
     def lat_long_to_bbox(self) -> BBox:
         """Converts a latitude + longitude point + radius_km into bounding box coordinates."""
-        if self.bbox:
-            return self.bbox  # we already are using the bounding box, so return it
+        return area_to_bbox(self.latitude, self.longitude, self.radius_km, self.bbox)
 
-        # check_location guarantees both are set when there is no bbox; this tells mypy
-        assert self.latitude is not None and self.longitude is not None
 
-        lat_padding = (
-            self.radius_km / 111.32
-        )  # one degree of latitude is approximately 111.32 km, so we can use that to convert the radius in km to degrees of latitude
-        south = max(-90.0, self.latitude - lat_padding)
-        north = min(90.0, self.latitude + lat_padding)
+def area_to_bbox(
+    latitude: float | None, longitude: float | None, radius_km: float, bbox: BBox | None
+) -> BBox:
+    """The bbox itself, or a square of half-width ``radius_km`` around the point.
 
-        # A radius that reaches a pole covers every longitude. Near a pole, the
-        # approximate longitude padding can also span the entire globe.
-        reaches_pole = self.latitude - lat_padding <= -90.0 or self.latitude + lat_padding >= 90.0
-        if reaches_pole:
+    Shared by the agent tools that take a place as a point or as a bbox.
+    """
+    if bbox:
+        return bbox  # we already are using the bounding box, so return it
+
+    if latitude is None or longitude is None:
+        raise ValueError("give latitude and longitude, or a bbox")
+
+    lat_padding = (
+        radius_km / 111.32
+    )  # one degree of latitude is approximately 111.32 km, so we can use that to convert the radius in km to degrees of latitude
+    south = max(-90.0, latitude - lat_padding)
+    north = min(90.0, latitude + lat_padding)
+
+    # A radius that reaches a pole covers every longitude. Near a pole, the
+    # approximate longitude padding can also span the entire globe.
+    reaches_pole = latitude - lat_padding <= -90.0 or latitude + lat_padding >= 90.0
+    if reaches_pole:
+        west, east = -180.0, 180.0
+    else:
+        long_padding = lat_padding / cos(radians(latitude))
+        if long_padding >= 180.0:
             west, east = -180.0, 180.0
         else:
-            long_padding = lat_padding / cos(radians(self.latitude))
-            if long_padding >= 180.0:
-                west, east = -180.0, 180.0
-            else:
-                west_edge = self.longitude - long_padding
-                east_edge = self.longitude + long_padding
+            west_edge = longitude - long_padding
+            east_edge = longitude + long_padding
 
-                # Preserve exact ±180° edges and wrap only values beyond them.
-                west = (
-                    (west_edge + 180.0) % 360.0 - 180.0
-                    if west_edge < -180.0 or west_edge > 180.0
-                    else west_edge
-                )
-                east = (
-                    (east_edge + 180.0) % 360.0 - 180.0
-                    if east_edge < -180.0 or east_edge > 180.0
-                    else east_edge
-                )
+            # Preserve exact ±180° edges and wrap only values beyond them.
+            west = (
+                (west_edge + 180.0) % 360.0 - 180.0
+                if west_edge < -180.0 or west_edge > 180.0
+                else west_edge
+            )
+            east = (
+                (east_edge + 180.0) % 360.0 - 180.0
+                if east_edge < -180.0 or east_edge > 180.0
+                else east_edge
+            )
 
-        return BBox(west=west, south=south, east=east, north=north)
+    return BBox(west=west, south=south, east=east, north=north)
 
 
 class GetDataTool(Tool):
@@ -265,6 +276,8 @@ class GetDataTool(Tool):
                 estimate = estimate_pull(
                     catalog, out_dir=out_dir, bbox=pull_request.bbox
                 )  # estimate the scenes and the bytes for the download
+                # record what the search found, so later answers can cite its index ids
+                indexed = index_pull(out_dir, catalog, DownloadReport(), clients)
                 lines = [render_pull_estimate(estimate), "scenes:"]
 
                 for src in catalog.sources:  # for all sources that we pull data from
@@ -273,10 +286,11 @@ class GetDataTool(Tool):
                         cloud = "n/a" if scene.cloud_cover is None else f"{scene.cloud_cover:.0f}%"
 
                         # make a line describing the scene with its source, ID, date, and cloud cover
-                        lines.append(
-                            f"  {src.source} {scene.id} {scene.datetime:%Y-%m-%d} cloud {cloud}"
-                        )
+                        line = f"  {src.source} {scene.id} {scene.datetime:%Y-%m-%d} cloud {cloud}"
+                        index_id = indexed.index_id(src.source, scene.id) if indexed else None
+                        lines.append(f"{line} {index_id}" if index_id else line)
 
+                lines.extend(_index_lines(indexed, store))
                 return ToolResult(
                     text="\n".join(lines)
                 )  # return the search results as a ToolResult object
@@ -301,6 +315,8 @@ class GetDataTool(Tool):
                 if close is not None:  # if the client has an aclose method
                     await close()  # close this client's network connections
 
+        # record the scenes and the layers that were saved, chip or whole file
+        indexed = index_pull(out_dir, catalog, report, clients)
         artifacts = [
             store.relative(path) for paths in report.saved_paths().values() for path in paths
         ]
@@ -321,6 +337,14 @@ class GetDataTool(Tool):
             lines.extend(f"  {o.scene_id}: {o.error}" for o in outcomes if o.error)
 
         lines.extend(f"saved: {path}" for path in artifacts)  # list every saved file at the end
+        lines.extend(_index_lines(indexed, store))
 
         # join the lines into one string and return it with the list of saved files
         return ToolResult(text="\n".join(lines), artifacts=artifacts)
+
+
+def _index_lines(indexed: PullIndexSummary | None, store: LocalArtifactStore) -> list[str]:
+    """One line saying what the scene index recorded, with the index path workspace-relative."""
+    if indexed is None:
+        return []
+    return [indexed.describe(path=store.relative(indexed.path))]

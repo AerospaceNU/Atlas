@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from atlas.archive import (
     CARD_VERSION,
+    MAX_CARD_LAYERS,
     Availability,
     CloudStatus,
     LayerRef,
@@ -370,3 +371,51 @@ def test_layer_scale_and_offset_must_be_finite() -> None:
         LayerRef(scale=float("nan"))
     with pytest.raises(ValidationError):
         LayerRef(offset=float("inf"))
+
+
+# --- image layers and the size cap ------------------------------------------
+
+
+def test_from_scene_lists_only_image_layers_with_common_bands_first() -> None:
+    assets = {
+        "AOT": Asset(href="https://example.com/aot.tif", roles=["data"]),
+        "B08": Asset(href="https://example.com/b08.tif", roles=["data"]),
+        "B04": Asset(href="https://example.com/b04.tif", roles=["data"]),
+        "SCL": Asset(href="https://example.com/scl.tif", roles=["data", "cloud"]),
+        "granule-metadata": Asset(href="https://example.com/MTD.xml", roles=["metadata"]),
+        "tilejson": Asset(
+            href="https://example.com/tilejson", media_type="application/json", roles=["tiles"]
+        ),
+        "notes": Asset(href="https://example.com/readme.txt"),
+        "rendered_preview": Asset(href="https://example.com/p.png", roles=["overview"]),
+    }
+    c = SceneCard.from_scene(scene(assets=assets, band_aliases={"red": "B04", "nir": "B08"}))
+    assert list(c.layers) == ["B04", "B08", "AOT", "SCL"]
+    assert c.layers_omitted == 0
+
+
+def test_from_scene_caps_layers_and_keeps_requested_ones() -> None:
+    assets = {
+        f"band_{n:03d}": Asset(href=f"https://example.com/{n}.tif", roles=["data"])
+        for n in range(MAX_CARD_LAYERS + 16)
+    }
+    c = SceneCard.from_scene(
+        scene(assets=assets, band_aliases={"red": "band_030"}), keep=["band_039"]
+    )
+    assert len(c.layers) == MAX_CARD_LAYERS
+    assert c.layers_omitted == 16
+    assert list(c.layers)[:2] == ["band_030", "band_039"]
+    assert len(c.model_dump_json(exclude_none=True)) < 2048
+
+
+def test_a_card_cannot_hold_more_than_the_cap() -> None:
+    with pytest.raises(ValidationError):
+        card(layers={f"b{n}": LayerRef() for n in range(MAX_CARD_LAYERS + 1)})
+
+
+def test_missing_layer_keeps_its_locator_and_is_not_local() -> None:
+    loc = Locator(scheme="index", key="sentinel2/x.tif")
+    with pytest.raises(ValidationError, match="needs a locator"):
+        LayerRef(availability=Availability.missing)
+    gone = LayerRef(availability=Availability.missing, locator=loc, window=BOX)
+    assert not card(layers={"red": gone}).has_local_data

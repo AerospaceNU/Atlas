@@ -1,11 +1,29 @@
 from atlas.archive.card import (
     CARD_VERSION,
+    MAX_CARD_LAYERS,
     Availability,
     CloudStatus,
     LayerRef,
     Locator,
     SceneCard,
+    is_layer_asset,
     make_index_id,
+)
+from atlas.archive.index import (
+    INDEX_FILENAME,
+    IndexEntry,
+    IndexVersionError,
+    SavedLayer,
+    SceneIndex,
+    UpsertStats,
+)
+from atlas.archive.query import (
+    QueryGroup,
+    QueryResult,
+    SceneOrder,
+    SceneQuery,
+    merge_results,
+    sort_cards,
 )
 from atlas.archive.store import (
     CardLookup,
@@ -16,14 +34,28 @@ from atlas.archive.store import (
 
 __all__ = [
     "CARD_VERSION",
+    "INDEX_FILENAME",
+    "MAX_CARD_LAYERS",
     "Availability",
     "CardLookup",
     "CardStore",
     "CloudStatus",
+    "IndexEntry",
+    "IndexVersionError",
     "LayerRef",
     "Locator",
     "LookupStatus",
+    "QueryGroup",
+    "QueryResult",
+    "SavedLayer",
     "SceneCard",
+    "SceneIndex",
+    "SceneOrder",
+    "SceneQuery",
     "TTLCardStore",
+    "UpsertStats",
+    "is_layer_asset",
     "make_index_id",
+    "merge_results",
+    "sort_cards",
 ]

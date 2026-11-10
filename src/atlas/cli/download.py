@@ -24,7 +24,7 @@ from atlas.cli.preview import (
     write_file_preview,
     write_read_preview,
 )
-from atlas.data.base import Asset, BBox, DataPullClient, Scene
+from atlas.data.base import BROWSE_KEYS, Asset, BBox, DataPullClient, Scene, is_browse_asset
 from atlas.data.cog import (
     CogError,
     CogLimitError,
@@ -38,8 +38,6 @@ from atlas.data.cog import (
 )
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
-_BROWSE_KEYS = frozenset({"rendered_preview", "thumbnail", "preview", "quicklook", "browse"})
-_BROWSE_ROLES = frozenset({"thumbnail", "overview", "preview", "rendered_preview"})
 _PREFERRED_KEYS = ("visual",)
 # Roles and key fragments of quality, mask, and geometry layers. A default pick
 # skips them so an optical download is imagery, not a QA band or cloud mask.
@@ -202,6 +200,8 @@ class DownloadOutcome:
     status: str
     path: Path | None = None
     error: str | None = None
+    # Asset key of the file in ``path``, set when it was saved or skipped.
+    asset: str | None = None
     bytes_read: int | None = None
     granule_size: int | None = None
     preview: Path | None = None
@@ -237,22 +237,9 @@ UNWINDOWABLE = _Unwindowable.TOKEN
 """``_windowed_cog`` result: the asset cannot be windowed, not a failed attempt."""
 
 
-def is_browse_asset(key: str, asset: Asset) -> bool:
-    """True for STAC browse products (previews, thumbnails, JPEG overviews)."""
-    if key.lower() in _BROWSE_KEYS:
-        return True
-    roles = {role.lower() for role in asset.roles}
-    if roles & _BROWSE_ROLES:
-        return True
-    media = (asset.media_type or "").lower()
-    if media.startswith("image/jpeg") or media.startswith("image/jpg"):
-        return True
-    return media.startswith("image/png") and "data" not in roles
-
-
 def is_forbidden_asset_name(name: str) -> bool:
     """True if ``--asset`` names a browse product."""
-    return name.strip().lower() in _BROWSE_KEYS
+    return name.strip().lower() in BROWSE_KEYS
 
 
 def pick_asset(scene: Scene, name: str | None = None) -> tuple[str, Asset] | None:
@@ -424,6 +411,17 @@ def write_aoi(data_path: Path, bbox: BBox) -> None:
             encoding="utf-8",
         )
         replace_with_retry(tmp, target)
+
+
+def read_aoi(data_path: Path) -> BBox | None:
+    """The AOI a windowed chip was read for, or None for a whole-file download."""
+    marker = aoi_path(data_path)
+    if marker.is_symlink() or not marker.is_file():
+        return None
+    try:
+        return BBox.model_validate_json(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
 
 
 def same_aoi(data_path: Path, bbox: BBox) -> bool:
@@ -628,6 +626,7 @@ async def download_assets(
                             scene_id=scene.id,
                             status="skipped",
                             path=present,
+                            asset=key,
                             preview=preview,
                             preview_error=preview_error,
                         )
@@ -674,6 +673,7 @@ async def download_assets(
                             scene_id=scene.id,
                             status="skipped",
                             path=stale,
+                            asset=key,
                             preview=preview,
                             preview_error=preview_error,
                         )
@@ -779,6 +779,7 @@ async def download_assets(
                 scene_id=scene.id,
                 status="saved",
                 path=path,
+                asset=key,
                 bytes_read=bytes_read,
                 granule_size=granule_size,
                 preview=preview,
