@@ -7,6 +7,8 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
+from atlas.archive.index import record_catalog
+from atlas.archive.store import CardStore
 from atlas.compile.product import SceneCatalog, SourceScenes
 from atlas.data.base import DataPullClient, PullRequest, PullResult, Scene
 from atlas.data.credentials import CredentialRejectedError, MissingCredentialError
@@ -287,11 +289,15 @@ async def aggregate(
     on_source: Callable[[SourceScenes], None] | None = None,
     page_cursors: Mapping[str, str | None] | None = None,
     unavailable_cursors: Mapping[str, str] | None = None,
+    card_store: CardStore | None = None,
 ) -> SceneCatalog:
     """Search every source for `request` and collect results into one catalog.
 
     A failure in one source is captured on its `SourceScenes.error` rather than
     aborting the whole fan-out. ``on_source`` is called as each source finishes.
+    When ``card_store`` is given, a scene card is stored for every scene found.
+    A scene that cannot form a card is left out of the store and never fails
+    the search.
 
     A source that fails with HTTP 429 is retried, up to three attempts in all.
     The wait is the ``Retry-After`` header when that parses as a finite number
@@ -331,6 +337,7 @@ async def aggregate(
             at page one.
         unavailable_cursors: Per-source reason a next page exists but was not
             stored. Used when that source's cursor is absent.
+        card_store: Where to put a card for each scene found. None keeps no cards.
 
     Returns:
         Catalog of scenes, errors, and the next cursor for each source.
@@ -353,4 +360,7 @@ async def aggregate(
         return result
 
     sources = await asyncio.gather(*(run(name, client) for name, client in clients.items()))
-    return SceneCatalog(request=request, sources=list(sources))
+    catalog = SceneCatalog(request=request, sources=list(sources))
+    if card_store is not None:
+        record_catalog(card_store, catalog)
+    return catalog

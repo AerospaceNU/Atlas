@@ -7,6 +7,7 @@ from atlas.archive.card import (
     SceneCard,
     make_index_id,
 )
+from atlas.archive.index import CardBatch, SkippedScene, cards_from_catalog, record_catalog
 from atlas.archive.store import (
     CardLookup,
     CardStore,
@@ -17,6 +18,7 @@ from atlas.archive.store import (
 __all__ = [
     "CARD_VERSION",
     "Availability",
+    "CardBatch",
     "CardLookup",
     "CardStore",
     "CloudStatus",
@@ -24,6 +26,9 @@ __all__ = [
     "Locator",
     "LookupStatus",
     "SceneCard",
+    "SkippedScene",
     "TTLCardStore",
+    "cards_from_catalog",
     "make_index_id",
+    "record_catalog",
 ]
