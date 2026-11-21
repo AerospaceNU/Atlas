@@ -148,6 +148,12 @@ def _shell_argv(command: str) -> list[str]:
     return [bash, "-c", command]
 
 
+def _analysis_dir(store: LocalArtifactStore) -> Path:
+    from atlas.geo.paths import analysis_dir
+
+    return analysis_dir(store)
+
+
 def _command_env(store: LocalArtifactStore) -> dict[str, str]:
     """Environment shared by foreground and background commands."""
     return {
@@ -155,6 +161,7 @@ def _command_env(store: LocalArtifactStore) -> dict[str, str]:
         "ATLAS_PYTHON": sys.executable,
         "ATLAS_WORKSPACE": str(store.read_root or store.root),
         "ATLAS_ARTIFACT_ROOT": str(store.artifact_root),
+        "ATLAS_ANALYSIS_DIR": str(_analysis_dir(store)),
     }
 
 

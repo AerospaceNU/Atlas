@@ -212,8 +212,8 @@ def _inspect(request: InspectStackInput, store: LocalArtifactStore) -> ToolResul
             full.append({"layer": row.pop("layer"), "band": stack.layer(s.name).band or "", **row})
         spill = GeoResult(summary=[], table=full, table_name="layers", table_limit=0)
         adir = _geo.analysis_dir(store)
-        csv = spill_table(spill, adir / "tables") or csv
-        artifacts.append(store.artifact_root / csv)
+        csv = spill_table(spill, adir / "tables", base=store.root) or csv
+        artifacts.append(store.root / csv)
     result = build(final_shown, chosen_extras, csv)
     result.run_id = None
     result.artifacts = artifacts

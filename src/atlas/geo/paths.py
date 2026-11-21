@@ -1,4 +1,10 @@
-"""Where analysis products live under an artifact root."""
+"""Where analysis products live: the persistent project ``.atlas/analysis`` directory.
+
+Stacks, figures, tables, exports, scripts and ``runs.jsonl`` outlive a session. They sit
+under the workspace's ``.atlas`` root, not under the per-session artifact root, so a new
+session on the same workspace sees them by id. ``ATLAS_ANALYSIS_DIR`` overrides the
+directory for scripts; the bash tool sets it so scripts and tools share one location.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +19,7 @@ __all__ = [
     "SUBDIRS",
     "analysis_dir",
     "latest_stack_dir",
+    "legacy_analysis_dir",
     "list_stack_ids",
     "runs_path",
     "stacks_dir",
@@ -24,27 +31,43 @@ _SCRATCH_MARKERS = (".tmp-", ".old-")
 
 
 def workspace() -> Path:
-    """Return ``ATLAS_ARTIFACT_ROOT`` when set, else ``./.atlas``."""
-    env = os.environ.get("ATLAS_ARTIFACT_ROOT")
-    return Path(env).expanduser() if env else Path.cwd() / ".atlas"
+    """Return the directory that holds ``analysis/`` (the project ``.atlas`` root).
+
+    ``ATLAS_ANALYSIS_DIR`` gives its parent; else ``ATLAS_ARTIFACT_ROOT`` when set, else
+    ``./.atlas``.
+    """
+    return analysis_dir().parent
 
 
 def analysis_dir(store: LocalArtifactStore | None = None, *, ensure: bool = False) -> Path:
-    """Return ``<artifact_root>/analysis``.
+    """Return the persistent ``<workspace>/.atlas/analysis`` directory.
 
     Args:
-        store: Session store; None uses ``workspace()``.
+        store: Session store; its project root (``read_root`` or ``root``) picks the
+            workspace. None reads ``ATLAS_ANALYSIS_DIR``, then ``ATLAS_ARTIFACT_ROOT``,
+            then uses ``./.atlas``.
         ensure: Create the standard subdirectories.
 
     Returns:
         The analysis directory.
     """
-    root = store.artifact_root if store is not None else workspace()
-    adir = root / "analysis"
+    if store is not None:
+        adir = (store.read_root or store.root) / ".atlas" / "analysis"
+    elif os.environ.get("ATLAS_ANALYSIS_DIR"):
+        adir = Path(os.environ["ATLAS_ANALYSIS_DIR"]).expanduser()
+    elif os.environ.get("ATLAS_ARTIFACT_ROOT"):
+        adir = Path(os.environ["ATLAS_ARTIFACT_ROOT"]).expanduser() / "analysis"
+    else:
+        adir = Path.cwd() / ".atlas" / "analysis"
     if ensure:
         for sub in SUBDIRS:
             (adir / sub).mkdir(parents=True, exist_ok=True)
     return adir
+
+
+def legacy_analysis_dir(store: LocalArtifactStore) -> Path:
+    """Return the old per-session ``<artifact_root>/analysis`` directory (read-only fallback)."""
+    return store.artifact_root / "analysis"
 
 
 def stacks_dir(adir: Path | None = None) -> Path:

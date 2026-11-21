@@ -133,7 +133,8 @@ def stacks_text(root: Path | None = None) -> str:
     """List committed stacks under ``<root>/analysis/stacks``.
 
     Args:
-        root: Artifact root; defaults to ``atlas.geo.paths.workspace()``.
+        root: Directory holding ``analysis/``; defaults to ``atlas.geo.paths.workspace()``
+            (the project ``.atlas``, or ``ATLAS_ANALYSIS_DIR``'s parent).
 
     Returns:
         One line per stack (id, LxHxW, crs, resolution, first layers), or a none message.

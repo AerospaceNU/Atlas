@@ -601,5 +601,5 @@ def test_downloads_are_not_budgeted(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert calls[0]["polygon"] is not None
     assert calls[0]["out"] == tmp_path / ".atlas" / "data"
     assert "whole_file" not in calls[0] and "allow_whole_file" not in calls[0]
-    runs = (tmp_path / "analysis" / "runs.jsonl").read_text().splitlines()
+    runs = (tmp_path / ".atlas" / "analysis" / "runs.jsonl").read_text().splitlines()
     assert json.loads(runs[0])["bytes_fetched"] == 2 * 1024 * 1024

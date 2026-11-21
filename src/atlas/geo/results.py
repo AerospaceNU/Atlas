@@ -185,15 +185,17 @@ def _csv_bytes(rows: list[dict[str, Any]]) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
-def spill_table(res: GeoResult, tables_dir: Path) -> str | None:
+def spill_table(res: GeoResult, tables_dir: Path, *, base: Path | None = None) -> str | None:
     """Save the full table as a content-addressed CSV when it exceeds the inline limit.
 
     Args:
         res: The result; ``csv_rel`` is set on it.
-        tables_dir: ``<artifact_root>/analysis/tables``.
+        tables_dir: ``<workspace>/.atlas/analysis/tables``.
+        base: Directory the returned path is relative to (the store root); default the
+            directory above ``analysis/``.
 
     Returns:
-        The CSV path relative to the artifact root, or None when nothing was spilled.
+        The CSV path relative to ``base``, or None when nothing was spilled.
     """
     if not res.table or len(res.table) <= res.limit:
         return None
@@ -204,8 +206,11 @@ def spill_table(res: GeoResult, tables_dir: Path) -> str | None:
         tmp = path.with_name(f".tmp-{hashlib.sha256(data).hexdigest()[:8]}-{id(res)}.csv")
         tmp.write_bytes(data)
         tmp.replace(path)
-    root = tables_dir.parent.parent
-    res.csv_rel = path.relative_to(root).as_posix()
+    root = base if base is not None else tables_dir.parent.parent
+    try:
+        res.csv_rel = path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        res.csv_rel = path.as_posix()
     return res.csv_rel
 
 
