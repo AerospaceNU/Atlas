@@ -74,17 +74,23 @@ _DIGEST_LIMIT_CHARS = 3000
 _MAX_EMPTY_REPLY_NUDGES = 2
 _MAX_INTENT_NUDGES = 1
 _INTENT_MAX_CHARS = 400
-_INTENT_PREFIXES = (
-    "let me",
-    "let's",
-    "i'll",
-    "i will",
-    "i'm going to",
-    "i am going to",
-    "now i",
-    "next, i",
-    "next i",
+_INTENT_RE = re.compile(
+    r"^(?:(?:now|next|first|then|ok|okay|so)\b[,:]?\s+)?"
+    r"(?:let me|let's|i'll|i will|i'm going to|i am going to|i need to|i should)\s+"
+    r"(?P<verb>[a-z][a-z-]*)",
+    re.IGNORECASE,
 )
+_INTENT_VERBS = frozenset(
+    {
+        "look", "check", "read", "run", "search", "find", "fix", "edit", "update", "write",
+        "create", "add", "verify", "test", "inspect", "try", "apply", "implement", "start",
+        "continue", "review", "use", "call", "list", "explore", "install", "build", "execute",
+        "grep", "trace", "confirm", "patch", "refactor", "remove", "rename", "fetch", "analyze",
+        "compare", "open", "make", "set", "begin", "proceed", "investigate", "examine", "see",
+        "take", "go", "get", "load", "delete", "move", "replace", "re-run", "rerun",
+        "double-check", "scan", "print", "show", "locate", "validate", "debug", "commit",
+    }
+)  # fmt: skip
 _NUDGE_INTENT = (
     "You described a next step but did not call a tool. If the work is not finished, make "
     "that tool call now. If it is finished, give your final answer."
@@ -203,11 +209,12 @@ class AgentRun(BaseModel):
 
 
 def _announces_next_step(text: str) -> bool:
-    """Return whether a short text-only reply announces work instead of finishing it."""
-    stripped = text.strip()
-    if not stripped or len(stripped) > _INTENT_MAX_CHARS:
+    """Return whether a short text-only reply announces a tool action instead of finishing."""
+    stripped = text.strip().replace("\u2019", "'")
+    if not stripped or len(stripped) > _INTENT_MAX_CHARS or stripped.endswith("?"):
         return False
-    return stripped.lower().startswith(_INTENT_PREFIXES)
+    match = _INTENT_RE.match(stripped)
+    return match is not None and match.group("verb").lower() in _INTENT_VERBS
 
 
 def _load_agent_config(root: Path) -> dict[str, object]:
@@ -403,6 +410,7 @@ class Agent:
         self.redact_output: Callable[[str], str] | None = None
         self._empty_replies = 0
         self._intent_nudges = 0
+        self._intent_text = ""
 
     def system_prompt(self) -> str:
         """Return the package system prompt, plus the skill catalog when skills are loaded."""
@@ -497,6 +505,7 @@ class Agent:
         self.partial_run = None
         self._empty_replies = 0
         self._intent_nudges = 0
+        self._intent_text = ""
         run = self._advance_turn(
             messages,
             on_step=on_step,
@@ -565,6 +574,7 @@ class Agent:
             if empty:
                 self._empty_replies += 1
             elif response.tool_calls:
+                self._intent_text = ""
                 nudges = 0  # the cap counts consecutive empty replies only
             discard = empty and nudges < _MAX_EMPTY_REPLY_NUDGES
             if not discard and not empty:
@@ -613,6 +623,7 @@ class Agent:
                             calls=calls,
                             compaction=compaction,
                         )
+                    self._intent_text = response.content or ""
                     self._intent_nudges += 1
                     messages.append(
                         ChatMessage(role=Role.USER, content=_NUDGE_INTENT, tool_observation=True)
@@ -620,7 +631,7 @@ class Agent:
                     continue
                 if not response.tool_calls:
                     return AgentRun(
-                        response=response.content or "",
+                        response=response.content or self._intent_text,
                         steps=steps,
                         calls=calls,
                         compaction=compaction,
