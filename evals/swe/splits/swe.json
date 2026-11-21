@@ -1,0 +1,29 @@
+{
+  "benchmark": "swe",
+  "seed": 42,
+  "train_fraction": 0.5,
+  "train": [
+    "django__django-11638",
+    "django__django-14453",
+    "django__django-15467",
+    "django__django-17045",
+    "scikit-learn__scikit-learn-14983",
+    "sympy__sympy-12194",
+    "sympy__sympy-23950"
+  ],
+  "test": [
+    "astropy__astropy-12825",
+    "django__django-12343",
+    "django__django-13553",
+    "django__django-14071",
+    "django__django-16454",
+    "django__django-16491",
+    "matplotlib__matplotlib-24749",
+    "pydata__xarray-6857",
+    "scikit-learn__scikit-learn-13536",
+    "scikit-learn__scikit-learn-14878",
+    "sphinx-doc__sphinx-9987",
+    "sympy__sympy-14024",
+    "sympy__sympy-20691"
+  ]
+}
