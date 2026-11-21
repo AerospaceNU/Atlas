@@ -4,6 +4,8 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from atlas.agent.contracts import ChatMessage, ModelResponse, ToolCall, ToolDefinition
 from atlas.agent.trace import read_trace
 from atlas.harness_eval.headless import render_trajectory, run_headless
@@ -188,7 +190,10 @@ def test_reasoning_effort_reaches_container_command_and_meta(tmp_path: Path) -> 
     assert _meta(result, "low")["reasoning_effort"] == "low"
 
 
-def test_coding_profile_drops_satellite_model_and_web_tools() -> None:
+def test_coding_profile_drops_satellite_model_and_web_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATLAS_HEURISTIC_MODELS", "1")
     from atlas.harness_eval.headless import NON_CODING_TOOLS, profile_registry
 
     full = profile_registry("full")
