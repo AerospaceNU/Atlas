@@ -46,6 +46,38 @@ impl Compaction {
     }
 }
 
+/// One replayed transcript item of a resumed session.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct ReplayItem {
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub summary: String,
+}
+
+/// One saved session in a `sessions` listing.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct SessionInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub saved: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub messages: i64,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub interrupted: bool,
+    #[serde(default)]
+    pub stopped_for_limit: bool,
+}
+
 /// A single server -> client message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerMessage {
@@ -118,6 +150,22 @@ pub enum ServerMessage {
         scope: String,
         kind: String,
         names: Vec<String>,
+        sessions: Vec<SessionInfo>,
+    },
+    SessionLoaded {
+        id: String,
+        goal: String,
+        messages: i64,
+        saved_model: String,
+        stopped_for_limit: bool,
+        interrupted: bool,
+        replay: Vec<ReplayItem>,
+        omitted: i64,
+        status: StatusSnapshot,
+    },
+    Undo {
+        restored: Option<String>,
+        message: String,
     },
     Removed {
         scope: String,
@@ -365,6 +413,36 @@ enum RawMessage {
         kind: String,
         #[serde(default)]
         names: Vec<String>,
+        #[serde(default)]
+        sessions: Vec<SessionInfo>,
+    },
+    #[serde(rename = "session_loaded")]
+    SessionLoaded {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        goal: String,
+        #[serde(default)]
+        messages: i64,
+        #[serde(default)]
+        saved_model: String,
+        #[serde(default)]
+        stopped_for_limit: bool,
+        #[serde(default)]
+        interrupted: bool,
+        #[serde(default)]
+        replay: Vec<ReplayItem>,
+        #[serde(default)]
+        omitted: i64,
+        #[serde(flatten)]
+        status: StatusSnapshot,
+    },
+    #[serde(rename = "undo")]
+    Undo {
+        #[serde(default)]
+        restored: Option<String>,
+        #[serde(default)]
+        message: String,
     },
     #[serde(rename = "phase")]
     Phase {
@@ -582,9 +660,39 @@ impl From<RawMessage> for ServerMessage {
                 warning,
                 name,
             },
-            RawMessage::Listing { scope, kind, names } => {
-                ServerMessage::Listing { scope, kind, names }
-            }
+            RawMessage::Listing {
+                scope,
+                kind,
+                names,
+                sessions,
+            } => ServerMessage::Listing {
+                scope,
+                kind,
+                names,
+                sessions,
+            },
+            RawMessage::SessionLoaded {
+                id,
+                goal,
+                messages,
+                saved_model,
+                stopped_for_limit,
+                interrupted,
+                replay,
+                omitted,
+                status,
+            } => ServerMessage::SessionLoaded {
+                id,
+                goal,
+                messages,
+                saved_model,
+                stopped_for_limit,
+                interrupted,
+                replay,
+                omitted,
+                status,
+            },
+            RawMessage::Undo { restored, message } => ServerMessage::Undo { restored, message },
             RawMessage::Removed { scope, kind, name } => {
                 ServerMessage::Removed { scope, kind, name }
             }

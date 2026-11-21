@@ -60,12 +60,18 @@ const TICK: Duration = Duration::from_millis(50);
 
 struct Config {
     workspace: PathBuf,
-    repo: PathBuf,
+    repo: Option<PathBuf>,
+    python: Option<PathBuf>,
+    resume: Option<String>,
 }
 
 fn parse_args() -> Result<Config> {
     let mut workspace: Option<PathBuf> = None;
     let mut repo: Option<PathBuf> = None;
+    let mut python: Option<PathBuf> = std::env::var_os("ATLAS_PYTHON")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let mut resume: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -80,8 +86,20 @@ fn parse_args() -> Result<Config> {
                 let value = args.next().ok_or_else(|| anyhow!("--repo needs a path"))?;
                 repo = Some(PathBuf::from(value));
             }
+            "--python" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--python needs a path"))?;
+                python = Some(PathBuf::from(value));
+            }
+            "--resume" => {
+                let value = args.next().ok_or_else(|| anyhow!("--resume needs an id"))?;
+                resume = Some(value);
+            }
             "--help" | "-h" => {
-                println!("usage: atlas-tui [--workspace PATH] [--repo PATH]");
+                println!(
+                    "usage: atlas-tui [--workspace PATH] [--repo PATH] [--python PATH] [--resume ID]"
+                );
                 std::process::exit(0);
             }
             other => return Err(anyhow!("unknown argument: {other}")),
@@ -92,13 +110,22 @@ fn parse_args() -> Result<Config> {
     let workspace = workspace.unwrap_or_else(|| cwd.clone());
     let workspace = workspace.canonicalize().unwrap_or(workspace).to_path_buf();
 
-    let repo = match repo {
-        Some(path) => path,
-        None => find_repo_root(&cwd)
-            .ok_or_else(|| anyhow!("could not find the Atlas repo root; pass --repo PATH"))?,
+    let repo = match (repo, &python) {
+        (Some(path), _) => Some(path),
+        (None, Some(_)) => None,
+        (None, None) => Some(find_repo_root(&cwd).ok_or_else(|| {
+            anyhow!(
+                "could not find the Atlas repo root; pass --repo PATH or --python PATH (or set ATLAS_PYTHON)"
+            )
+        })?),
     };
 
-    Ok(Config { workspace, repo })
+    Ok(Config {
+        workspace,
+        repo,
+        python,
+        resume,
+    })
 }
 
 fn find_repo_root(start: &Path) -> Option<PathBuf> {
@@ -120,24 +147,35 @@ struct ChildProcess {
 
 impl ChildProcess {
     fn spawn(config: &Config) -> Result<Self> {
-        let mut child = Command::new("uv")
-            .args([
-                "run",
-                "python",
-                "-m",
-                "atlas.agent",
-                "--approval",
-                "ask",
-                "--workspace",
-            ])
+        let (mut command, program) = match (&config.python, &config.repo) {
+            (Some(python), _) => {
+                let mut command = Command::new(python);
+                command.args(["-P", "-m", "atlas.agent"]);
+                (command, format!("{} -P -m atlas.agent", python.display()))
+            }
+            (None, Some(_)) => {
+                let mut command = Command::new("uv");
+                command.args(["run", "python", "-m", "atlas.agent"]);
+                (command, "uv run python -m atlas.agent".to_string())
+            }
+            (None, None) => {
+                return Err(anyhow!("no Atlas repo or python interpreter configured"));
+            }
+        };
+        command.args(["--approval", "ask"]);
+        if let Some(id) = &config.resume {
+            command.args(["--resume", id]);
+        }
+        let mut child = command
+            .arg("--workspace")
             .arg(&config.workspace)
-            .current_dir(&config.repo)
+            .current_dir(config.repo.as_ref().unwrap_or(&config.workspace))
             .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("failed to start `uv run python -m atlas.agent`")?;
+            .with_context(|| format!("failed to start `{program}`"))?;
 
         let stdin = child
             .stdin
@@ -688,7 +726,19 @@ impl App {
                     self.transcript.push(tool_note(warning));
                 }
             }
-            ServerMessage::Listing { scope, kind, names } => {
+            ServerMessage::Listing {
+                scope,
+                kind,
+                names,
+                sessions,
+            } => {
+                if kind == "sessions" && !sessions.is_empty() {
+                    self.session_names = sessions.iter().map(|s| s.id.clone()).collect();
+                    for info in &sessions {
+                        self.transcript.push(tool_note(session_row(info)));
+                    }
+                    return;
+                }
                 if kind == "sessions" {
                     self.session_names = names.clone();
                 }
@@ -790,6 +840,65 @@ impl App {
                     note.push_str(&format!(". {catalog}"));
                 }
                 self.transcript.push(tool_note(note));
+            }
+            ServerMessage::SessionLoaded {
+                id,
+                messages,
+                saved_model,
+                stopped_for_limit,
+                interrupted,
+                replay,
+                omitted,
+                status,
+                ..
+            } => {
+                finish_streams(self);
+                self.transcript.clear();
+                if omitted > 0 {
+                    self.transcript
+                        .push(tool_note(format!("{omitted} earlier items not shown")));
+                }
+                for item in replay {
+                    match item.role.as_str() {
+                        "user" => self.transcript.push(TranscriptLine::User(item.text)),
+                        "assistant" => self
+                            .transcript
+                            .push(TranscriptLine::Assistant(StreamText::settled(item.text))),
+                        _ => self
+                            .transcript
+                            .push(tool_note(format!("{} - {}", item.name, item.summary))),
+                    }
+                }
+                let model = if saved_model.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({saved_model})")
+                };
+                self.transcript.push(tool_note(format!(
+                    "resumed {id}: {messages} messages{model}"
+                )));
+                self.adopt_status(&status);
+                self.status_notice = None;
+                self.pending_permission = None;
+                self.activity = None;
+                self.waiting_from_stopped = false;
+                self.status = if stopped_for_limit || interrupted {
+                    Status::Stopped
+                } else {
+                    Status::Ready
+                };
+                self.follow = true;
+            }
+            ServerMessage::Undo { restored, message } => {
+                let note = match restored {
+                    Some(path) => format!("restored {path}"),
+                    None if message.is_empty() => "no checkpoint to restore".to_string(),
+                    None => message,
+                };
+                self.transcript.push(tool_note(note));
+                self.status = Status::Ready;
+                self.activity = None;
+                self.waiting_from_stopped = false;
             }
             ServerMessage::Unknown => {}
         }
@@ -1999,22 +2108,13 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
             }
         }
         "/resume" => {
-            let id = text.trim().trim_start_matches("/resume").trim();
-            if id.is_empty() {
-                match app.session_names.last().cloned() {
-                    Some(newest) => {
-                        app.transcript.clear();
-                        app.status = Status::Waiting;
-                        Some(serde_json::json!({"type": "load_session", "id": newest}))
-                    }
-                    None => {
-                        app.transcript
-                            .push(tool_note("/resume needs an id; run /sessions first"));
-                        None
-                    }
-                }
+            let rest: Vec<&str> = text.split_whitespace().skip(1).collect();
+            if rest.len() > 1 {
+                app.transcript.push(tool_note("usage: /resume [ID]"));
+                None
             } else {
-                app.transcript.clear();
+                let id = rest.first().copied().unwrap_or("last");
+                app.waiting_from_stopped = app.status == Status::Stopped;
                 app.status = Status::Waiting;
                 Some(serde_json::json!({"type": "load_session", "id": id}))
             }
@@ -2186,7 +2286,7 @@ fn key_command(
 
 const PICKER_PAGE: usize = 8;
 /// Slash commands stay on one page so a new command is not clipped off `/`.
-const MENU_PAGE: usize = 15;
+const MENU_PAGE: usize = 17;
 
 /// Transcript note for a turn that stopped because the request cannot fit.
 const CONTEXT_STOP_NOTE: &str =
@@ -2212,7 +2312,7 @@ struct MenuItem {
 }
 
 /// Slash commands offered in the menu and the help panel.
-const COMMANDS: [MenuItem; 15] = [
+const COMMANDS: [MenuItem; 17] = [
     MenuItem {
         token: "/new",
         description: "Start a fresh conversation",
@@ -2252,6 +2352,14 @@ const COMMANDS: [MenuItem; 15] = [
     MenuItem {
         token: "/sessions",
         description: "List sessions",
+    },
+    MenuItem {
+        token: "/resume",
+        description: "Restore a saved conversation (default: newest)",
+    },
+    MenuItem {
+        token: "/undo",
+        description: "Restore the newest edited file",
     },
     MenuItem {
         token: "/artifacts",
@@ -2468,17 +2576,42 @@ fn confirmed_sha256(app: &App, name: &str, sha8: &str) -> String {
     sha8.to_string()
 }
 
+fn session_row(info: &protocol::SessionInfo) -> String {
+    let prompt: String = info.prompt.chars().take(60).collect();
+    let mut row = format!(
+        "{}  {}  {}  {} msgs  {}",
+        info.id, info.saved, info.model, info.messages, prompt
+    );
+    if info.interrupted {
+        row.push_str(" [interrupted]");
+    }
+    if info.stopped_for_limit {
+        row.push_str(" [limit]");
+    }
+    row
+}
+
 fn is_finished_command(text: &str) -> bool {
     let trimmed = text.trim_end();
     if matches!(
         trimmed,
-        "/new" | "/compact" | "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy" | "/yolo"
+        "/new"
+            | "/compact"
+            | "/sessions"
+            | "/artifacts"
+            | "/quit"
+            | "/exit"
+            | "/copy"
+            | "/yolo"
+            | "/undo"
+            | "/resume"
     ) {
         return true;
     }
     let mut words = trimmed.split_whitespace();
     let command = words.next().unwrap_or("");
     match command {
+        "/resume" => words.next().is_some() && words.next().is_none(),
         "/goal" => goal_argument(trimmed).is_some(),
         "/skill" => words.next().is_some(),
         "/save-skill" => words.next().is_some() && words.next().is_none(),
@@ -2695,7 +2828,10 @@ fn help_lines(app: &App) -> Vec<String> {
         ("← / →", "select and expand a tool row"),
         ("PgUp / PgDn", "scroll the transcript"),
         ("Esc", "stop the turn, or close this panel"),
-        ("Ctrl+R", "resume the newest session"),
+        (
+            "Ctrl+R",
+            "resume after a tool-limit stop or interrupted turn",
+        ),
         ("Ctrl+C", "copy a selection, or quit"),
         ("/", "open the command menu"),
     ];
@@ -4231,6 +4367,8 @@ mod tests {
                 "/key",
                 "/skill",
                 "/sessions",
+                "/resume",
+                "/undo",
                 "/artifacts",
                 "/quit",
                 "/exit",
