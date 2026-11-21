@@ -48,6 +48,64 @@ guidance that is followed where it does not conflict with the system prompt.
 It is the only honored filename; nested instruction files are ignored, and no
 file can change tools or the system rules.
 
+### Extras
+
+Satellite analysis needs optional extras; the default suite needs neither:
+
+```bash
+uv sync --extra geo --extra onnx   # rasterio + pyproj; onnxruntime
+```
+
+Intel macOS resolves an older onnxruntime.
+
+## Satellite analysis
+
+The agent pulls scenes with `get_satellite_data`, builds one analysis-ready
+stack with `prepare_stack`, and works on it with typed tools:
+`inspect_stack`, `band_math`, `classify`, `change_detect`, `area_table`,
+`composite`, `time_series`, `render_map`, `export_geotiff`, and
+`satellite_guide`. Model tools (`cloud_mask`, `burn_severity`, `water_extent`,
+`sar_flood`) run only on prepared stacks. Results and figures go under
+`analysis/` in the artifact root; each call appends to `analysis/runs.jsonl`.
+`atlas geo guide TOPIC` prints the agent's guide. Details:
+[docs/satellite-analysis.md](docs/satellite-analysis.md).
+
+### Models
+
+```bash
+atlas models list
+atlas models info NAME
+atlas models pull NAME [--from PATH | --url URL] [--accept-license]
+atlas models verify
+```
+
+Pull is human-run; no agent tool downloads weights. Exit codes: 0 ok, 3
+checksum mismatch, 4 network, 5 unpublished. `cloud_mask` is unpublished until
+the owner publishes its weight; install a local file with `--from`. The
+heuristic RGB tools need `ATLAS_HEURISTIC_MODELS=1`.
+
+## Headless runs
+
+```bash
+atlas run "prompt" --workspace PATH [--approval allow] [--output json]
+```
+
+Flags: `--prompt-file`, `--model`, `--max-tool-calls`, `--max-spend-usd`,
+`--timeout`, `--resume ID|last`, `--quiet`, `--trace FILE`. Exit codes: 0 ok,
+1 error, 2 usage, 3 tool-call limit, 4 spend budget, 5 context stop, 6
+cancelled or timed out, 7 not configured. Approval defaults to deny, so edits
+and commands are refused. `--output json` prints schema 1.
+
+In the TUI, `--resume` / Ctrl+R / `/resume` reopen a saved session and `/undo`
+reverts the last edits.
+
+### Foreign repositories
+
+Atlas creates `.atlas/.gitignore` in a workspace so its state stays out of git.
+A repo's `AGENTS.md` and `.atlas/skills` are untrusted. The TUI asks before
+edits; `atlas run` denies them unless `--approval allow`. There is no sandbox.
+POSIX or WSL2 only.
+
 ## Layout
 
 Project files live in `.atlas/` in the working directory (`sessions/`,

@@ -77,7 +77,9 @@ class SpectralIndicesTool(Tool):
     """Compute spectral indices from surface-reflectance arrays in the workspace."""
 
     name = "spectral_indices"
+    domain: ClassVar[str] = "satellite"
     description = (
+        "Legacy NDVI/NDWI/NBR on .npy arrays; for stacks use band_math (index=...). "
         "Compute NDVI, McFeeters NDWI (ndwi_mcfeeters), and NBR from surface "
         "reflectance .npy arrays once red and NIR are available. Optional scale "
         "and offset convert digital numbers (reflectance = stored * scale + offset). "
