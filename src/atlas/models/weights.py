@@ -74,7 +74,7 @@ class WeightNetworkError(WeightError):
 
 
 class WeightUnpublished(WeightError):
-    """No pin or no source is published for these weights (exit 5)."""
+    """No pin, or no URL and no local file given, for these weights (exit 5)."""
 
     exit_code = 5
 
@@ -84,12 +84,14 @@ class WeightState:
     """Install state of one model's weights.
 
     Attributes:
-        status: ready, missing, corrupt or unpublished.
+        status: ready, missing, corrupt, local or unpublished. ``local`` means the manifest has
+            a pin but no public URL, so the weight is installed from a file with --from PATH;
+            ``unpublished`` means the manifest has no pin at all.
         path: Expected file location (None when the model has no weights).
         detail: Human-readable reason.
     """
 
-    status: Literal["ready", "missing", "corrupt", "unpublished"]
+    status: Literal["ready", "missing", "corrupt", "local", "unpublished"]
     path: Path | None
     detail: str = ""
 
@@ -177,7 +179,7 @@ def _inspect(manifest: ModelManifest, *, rehash: bool) -> WeightState:
         return WeightState("unpublished", path, "no sha256 pin")
     if not path.is_file():
         if not spec.url:
-            return WeightState("unpublished", path, "no url; use --from PATH")
+            return WeightState("local", path, "local weight: not installed; use --from PATH")
         return WeightState("missing", path, "not installed")
     size = path.stat().st_size
     if spec.size_bytes and size != spec.size_bytes:
@@ -316,14 +318,17 @@ def pull(
     if spec is None:
         raise WeightUsageError(f"{manifest.name} has no weights to pull")
     if not spec.sha256:
-        raise WeightUnpublished(f"{manifest.name} is not published: no sha256 pin")
+        raise WeightUnpublished(f"{manifest.name} has no sha256 pin")
     target = weight_path(manifest)
     if src is None and url is None and status(manifest).status == "ready":
         print(f"{manifest.name} already installed at {target}")
         return target
     source = url or spec.url
     if src is None and not source:
-        raise WeightUnpublished(f"{manifest.name} is not published; use --from PATH")
+        raise WeightUnpublished(
+            f"{manifest.name} is a local weight with no URL: "
+            f"atlas models pull {manifest.name} --from PATH"
+        )
     _licence_gate(manifest, accept_license)
     cap = _size_cap(spec.size_bytes)
     part = target.parent / f"{target.name}.part-{os.getpid()}"

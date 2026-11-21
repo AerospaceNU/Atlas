@@ -53,11 +53,14 @@ def _find(name: str) -> ModelManifest | None:
 
 def _state_note(manifest: ModelManifest, state: weights.WeightState) -> str:
     if state.status == "ready":
-        return "ready"
+        return "installed (verified)"
     if state.status == "missing":
         return f"missing: {_PULL_HINT.format(name=manifest.name)}"
+    if state.status == "local":
+        hint = _PULL_HINT.format(name=manifest.name)
+        return f"local weight: not installed; install: {hint} --from PATH --accept-license"
     if state.status == "unpublished":
-        return "not published; use --from PATH"
+        return "no sha256 pin; cannot install"
     return f"corrupt: {_PULL_HINT.format(name=manifest.name)} --from PATH"
 
 
@@ -136,13 +139,13 @@ def _verify(args: argparse.Namespace) -> int:
         print(f"{manifest.name}  {state.status}  {state.detail}")
     if "corrupt" in states:
         return 3
-    if any(s in ("missing", "unpublished") for s in states):
+    if any(s in ("missing", "local", "unpublished") for s in states):
         return 5
     return 0
 
 
 def run_models(args: argparse.Namespace) -> int:
-    """Run ``atlas models``; returns 0 ok, 2 usage, 3 mismatch, 4 network, 5 unpublished."""
+    """Run ``atlas models``; returns 0 ok, 2 usage, 3 mismatch, 4 network, 5 not installed."""
     handlers = {"list": _list, "info": _info, "pull": _pull, "verify": _verify}
     handler = handlers.get(getattr(args, "models_cmd", None) or "")
     if handler is None:

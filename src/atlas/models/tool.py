@@ -49,7 +49,7 @@ def _weights_module() -> Any | None:
 
 
 def weights_state(manifest: ModelManifest) -> str:
-    """Return `none` (no weights), or the weight store status ready|missing|corrupt|unpublished.
+    """Return `none` (no weights), or the weight store status ready|missing|corrupt|local|unpublished.
 
     The weight store (`atlas.models.weights`) decides; when it is unavailable the weights
     count as missing, so a learned model stays hidden rather than run unverified.
