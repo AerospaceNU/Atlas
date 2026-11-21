@@ -13,7 +13,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -132,12 +132,9 @@ SIGN_WAIT_CAP_SECONDS = 16.0
 # success, so a killed run never leaves a truncated file at the final name.
 PARTIAL_PREFIX = "."
 PARTIAL_SUFFIX = ".part"
-# Agent-facing limits: one window per asset is capped at 36 megapixels, a whole
-# file larger than 200 MB needs an explicit opt-in, and a whole-file fallback for
-# a window that failed transiently is abandoned after 64 MiB.
+# Memory guard: one window per asset is capped at 36 megapixels (decoded in memory).
+# There is no download size limit.
 WINDOW_MAX_PIXELS = 36_000_000
-WHOLE_FILE_CAP_BYTES = 200_000_000
-WINDOW_INTENDED_ABORT_BYTES = 64 * 1024 * 1024
 _CHIP_TILE = 512
 _SIDECAR_PROPERTIES = ("eo:cloud_cover", "s2:processing_baseline", "earthsearch:boa_offset_applied")
 _SIDECAR_PROPERTY_PREFIXES = ("sat:", "sar:")
@@ -161,14 +158,6 @@ class BrowseAssetError(ValueError):
 
 class DownloadStallError(OSError):
     """Raised when a whole-file GET stops making progress."""
-
-
-class _WholeFileAbort(OSError):
-    """A whole-file fallback for an intended window passed the abort size."""
-
-
-class _WholeFileRefused(Exception):
-    """A whole-file fetch was refused for size; carries the final error text."""
 
 
 class _Stop(Exception):
@@ -568,8 +557,6 @@ async def download_assets(
     attempts: int = GET_ATTEMPTS,
     retry_backoff: float = RETRY_BACKOFF_SECONDS,
     asset_names: Sequence[str] | None = None,
-    whole_file: Literal["allow", "size_limited"] = "allow",
-    allow_whole_file: bool = False,
     max_pixels: int | None = None,
     deadline_seconds: float | None = None,
     polygon: Sequence[Sequence[float]] | None = None,
@@ -623,12 +610,8 @@ async def download_assets(
     calibration, and the AOI ``polygon``. A chip is reused only when its AOI marker
     and sidecar polygon match the request.
 
-    ``whole_file="allow"`` keeps the CLI behaviour. ``"size_limited"`` refuses a
-    whole-file GET for an asset that cannot be windowed when its size is known to
-    exceed ``WHOLE_FILE_CAP_BYTES`` (or turns out to, from Content-Length) unless
-    ``allow_whole_file``, and abandons the whole-file fallback for a transient
-    window failure after ``WINDOW_INTENDED_ABORT_BYTES``. ``max_pixels`` caps one
-    window. ``deadline_seconds`` is a wall-clock cap; user cancellation
+    There is no size limit: an asset that cannot be windowed is fetched whole. ``max_pixels``
+    caps one window as a memory guard. ``deadline_seconds`` is a wall-clock cap; user cancellation
     (``atlas.geo._lazy.check_cancel``) and the cap record ``cancelled`` or ``timeout``
     for work not finished, delete partial files, and keep finished outputs. The
     caller must run this coroutine in the thread that holds the cancel scope.
@@ -823,10 +806,6 @@ async def download_assets(
                     return
                 else:
                     reason = "; ".join(why) or "window not read"
-                    limit_check = _WholeFilePolicy.for_download(
-                        whole_file, allow_whole_file, window, windowed is UNWINDOWABLE, asset
-                    )
-                    limit_check.pre_check(key, reason)
                     total_attempts = max(1, attempts)
                     written = 0
                     for attempt in range(1, total_attempts + 1):
@@ -842,7 +821,6 @@ async def download_assets(
                                 await asyncio.sleep(delay)
                                 continue
                             response.raise_for_status()
-                            limit_check.check_headers(response, key, reason)
                             suffix = asset_suffix(asset, response.headers.get("content-type"))
                             final = dest_dir / scene_filename(scene.id, key, suffix)
                             partial = partial_path(final)
@@ -854,7 +832,6 @@ async def download_assets(
                                 ):
                                     checkpoint()
                                     written += len(chunk)
-                                    limit_check.check_written(written, key, reason)
                                     handle.write(chunk)
                             path = _commit_partial(partial, final)
                             clear_aoi(path)
@@ -889,11 +866,6 @@ async def download_assets(
             _unlink_partial(path, stale)
             _unlink_file(partial)
             await record(make("failed", error=_limit_error(exc, max_pixels)))
-            return
-        except (_WholeFileRefused, _WholeFileAbort) as exc:
-            _unlink_partial(path, stale)
-            _unlink_file(partial)
-            await record(make("failed", error=str(exc), windowed=False))
             return
         except BrowseAssetError as exc:
             _unlink_file(partial)
@@ -1308,62 +1280,6 @@ def _limit_error(exc: BaseException, max_pixels: int | None) -> str:
     if max_pixels is None or "Fix:" in text or not isinstance(exc, CogLimitError):
         return text
     return f"{text}. Fix: shrink the AOI (limit {max_pixels / 1e6:g} megapixels per asset)"
-
-
-@dataclass(frozen=True)
-class _WholeFilePolicy:
-    """Size rules for a whole-file GET when a window was intended."""
-
-    known_size: int | None = None
-    refuse_over: int | None = None
-    abort_over: int | None = None
-
-    @classmethod
-    def for_download(
-        cls,
-        mode: str,
-        allow: bool,
-        window: bool,
-        unwindowable: bool,
-        asset: Asset,
-    ) -> _WholeFilePolicy:
-        if mode != "size_limited" or not window:
-            return cls()
-        if not unwindowable:
-            return cls(abort_over=WINDOW_INTENDED_ABORT_BYTES)
-        if allow:
-            return cls()
-        size = asset.size_bytes
-        if size is None:
-            return cls(refuse_over=WHOLE_FILE_CAP_BYTES)
-        return cls(known_size=size if size > WHOLE_FILE_CAP_BYTES else None)
-
-    def pre_check(self, key: str, reason: str) -> None:
-        if self.known_size is not None:
-            raise _WholeFileRefused(_refusal(key, reason, f"{self.known_size / 1e6:.0f} MB"))
-
-    def check_headers(self, response: httpx.Response, key: str, reason: str) -> None:
-        if self.refuse_over is None:
-            return
-        header = response.headers.get("content-length", "")
-        if header.isdigit() and int(header) > self.refuse_over:
-            raise _WholeFileRefused(_refusal(key, reason, f"{int(header) / 1e6:.0f} MB"))
-
-    def check_written(self, written: int, key: str, reason: str) -> None:
-        if self.refuse_over is not None and written > self.refuse_over:
-            raise _WholeFileRefused(_refusal(key, reason, f"over {self.refuse_over / 1e6:.0f} MB"))
-        if self.abort_over is not None and written > self.abort_over:
-            raise _WholeFileAbort(
-                f"window read failed ({reason}); whole-file fetch aborted at "
-                f"{self.abort_over // (1024 * 1024)} MiB"
-            )
-
-
-def _refusal(key: str, reason: str, size: str) -> str:
-    return (
-        f"{key} cannot be windowed ({reason}) and is {size}; whole-file fetch skipped. "
-        "Fix: allow_whole_file=true, or choose another asset"
-    )
 
 
 async def _windowed_cog(

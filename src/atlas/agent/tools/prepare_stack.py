@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.contracts import Tool, ToolDefinition, ToolResult
 
 if TYPE_CHECKING:
     from atlas.geo.prepare import PrepareReport
@@ -136,9 +136,9 @@ class PrepareStackTool(Tool):
     description = (
         "Build an analysis-ready stack once: reflectance/dB layers on one grid, one layer per "
         "date (red@YYYYMMDD), QA planes from scl/qa chips, optional AOI. Run after "
-        "get_satellite_data download. Reuses an identical stack. files=[{path,name:'dem',"
-        "unit:'m',scale,offset,nodata,categorical}] adds rasters without a sidecar (integer "
-        "rasters need scale)."
+        "get_satellite_data download. Reuses an identical stack. files=[{path,name,band,unit,scale,"
+        "offset,nodata,datetime,categorical}] adds rasters without a sidecar (integer rasters "
+        "need scale)."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     domain: ClassVar[str] = "satellite"
@@ -146,6 +146,16 @@ class PrepareStackTool(Tool):
     @property
     def input_model(self) -> type[BaseModel]:
         return PrepareStackInput
+
+    def definition(self) -> ToolDefinition:
+        """Return the advertised schema with the file spec inlined as a plain object."""
+        base = super().definition()
+        schema = dict(base.parameters)
+        schema.pop("$defs", None)
+        props = {k: dict(v) for k, v in schema["properties"].items()}
+        props["files"]["items"] = {"type": "object"}
+        schema["properties"] = props
+        return ToolDefinition(name=base.name, description=base.description, parameters=schema)
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         from atlas.agent.tools import _geo
