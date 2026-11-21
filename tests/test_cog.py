@@ -194,8 +194,10 @@ def build_cog(
                     source[:, row0:row1, col0:col1], 0, -1
                 )
                 if predictor_code == 2:
-                    for col in range(block.shape[1] - 1, 0, -1):
-                        block[:, col, :] -= block[:, col - 1, :]
+                    # Float tiles are differenced as 32-bit words, as libtiff does.
+                    target = block.view(f"{endian}u4") if block.dtype.kind == "f" else block
+                    for col in range(target.shape[1] - 1, 0, -1):
+                        target[:, col, :] -= target[:, col - 1, :]
                 if predictor_code == 3:
                     raw = _float_predictor_rows(block)
                 else:
@@ -1883,7 +1885,6 @@ async def test_uncompressed_float32_window() -> None:
 @pytest.mark.parametrize(
     ("pixels", "predictor", "message"),
     [
-        (_float_grid(), 2, "predictor 2 on SampleFormat 3"),
         (_signed_grid(), 3, "predictor 3 on SampleFormat 2"),
         (np.zeros((1, 4, 4), dtype=np.int32), 1, "32-bit samples of SampleFormat 2"),
         (np.zeros((1, 4, 4), dtype=np.float64), 1, "64-bit samples of SampleFormat 3"),
