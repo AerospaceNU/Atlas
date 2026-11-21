@@ -1,0 +1,79 @@
+schema = 2
+name = "water_extent"
+description = "Open-water mask from the modified normalised difference water index, MNDWI = (green - swir16) / (green + swir16), on one prepared date. Threshold 0.0 by default. Baseline rule pack: verify against imagery."
+version = "0.1.0"
+tier = "baseline"
+status = "rule_based"
+task = "water_extent"
+
+[license]
+spdx = "MIT"
+holder = "Atlas contributors"
+
+[citation]
+text = "Xu, H. (2006). Modification of normalised difference water index (NDWI) to enhance open water features in remotely sensed imagery. International Journal of Remote Sensing 27(14), 3025-3033."
+doi = "10.1080/01431160600589179"
+
+[input]
+mode = "single"
+sensors = ["sentinel2", "landsat8", "landsat9", "hls_sentinel", "hls_landsat"]
+bands = ["green", "swir16"]
+unit = "reflectance"
+resolution_m = [10, 60]
+min_size = 16
+max_nodata_fraction = 0.5
+
+[input.band_sources.sentinel2]
+swir16 = "B11"
+
+[input.band_sources.landsat8]
+swir16 = "SR_B6"
+
+[input.band_sources.landsat9]
+swir16 = "SR_B6"
+
+[input.band_sources.hls_sentinel]
+swir16 = "B11"
+
+[input.band_sources.hls_landsat]
+swir16 = "B06"
+
+[runtime]
+kind = "rules"
+
+[runtime.rules.define]
+mndwi = "(green - swir16) / (green + swir16)"
+
+[[runtime.rules.classes]]
+code = 1
+name = "land"
+when = "mndwi <= threshold"
+
+[[runtime.rules.classes]]
+code = 2
+name = "water"
+when = "mndwi > threshold"
+
+[output]
+kind = "mask"
+layer = "water"
+
+[output.classes]
+1 = "land"
+2 = "water"
+
+[parameters.threshold]
+type = "float"
+default = 0.0
+min = -0.5
+max = 0.5
+
+[evidence]
+card = "README.md"
+known_limits = [
+  "Threshold 0.0 is a textbook default, not tuned to any scene; adjust it and check against imagery.",
+  "Cloud shadow, dark asphalt, burn scars and snow can read as water.",
+  "Turbid or vegetated water can be missed.",
+  "Mixed shoreline pixels at 20 m resolution are classified by their blend, not their majority cover.",
+  "No split between permanent and seasonal water; one date gives one extent.",
+]
