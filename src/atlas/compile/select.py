@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import re
+from datetime import date, datetime
+from typing import Literal
+
 from atlas.data.base import BBox, GeometryKind, LimitMode, Scene, SceneKind
 
 _CLOUD_KINDS = frozenset({SceneKind.optical, SceneKind.browse})
@@ -109,6 +113,136 @@ def select(
     if limit is None:
         return sort_clearest(chosen)
     return pick_my_mode(sorted(chosen, key=lambda s: s.datetime), limit, limit_mode)
+
+
+Period = Literal["month", "season", "year"]
+SelectMode = Literal["clearest", "newest", "oldest", "even", "per_month", "per_period"]
+
+_STATE_WORDS = {
+    "asc": "ascending",
+    "ascending": "ascending",
+    "desc": "descending",
+    "descending": "descending",
+}
+_ORBIT_RE = re.compile(r"^(?:(\d+)(?::([a-z]+))?|([a-z]+))$")
+_NO_CLOUD_SCORE = 101.0
+
+
+def acquisition_key(scene: Scene) -> tuple[str, date]:
+    """Return the key shared by the tiles of one acquisition (platform and UTC day)."""
+    return (scene.platform, scene.datetime.date())
+
+
+def period_key(moment: datetime, period: Period) -> tuple[int, int]:
+    """Return the bucket of ``moment`` for ``period``.
+
+    Seasons are meteorological: December belongs to the winter that ends the next
+    February, so the key year is the year of that February (0 DJF, 1 MAM, 2 JJA, 3 SON).
+    """
+    if period == "month":
+        return (moment.year, moment.month)
+    if period == "year":
+        return (moment.year, 0)
+    year = moment.year + 1 if moment.month == 12 else moment.year
+    return (year, (moment.month % 12) // 3)
+
+
+def _acquisition_score(group: list[Scene]) -> float:
+    """Lower is better: mean known cloud, 101 when unknown, 0 for kinds without cloud."""
+    cloudy = [s for s in group if s.kind in _CLOUD_KINDS]
+    if not cloudy:
+        return 0.0
+    known = [s.cloud_cover for s in cloudy if s.cloud_cover is not None]
+    return sum(known) / len(known) if known else _NO_CLOUD_SCORE
+
+
+def select_per_period(scenes: list[Scene], period: Period = "month") -> list[Scene]:
+    """Keep the best acquisition of each period, with every tile of that acquisition.
+
+    Best is the lowest mean cloud cover, then the newest. SAR and other kinds
+    without cloud score 0 and are kept. Scenes of one acquisition are never split.
+
+    Args:
+        scenes: Candidate scenes, already deduplicated.
+        period: Bucket size: month, meteorological season, or year.
+
+    Returns:
+        The chosen scenes sorted by time.
+    """
+    acquisitions: dict[tuple[str, date], list[Scene]] = {}
+    for scene in scenes:
+        acquisitions.setdefault(acquisition_key(scene), []).append(scene)
+    best: dict[tuple[int, int], list[Scene]] = {}
+    best_rank: dict[tuple[int, int], tuple[float, float]] = {}
+    for group in acquisitions.values():
+        bucket = period_key(group[0].datetime, period)
+        rank = (_acquisition_score(group), -max(s.datetime.timestamp() for s in group))
+        if bucket not in best or rank < best_rank[bucket]:
+            best[bucket], best_rank[bucket] = group, rank
+    return sorted((s for g in best.values() for s in g), key=lambda s: (s.datetime, s.id))
+
+
+def select_scenes(
+    scenes: list[Scene],
+    mode: SelectMode,
+    *,
+    limit: int,
+    period: Period = "month",
+    max_cloud: float | None = None,
+) -> list[Scene]:
+    """Filter by cloud, deduplicate, then pick scenes by ``mode``.
+
+    ``per_month`` and ``per_period`` ignore ``limit``; the caller caps their total.
+    """
+    chosen = dedup(filter_cloud(scenes, max_cloud))
+    by_time = sorted(chosen, key=lambda s: (s.datetime, s.id))
+    if mode == "clearest":
+        return sort_clearest(chosen)[:limit]
+    if mode == "newest":
+        return by_time[::-1][:limit]
+    if mode == "oldest":
+        return by_time[:limit]
+    if mode == "even":
+        return pick_my_mode(by_time, limit, LimitMode.even)
+    return select_per_period(chosen, "month" if mode == "per_month" else period)
+
+
+def parse_orbit(orbit: str) -> tuple[str | None, str | None]:
+    """Parse ``8``, ``8:ascending`` or ``ascending`` into (relative orbit, state).
+
+    Raises:
+        ValueError: The text is none of those forms.
+    """
+    match = _ORBIT_RE.match(orbit.strip().lower())
+    word = (match.group(2) or match.group(3)) if match else None
+    if match is None or (word is not None and word not in _STATE_WORDS):
+        raise ValueError(
+            f"orbit {orbit!r} is not understood. Fix: use a relative orbit number, a direction "
+            "(ascending or descending), or both as 8:descending"
+        )
+    return match.group(1), _STATE_WORDS[word] if word else None
+
+
+def orbit_of(scene: Scene) -> tuple[str | None, str | None]:
+    """Return the scene's (relative orbit, orbit state) properties, None when absent."""
+    rel = scene.properties.get("sat:relative_orbit")
+    state = scene.properties.get("sat:orbit_state")
+    return (None if rel is None else str(rel), None if state is None else str(state).lower())
+
+
+def filter_orbit(scenes: list[Scene], orbit: str) -> tuple[list[Scene], list[Scene]]:
+    """Split scenes into (kept, dropped) by relative orbit and/or orbit state.
+
+    A scene missing a property the filter needs is dropped.
+    """
+    want_rel, want_state = parse_orbit(orbit)
+    kept: list[Scene] = []
+    dropped: list[Scene] = []
+    for scene in scenes:
+        rel, state = orbit_of(scene)
+        ok = (want_rel is None or rel == want_rel) and (want_state is None or state == want_state)
+        (kept if ok else dropped).append(scene)
+    return kept, dropped
 
 
 def representative_cloud(scenes: list[Scene]) -> float | None:
