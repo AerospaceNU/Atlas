@@ -43,7 +43,11 @@ class JobsTool(Tool):
         try:
             request = JobsInput.model_validate(arguments)
         except ValidationError as exc:
-            return ToolResult(text=f"invalid arguments: {exc.errors()[0].get('msg', exc)}")
+            first = exc.errors()[0]
+            where = ".".join(str(part) for part in first.get("loc", ()))
+            return ToolResult(
+                text=f"invalid arguments: {where}: {first.get('msg', exc)}. Fix: jobs action=list"
+            )
         owner = str(store.artifact_root)
         try:
             if request.action == "list":

@@ -303,7 +303,7 @@ class ModelTool(Tool):
         area = stack.pixel_area_m2 / 1e4
         classes: list[dict[str, Any]] = []
         for code, label in sorted(spec.classes.items()):
-            px = int(np.count_nonzero(layer == code))
+            px = int(np.count_nonzero((layer == code) & valid))
             share = 100.0 * px / valid_px if valid_px else float("nan")
             classes.append({"class": label, "px": px, "ha": px * area, "pct_valid": share})
         valid_fraction = valid_px / aoi_px if aoi_px else 0.0

@@ -40,8 +40,8 @@ class ChangeDetectTool(Tool):
     name = "change_detect"
     description = (
         "Compare a layer between two dates (multi-date stack, or stack + stack_b): "
-        "difference, ratio, log_ratio_db (need delta) or transitions. Gain/loss/stable "
-        "hectares over pixels valid in both dates."
+        "difference (post minus pre; dNBR is pre minus post), ratio, log_ratio_db (need delta) or "
+        "transitions. Gain/loss/stable hectares over pixels valid in both dates."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     domain: ClassVar[str] = "satellite"

@@ -138,7 +138,7 @@ MUTATING_TOOLS = frozenset(
 
 # Satellite tools that become mutating only for specific arguments. Approval-gated, not
 # undoable (regenerable analysis/ data).
-_PATH_WRITING_TOOLS = frozenset({"render_map", "export_geotiff"})
+_PATH_WRITING_TOOLS = frozenset({"render_map", "export_geotiff", "spectral_indices"})
 
 
 _FALSE_WORDS = frozenset({"false", "0", "no", "off", "f", "n"})
@@ -157,6 +157,9 @@ def _truthy(value: object) -> bool:
 
 
 def _writes_to_path(call: ToolCall) -> bool:
+    if call.name == "spectral_indices":
+        out = call.arguments.get("out")
+        return isinstance(out, str) and (out.startswith(("/", "~")) or ".." in out.split("/"))
     path = call.arguments.get("path")
     return call.name in _PATH_WRITING_TOOLS and isinstance(path, str) and bool(path.strip())
 
@@ -1241,7 +1244,8 @@ class Agent:
                 target = call.arguments.get("name") or call.arguments.get("path") or "?"
                 return f"replaces existing output: {target}"
             if _writes_to_path(call):
-                return f"writes outside analysis/: {call.arguments.get('path')}"
+                target = call.arguments.get("path") or call.arguments.get("out")
+                return f"writes outside analysis/: {target}"
         patch = call.arguments.get("patch")
         if isinstance(patch, str):
             return patch[:_PREVIEW_LIMIT]
@@ -1284,7 +1288,7 @@ def _summary(call: ToolCall) -> str:
             name = call.arguments.get("name")
             return f"{call.name} overwrite=true {name or path or '?'}"[:200]
         if _writes_to_path(call):
-            return f"{call.name} write {path}"
+            return f"{call.name} write {path or call.arguments.get('out')}"
     return f"{call.name} {path}" if path else call.name
 
 

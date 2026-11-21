@@ -74,6 +74,7 @@ SEMANTICS = (
     "adjacent",
     "outside_aoi",
 )
+_AOI_EXCLUDE = frozenset({"outside_aoi"})
 CLEAR_EXCLUDE = frozenset({"nodata", "saturated", "cloud", "cloud_shadow", "cirrus", "outside_aoi"})
 LAYER_KINDS = (
     "reflectance",
@@ -719,7 +720,7 @@ class Stack:
         if mask == "clear":
             return CLEAR_EXCLUDE
         if mask == "none":
-            return frozenset()
+            return _AOI_EXCLUDE
         if isinstance(mask, str):
             raise StackError(
                 fix(f"unknown mask {mask!r}.", 'use "clear", "none" or a list of semantics')
@@ -727,7 +728,7 @@ class Stack:
         unknown = [s for s in mask if s not in SEMANTICS]
         if unknown:
             raise StackError(fix(f"unknown semantics {unknown}.", f"use values of {SEMANTICS}"))
-        return frozenset(mask)
+        return frozenset(mask) | _AOI_EXCLUDE
 
     def valid(
         self,

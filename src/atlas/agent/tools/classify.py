@@ -40,7 +40,9 @@ class ClassifyTool(Tool):
     description = (
         "Classify one continuous stack layer into classes by rules, thresholds+labels, a "
         "preset (ndvi, mndwi_water, dnbr, sar_db_water) or method=otsu. Writes a categorical "
-        "stack and returns class pixels, hectares and percent of valid pixels."
+        "stack and returns class pixels, hectares and percent of valid pixels. dnbr expects "
+        "pre minus post; change_detect difference is post minus pre, so negate it (rules with "
+        "negated bounds) or use burn_severity."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     domain: ClassVar[str] = "satellite"

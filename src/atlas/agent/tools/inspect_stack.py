@@ -104,7 +104,7 @@ def _citations(stack: Any) -> str:
     for meta in stack.meta.layers:
         keys = [meta.sensor, meta.source.collection if meta.source else None]
         for key in keys:
-            for text in citations(key) if key else []:
+            for text in citations(key, year=(meta.datetime or "")[:4] or None) if key else []:
                 if text not in found:
                     found.append(text)
     return "; ".join(found)

@@ -94,7 +94,8 @@ Window cap: 36 MP per pulled window; larger AOIs are refused with advice to shri
 Per-pixel cloud masking only through QA planes or cloud_mask. Heuristic RGB tools (mask_clouds, burn_scar, flood_mask, segment_landcover, rgb_change) work on 8-bit PNG previews and are not trained models.
 nir is B8A (20 m) on Sentinel-2; nir_broad is B08 (10 m). Landsat nir is B5. The result names the real band.
 SAR: urban and vegetated areas give double-bounce returns that fool fixed-threshold flood rules. Use the same relative orbit and direction for a pair. Sentinel-1 is shown in dB.
-Landsat GeoTIFFs use PixelIsPoint; the reader shifts half a pixel and logs it in the layer processing.
+Landsat GeoTIFFs use PixelIsPoint; the reader shifts half a pixel.
+change_detect difference is post minus pre; the dnbr preset assumes pre minus post, so negate before classifying.
 Fixed thresholds (dNBR classes, water, flood) are fire-, scene- and sensor-specific, not calibrated. Say so.
 One UTM zone per AOI. FIRMS, GIBS and browse sources are search-only here; use atlas data for them.
 Stacks do not persist across sessions. Downloads are bounded by max_download_mb (default 2048).

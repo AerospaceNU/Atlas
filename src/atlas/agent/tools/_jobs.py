@@ -95,7 +95,7 @@ def start_job(
                 "Fix: jobs action=stop job_id=<id>"
             )
         job_id = f"j{next(_COUNTER)}"
-        log_path = Path(artifact_root) / "jobs" / f"{job_id}.log"
+        log_path = Path(artifact_root) / "jobs" / f"{os.getpid()}-{job_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o644)
         try:

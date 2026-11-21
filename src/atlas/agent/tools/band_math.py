@@ -205,13 +205,17 @@ def _sources(items: list[_Item]) -> str:
     return "bands: " + " ".join(shown) + (f" +{extra}" if extra > 0 else "")
 
 
+def _year(stamp: str | None) -> str | None:
+    return stamp[:4] if stamp and stamp[:4].isdigit() else None
+
+
 def _citation_text(items: list[_Item], request: BandMathInput) -> str:
     from atlas.geo.indices import INDEX_CATALOGUE
     from atlas.geo.provenance import citations
 
     found: list[str] = []
     for item in items:
-        for text in citations(item.sensor) if item.sensor else []:
+        for text in citations(item.sensor, year=_year(item.datetime)) if item.sensor else []:
             if text not in found:
                 found.append(text)
     if request.index:

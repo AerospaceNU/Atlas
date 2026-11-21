@@ -212,6 +212,7 @@ def _analyse(
     if trend is not None and trend.kind == "ols":
         summary.append(OLS_CAVEAT)
     summary.append(f"csv: {_rel(store, csv_path)} ({len(points)} rows)")
+    summary.extend(f"figure: {_rel(store, png)}" for png in artifacts if str(png).endswith(".png"))
     return GeoResult(
         summary=summary,
         table=_sketch(points),
