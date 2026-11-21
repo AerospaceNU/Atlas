@@ -88,15 +88,29 @@ def _write_atomic(path: Path, text: str) -> None:
         raise
 
 
+def _is_child(store: LocalArtifactStore) -> bool:
+    root = store.artifact_root
+    return root != store.root and root.parent.name == "subagents"
+
+
+def _plan_path(store: LocalArtifactStore, *, write: bool) -> Path:
+    """Return the plan file: private to a subagent, else the workspace plan."""
+    if _is_child(store):
+        return store.artifact_root / "plan.json"
+    return store.resolve(PLAN_RELATIVE) if write else store.resolve_read(PLAN_RELATIVE)
+
+
 def _load(store: LocalArtifactStore) -> list[PlanItem] | None:
     """Return the stored plan, or ``None`` when no plan file exists."""
-    path = store.resolve_read(PLAN_RELATIVE)
+    path = _plan_path(store, write=False)
     if not path.is_file():
         return None
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Plan file is not readable JSON: {PLAN_RELATIVE}") from exc
+        raise ValueError(
+            f"Plan file is not readable JSON: {path.name if _is_child(store) else PLAN_RELATIVE}"
+        ) from exc
     return UpdatePlanInput.model_validate(raw).items
 
 
@@ -106,7 +120,8 @@ class UpdatePlanTool(Tool):
     The whole list is replaced on every call and rendered back as a checklist
     that the caller shows to the user. The plan is stored as JSON under
     ``.atlas/plan.json`` inside the workspace, and every path goes through
-    :class:`~atlas.agent.artifacts.LocalArtifactStore`.
+    :class:`~atlas.agent.artifacts.LocalArtifactStore`. A subagent keeps its own plan
+    under its artifact root.
     """
 
     name = "update_plan"
@@ -123,7 +138,7 @@ class UpdatePlanTool(Tool):
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request = UpdatePlanInput.model_validate(arguments)
-        path = store.resolve(PLAN_RELATIVE)
+        path = _plan_path(store, write=True)
         _write_atomic(path, _serialize(request.items))
         return ToolResult(text=_render(request.items))
 
@@ -133,7 +148,8 @@ class ReadPlanTool(Tool):
 
     The result uses the same checklist rendering as ``update_plan``. A
     workspace with no plan file reports ``no plan yet``; the path is resolved
-    only through :class:`~atlas.agent.artifacts.LocalArtifactStore`.
+    only through :class:`~atlas.agent.artifacts.LocalArtifactStore`. A subagent keeps its own
+    plan under its artifact root.
     """
 
     name = "read_plan"

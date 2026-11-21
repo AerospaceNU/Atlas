@@ -6,7 +6,8 @@ The copy lives beside the session artifacts, under
 the highest sequence is the one ``restore_latest`` puts back.
 
 Only paths that exist before the write are copied, so a newly created file is
-undone by removing it rather than by restoring bytes. The shell tool is not
+undone by removing it rather than by restoring bytes. Subagents write into their
+parent's chain, so the parent's undo restores their edits. The shell tool is not
 checkpointed: its targets are not known before it runs.
 """
 
@@ -22,14 +23,21 @@ from atlas.agent.artifacts import LocalArtifactStore
 _MANIFEST = "manifest.json"
 
 
+def _session_name(store: LocalArtifactStore) -> str:
+    """Name the undo chain; a subagent shares its parent's chain, however deep."""
+    current = store.artifact_root
+    while current != store.root and current.parent.name == "subagents":
+        current = current.parent.parent
+    return "session" if current == store.root else current.name
+
+
 def checkpoints_root(store: LocalArtifactStore) -> Path:
     """Return the checkpoint directory for this session.
 
     Checkpoints live in the workspace's ``.atlas`` tree, beside artifacts but
     outside them, so removing a session does not throw away its undo history.
     """
-    name = store.artifact_root.name if store.artifact_root != store.root else "session"
-    return store.root / ".atlas" / "checkpoints" / name
+    return store.root / ".atlas" / "checkpoints" / _session_name(store)
 
 
 def _next_sequence(root: Path) -> int:
@@ -64,6 +72,7 @@ def snapshot(store: LocalArtifactStore, relative_path: str) -> None:
         store: Session store whose working tree and artifacts bound the copy.
         relative_path: Path the tool is about to change.
     """
+    # Sequence allocation is race-free only because writing children are serialised.
     source = store.resolve_read(relative_path)
     if source.is_symlink() or (source.exists() and not source.is_file()):
         return
