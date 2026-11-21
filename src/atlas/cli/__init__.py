@@ -9,12 +9,14 @@ from atlas.cli.data import add_data_parser, run_data
 from atlas.cli.geo import add_geo_parser, run_geo
 from atlas.cli.indices import add_indices_parser, run_indices
 from atlas.cli.models import add_models_parser, run_models
+from atlas.cli.run import add_run_parser, run_run
 
-_ROOT = frozenset({"data", "indices", "models", "geo", "-h", "--help"})
-_TUI_FLAGS = frozenset({"--workspace", "--repo"})
+_ROOT = frozenset({"data", "indices", "models", "geo", "run", "-h", "--help"})
+_TUI_FLAGS = frozenset({"--workspace", "--repo", "--resume"})
 _HELP = """examples:
   atlas                          open the agent TUI
   atlas data                     list satellites
+  atlas run "fix the bug" --approval allow   one-shot turn, exit code
   atlas models list              list model plugins
   atlas geo guide workflow       satellite analysis guide
   atlas sentinel2 optical ...    search one collection
@@ -52,6 +54,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     add_indices_parser(sub)
     add_models_parser(sub)
     add_geo_parser(sub)
+    add_run_parser(sub)
     args = parser.parse_args(tokens)
     if getattr(args, "_atlas_cmd", None) == "data":
         return run_data(args)
@@ -61,6 +64,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_models(args)
     if getattr(args, "_atlas_cmd", None) == "geo":
         return run_geo(args)
+    if getattr(args, "_atlas_cmd", None) == "run":
+        return run_run(args)
     parser.print_help()
     return 0
 
