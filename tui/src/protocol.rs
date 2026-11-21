@@ -95,6 +95,8 @@ pub enum ServerMessage {
         error: Option<String>,
         error_kind: Option<String>,
         artifacts: Vec<String>,
+        summary: String,
+        notes: Vec<String>,
     },
     Thought {
         text: String,
@@ -325,6 +327,10 @@ enum RawMessage {
         error_kind: Option<String>,
         #[serde(default)]
         artifacts: Vec<String>,
+        #[serde(default)]
+        summary: String,
+        #[serde(default)]
+        notes: Vec<String>,
     },
     #[serde(rename = "done")]
     Done {
@@ -575,6 +581,8 @@ impl From<RawMessage> for ServerMessage {
                 error,
                 error_kind,
                 artifacts,
+                summary,
+                notes,
             } => ServerMessage::Step {
                 name,
                 call_id,
@@ -584,6 +592,8 @@ impl From<RawMessage> for ServerMessage {
                 error,
                 error_kind,
                 artifacts,
+                summary,
+                notes,
             },
             RawMessage::Done {
                 response,
