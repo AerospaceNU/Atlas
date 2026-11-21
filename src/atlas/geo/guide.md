@@ -98,4 +98,4 @@ Landsat GeoTIFFs use PixelIsPoint; the reader shifts half a pixel.
 change_detect difference is post minus pre; the dnbr preset assumes pre minus post, so negate before classifying.
 Fixed thresholds (dNBR classes, water, flood) are fire-, scene- and sensor-specific, not calibrated. Say so.
 One UTM zone per AOI. FIRMS, GIBS and browse sources are search-only here; use atlas data for them.
-Stacks do not persist across sessions. Downloads are bounded by max_download_mb (default 2048).
+Stacks and pulls persist across sessions under .atlas/analysis and .atlas/data. There is no download limit; the 36 MP window cap is a memory guard.
