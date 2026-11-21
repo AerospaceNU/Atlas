@@ -11,6 +11,9 @@ from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 
 _TIMEOUT_SECONDS = 30.0
+_COMMIT_TIMEOUT_SECONDS = 300.0
+_DETAIL_TAIL_CHARS = 4000
+_LISTED_FILES = 10
 
 
 def _git_binary() -> str:
@@ -21,7 +24,12 @@ def _git_binary() -> str:
     return binary
 
 
-def _run(store: LocalArtifactStore, arguments: list[str]) -> subprocess.CompletedProcess[str]:
+def _run(
+    store: LocalArtifactStore,
+    arguments: list[str],
+    *,
+    timeout: float = _TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
     """Run one git subcommand in the workspace without a shell.
 
     ``arguments`` is always an argument list, so no model-supplied string is
@@ -37,11 +45,11 @@ def _run(store: LocalArtifactStore, arguments: list[str]) -> subprocess.Complete
             errors="replace",
             stdin=subprocess.DEVNULL,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat"},
-            timeout=_TIMEOUT_SECONDS,
+            timeout=timeout,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise ValueError("git command timed out") from exc
+        raise ValueError(f"git {arguments[0]} timed out after {timeout:g}s") from exc
 
 
 def _is_work_tree(store: LocalArtifactStore) -> bool:
@@ -87,8 +95,31 @@ def _workspace_status_line(line: str, prefix: str) -> str:
 
 def _failure(action: str, result: subprocess.CompletedProcess[str]) -> ValueError:
     """Build a workspace-relative error for a failed git invocation."""
-    detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+    parts = [text for text in (result.stderr.strip(), result.stdout.strip()) if text]
+    detail = "\n".join(parts)
+    if len(detail) > _DETAIL_TAIL_CHARS:
+        detail = "... " + detail[-_DETAIL_TAIL_CHARS:]
+    detail = detail or f"exit status {result.returncode}"
     return ValueError(f"git {action} failed: {detail}")
+
+
+def _committed_summary(store: LocalArtifactStore) -> str:
+    """Return ``committed N files: a, b`` for HEAD, or an empty string when unknown."""
+    listed = _run(
+        store,
+        ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "-z", "--relative", "HEAD"],
+    )
+    if listed.returncode != 0:
+        return ""
+    names = [name for name in listed.stdout.split("\x00") if name]
+    if not names:
+        return ""
+    shown = ", ".join(names[:_LISTED_FILES])
+    extra = len(names) - _LISTED_FILES
+    if extra > 0:
+        shown += f", +{extra} more"
+    noun = "file" if len(names) == 1 else "files"
+    return f"committed {len(names)} {noun}: {shown}"
 
 
 class GitStatusInput(BaseModel):
@@ -224,7 +255,8 @@ class GitCommitTool(Tool):
     name = "git_commit"
     description = (
         "Stage workspace-relative paths (or all changes) and create one git commit. "
-        "Returns the first line of the commit output, or 'nothing to commit'."
+        "This also commits anything already staged, not just the given paths. "
+        "Returns the first commit line and the committed file names, or 'nothing to commit'."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
 
@@ -251,8 +283,11 @@ class GitCommitTool(Tool):
         if staged.returncode != 1:
             raise _failure("diff", staged)
 
-        committed = _run(store, ["commit", "-m", request.message])
+        committed = _run(store, ["commit", "-m", request.message], timeout=_COMMIT_TIMEOUT_SECONDS)
         if committed.returncode != 0:
             raise _failure("commit", committed)
         lines = committed.stdout.strip().splitlines()
-        return ToolResult(text=lines[0] if lines else "committed")
+        first = next((line for line in lines if line.startswith("[")), None)
+        text = first or (lines[0] if lines else "committed")
+        summary = _committed_summary(store)
+        return ToolResult(text=f"{text}\n{summary}" if summary else text)

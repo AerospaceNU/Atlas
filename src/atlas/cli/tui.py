@@ -17,16 +17,34 @@ def launch_tui(argv: list[str]) -> int:
     ``os.execv`` does not return on success. The terminal stays attached to
     the TUI, which is what raw mode needs.
     """
+    if sys.platform == "win32" and os.environ.get("ATLAS_ALLOW_NATIVE_WINDOWS") != "1":
+        print(f"atlas: {native_windows_message()}", file=sys.stderr)
+        return 1
     try:
         binary = ensure_tui_binary()
     except TuiLaunchError as exc:
         print(f"atlas: {exc}", file=sys.stderr)
         return 1
+    args = list(argv)
+    has_repo = any(arg == "--repo" or arg.startswith("--repo=") for arg in args)
+    if not has_repo and (root := _repo_root()) is not None:
+        args += ["--repo", str(root)]
+    os.environ.setdefault("ATLAS_PYTHON", sys.executable)
     try:
-        os.execv(str(binary), [str(binary), *argv])
+        os.execv(str(binary), [str(binary), *args])
     except OSError as exc:
         print(f"atlas: could not start {binary}: {exc}", file=sys.stderr)
         return 1
+
+
+def native_windows_message() -> str:
+    """Return the guidance shown when Atlas is started on native Windows."""
+    return (
+        "the Atlas agent needs a POSIX shell and process groups; native Windows is not "
+        "supported. Install WSL2 (`wsl --install -d Ubuntu`) and run atlas inside it "
+        "(see install-instructions/INSTALL-LINUX.md). Set ATLAS_ALLOW_NATIVE_WINDOWS=1 "
+        "to try anyway (unsupported)."
+    )
 
 
 def ensure_tui_binary() -> Path:
@@ -90,7 +108,7 @@ def _is_fresh(binary: Path, source_mtime: float | None) -> bool:
 
 
 def _repo_root() -> Path | None:
-    starts = [Path.cwd(), Path(__file__).resolve()]
+    starts = [Path(__file__).resolve(), Path.cwd()]
     seen: set[Path] = set()
     for start in starts:
         for candidate in (start, *start.parents):

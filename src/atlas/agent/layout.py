@@ -343,6 +343,25 @@ def user_defaults_dir(home: Path | None = None) -> Path:
     return user_atlas_root(home) / "defaults"
 
 
+_ATLAS_GITIGNORE = (
+    "# Atlas local state: sessions, artifacts, checkpoints. Not for version control.\n*\n"
+)
+
+
+def ensure_atlas_gitignore(workspace: Path) -> None:
+    """Write ``.atlas/.gitignore`` ignoring everything, only when missing.
+
+    Invariant: an existing file is never rewritten; OSError is swallowed so a
+    read-only workspace still starts.
+    """
+    target = project_atlas_root(workspace) / ".gitignore"
+    try:
+        if not target.exists():
+            target.write_text(_ATLAS_GITIGNORE, encoding="utf-8")
+    except OSError:
+        return
+
+
 def ensure_project_layout(workspace: Path) -> Path:
     """Create project session, artifact, and data directories if missing.
 
@@ -355,6 +374,7 @@ def ensure_project_layout(workspace: Path) -> Path:
         project_data_dir(workspace),
     ):
         directory.mkdir(parents=True, exist_ok=True)
+    ensure_atlas_gitignore(workspace)
     return root
 
 
