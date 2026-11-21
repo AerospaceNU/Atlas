@@ -159,9 +159,13 @@ def _chip_source(path: Path, chip: ChipMeta) -> Source:
     )
 
 
+def _extra_roots(store: LocalArtifactStore) -> tuple[Path, ...]:
+    return (store.read_root,) if store.read_root is not None else ()
+
+
 def _roots(store: LocalArtifactStore) -> list[Path]:
     found: list[Path] = []
-    for base in (store.artifact_root, store.root):
+    for base in dict.fromkeys((store.artifact_root, store.root, *_extra_roots(store))):
         for rel in ("data", ".atlas/data"):
             cand = base / rel
             if cand.is_dir() and cand not in found:
@@ -232,7 +236,11 @@ def _output_paths(outputs: Any) -> list[str]:
 
 def _resolve_output(text: str, store: LocalArtifactStore) -> Path | None:
     raw = Path(text[: -len(_META)] if text.endswith(_META) else text).expanduser()
-    candidates = [raw] if raw.is_absolute() else [store.artifact_root / raw, store.root / raw]
+    candidates = (
+        [raw]
+        if raw.is_absolute()
+        else [base / raw for base in (store.root, store.artifact_root, *_extra_roots(store))]
+    )
     for cand in candidates:
         if cand.is_file():
             return cand.resolve()
@@ -240,12 +248,15 @@ def _resolve_output(text: str, store: LocalArtifactStore) -> Path | None:
 
 
 def _run_chips(ref: str, store: LocalArtifactStore, index: Sequence[Source]) -> list[Source]:
-    runs = provenance.read_runs(paths.analysis_dir(store))
+    runs = [
+        *provenance.read_runs(paths.legacy_analysis_dir(store)),  # old per-session runs
+        *provenance.read_runs(paths.analysis_dir(store)),
+    ]
     if ref == "last_pull":
         pulls = [r for r in runs if r.get("tool") == "get_satellite_data" and r.get("outputs")]
         run = pulls[-1] if pulls else None
     else:
-        run = next((r for r in runs if r.get("id") == ref), None)
+        run = next((r for r in reversed(runs) if r.get("id") == ref), None)
     if run is None:
         what = "pull" if ref == "last_pull" else "run"
         raise StackError(

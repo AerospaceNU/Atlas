@@ -601,5 +601,5 @@ def test_download_budget_refuses_after_the_cap(
     assert calls[0]["asset_names"] == ["red"]
     assert calls[0]["polygon"] is not None
     assert "max_download_mb" in second.text and second.text.startswith("refused")
-    runs = (tmp_path / "analysis" / "runs.jsonl").read_text().splitlines()
+    runs = (tmp_path / ".atlas" / "analysis" / "runs.jsonl").read_text().splitlines()
     assert json.loads(runs[0])["bytes_fetched"] == 2 * 1024 * 1024

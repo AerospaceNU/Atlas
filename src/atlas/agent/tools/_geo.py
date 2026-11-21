@@ -104,12 +104,12 @@ def result_to_tool_result(
     adir = paths.analysis_dir(store)
     artifacts = [Path(a) for a in res.artifacts]
     try:
-        csv_rel = spill_table(res, adir / "tables")
+        csv_rel = spill_table(res, adir / "tables", base=store.root)
     except OSError as exc:
         csv_rel = None
         res.warnings.append(f"table not saved: {exc}")
     if csv_rel:
-        artifacts.append(store.artifact_root / csv_rel)
+        artifacts.append(store.root / csv_rel)
     outputs = [_rel(store, p) for p in artifacts]
     try:
         res.run_id = append_run(

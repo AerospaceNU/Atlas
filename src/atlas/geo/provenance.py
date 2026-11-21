@@ -191,9 +191,10 @@ def finish(
     """
     from atlas.geo import paths
 
-    root = paths.workspace()
+    adir = paths.analysis_dir()
+    root = adir.parent
     run_id = append_run(
-        root / "analysis",
+        adir,
         {
             "tool": tool,
             "arguments": _script_arguments(root),

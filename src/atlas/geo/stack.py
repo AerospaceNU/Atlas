@@ -414,6 +414,8 @@ class Stack:
                 candidates.append(store.root / Path(text).expanduser())
         else:
             candidates.append(paths.stacks_dir(adir) / text)
+            if store is not None:  # old per-session location, read-only, never migrated
+                candidates.append(paths.stacks_dir(paths.legacy_analysis_dir(store)) / text)
         for cand in candidates:
             directory = cand.parent if cand.name == "stack.json" else cand
             if _SCRATCH_RE.search(directory.name):
