@@ -12,7 +12,14 @@ from urllib.parse import urlparse
 
 import numpy as np
 from numpy.typing import NDArray
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 
 class SceneKind(StrEnum):
@@ -943,6 +950,12 @@ class Asset(BaseModel):
     offset: float | None = None
     # STAC ``file:size`` in bytes. None when the catalog did not report one.
     size_bytes: int | None = Field(default=None, ge=0)
+    # Raster facts from the first ``raster:bands`` / single ``eo:bands`` entry.
+    nodata: float | None = None
+    data_type: str | None = None
+    spatial_resolution: float | None = None
+    common_name: str | None = None
+    center_wavelength: float | None = None
 
     @field_validator("href")
     @classmethod
@@ -960,6 +973,31 @@ class Asset(BaseModel):
         if not math.isfinite(value):
             raise ValueError("scale and offset must be finite")
         return value
+
+    @field_validator("nodata", "spatial_resolution", "center_wavelength", mode="before")
+    @classmethod
+    def coerce_raster_fact(cls, value: object, info: ValidationInfo) -> float | None:
+        """Turn unusable values into None; never raises, so the asset is kept.
+
+        ``Asset.try_new`` drops the whole asset on a validation error, and these
+        fields are optional hints that catalogs fill carelessly.
+        """
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        if info.field_name != "nodata" and number <= 0:
+            return None
+        return number
+
+    @field_validator("data_type", "common_name", mode="before")
+    @classmethod
+    def coerce_label(cls, value: object) -> str | None:
+        """Lowercase a text label; anything else becomes None."""
+        if not isinstance(value, str):
+            return None
+        return value.strip().lower() or None
 
     @field_validator("size_bytes", mode="before")
     @classmethod

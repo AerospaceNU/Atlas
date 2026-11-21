@@ -1,0 +1,80 @@
+schema = 2
+name = "sar_flood"
+description = "Flood extent from a Sentinel-1 VV pair in dB: permanent water where both dates are below the water threshold, flooded where post-event backscatter is low and fell by the change threshold. Baseline rule pack: verify against imagery."
+version = "0.1.0"
+tier = "baseline"
+status = "rule_based"
+task = "flood_extent"
+
+[license]
+spdx = "MIT"
+holder = "Atlas contributors"
+
+[citation]
+text = "Fixed-threshold SAR change detection on Sentinel-1 RTC gamma0 dB; thresholds are common practice, not fitted to a scene."
+
+[input]
+mode = "pair"
+sensors = ["sentinel1"]
+bands = ["vv"]
+unit = "dB"
+resolution_m = [10, 50]
+min_size = 16
+max_nodata_fraction = 0.5
+
+[input.pair]
+require_same_grid = true
+require_same_orbit = true
+
+[runtime]
+kind = "rules"
+
+[runtime.rules.define]
+diff = "post.vv - pre.vv"
+
+[[runtime.rules.classes]]
+code = 1
+name = "permanent_water"
+when = "(pre.vv < t_water) & (post.vv < t_water)"
+
+[[runtime.rules.classes]]
+code = 2
+name = "flooded"
+when = "(post.vv < t_water) & (diff < t_change)"
+
+[[runtime.rules.classes]]
+code = 3
+name = "dry"
+when = "(post.vv >= t_water) | (diff >= t_change)"
+
+[output]
+kind = "classes"
+layer = "sar_flood"
+
+[output.classes]
+1 = "permanent_water"
+2 = "flooded"
+3 = "dry"
+
+[parameters.t_water]
+type = "float"
+default = -15.0
+min = -30.0
+max = -5.0
+
+[parameters.t_change]
+type = "float"
+default = -3.0
+min = -10.0
+max = 0.0
+
+[evidence]
+card = "README.md"
+known_limits = [
+  "Urban and vegetated areas hide flooding through double-bounce backscatter that stays bright.",
+  "Smooth surfaces (tarmac, sand, ice) and radar shadow read as water.",
+  "Wind-roughened water is missed because it stays bright.",
+  "Wet snow lowers backscatter and can read as water.",
+  "Fixed thresholds on RTC gamma0 dB, with no per-scene tuning.",
+  "The pair must share relative orbit and orbit direction; mixed geometry is refused.",
+]

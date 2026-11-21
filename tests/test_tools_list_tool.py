@@ -17,7 +17,7 @@ tool_def1 = ToolDefinition(
     parameters={"type": "object", "properties": {"path": {"type": "string"}}},
 )
 tool_def2 = ToolDefinition(
-    name="bash_tool",
+    name="bash",
     description="Run a shell command.",
     parameters={"type": "object", "properties": {}},
 )
@@ -56,7 +56,7 @@ def test_tools_list_returns_info_for_each_current_definition(tmp_path: Path) -> 
         "properties": {"path": {"type": "string"}},
     }
 
-    assert by_name["bash_tool"]["parameters"] == {"type": "object", "properties": {}}
+    assert by_name["bash"]["parameters"] == {"type": "object", "properties": {}}
 
 
 def test_tools_list_looks_up_definitions_for_each_run(tmp_path: Path) -> None:

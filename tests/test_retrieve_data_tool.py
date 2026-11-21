@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from datetime import UTC, datetime
 from pathlib import Path
@@ -408,14 +409,15 @@ def test_download_saves_files_and_reports_each_source(
     # only scenes from the source whose search worked are downloaded, cut to the box
     call = downloaded[0]
     assert call["ids"] == ["a", "b"]
-    assert call["out"] == store.resolve("data")
+    assert call["out"] == tmp_path / ".atlas" / "data"
     assert call["bbox"].contains(-71.06, 42.36)
 
-    assert result.artifacts == ["data/sentinel2/a_visual.tif"]
+    assert result.artifacts == [".atlas/data/sentinel2/a_visual.tif"]
     assert "sentinel2: 1 of 2 scenes saved" in result.text
     assert "  b: no native-resolution asset" in result.text
     assert "landsat9: search failed: RuntimeError: catalog is down" in result.text
-    assert "saved: data/sentinel2/a_visual.tif" in result.text
+    assert "saved: .atlas/data/sentinel2/a_visual.tif" in result.text
+    assert "run: r0001" in result.text
     assert good.closed and broken.closed
 
 
@@ -442,3 +444,162 @@ def test_clients_are_closed_when_the_download_fails(
             LocalArtifactStore(tmp_path),
         )
     assert client.closed
+
+
+# polygon, orbit, assets, budget
+
+
+RING = [[-71.10, 42.33], [-71.04, 42.33], [-71.04, 42.38], [-71.10, 42.38], [-71.10, 42.33]]
+
+
+def test_polygon_alone_is_a_location_and_sends_its_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakePullClient()
+    _use_clients(monkeypatch, {"sentinel2": client})
+    _no_download(monkeypatch)
+
+    GetDataTool().run(
+        {"data_type": "optical", **WINDOW, "polygon": RING, "sources": ["sentinel2"]},
+        LocalArtifactStore(tmp_path),
+    )
+
+    sent = client.requests[0]
+    assert (sent.bbox.west, sent.bbox.south, sent.bbox.east, sent.bbox.north) == (
+        -71.10,
+        42.33,
+        -71.04,
+        42.38,
+    )
+    assert sent.polygon is not None
+
+
+def test_polygon_with_a_point_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="polygon together with latitude"):
+        GetDataToolInput.model_validate(
+            {"data_type": "optical", **WINDOW, **BOSTON, "polygon": RING}
+        )
+
+
+def test_orbit_needs_sar() -> None:
+    with pytest.raises(ValidationError, match="sar only"):
+        GetDataToolInput.model_validate(
+            {"data_type": "optical", **WINDOW, **BOSTON, "orbit": "8:ascending"}
+        )
+
+
+def test_schema_stays_small_and_untitled() -> None:
+    tool = GetDataTool()
+    parameters = json.dumps(tool.definition().parameters)
+    assert len(tool.description) + len(parameters) <= 2400
+    assert '"title"' not in parameters
+
+
+def test_search_without_assets_says_preview_grade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_clients(monkeypatch, {"sentinel2": FakePullClient([_scene(id="a", cloud_cover=3)])})
+    _no_download(monkeypatch)
+
+    result = GetDataTool().run(
+        {"data_type": "optical", **WINDOW, **BOSTON, "sources": ["sentinel2"]},
+        LocalArtifactStore(tmp_path),
+    )
+
+    assert "preview-grade" in result.text
+
+
+def test_orbit_filter_reports_what_it_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    props = [
+        {"sat:relative_orbit": 8, "sat:orbit_state": "descending"},
+        {"sat:relative_orbit": 8, "sat:orbit_state": "ascending"},
+        {},
+    ]
+    scenes = [
+        _scene(id=f"s{i}", kind=SceneKind.sar, source="sentinel1", properties=p)
+        for i, p in enumerate(props)
+    ]
+    _use_clients(monkeypatch, {"sentinel1": FakePullClient(scenes)})
+    _no_download(monkeypatch)
+
+    result = GetDataTool().run(
+        {
+            "data_type": "sar",
+            **WINDOW,
+            **BOSTON,
+            "sources": ["sentinel1"],
+            "orbit": "8:descending",
+        },
+        LocalArtifactStore(tmp_path),
+    )
+
+    assert "kept 1 of 3 scenes (2 dropped, 1 without orbit data)" in result.text
+    assert "sentinel1 s0 2024-07-01 cloud n/a orbit 8 desc" in result.text
+    assert "s1" not in result.text.split("scenes:")[1]
+
+
+def test_search_only_sources_refuse_a_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_clients(monkeypatch, {})
+    with pytest.raises(ValueError, match="search-only here"):
+        GetDataTool().run(
+            {
+                "data_type": "detection",
+                **WINDOW,
+                **BOSTON,
+                "sources": ["firms_viirs"],
+                "download": True,
+            },
+            LocalArtifactStore(tmp_path),
+        )
+
+
+def test_downloads_are_not_budgeted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / ".atlas").mkdir()
+    (tmp_path / ".atlas" / "agent.toml").write_text("max_download_mb = 1\n")
+    _use_clients(monkeypatch, {"sentinel2": FakePullClient([_scene(id="a")])})
+    calls: list[dict[str, Any]] = []
+
+    async def fake_download(scenes: list[Scene], out: Path, **kwargs: Any) -> DownloadReport:
+        calls.append({"out": out, **kwargs})
+        path = out / "sentinel2" / "a_B04.tif"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"tif")
+        return DownloadReport(
+            outcomes=[
+                DownloadOutcome(
+                    source="sentinel2",
+                    scene_id="a",
+                    status="saved",
+                    path=path,
+                    bytes_fetched=2 * 1024 * 1024,
+                )
+            ]
+        )
+
+    monkeypatch.setattr(f"{MODULE}.download_assets", fake_download)
+    store = LocalArtifactStore(tmp_path)
+    arguments = {
+        "data_type": "optical",
+        **WINDOW,
+        "sources": ["sentinel2"],
+        "assets": ["red"],
+        "polygon": RING,
+        "download": True,
+    }
+
+    first = GetDataTool().run(arguments, store)
+    second = GetDataTool().run(arguments, store)
+
+    assert "run: r0001" in first.text and "run: r0002" in second.text
+    assert not second.text.startswith("refused")
+    assert len(calls) == 2
+    assert calls[0]["asset_names"] == ["red"]
+    assert calls[0]["polygon"] is not None
+    assert calls[0]["out"] == tmp_path / ".atlas" / "data"
+    assert "whole_file" not in calls[0] and "allow_whole_file" not in calls[0]
+    runs = (tmp_path / ".atlas" / "analysis" / "runs.jsonl").read_text().splitlines()
+    assert json.loads(runs[0])["bytes_fetched"] == 2 * 1024 * 1024

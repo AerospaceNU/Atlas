@@ -1,0 +1,93 @@
+schema = 2
+name = "cloud_mask"
+description = "OmniCloudMask V4 cloud and cloud-shadow segmentation on red, green and NIR reflectance (Sentinel-2 B8A, Landsat 8/9 B5) at 5-50 m. Writes clear, thick cloud, thin cloud and cloud shadow classes and the cloud, cirrus and cloud_shadow QA planes."
+version = "4"
+tier = "learned"
+status = "trained"
+task = "cloud_mask"
+extra = "onnx"
+
+[license]
+spdx = "MIT"
+holder = "The Government of Western Australia, managed by the Department of Primary Industries and Regional Development"
+url = "https://huggingface.co/NickWright/OmniCloudMask/blob/main/LICENSES.md"
+notice_file = "NOTICE"
+
+[citation]
+text = "Wright, N., Duncan, J.M.A., Callow, J.N., Thompson, S.E., George, R.J. (2025). Training sensor-agnostic deep learning models for remote sensing: Achieving state-of-the-art cloud and cloud shadow identification with OmniCloudMask. Remote Sensing of Environment 322, 114694."
+doi = "10.1016/j.rse.2025.114694"
+url = "https://github.com/DPIRD-DMA/OmniCloudMask"
+
+# Local weight: sha256 of the maintainer conversion (tools/models/convert_omnicloudmask.py),
+# hosted on this machine in the user weight store. There is no public URL (url is empty), so
+# the weight reports "local" until installed with: atlas models pull cloud_mask --from PATH
+# It registers whenever the verified file is present and onnxruntime imports.
+[weights]
+file = "omnicloudmask_v4.onnx"
+url = ""
+sha256 = "d31d7a9ae443b53c7da63b8f97cccdfd1238543231aa24f7c611bba0629e8e43"
+size_bytes = 57892640
+
+[weights.upstream]
+repo = "NickWright/OmniCloudMask"
+revision = "66b606a7199bd80b499f8a871930a7d5c7ef94eb"
+
+[input]
+mode = "single"
+sensors = ["sentinel2", "landsat8", "landsat9"]
+bands = ["red", "green", "nir"]
+unit = "reflectance"
+resolution_m = [5, 50]
+min_size = 32
+max_nodata_fraction = 0.95
+
+[input.band_sources.sentinel2]
+nir = "B8A"
+
+[input.band_sources.landsat8]
+nir = "B5"
+
+[input.band_sources.landsat9]
+nir = "B5"
+
+[runtime]
+kind = "onnx"
+
+[runtime.onnx]
+input_name = "input"
+output_name = "logits"
+normalisation = "in_graph"
+head = "argmax"
+threads = 0
+ms_per_mp = 2400
+max_seconds = 600
+
+[runtime.onnx.tile]
+size = 1024
+margin = 128
+max_single_pass = 1048576
+
+[output]
+kind = "mask"
+layer = "cloud_mask"
+
+[output.classes]
+0 = "clear"
+1 = "thick_cloud"
+2 = "thin_cloud"
+3 = "cloud_shadow"
+
+[output.qa_planes]
+cloud = ["thick_cloud"]
+cirrus = ["thin_cloud"]
+cloud_shadow = ["cloud_shadow"]
+
+[evidence]
+card = "README.md"
+known_limits = [
+  "Thin cloud and cirrus are the least reliable class: the model separates them from clear sky inconsistently, and the shipped test scene held no thin cloud pixels, so the cirrus plane is untested on real data.",
+  "Cloud shadow is predicted from appearance only (no sun geometry); terrain shadow, dark burn scars and dark water are confused with it.",
+  "Snow, ice and bright bare ground can be labelled cloud; dark water can be labelled shadow.",
+  "Output depends on tile extent: the in-graph z-score uses each tile's own statistics, so a scene run in one pass and the same scene run in 1024 px tiles differ (0.25 to 0.8 percent of pixels on the test scenes; see the card).",
+  "Needs red, green and NIR; a red-green-blue stack is refused. Not validated outside 5-50 m, and pixels that are zero in every band are treated as no data.",
+]

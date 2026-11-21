@@ -79,7 +79,8 @@ def test_tools_package_does_not_export_the_framework() -> None:
     assert tools_package.ReadFileTool.name == "read_file"
 
 
-def test_default_registry_has_discovered_tools_only() -> None:
+def test_default_registry_has_discovered_tools_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATLAS_HEURISTIC_MODELS", "1")
     names = [tool.name for tool in default_registry().definitions]
 
     assert "read_file" in names

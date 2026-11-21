@@ -186,7 +186,7 @@ def test_rate_limit_is_retried_and_then_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sleeps: list[float] = []
-    monkeypatch.setattr("atlas.agent.model.time.sleep", sleeps.append)
+    monkeypatch.setattr("atlas.agent.model._sleep", sleeps.append)
     client = _FailThenSucceedClient()
     model = OpenRouterModel(
         ModelConfig(model="vendor/model", api_key="test-key"),
@@ -197,7 +197,8 @@ def test_rate_limit_is_retried_and_then_succeeds(
 
     assert response.content == "recovered"
     assert client.calls == 2
-    assert sleeps == [0.5]
+    assert len(sleeps) == 1
+    assert 0.375 <= sleeps[0] <= 0.625
 
 
 class _AlwaysFailsClient:
@@ -212,7 +213,7 @@ class _AlwaysFailsClient:
 
 def test_a_bad_request_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     sleeps: list[float] = []
-    monkeypatch.setattr("atlas.agent.model.time.sleep", sleeps.append)
+    monkeypatch.setattr("atlas.agent.model._sleep", sleeps.append)
     client = _AlwaysFailsClient(400)
     model = OpenRouterModel(
         ModelConfig(model="vendor/model", api_key="test-key"),
@@ -228,7 +229,7 @@ def test_a_bad_request_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_rate_limit_gives_up_after_the_attempt_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     sleeps: list[float] = []
-    monkeypatch.setattr("atlas.agent.model.time.sleep", sleeps.append)
+    monkeypatch.setattr("atlas.agent.model._sleep", sleeps.append)
     client = _AlwaysFailsClient(503)
     model = OpenRouterModel(
         ModelConfig(model="vendor/model", api_key="test-key"),
@@ -238,5 +239,6 @@ def test_rate_limit_gives_up_after_the_attempt_cap(monkeypatch: pytest.MonkeyPat
     with pytest.raises(OpenRouterHTTPError):
         model.complete([ChatMessage(role="user", content="hi")], [])
 
-    assert client.calls == 3
-    assert sleeps == [0.5, 1.0]
+    assert client.calls == 4
+    assert len(sleeps) == 3
+    assert all(0.375 <= s <= 0.625 * 4 * 1.25 for s in sleeps)

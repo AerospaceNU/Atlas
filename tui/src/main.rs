@@ -60,12 +60,18 @@ const TICK: Duration = Duration::from_millis(50);
 
 struct Config {
     workspace: PathBuf,
-    repo: PathBuf,
+    repo: Option<PathBuf>,
+    python: Option<PathBuf>,
+    resume: Option<String>,
 }
 
 fn parse_args() -> Result<Config> {
     let mut workspace: Option<PathBuf> = None;
     let mut repo: Option<PathBuf> = None;
+    let mut python: Option<PathBuf> = std::env::var_os("ATLAS_PYTHON")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let mut resume: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -80,8 +86,20 @@ fn parse_args() -> Result<Config> {
                 let value = args.next().ok_or_else(|| anyhow!("--repo needs a path"))?;
                 repo = Some(PathBuf::from(value));
             }
+            "--python" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--python needs a path"))?;
+                python = Some(PathBuf::from(value));
+            }
+            "--resume" => {
+                let value = args.next().ok_or_else(|| anyhow!("--resume needs an id"))?;
+                resume = Some(value);
+            }
             "--help" | "-h" => {
-                println!("usage: atlas-tui [--workspace PATH] [--repo PATH]");
+                println!(
+                    "usage: atlas-tui [--workspace PATH] [--repo PATH] [--python PATH] [--resume ID]"
+                );
                 std::process::exit(0);
             }
             other => return Err(anyhow!("unknown argument: {other}")),
@@ -92,13 +110,22 @@ fn parse_args() -> Result<Config> {
     let workspace = workspace.unwrap_or_else(|| cwd.clone());
     let workspace = workspace.canonicalize().unwrap_or(workspace).to_path_buf();
 
-    let repo = match repo {
-        Some(path) => path,
-        None => find_repo_root(&cwd)
-            .ok_or_else(|| anyhow!("could not find the Atlas repo root; pass --repo PATH"))?,
+    let repo = match (repo, &python) {
+        (Some(path), _) => Some(path),
+        (None, Some(_)) => None,
+        (None, None) => Some(find_repo_root(&cwd).ok_or_else(|| {
+            anyhow!(
+                "could not find the Atlas repo root; pass --repo PATH or --python PATH (or set ATLAS_PYTHON)"
+            )
+        })?),
     };
 
-    Ok(Config { workspace, repo })
+    Ok(Config {
+        workspace,
+        repo,
+        python,
+        resume,
+    })
 }
 
 fn find_repo_root(start: &Path) -> Option<PathBuf> {
@@ -120,24 +147,35 @@ struct ChildProcess {
 
 impl ChildProcess {
     fn spawn(config: &Config) -> Result<Self> {
-        let mut child = Command::new("uv")
-            .args([
-                "run",
-                "python",
-                "-m",
-                "atlas.agent",
-                "--approval",
-                "ask",
-                "--workspace",
-            ])
+        let (mut command, program) = match (&config.python, &config.repo) {
+            (Some(python), _) => {
+                let mut command = Command::new(python);
+                command.args(["-P", "-m", "atlas.agent"]);
+                (command, format!("{} -P -m atlas.agent", python.display()))
+            }
+            (None, Some(_)) => {
+                let mut command = Command::new("uv");
+                command.args(["run", "python", "-m", "atlas.agent"]);
+                (command, "uv run python -m atlas.agent".to_string())
+            }
+            (None, None) => {
+                return Err(anyhow!("no Atlas repo or python interpreter configured"));
+            }
+        };
+        command.args(["--approval", "ask"]);
+        if let Some(id) = &config.resume {
+            command.args(["--resume", id]);
+        }
+        let mut child = command
+            .arg("--workspace")
             .arg(&config.workspace)
-            .current_dir(&config.repo)
+            .current_dir(config.repo.as_ref().unwrap_or(&config.workspace))
             .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("failed to start `uv run python -m atlas.agent`")?;
+            .with_context(|| format!("failed to start `{program}`"))?;
 
         let stdin = child
             .stdin
@@ -244,6 +282,10 @@ struct App {
     screen_snapshot: Option<Buffer>,
     text_selection: Option<TextSelection>,
     status_notice: Option<&'static str>,
+    /// When the current activity began; `None` until one is set.
+    activity_since: Option<Instant>,
+    /// 0 none, 1 cancel sent, 2 second Esc shown.
+    cancel_stage: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,6 +370,67 @@ enum TranscriptLine {
     Tool(ToolLine),
 }
 
+const STILL_STOPPING: &str =
+    "Still stopping. Ctrl+C quits; the conversation is saved up to the last finished step.";
+
+/// Cooperative tools poll the cancel flag between steps of their own work.
+const COOPERATIVE_TOOLS: [&str; 10] = [
+    "get_satellite_data",
+    "prepare_stack",
+    "time_series",
+    "composite",
+    "band_math",
+    "classify",
+    "change_detect",
+    "area_table",
+    "render_map",
+    "export_geotiff",
+];
+
+/// Words the first Esc by what is running; never promises more than the tool class delivers.
+fn cancel_message(activity: &Option<Activity>) -> String {
+    match activity {
+        Some(Activity::Thinking | Activity::Working | Activity::ToolCalling(_)) => {
+            "cancelling...".to_string()
+        }
+        Some(Activity::ToolExecuting(name)) => match name.as_str() {
+            "bash" | "run_tests" => "cancelling the running command...".to_string(),
+            tool if COOPERATIVE_TOOLS.contains(&tool) => {
+                "cancel requested; the tool stops at its next check".to_string()
+            }
+            other => format!(
+                "cancel requested; {other} is still running and the turn stops right after it returns"
+            ),
+        },
+        None => "cancel requested; the turn stops at the next step".to_string(),
+    }
+}
+
+/// First `max` characters with newlines flattened, `...` when cut.
+fn clip_chars(text: &str, max: usize) -> String {
+    let flat: String = text
+        .trim()
+        .chars()
+        .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+        .collect();
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max).collect();
+    format!("{cut}...")
+}
+
+/// `7s`, `1m12s` or `1h02m`.
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 fn tool_note(label: impl Into<String>) -> TranscriptLine {
     TranscriptLine::Tool(ToolLine {
         name: String::new(),
@@ -344,6 +447,7 @@ fn tool_body(
     error: Option<&str>,
     error_kind: Option<&str>,
     artifacts: &[String],
+    notes: &[String],
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let args = format_arguments(arguments);
@@ -366,6 +470,14 @@ fn tool_body(
         let body = text.filter(|item| !item.is_empty()).unwrap_or("(empty)");
         for line in body.lines() {
             lines.push(format!("  {line}"));
+        }
+    }
+    if notes.iter().any(|note| !note.trim().is_empty()) {
+        lines.push("notes".to_string());
+        for note in notes {
+            for line in note.lines() {
+                lines.push(format!("  {line}"));
+            }
         }
     }
     if !artifacts.is_empty() {
@@ -450,7 +562,17 @@ impl App {
             screen_snapshot: None,
             text_selection: None,
             status_notice: None,
+            activity_since: None,
+            cancel_stage: 0,
         }
+    }
+
+    /// Sets the activity; the elapsed clock restarts only when it changes.
+    fn set_activity(&mut self, next: Option<Activity>) {
+        if next != self.activity {
+            self.activity_since = next.as_ref().map(|_| Instant::now());
+        }
+        self.activity = next;
     }
 
     fn in_flight(&self) -> bool {
@@ -486,7 +608,8 @@ impl App {
                 error,
                 error_kind,
                 artifacts,
-                ..
+                summary,
+                notes,
             } => {
                 if self
                     .pending_permission
@@ -495,17 +618,22 @@ impl App {
                 {
                     self.pending_permission = None;
                 }
-                let label = if ok {
+                let mut label = if ok {
                     name.clone()
                 } else {
                     format!("{name} failed")
                 };
+                if !summary.trim().is_empty() {
+                    label.push_str(" - ");
+                    label.push_str(&clip_chars(&summary, 60));
+                }
                 let body = tool_body(
                     &arguments,
                     text.as_deref(),
                     error.as_deref(),
                     error_kind.as_deref(),
                     &artifacts,
+                    &notes,
                 );
                 self.transcript.push(TranscriptLine::Tool(ToolLine {
                     name,
@@ -531,17 +659,19 @@ impl App {
                 }
             }
             ServerMessage::Phase { phase, name } => {
-                self.activity = activity_from(&phase, name.as_deref());
+                self.set_activity(activity_from(&phase, name.as_deref()));
             }
             ServerMessage::Done {
                 response,
                 stopped_for_limit,
                 stopped_for_budget,
+                stopped_for_context,
                 cancelled,
                 compaction,
                 status,
             } => {
                 self.status_notice = None;
+                self.cancel_stage = 0;
                 self.adopt_status(&status);
                 self.pending_permission = None;
                 if !response.is_empty() {
@@ -550,7 +680,7 @@ impl App {
                     self.transcript
                         .push(TranscriptLine::Assistant(StreamText::fresh(response, tps)));
                 }
-                self.activity = None;
+                self.set_activity(None);
                 self.waiting_from_stopped = false;
                 if cancelled {
                     self.transcript
@@ -561,6 +691,9 @@ impl App {
                         "stopped at the token or spend budget in .atlas/agent.toml",
                     ));
                 }
+                if stopped_for_context {
+                    self.transcript.push(tool_note(CONTEXT_STOP_NOTE));
+                }
                 if let Some(notice) = compaction.notice() {
                     self.transcript.push(tool_note(notice));
                 }
@@ -569,6 +702,14 @@ impl App {
                 } else {
                     Status::Ready
                 };
+            }
+            ServerMessage::Compacted { compaction, status } => {
+                self.status_notice = None;
+                self.adopt_status(&status);
+                let note = compaction
+                    .notice()
+                    .unwrap_or_else(|| "nothing to compact".to_string());
+                self.transcript.push(tool_note(note));
             }
             ServerMessage::PermissionRequest {
                 id,
@@ -579,7 +720,7 @@ impl App {
                 finish_streams(self);
                 self.pending_permission = Some(PermissionPrompt::new(id, tool, summary, preview));
                 self.status = Status::Waiting;
-                self.activity = None;
+                self.set_activity(None);
             }
             ServerMessage::Error {
                 message,
@@ -587,6 +728,7 @@ impl App {
                 ..
             } => {
                 self.status_notice = None;
+                self.cancel_stage = 0;
                 self.pending_permission = None;
                 self.transcript
                     .push(TranscriptLine::Assistant(StreamText::settled(format!(
@@ -595,7 +737,7 @@ impl App {
                 if !status_line.is_empty() {
                     self.status_line = status_line;
                 }
-                self.activity = None;
+                self.set_activity(None);
                 self.status = if self.waiting_from_stopped {
                     Status::Stopped
                 } else {
@@ -676,7 +818,19 @@ impl App {
                     self.transcript.push(tool_note(warning));
                 }
             }
-            ServerMessage::Listing { scope, kind, names } => {
+            ServerMessage::Listing {
+                scope,
+                kind,
+                names,
+                sessions,
+            } => {
+                if kind == "sessions" && !sessions.is_empty() {
+                    self.session_names = sessions.iter().map(|s| s.id.clone()).collect();
+                    for info in &sessions {
+                        self.transcript.push(tool_note(session_row(info)));
+                    }
+                    return;
+                }
                 if kind == "sessions" {
                     self.session_names = names.clone();
                 }
@@ -778,6 +932,65 @@ impl App {
                     note.push_str(&format!(". {catalog}"));
                 }
                 self.transcript.push(tool_note(note));
+            }
+            ServerMessage::SessionLoaded {
+                id,
+                messages,
+                saved_model,
+                stopped_for_limit,
+                interrupted,
+                replay,
+                omitted,
+                status,
+                ..
+            } => {
+                finish_streams(self);
+                self.transcript.clear();
+                if omitted > 0 {
+                    self.transcript
+                        .push(tool_note(format!("{omitted} earlier items not shown")));
+                }
+                for item in replay {
+                    match item.role.as_str() {
+                        "user" => self.transcript.push(TranscriptLine::User(item.text)),
+                        "assistant" => self
+                            .transcript
+                            .push(TranscriptLine::Assistant(StreamText::settled(item.text))),
+                        _ => self
+                            .transcript
+                            .push(tool_note(format!("{} - {}", item.name, item.summary))),
+                    }
+                }
+                let model = if saved_model.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({saved_model})")
+                };
+                self.transcript.push(tool_note(format!(
+                    "resumed {id}: {messages} messages{model}"
+                )));
+                self.adopt_status(&status);
+                self.status_notice = None;
+                self.pending_permission = None;
+                self.set_activity(None);
+                self.waiting_from_stopped = false;
+                self.status = if stopped_for_limit || interrupted {
+                    Status::Stopped
+                } else {
+                    Status::Ready
+                };
+                self.follow = true;
+            }
+            ServerMessage::Undo { restored, message } => {
+                let note = match restored {
+                    Some(path) => format!("restored {path}"),
+                    None if message.is_empty() => "no checkpoint to restore".to_string(),
+                    None => message,
+                };
+                self.transcript.push(tool_note(note));
+                self.status = Status::Ready;
+                self.set_activity(None);
+                self.waiting_from_stopped = false;
             }
             ServerMessage::Unknown => {}
         }
@@ -1087,9 +1300,20 @@ fn handle_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) -> Result<
         if app.in_flight() {
             // Stop the turn, keep the conversation. The runtime answers every
             // pending tool call before it returns, so the next turn is valid.
-            child.send(serde_json::json!({"type": "cancel"}))?;
-            app.transcript
-                .push(tool_note("cancelling after this step..."));
+            match app.cancel_stage {
+                0 => {
+                    child.send(serde_json::json!({"type": "cancel"}))?;
+                    app.cancel_stage = 1;
+                    app.transcript
+                        .push(tool_note(cancel_message(&app.activity)));
+                }
+                1 => {
+                    app.cancel_stage = 2;
+                    app.status_notice = Some(STILL_STOPPING);
+                    app.transcript.push(tool_note(STILL_STOPPING));
+                }
+                _ => {}
+            }
             return Ok(false);
         }
         if !app.input.is_empty() {
@@ -1304,6 +1528,7 @@ fn handle_compose_key(app: &mut App, child: &mut ChildProcess, key: KeyEvent) ->
                     app.prompt_history.record(&text);
                     app.transcript.push(TranscriptLine::User(text));
                     app.waiting_from_stopped = false;
+                    app.cancel_stage = 0;
                     app.status = Status::Waiting;
                     app.follow = true;
                 }
@@ -1902,7 +2127,8 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
                 app.transcript.clear();
                 app.status = Status::Ready;
                 app.waiting_from_stopped = false;
-                app.activity = None;
+                app.cancel_stage = 0;
+                app.set_activity(None);
                 app.pending_permission = None;
                 app.selected = None;
                 app.reveal_selected = false;
@@ -1966,6 +2192,16 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
                 }
             }
         }
+        "/compact" => {
+            if parts.next().is_some() {
+                app.transcript.push(tool_note("usage: /compact"));
+                None
+            } else {
+                app.transcript
+                    .push(tool_note("compacting the conversation context"));
+                Some(serde_json::json!({"type": "compact"}))
+            }
+        }
         "/undo" => {
             if parts.next().is_some() {
                 app.transcript.push(tool_note("usage: /undo"));
@@ -1977,22 +2213,13 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
             }
         }
         "/resume" => {
-            let id = text.trim().trim_start_matches("/resume").trim();
-            if id.is_empty() {
-                match app.session_names.last().cloned() {
-                    Some(newest) => {
-                        app.transcript.clear();
-                        app.status = Status::Waiting;
-                        Some(serde_json::json!({"type": "load_session", "id": newest}))
-                    }
-                    None => {
-                        app.transcript
-                            .push(tool_note("/resume needs an id; run /sessions first"));
-                        None
-                    }
-                }
+            let rest: Vec<&str> = text.split_whitespace().skip(1).collect();
+            if rest.len() > 1 {
+                app.transcript.push(tool_note("usage: /resume [ID]"));
+                None
             } else {
-                app.transcript.clear();
+                let id = rest.first().copied().unwrap_or("last");
+                app.waiting_from_stopped = app.status == Status::Stopped;
                 app.status = Status::Waiting;
                 Some(serde_json::json!({"type": "load_session", "id": id}))
             }
@@ -2164,7 +2391,11 @@ fn key_command(
 
 const PICKER_PAGE: usize = 8;
 /// Slash commands stay on one page so a new command is not clipped off `/`.
-const MENU_PAGE: usize = 14;
+const MENU_PAGE: usize = 17;
+
+/// Transcript note for a turn that stopped because the request cannot fit.
+const CONTEXT_STOP_NOTE: &str =
+    "stopped: the conversation no longer fits the model context; run /compact or start /new";
 
 /// Slice of the filtered catalog that stays on screen around `index`.
 fn picker_window(len: usize, index: usize, page: usize) -> std::ops::Range<usize> {
@@ -2186,10 +2417,14 @@ struct MenuItem {
 }
 
 /// Slash commands offered in the menu and the help panel.
-const COMMANDS: [MenuItem; 14] = [
+const COMMANDS: [MenuItem; 17] = [
     MenuItem {
         token: "/new",
         description: "Start a fresh conversation",
+    },
+    MenuItem {
+        token: "/compact",
+        description: "Compact the conversation context",
     },
     MenuItem {
         token: "/help",
@@ -2222,6 +2457,14 @@ const COMMANDS: [MenuItem; 14] = [
     MenuItem {
         token: "/sessions",
         description: "List sessions",
+    },
+    MenuItem {
+        token: "/resume",
+        description: "Restore a saved conversation (default: newest)",
+    },
+    MenuItem {
+        token: "/undo",
+        description: "Restore the newest edited file",
     },
     MenuItem {
         token: "/artifacts",
@@ -2438,17 +2681,42 @@ fn confirmed_sha256(app: &App, name: &str, sha8: &str) -> String {
     sha8.to_string()
 }
 
+fn session_row(info: &protocol::SessionInfo) -> String {
+    let prompt: String = info.prompt.chars().take(60).collect();
+    let mut row = format!(
+        "{}  {}  {}  {} msgs  {}",
+        info.id, info.saved, info.model, info.messages, prompt
+    );
+    if info.interrupted {
+        row.push_str(" [interrupted]");
+    }
+    if info.stopped_for_limit {
+        row.push_str(" [limit]");
+    }
+    row
+}
+
 fn is_finished_command(text: &str) -> bool {
     let trimmed = text.trim_end();
     if matches!(
         trimmed,
-        "/new" | "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy" | "/yolo"
+        "/new"
+            | "/compact"
+            | "/sessions"
+            | "/artifacts"
+            | "/quit"
+            | "/exit"
+            | "/copy"
+            | "/yolo"
+            | "/undo"
+            | "/resume"
     ) {
         return true;
     }
     let mut words = trimmed.split_whitespace();
     let command = words.next().unwrap_or("");
     match command {
+        "/resume" => words.next().is_some() && words.next().is_none(),
         "/goal" => goal_argument(trimmed).is_some(),
         "/skill" => words.next().is_some(),
         "/save-skill" => words.next().is_some() && words.next().is_none(),
@@ -2665,7 +2933,10 @@ fn help_lines(app: &App) -> Vec<String> {
         ("← / →", "select and expand a tool row"),
         ("PgUp / PgDn", "scroll the transcript"),
         ("Esc", "stop the turn, or close this panel"),
-        ("Ctrl+R", "resume the newest session"),
+        (
+            "Ctrl+R",
+            "resume after a tool-limit stop or interrupted turn",
+        ),
         ("Ctrl+C", "copy a selection, or quit"),
         ("/", "open the command menu"),
     ];
@@ -3157,7 +3428,7 @@ fn is_diff_tool(name: &str) -> bool {
 
 /// Tools whose result reports an explicit exit code.
 fn is_exit_tool(name: &str) -> bool {
-    matches!(name, "bash_tool" | "run_tests")
+    matches!(name, "bash" | "run_tests")
 }
 
 /// Return whether an ``exit_code:`` line reports success.
@@ -3321,6 +3592,10 @@ fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
         Activity::Working => "model working".to_string(),
         Activity::ToolCalling(name) => format!("tool calling {name}"),
         Activity::ToolExecuting(name) => format!("tool executing {name}"),
+    };
+    let label = match app.activity_since.map(|since| since.elapsed().as_secs()) {
+        Some(secs) if secs >= 5 => format!("{label} {}", format_elapsed(secs)),
+        _ => label,
     };
     let line = Line::from(vec![
         Span::styled(
@@ -3761,8 +4036,9 @@ fn note_session_closed(app: &mut App) {
         return;
     }
     app.session_open = false;
+    app.cancel_stage = 0;
     app.pending_permission = None;
-    app.activity = None;
+    app.set_activity(None);
     let detail = app
         .last_stderr
         .clone()
@@ -3775,14 +4051,17 @@ fn note_session_closed(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_streams, collapse_selected, dashboard_text, delete_word_backward, draw,
-        expand_selected, finish_streams, format_context, help_lines, is_finished_command,
-        menu_action, menu_options, nudge_scroll, picker_selection, price_per_million, select_tool,
-        select_tool_at, slash_outcome, status_hint, tool_body_kind, wrap_text, Activity, App,
-        MenuAction, Mode, RowKind, Status, StreamText, ToolHit, TranscriptLine,
+        advance_streams, cancel_message, collapse_selected, dashboard_text, delete_word_backward,
+        draw, expand_selected, finish_streams, format_context, format_elapsed, help_lines,
+        is_finished_command, menu_action, menu_options, nudge_scroll, picker_selection,
+        price_per_million, select_tool, select_tool_at, slash_outcome, status_hint, tool_body_kind,
+        wrap_text, Activity, App, MenuAction, Mode, RowKind, Status, StreamText, ToolHit,
+        TranscriptLine,
     };
     use crate::logo::logo_size;
-    use crate::protocol::{CatalogEntry, ResourcePreview, ServerMessage, StatusSnapshot};
+    use crate::protocol::{
+        parse_line, CatalogEntry, ResourcePreview, ServerMessage, StatusSnapshot,
+    };
 
     fn tool_text(app: &App) -> String {
         app.transcript
@@ -4192,6 +4471,7 @@ mod tests {
             tokens,
             vec![
                 "/new",
+                "/compact",
                 "/help",
                 "/goal",
                 "/yolo",
@@ -4200,6 +4480,8 @@ mod tests {
                 "/key",
                 "/skill",
                 "/sessions",
+                "/resume",
+                "/undo",
                 "/artifacts",
                 "/quit",
                 "/exit",
@@ -4379,6 +4661,7 @@ mod tests {
         let painted = screen(&mut app, 80, 40);
         for name in [
             "/new",
+            "/compact",
             "/help",
             "/goal",
             "/model",
@@ -4429,6 +4712,71 @@ mod tests {
     }
 
     #[test]
+    fn tool_row_shows_summary_and_notes_section() {
+        let mut app = App::new();
+        app.apply(ServerMessage::Step {
+            name: "bash".to_string(),
+            call_id: "1".to_string(),
+            ok: true,
+            arguments: serde_json::json!({"command": "sleep 8"}),
+            text: Some("done".to_string()),
+            error: None,
+            error_kind: None,
+            artifacts: Vec::new(),
+            summary: "sleep 8".to_string(),
+            notes: vec!["repeated result".to_string()],
+        });
+        let painted = screen(&mut app, 80, 24);
+        assert!(painted.contains("bash - sleep 8"), "{painted}");
+        assert!(!painted.contains("repeated result"), "{painted}");
+        expand_selected(&mut app);
+        let opened = screen(&mut app, 80, 24);
+        assert!(opened.contains("notes"), "{opened}");
+        assert!(opened.contains("repeated result"), "{opened}");
+    }
+
+    #[test]
+    fn format_elapsed_scales_units() {
+        assert_eq!(format_elapsed(7), "7s");
+        assert_eq!(format_elapsed(72), "1m12s");
+        assert_eq!(format_elapsed(3720), "1h02m");
+    }
+
+    #[test]
+    fn cancel_message_is_worded_by_tool_class() {
+        let run = |name: &str| cancel_message(&Some(Activity::ToolExecuting(name.to_string())));
+        assert_eq!(run("bash"), "cancelling the running command...");
+        assert!(run("read_file").contains("read_file is still running"));
+        assert!(run("band_math").contains("next check"));
+        assert_eq!(cancel_message(&Some(Activity::Thinking)), "cancelling...");
+        assert!(cancel_message(&None).contains("next step"));
+    }
+
+    #[test]
+    fn activity_clock_resets_only_on_change() {
+        let mut app = App::new();
+        app.set_activity(Some(Activity::Thinking));
+        let first = app.activity_since;
+        assert!(first.is_some());
+        app.set_activity(Some(Activity::Thinking));
+        assert_eq!(app.activity_since, first);
+        app.set_activity(None);
+        assert!(app.activity_since.is_none());
+    }
+
+    #[test]
+    fn step_line_without_summary_or_notes_parses_with_defaults() {
+        let line = r#"{"type":"step","name":"ls","ok":true}"#;
+        match parse_line(line) {
+            Ok(Some(ServerMessage::Step { summary, notes, .. })) => {
+                assert!(summary.is_empty());
+                assert!(notes.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn tool_step_hides_the_raw_result() {
         let mut app = App::new();
         app.apply(ServerMessage::Step {
@@ -4440,6 +4788,8 @@ mod tests {
             error: None,
             error_kind: None,
             artifacts: vec!["notes.md".to_string()],
+            summary: String::new(),
+            notes: Vec::new(),
         });
         let painted = screen(&mut app, 80, 24);
         assert!(painted.contains("read_file"), "{painted}");
@@ -4527,6 +4877,7 @@ mod tests {
             response: "alpha beta gamma".to_string(),
             stopped_for_limit: false,
             stopped_for_budget: false,
+            stopped_for_context: false,
             cancelled: false,
             compaction: Default::default(),
             status: StatusSnapshot {
@@ -4591,6 +4942,8 @@ mod tests {
             error: None,
             error_kind: None,
             artifacts: Vec::new(),
+            summary: String::new(),
+            notes: Vec::new(),
         });
         app.apply(ServerMessage::Thought {
             text: "look around".to_string(),
@@ -4625,6 +4978,8 @@ mod tests {
             error: None,
             error_kind: None,
             artifacts: Vec::new(),
+            summary: String::new(),
+            notes: Vec::new(),
         });
         app.apply(ServerMessage::Step {
             name: "list".to_string(),
@@ -4635,6 +4990,8 @@ mod tests {
             error: Some("missing".to_string()),
             error_kind: Some("tool_failure".to_string()),
             artifacts: Vec::new(),
+            summary: String::new(),
+            notes: Vec::new(),
         });
         assert_eq!(app.selected, Some(1));
         select_tool(&mut app, -1);
@@ -5060,12 +5417,60 @@ mod tests {
     }
 
     #[test]
+    fn compact_command_sends_the_compact_request() {
+        let mut app = App::new();
+        let payload = slash_outcome(&mut app, "/compact").expect("compact request");
+        assert_eq!(payload, serde_json::json!({"type": "compact"}));
+        assert!(is_finished_command("/compact"));
+        assert!(!is_finished_command("/compact now"));
+        assert!(slash_outcome(&mut app, "/compact now").is_none());
+    }
+
+    #[test]
+    fn compacted_event_adds_a_note() {
+        let mut app = App::new();
+        app.apply(ServerMessage::Compacted {
+            compaction: crate::protocol::Compaction {
+                occurred: true,
+                tokens_reclaimed: 900,
+                ..Default::default()
+            },
+            status: StatusSnapshot::default(),
+        });
+        assert!(tool_text(&app).contains("900 tokens reclaimed"));
+        let mut idle = App::new();
+        idle.apply(ServerMessage::Compacted {
+            compaction: Default::default(),
+            status: StatusSnapshot::default(),
+        });
+        assert!(tool_text(&idle).contains("nothing to compact"));
+    }
+
+    #[test]
+    fn context_stop_adds_a_note_and_stays_ready() {
+        let mut app = App::new();
+        app.apply(ServerMessage::Done {
+            response: String::new(),
+            stopped_for_limit: false,
+            stopped_for_budget: false,
+            stopped_for_context: true,
+            cancelled: false,
+            compaction: Default::default(),
+            status: StatusSnapshot::default(),
+        });
+        assert!(tool_text(&app).contains("no longer fits the model context"));
+        assert!(tool_text(&app).contains("/compact"));
+        assert!(matches!(app.status, Status::Ready));
+    }
+
+    #[test]
     fn compaction_notice_reports_what_changed() {
         let mut app = App::new();
         app.apply(ServerMessage::Done {
             response: String::new(),
             stopped_for_limit: false,
             stopped_for_budget: false,
+            stopped_for_context: false,
             cancelled: false,
             compaction: crate::protocol::Compaction {
                 occurred: true,
@@ -5101,7 +5506,7 @@ mod tests {
             RowKind::ToolHunk
         ));
         assert!(matches!(
-            tool_body_kind("bash_tool", false, "  exit_code: 0", false),
+            tool_body_kind("bash", false, "  exit_code: 0", false),
             RowKind::ToolExitOk
         ));
         assert!(matches!(

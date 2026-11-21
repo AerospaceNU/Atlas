@@ -1077,3 +1077,43 @@ def test_live_openrouter_model_list() -> None:
             assert all(ord(char) >= 32 for char in model.description)
         assert "\u202e" not in model.id
         assert all(ord(char) >= 32 and not 0x7F <= ord(char) <= 0x9F for char in model.id)
+
+
+def _payload_sent(**config: Any) -> dict[str, Any]:
+    client = FakeClient({"choices": [{"message": {"content": "ok", "tool_calls": []}}]})
+    model = OpenRouterModel(ModelConfig(model="example/model", api_key="test", **config), client)
+    model.complete([ChatMessage(role=Role.USER, content="hi")], [])
+    sent = client.calls[0]["json"]
+    assert isinstance(sent, dict)
+    return sent
+
+
+def _reasoning_sent(**config: Any) -> dict[str, Any]:
+    reasoning: dict[str, Any] = _payload_sent(**config)["reasoning"]
+    return reasoning
+
+
+def test_reasoning_payload_shapes() -> None:
+    assert _reasoning_sent() == {"enabled": True}
+    assert _reasoning_sent(reasoning=False) == {"enabled": False}
+    assert _reasoning_sent(reasoning_effort="low") == {"effort": "low"}
+    assert _reasoning_sent(reasoning_effort="max") == {"effort": "max"}
+
+
+def test_reasoning_effort_is_validated() -> None:
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        ModelConfig(model="m", api_key="k", reasoning_effort="extreme")
+
+
+def test_sampling_params_are_sent_only_when_set() -> None:
+    unset = _payload_sent()
+    assert "temperature" not in unset and "top_p" not in unset
+    sent = _payload_sent(temperature=0.2, top_p=0.9)
+    assert sent["temperature"] == 0.2 and sent["top_p"] == 0.9
+    assert _payload_sent(temperature=0.0)["temperature"] == 0.0
+
+
+def test_provider_order_pins_routing_without_fallback() -> None:
+    assert "provider" not in _payload_sent()
+    sent = _payload_sent(provider_order=("deepinfra/fp8", "baseten"))
+    assert sent["provider"] == {"order": ["deepinfra/fp8", "baseten"], "allow_fallbacks": False}

@@ -1,0 +1,135 @@
+diff --git a/harness2/benchmarks/tasks.py b/harness2/benchmarks/tasks.py
+index 6fff81c..aca5b6c 100644
+--- a/harness2/benchmarks/tasks.py
++++ b/harness2/benchmarks/tasks.py
+@@ -49,6 +49,21 @@ def discover(bench: str, subset: str | None = None) -> dict[str, str]:
+             if not (p.parent / "instruction.md").is_file():
+                 raise FileNotFoundError(f"Missing task instructions: {p.parent / 'instruction.md'}")
+             tasks[p.parent.name] = domain.strip()
++    elif bench == "swe":
++        import os
++        jsonl = os.environ.get("SWE_BENCH_JSONL", "")
++        from pathlib import Path as _P
++        if not jsonl or not _P(jsonl).is_file():
++            raise FileNotFoundError(
++                f"SWE_BENCH_JSONL not found: {jsonl!r} (set it to evals/swe/lite-smoke.jsonl)"
++            )
++        import json as _json
++        tasks = {}
++        for _line in _P(jsonl).read_text(encoding="utf-8").splitlines():
++            if not _line.strip():
++                continue
++            _rec = _json.loads(_line)
++            tasks[str(_rec["instance_id"])] = str(_rec["repo"])
+     else:
+         raise ValueError(f"Unknown benchmark/subset: {bench}/{subset}")
+     if not tasks:
+diff --git a/harness2/cli/_common.py b/harness2/cli/_common.py
+index 06d4130..1e2d6ca 100644
+--- a/harness2/cli/_common.py
++++ b/harness2/cli/_common.py
+@@ -27,9 +27,9 @@ from ..core import library as LIB
+ from ..core import schedule as SCHED
+ from ..core.spec import BenchmarkAdapter
+ 
+-BENCHES = ("jb", "wb", "lab")
++BENCHES = ("jb", "wb", "lab", "swe")
+ WB_SUBSETS = ("office", "web", "code")
+-SUBSTRATES = ("oc", "cx")
++SUBSTRATES = ("oc", "cx", "atlas")
+ 
+ MODES_DEFAULT = "parallel"
+ MODES_HELP = (
+@@ -64,6 +64,10 @@ def make_adapter(
+         return JobBenchAdapter(substrate=substrate, split_file=split_file)
+     from ..benchmarks.lab import LabAdapter
+ 
++    from ..benchmarks.swebench import SWEBenchAdapter
++
++    if bench == "swe":
++        return SWEBenchAdapter(substrate=substrate, split_file=split_file)
+     return LabAdapter(substrate=substrate, split_file=split_file)
+ 
+ 
+diff --git a/harness2/cli/check.py b/harness2/cli/check.py
+index 638eaab..2fb3335 100644
+--- a/harness2/cli/check.py
++++ b/harness2/cli/check.py
+@@ -24,9 +24,9 @@ from harness2.preflight import check
+ 
+ def main(argv=None):
+     p = argparse.ArgumentParser(description=__doc__)
+-    p.add_argument("--bench", choices=("jb", "lab", "wb"), required=True)
++    p.add_argument("--bench", choices=("jb", "lab", "wb", "swe"), required=True)
+     p.add_argument("--subset", choices=("office", "web", "code"))
+-    p.add_argument("--substrate", choices=("oc", "cx"), default="oc")
++    p.add_argument("--substrate", choices=("oc", "cx", "atlas"), default="atlas")
+     args = p.parse_args(argv)
+     try:
+         adapter = make_adapter(args.bench, args.subset, args.substrate)
+diff --git a/harness2/core/proposer.py b/harness2/core/proposer.py
+index 0652863..cf2faa7 100644
+--- a/harness2/core/proposer.py
++++ b/harness2/core/proposer.py
+@@ -263,6 +263,9 @@ class Proposer:
+         )
+         env["XDG_DATA_HOME"] = str(cwd / ".ocdata")
+         env["XDG_STATE_HOME"] = str(cwd / ".ocstate")
++        # Keep the user's own OpenCode config (other versions' keys, plugins, MCP servers,
++        # personal instructions) out of an improver session.
++        env["XDG_CONFIG_HOME"] = str(cwd / ".occonfig")
+ 
+         cmd = [
+             str(config.BUN),
+@@ -287,6 +290,9 @@ class Proposer:
+             cwd=cwd,
+             env=env,
+             text=True,
++            # `opencode run` appends a non-TTY stdin to its prompt and waits for EOF, so an
++            # inherited pipe that never closes hangs the session until the timeout.
++            stdin=subprocess.DEVNULL,
+             stdout=subprocess.PIPE,
+             stderr=subprocess.PIPE,
+             timeout=wall,
+diff --git a/harness2/preflight.py b/harness2/preflight.py
+index 93651cd..88c94bd 100644
+--- a/harness2/preflight.py
++++ b/harness2/preflight.py
+@@ -43,10 +43,13 @@ def check(adapter, *, judge=False) -> list[str]:
+             errors.append(f"{label}: {type(exc).__name__}; see README.md")
+             return False
+ 
++    bench = adapter.spec.name.split("-", 1)[0]
++    # The Atlas solver has no OpenCode executor to probe; its adapter checks its own runtime.
++    substrate_checks = () if bench == "swe" else (OpencodeSubstrate().preflight,)
+     for validate in (
+         lambda: config.validate_models(judge=judge),
+         adapter.tasks,
+-        OpencodeSubstrate().preflight,
++        *substrate_checks,
+         adapter.preflight,
+     ):
+         try:
+@@ -54,7 +57,8 @@ def check(adapter, *, judge=False) -> list[str]:
+         except (OSError, RuntimeError, ValueError) as exc:
+             errors.append(str(exc))
+ 
+-    bench = adapter.spec.name.split("-", 1)[0]
++    if bench == "swe":
++        return errors
+     name = {"jb": "job-bench-eval", "lab": "harvey-labs", "wb": "workbuddy-bench"}[bench]
+     repo = config.DEPENDENCIES / name
+     for dependency in (name, "opencode"):
+diff --git a/scripts/split_tasks.py b/scripts/split_tasks.py
+index 8a778e7..cfd8d8c 100644
+--- a/scripts/split_tasks.py
++++ b/scripts/split_tasks.py
+@@ -28,7 +28,7 @@ from harness2.benchmarks.tasks import discover
+ 
+ def main(argv=None) -> int:
+     p = argparse.ArgumentParser(description=__doc__)
+-    p.add_argument("--bench", required=True, choices=("jb", "lab", "wb"))
++    p.add_argument("--bench", required=True, choices=("jb", "lab", "wb", "swe"))
+     p.add_argument("--subset", choices=("office", "web", "code"))
+     p.add_argument("--seed", type=int, default=42)
+     p.add_argument("--train-fraction", type=float, default=0.5)

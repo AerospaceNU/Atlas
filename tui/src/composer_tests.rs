@@ -56,6 +56,7 @@ fn done(app: &mut App) {
         response: String::new(),
         stopped_for_limit: false,
         stopped_for_budget: false,
+        stopped_for_context: false,
         cancelled: false,
         compaction: Default::default(),
         status: StatusSnapshot::default(),

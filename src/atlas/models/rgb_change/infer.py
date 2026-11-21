@@ -11,7 +11,7 @@ from scipy import ndimage
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 from atlas.models import base as model_base
-from atlas.models.base import PluginSpec, load_rgb_array
+from atlas.models.base import HEURISTIC_PREFIX, PluginSpec, load_rgb_array
 
 CHANGE_THRESHOLD = 0.2
 MIN_BLOB_PIXELS = 16
@@ -184,7 +184,7 @@ class RgbChangeTool(Tool):
         json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return ToolResult(
             text=(
-                f"{self.name}: {width}x{height} (changed={changed:.2f}, polygons={len(polygons)})"
+                f"{HEURISTIC_PREFIX} {self.name}: {width}x{height} (changed={changed:.2f}, polygons={len(polygons)})"
             ),
             artifacts=[store.relative(heatmap_path), store.relative(json_path)],
         )

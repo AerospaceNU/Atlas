@@ -343,7 +343,7 @@ def test_author_quoted_description_keeps_newlines_and_literal_backslashes(tmp_pa
         "metadata:\n"
         '  "author": "atlas"\n'
         '  "version": "1.0"\n'
-        'allowed-tools: "read_file bash_tool"\n'
+        'allowed-tools: "read_file bash"\n'
         "---\n"
         "\n"
         "Subtract the later scene.\n",

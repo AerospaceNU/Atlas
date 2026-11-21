@@ -1,6 +1,6 @@
 [project]
 name = "atlas"
-version = "0.15.1"
+version = "0.17.0"
 description = "Automated satellite data analysis framework"
 readme = "README.md"
 authors = [
@@ -28,8 +28,14 @@ dependencies = [
 
 [project.optional-dependencies]
 gemini = ["google-genai>=2.28.0"]
+geo = ["rasterio>=1.4.0", "pyproj>=3.7.0"]
 geotiff = ["rasterio>=1.4.0"]
 lightgbm = ["lightgbm>=4.6.0"]
+# ONNX Runtime has no macOS x86_64 wheels after 1.19.2, hence the marker pair.
+onnx = [
+    "onnxruntime>=1.20.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "onnxruntime>=1.19.2,<1.20; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
 
 [project.scripts]
 atlas = "atlas:main"
@@ -96,6 +102,12 @@ module = [
     "google.*",
     "lightgbm",
     "lightgbm.*",
+    "onnxruntime",
+    "onnxruntime.*",
+    "pyproj",
+    "pyproj.*",
+    "rasterio",
+    "rasterio.*",
     "rich",
     "rich.*",
     "scipy",

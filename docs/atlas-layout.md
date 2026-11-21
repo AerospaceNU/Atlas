@@ -19,9 +19,17 @@ searched.
 
 | Path | What it holds |
 |---|---|
-| `sessions/<id>/` | One agent session. `meta.json` is the id and model. No keys. |
+| `.gitignore` | Written by `ensure_project_layout` with a comment and `*` only when missing. It keeps `.atlas/` out of a foreign repository's git status. Edit or delete it to track files. |
+| `sessions/<id>/` | One agent session. `meta.json`: `id`, `model`, `created`, `saved`, `messages`, `prompt`, `interrupted`, `stopped_for_limit`. `state.json`: `id`, `model`, `goal`, `messages`, `totals`, `saved`, `interrupted`, `stopped_for_limit`. No keys. A session with a `state.json` resumes through `--resume ID` or `--resume last` and `/resume`. |
 | `artifacts/<id>/` | Files for that session. Removing the session removes this directory. |
-| `data/` | Data CLI pulls. This is the existing `.atlas/data` default. `manifest.json` is the pull manifest, one row per source, each with its own request. |
+| `artifacts/<id>/tool-output/` | Full text of any tool result over 20,000 characters, redacted. It is `.atlas/tool-output/` when the artifact root is the workspace. |
+| `artifacts/<id>/jobs/<jobid>.log` | Background bash jobs, capped at 64 MiB each. Removed with the session. |
+| `analysis/{stacks,figures,tables,exports,scripts}/` and `analysis/runs.jsonl` | Satellite analysis outputs and the run record. Persistent and shared across sessions; removing a session does not remove them. Old per-session `artifacts/<id>/analysis/` directories are read-only fallbacks. |
+| `artifacts/<id>/subagents/<child>/plan.json` | A sub-agent's private plan. |
+| `checkpoints/<session>/<n>/` | Pre-edit copies of files for `/undo`. Child agents share the parent's chain. Outside `artifacts/`, so removing a session keeps its undo history. |
+| `audit.log` | One JSON line per tool and model event. |
+| `plan.json` | The plan written by `update_plan` and read by `read_plan`. |
+| `data/` | Pulls from the data CLI and from `get_satellite_data`. Persistent across sessions. `manifest.json` is the pull manifest, one row per source, each with its own request. |
 | `skills/` | Vetted skills. |
 | `skills-drafts/` | Draft skills. They are not loaded until a person enables one. |
 | `agent.toml` | Workspace model and tool-call budget. |
@@ -31,7 +39,7 @@ searched.
 | Path | What it holds |
 |---|---|
 | `keys/` | API keys. The directory is mode `0700` and each file is mode `0600`. Keys are not written into the project. |
-| `weights/` | User-level weights. This is the existing `~/.atlas/weights` fallback. |
+| `weights/` | Model weights, laid out as `<dir>/<name>/<version>/<file>` plus a `.verified.json` marker. Fetched only by the human-run `atlas models pull`. |
 | `defaults/` | User defaults. |
 | `skills/` | User skills, loaded only when home skills are on. |
 | `skills-drafts/` | User skill drafts. |
@@ -42,8 +50,9 @@ otherwise be `~/.atlas`, not to the parent home. `ATLAS_HOME_SKILLS` still
 only turns user skills on. The skills and `config.toml` it refers to are
 read from that same root. `.agents/skills` does not move with `ATLAS_HOME`.
 
-`ATLAS_WEIGHTS_DIR` overrides the weights location. When a checkout is visible,
-`<repo>/weights` is used before the user weights directory.
+`ATLAS_WEIGHTS_DIR` sets the weights location; otherwise it is `~/.atlas/weights`
+(under `ATLAS_HOME` when set). The current directory and the repository are never
+probed for weights.
 
 ## Windows
 
@@ -56,3 +65,7 @@ the user root itself.
 Key files request mode `0600` and the keys directory requests mode `0700`.
 Windows does not enforce those Unix bits. The file ACL is what keeps a key
 private. Atlas still rejects a key symlink there.
+
+The agent (TUI and `atlas run`) needs a POSIX shell and process groups, so on
+Windows it runs under WSL2. See
+[INSTALL-WINDOWS.md](../install-instructions/INSTALL-WINDOWS.md).

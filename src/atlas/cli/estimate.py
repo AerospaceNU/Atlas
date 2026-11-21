@@ -6,6 +6,7 @@ so a caller can show the estimate without prompting.
 
 from __future__ import annotations
 
+import math
 import sys
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from atlas.cli.download import (
 )
 from atlas.compile.product import SceneCatalog
 from atlas.data.base import Asset, BBox, Scene
+from atlas.data.profiles import AssetNotFound, list_aliases, resolve_asset
 from atlas.data.registry import SOURCES
 
 # A successful search that returned nothing will not be downloaded.
@@ -43,6 +45,21 @@ _YES = frozenset({"y", "yes"})
 # instead of filling in a number.
 QUOTA_NOT_READABLE = "not readable"
 _BYTE_UNITS = ("bytes", "KB", "MB", "GB", "TB", "PB")
+_MAX_ASSET_ITEMS = 12
+_WINDOW_CAP_PX = 36_000_000
+_METRES_PER_DEG_LON = 111_320.0
+_METRES_PER_DEG_LAT = 110_574.0
+_DEFAULT_ITEMSIZE = 2
+_ITEMSIZE = {
+    "uint8": 1,
+    "int8": 1,
+    "uint16": 2,
+    "int16": 2,
+    "uint32": 4,
+    "int32": 4,
+    "float32": 4,
+    "float64": 8,
+}
 _EARTHDATA_MODULES = frozenset({"atlas.data.modis_base", "atlas.data.sources.fldas"})
 
 
@@ -72,6 +89,9 @@ class SourceSize:
         unknown_scenes: Scenes whose size the catalog did not report.
         windowed: Scenes read as a COG window. Their catalog size is an upper
             bound; the bytes transferred are usually much smaller.
+        assets_text: Alias=key items for the first scene, or empty when the
+            collection has no profile.
+        window_text: Window-size estimate for the requested bands, or empty.
     """
 
     source: str
@@ -79,6 +99,8 @@ class SourceSize:
     known_bytes: int
     unknown_scenes: int
     windowed: int = 0
+    assets_text: str = ""
+    window_text: str = ""
 
     @property
     def bytes_text(self) -> str:
@@ -222,6 +244,7 @@ def estimate_pull(
     catalog: SceneCatalog,
     *,
     asset_name: str | None = None,
+    asset_names: Sequence[str] = (),
     unknown_byte_sources: Collection[str] = (),
     out_dir: Path | None = None,
     prior_manifest: Mapping[str, Any] | None = None,
@@ -247,6 +270,8 @@ def estimate_pull(
     Args:
         catalog: Search results for one pull.
         asset_name: Band or asset key the download would select.
+        asset_names: Aliases or keys a typed pull would fetch. Adds the ``assets:``
+            and ``window:`` text when the collection has a profile.
         unknown_byte_sources: Registry names whose byte size this catalog
             cannot report. Their scenes still count.
         out_dir: Directory the download would write. ``None`` skips the disk check.
@@ -300,6 +325,8 @@ def estimate_pull(
                 known_bytes=known_bytes,
                 unknown_scenes=unknown_scenes,
                 windowed=windowed,
+                assets_text=_assets_text(remaining[0], asset_names),
+                window_text=_window_text(remaining, asset_names, bbox),
             )
         )
     return PullEstimate(
@@ -336,6 +363,10 @@ def render_pull_estimate(estimate: PullEstimate) -> str:
         lines.append("sources:")
         for source in estimate.sources:
             lines.append(f"  {source.source}: {source.scene_count} scenes, {source.bytes_text}")
+            if source.assets_text:
+                lines.append(f"    assets: {source.assets_text}")
+            if source.window_text:
+                lines.append(f"    window: {source.window_text}")
     if estimate.skipped:
         lines.append("skipped:")
         for skipped in estimate.skipped:
@@ -384,6 +415,66 @@ def confirm_download(
         return None
     print(DOWNLOAD_CANCELLED, file=outgoing, flush=True)
     return EXIT_CANCELLED
+
+
+def _alias_item(alias: str, key: str, gsd: float | None) -> str:
+    return f"{alias}={key} ({gsd:g} m)" if gsd is not None else f"{alias}={key}"
+
+
+def _assets_text(scene: Scene, asset_names: Sequence[str]) -> str:
+    """Return ``alias=key (gsd)`` items for the first scene; empty when unprofiled."""
+    rows = list_aliases(scene)
+    if not rows:
+        return ""
+    wanted = {name.strip().casefold() for name in asset_names}
+    plain = [r for r in rows if not r[3] and (not wanted or r[0] in wanted)]
+    items = [_alias_item(a, k, g) for a, k, g, _q in plain]
+    if len(items) > _MAX_ASSET_ITEMS:
+        items = [*items[:_MAX_ASSET_ITEMS], f"+{len(items) - _MAX_ASSET_ITEMS} more"]
+    text = ", ".join(items)
+    qa = [_alias_item(a, k, g) for a, k, g, is_qa in rows if is_qa]
+    if qa:
+        text += f"{' ' if text else ''}qa: " + ", ".join(qa)
+    return text
+
+
+def _window_text(scenes: Sequence[Scene], asset_names: Sequence[str], bbox: BBox | None) -> str:
+    """Estimate pixels and raw bytes of the requested windows; empty when unknown."""
+    if bbox is None or not asset_names or not scenes:
+        return ""
+    dlon = bbox.east - bbox.west
+    if dlon <= 0:
+        return ""
+    width_m = dlon * _METRES_PER_DEG_LON * math.cos(math.radians((bbox.south + bbox.north) / 2))
+    height_m = (bbox.north - bbox.south) * _METRES_PER_DEG_LAT
+    first = scenes[0]
+    sizes: list[tuple[int, float, int]] = []
+    for name in asset_names:
+        try:
+            resolved = resolve_asset(first, name)
+        except AssetNotFound:
+            continue
+        gsd = resolved.asset.spatial_resolution or (resolved.band.gsd_m if resolved.band else None)
+        if gsd is None:
+            continue
+        pixels = math.ceil(width_m / gsd) * math.ceil(height_m / gsd)
+        itemsize = _ITEMSIZE.get(resolved.asset.data_type or "", _DEFAULT_ITEMSIZE)
+        sizes.append((pixels, gsd, itemsize))
+    if not sizes:
+        return ""
+    biggest = max(sizes)
+    if biggest[0] > _WINDOW_CAP_PX:
+        return (
+            f"~{biggest[0] / 1e6:.3g} MP/band at {biggest[1]:g} m exceeds "
+            f"{_WINDOW_CAP_PX // 1_000_000} MP window cap; shrink the AOI"
+        )
+    raw = sum(px * size for px, _g, size in sizes) * len(scenes)
+    gsds = sorted({g for _p, g, _s in sizes})
+    res = f"{gsds[0]:g} m" if len(gsds) == 1 else f"{gsds[0]:g}-{gsds[-1]:g} m"
+    return (
+        f"~{biggest[0] / 1e6:.3g} MP/band at {res}, ~{_human_bytes(raw)} raw for "
+        f"{len(sizes)} bands x {len(scenes)} scenes ({_WINDOW_CAP_PX // 1_000_000} MP cap)"
+    )
 
 
 def _bytes_for_scenes(

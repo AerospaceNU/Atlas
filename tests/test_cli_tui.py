@@ -413,6 +413,7 @@ def test_launch_replaces_the_process(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     binary.write_text("", encoding="utf-8")
     recorded: dict[str, object] = {}
 
+    monkeypatch.delenv("ATLAS_PYTHON", raising=False)
     monkeypatch.setattr("atlas.cli.tui.ensure_tui_binary", lambda: binary)
 
     def fake_exec(path: str, argv: list[str]) -> None:
@@ -452,6 +453,9 @@ def test_stale_binary_is_rebuilt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     os.utime(source, (10, 10))
     monkeypatch.delenv("ATLAS_TUI", raising=False)
     monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "atlas.cli.tui.__file__", str(tmp_path / "site" / "atlas" / "cli" / "tui.py")
+    )
     monkeypatch.setattr("atlas.cli.tui._cargo_path", lambda: tmp_path / "cargo")
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
@@ -471,6 +475,9 @@ def test_missing_cargo_reports_a_clear_error(
     repo = _fake_repo(tmp_path)
     monkeypatch.delenv("ATLAS_TUI", raising=False)
     monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "atlas.cli.tui.__file__", str(tmp_path / "site" / "atlas" / "cli" / "tui.py")
+    )
     monkeypatch.setattr("atlas.cli.tui._cargo_path", lambda: None)
     monkeypatch.setattr("atlas.cli.tui._which", lambda name: None)
 

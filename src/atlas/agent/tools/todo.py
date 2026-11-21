@@ -34,7 +34,8 @@ class UpdatePlanInput(BaseModel):
     """Arguments for ``update_plan``.
 
     The list replaces the previous plan in full, has between 1 and 50 items,
-    and exactly one item must be ``in_progress``.
+    and at most one item may be ``in_progress``. Zero is valid: a finished plan
+    has every item completed, and a new plan may not be started yet.
     """
 
     items: list[PlanItem] = Field(
@@ -44,8 +45,8 @@ class UpdatePlanInput(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _exactly_one_in_progress(self) -> Self:
-        _require_one_in_progress(self.items)
+    def _at_most_one_in_progress(self) -> Self:
+        _require_at_most_one_in_progress(self.items)
         return self
 
 
@@ -53,11 +54,11 @@ class ReadPlanInput(BaseModel):
     """Arguments for ``read_plan`` (none)."""
 
 
-def _require_one_in_progress(items: Sequence[PlanItem]) -> None:
-    """Refuse a plan with zero or several in-progress tasks."""
+def _require_at_most_one_in_progress(items: Sequence[PlanItem]) -> None:
+    """Refuse a plan with several in-progress tasks; zero is valid."""
     in_progress = sum(item.status == "in_progress" for item in items)
-    if in_progress != 1:
-        raise ValueError(f"Plan must have exactly one in_progress item, got {in_progress}")
+    if in_progress > 1:
+        raise ValueError(f"Plan may have at most one in_progress item, got {in_progress}")
 
 
 def _render(items: Sequence[PlanItem]) -> str:
@@ -87,15 +88,29 @@ def _write_atomic(path: Path, text: str) -> None:
         raise
 
 
+def _is_child(store: LocalArtifactStore) -> bool:
+    root = store.artifact_root
+    return root != store.root and root.parent.name == "subagents"
+
+
+def _plan_path(store: LocalArtifactStore, *, write: bool) -> Path:
+    """Return the plan file: private to a subagent, else the workspace plan."""
+    if _is_child(store):
+        return store.artifact_root / "plan.json"
+    return store.resolve(PLAN_RELATIVE) if write else store.resolve_read(PLAN_RELATIVE)
+
+
 def _load(store: LocalArtifactStore) -> list[PlanItem] | None:
     """Return the stored plan, or ``None`` when no plan file exists."""
-    path = store.resolve_read(PLAN_RELATIVE)
+    path = _plan_path(store, write=False)
     if not path.is_file():
         return None
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Plan file is not readable JSON: {PLAN_RELATIVE}") from exc
+        raise ValueError(
+            f"Plan file is not readable JSON: {path.name if _is_child(store) else PLAN_RELATIVE}"
+        ) from exc
     return UpdatePlanInput.model_validate(raw).items
 
 
@@ -105,14 +120,15 @@ class UpdatePlanTool(Tool):
     The whole list is replaced on every call and rendered back as a checklist
     that the caller shows to the user. The plan is stored as JSON under
     ``.atlas/plan.json`` inside the workspace, and every path goes through
-    :class:`~atlas.agent.artifacts.LocalArtifactStore`.
+    :class:`~atlas.agent.artifacts.LocalArtifactStore`. A subagent keeps its own plan
+    under its artifact root.
     """
 
     name = "update_plan"
     description = (
         "Keep a short ordered task list for the current session. The list is shown to the user "
         "as a checklist. Each call replaces the whole list; use it to mark progress, with "
-        "exactly one item in_progress."
+        "at most one item in_progress."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
 
@@ -122,7 +138,7 @@ class UpdatePlanTool(Tool):
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request = UpdatePlanInput.model_validate(arguments)
-        path = store.resolve(PLAN_RELATIVE)
+        path = _plan_path(store, write=True)
         _write_atomic(path, _serialize(request.items))
         return ToolResult(text=_render(request.items))
 
@@ -132,7 +148,8 @@ class ReadPlanTool(Tool):
 
     The result uses the same checklist rendering as ``update_plan``. A
     workspace with no plan file reports ``no plan yet``; the path is resolved
-    only through :class:`~atlas.agent.artifacts.LocalArtifactStore`.
+    only through :class:`~atlas.agent.artifacts.LocalArtifactStore`. A subagent keeps its own
+    plan under its artifact root.
     """
 
     name = "read_plan"

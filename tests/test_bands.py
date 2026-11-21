@@ -24,7 +24,12 @@ def test_s30_nir_is_the_narrow_band_not_the_tagged_one() -> None:
         "B08": _band(0.8351, "nir"),
         "B8A": _band(0.8648),
     }
-    assert resolve_bands(assets) == {"red": "B04", "nir": "B8A"}
+    assert resolve_bands(assets) == {
+        "red": "B04",
+        "nir": "B8A",
+        "nir_broad": "B08",
+        "rededge1": "B05",
+    }
 
 
 def test_l30_nir_is_b05() -> None:
@@ -77,7 +82,12 @@ def test_names_resolve_even_when_other_assets_carry_wavelengths() -> None:
         "red": _band(common_name="red"),
         "nir08": _band(common_name="nir08"),
     }
-    assert resolve_bands(assets) == {"red": "red", "green": "green", "nir": "nir08"}
+    assert resolve_bands(assets) == {
+        "red": "red",
+        "green": "green",
+        "nir": "nir08",
+        "coastal": "coastal",
+    }
 
 
 def test_wavelength_wins_before_names_are_consulted() -> None:
@@ -98,7 +108,7 @@ def test_assets_without_band_metadata_are_ignored() -> None:
 
 def test_rededge_is_outside_the_red_tolerance() -> None:
     assert abs(0.7039 - BANDS["red"].target) > BANDS["red"].tolerance
-    assert resolve_bands({"B05": _band(0.7039)}) == {}
+    assert resolve_bands({"B05": _band(0.7039)}) == {"rededge1": "B05"}
 
 
 def test_earth_search_keys_resolve_red_green_nir_and_swir22() -> None:
@@ -127,12 +137,15 @@ def test_earth_search_keys_resolve_red_green_nir_and_swir22() -> None:
         "green": "green",
         "nir": "nir08",
         "swir22": "swir22",
+        "blue": "blue",
+        "swir16": "swir16",
+        "nir_broad": "nir",
     }
 
 
 def test_unmatched_names_are_absent_rather_than_none() -> None:
     resolved = resolve_bands({"B11": _band(1.6137, "swir16")})
-    assert resolved == {}
+    assert resolved == {"swir16": "B11"}
     assert "nir" not in resolved
 
 
@@ -163,7 +176,7 @@ def test_common_names_are_matched_case_insensitively() -> None:
 
 
 def test_out_of_tolerance_band_does_not_resolve_by_name() -> None:
-    assert resolve_bands({"B07": _band(0.79, "nir")}) == {}
+    assert resolve_bands({"B07": _band(0.79, "nir")}) == {"rededge3": "B07"}
 
 
 def test_empty_assets() -> None:

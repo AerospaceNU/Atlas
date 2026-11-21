@@ -73,7 +73,9 @@ def test_ingest_truncates_only_model_text_and_preserves_original_result() -> Non
 
     visible = ToolResult.model_validate_json(_tool_message(step))
 
-    assert visible.text == "x" * runtime.MAX_TOOL_RESULT_CHARS + "...[truncated 123 characters]"
+    head = runtime.MAX_TOOL_RESULT_CHARS // 2
+    tail = runtime.MAX_TOOL_RESULT_CHARS - head
+    assert visible.text == "x" * head + "\n...[truncated 123 characters]...\n" + "x" * tail
     assert visible.artifacts == ["map.tif"]
     assert step.result == original
     assert len(original.text) == runtime.MAX_TOOL_RESULT_CHARS + 123
@@ -280,8 +282,9 @@ def test_compaction_replaces_dropped_exchanges_with_a_digest(
     body = _digest_text(messages)
     assert "messages compacted" in body
     assert "pytest -q -> exit 1" in body
-    assert "out0.txt" in body
-    assert "Files:" in body
+    assert "out76.txt" in body
+    assert "out0.txt" not in body
+    assert "Read:" in body
     assert "[~] ship tools" in body
     _assert_paired(messages)
 
@@ -356,3 +359,131 @@ def test_digest_is_bounded_and_keeps_protected_messages(
     assert any(message is current for message in messages)
     assert messages[-1] is current
     _assert_paired(messages)
+
+
+def _edit_exchange(call_id: str, name: str, path: str, *, error: bool) -> list[ChatMessage]:
+    call = ToolCall(id=call_id, name=name, arguments={"path": path})
+    content = (
+        json.dumps({"error": "refused", "error_kind": "denied"})
+        if error
+        else ToolResult(text="ok").model_dump_json()
+    )
+    return [
+        ChatMessage(role=Role.ASSISTANT, tool_calls=[call]),
+        ChatMessage(role=Role.TOOL, tool_call_id=call_id, content=content),
+    ]
+
+
+def test_digest_lists_only_successful_edits_as_edited() -> None:
+    messages = [
+        *_edit_exchange("a", "edit_file", "bad.py", error=True),
+        *_edit_exchange("b", "edit_file", "good.py", error=False),
+        *_edit_exchange("c", "read_file", "bad2.py", error=False),
+        *_edit_exchange("d", "edit_file", "bad2.py", error=True),
+    ]
+
+    digest = runtime._collect_digest(messages, list(range(len(messages))), None)
+
+    assert digest.edited == ["good.py"]
+    assert "bad.py" not in digest.read
+    assert digest.read == ["bad2.py"]
+
+
+def test_digest_lists_patch_envelope_targets() -> None:
+    patch = "*** Begin Patch\n*** Update File: a.py\n*** Add File: b.py\n*** End Patch"
+    call = ToolCall(id="p", name="apply_patch", arguments={"patch": patch})
+    messages = [
+        ChatMessage(role=Role.ASSISTANT, tool_calls=[call]),
+        ChatMessage(
+            role=Role.TOOL, tool_call_id="p", content=ToolResult(text="ok").model_dump_json()
+        ),
+    ]
+
+    digest = runtime._collect_digest(messages, [0, 1], None)
+
+    assert digest.edited == ["a.py", "b.py"]
+
+
+def test_patch_paths_recognise_headers_and_envelope_without_duplicates() -> None:
+    patch = (
+        "--- a/x.py\n+++ b/x.py\n--- /dev/null\n+++ b/new.py\n"
+        "*** Update File: y.py\n*** Add File: x.py\n"
+    )
+
+    assert runtime._patch_paths({"patch": patch}) == ["x.py", "new.py", "y.py"]
+
+
+# --- digest and marker corrections ---
+
+
+def _tool_exchange(
+    call_id: str, name: str, arguments: dict[str, Any], content: str
+) -> list[ChatMessage]:
+    return [
+        ChatMessage(
+            role=Role.ASSISTANT,
+            tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)],
+        ),
+        ChatMessage(role=Role.TOOL, tool_call_id=call_id, content=content),
+    ]
+
+
+def test_a_saved_output_pointer_is_listed_under_read(tmp_path: Path) -> None:
+    text = "head\n...[truncated 5 characters; full output saved to .atlas/tool-output/c1-ab.txt: read it with read_file (offset/limit) or search it with grep]...\ntail"
+    messages = _tool_exchange(
+        "c1", "bash", {"command": "ls"}, ToolResult(text=text).model_dump_json()
+    )
+    digest = runtime._collect_digest(messages, [0, 1], None)
+    assert ".atlas/tool-output/c1-ab.txt" in digest.read
+    error = json.dumps(
+        {
+            "error": "x\n...[10 characters compacted; full output saved to s/e.txt]...\ny",
+            "error_kind": "tool_failure",
+        }
+    )
+    messages = _tool_exchange("c2", "bash", {}, error)
+    assert "s/e.txt" in runtime._collect_digest(messages, [0, 1], None).read
+
+
+def test_unique_keeps_the_last_occurrence() -> None:
+    assert runtime._unique(["a", "b", "a", "c"]) == ["b", "a", "c"]
+
+
+def test_a_file_read_again_recently_survives_the_cap() -> None:
+    old = runtime._Digest(read=[f"f{i}.py" for i in range(40)])
+    new = runtime._Digest(read=["f0.py"])
+    merged = runtime._merge_digest(old, new)
+    assert merged.read[-1] == "f0.py"
+
+
+def test_merge_replaces_the_plan_with_the_new_snapshot() -> None:
+    old = runtime._Digest(plan=["[ ] old"])
+    assert runtime._merge_digest(old, runtime._Digest(plan=["[x] new"])).plan == ["[x] new"]
+    assert runtime._merge_digest(old, runtime._Digest()).plan == ["[ ] old"]
+
+
+def test_digest_entries_are_single_lines_and_round_trip(tmp_path: Path) -> None:
+    (tmp_path / ".atlas").mkdir()
+    (tmp_path / ".atlas" / "plan.json").write_text(
+        json.dumps({"items": [{"text": "step\none", "status": "pending"}]}), encoding="utf-8"
+    )
+    result = ToolResult(text="command: echo a\nb\nexit_code: 1")
+    messages = _tool_exchange("c1", "read_file", {"path": "a\nb.txt"}, result.model_dump_json())
+    messages[0].content = "note line\r\nsecond"
+    digest = runtime._collect_digest(messages, [0, 1], tmp_path)
+    for entries in (digest.read, digest.commands, digest.notes, digest.plan):
+        assert all("\n" not in e and "\r" not in e for e in entries)
+    parsed = runtime._parse_digest(runtime._render_digest(digest))
+    assert parsed.read == digest.read and parsed.plan == digest.plan
+
+
+def test_compact_text_is_idempotent_for_a_path_with_a_bracket() -> None:
+    path = ".atlas/tool-output/we]ird.txt"
+    body = (
+        "x" * 5000
+        + f"\n...[truncated 9 characters; full output saved to {path}: read it with read_file]...\n"
+        + "y" * 5000
+    )
+    once = runtime._compact_text(body)
+    assert f"full output saved to {path}" in once
+    assert runtime._compact_text(once) == once

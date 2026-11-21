@@ -166,3 +166,49 @@ def test_child_artifacts_live_under_subagents(tmp_path: Path) -> None:
     agent.run("go")
 
     assert seen and seen[0].parent.name == "subagents"
+
+
+class _Run:
+    def __init__(self, **flags: bool) -> None:
+        self.steps: list[Any] = []
+        self.response = "partial answer"
+        for name, value in flags.items():
+            setattr(self, name, value)
+
+
+class _FakeAgent:
+    def __init__(self, run: Any) -> None:
+        self._run = run
+
+    def run(self, task: str) -> Any:
+        return self._run
+
+
+def _header(tmp_path: Path, run: Any) -> str:
+    tool = SubagentTool(lambda *_args: _FakeAgent(run))
+    return tool.run({"task": "x"}, LocalArtifactStore(tmp_path)).text.split("\n", 1)[0]
+
+
+def test_allow_writes_description_names_real_tools() -> None:
+    from atlas.agent.tools._subagent import SubagentInput
+
+    description = SubagentInput.model_fields["allow_writes"].description or ""
+    assert "apply_patch and bash" in description
+    assert "bash_tool" not in description
+
+
+def test_report_header_marks_early_stops(tmp_path: Path) -> None:
+    assert _header(tmp_path, _Run(stopped_for_limit=True)).endswith(
+        "writes=refused; stopped: tool-call budget reached):"
+    )
+    assert "; stopped: token or spend budget reached" in _header(
+        tmp_path, _Run(stopped_for_budget=True)
+    )
+    assert "; stopped: context limit" in _header(tmp_path, _Run(stopped_for_context=True))
+
+
+def test_report_header_is_unchanged_without_stop_flags(tmp_path: Path) -> None:
+    header = _header(tmp_path, _Run())
+
+    assert "stopped" not in header
+    assert header.endswith("(0 tool calls, writes=refused):")

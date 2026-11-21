@@ -16,6 +16,40 @@ def _clear_openrouter_catalog_cache() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_provider_backoff(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep default tests from really waiting out provider retry backoff.
+
+    A test that needs to observe the waits patches ``atlas.agent.model._sleep`` itself.
+    """
+    if request.node.get_closest_marker("evals") is not None:
+        return
+    monkeypatch.setattr("atlas.agent.model._sleep", lambda _delay: None)
+
+
+_GIT_REDIRECT_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_git_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep git variables from an enclosing hook out of tests that run git.
+
+    A pre-commit hook in a linked worktree exports ``GIT_INDEX_FILE`` (and can
+    export ``GIT_DIR``); a test that runs git in a temporary repository would
+    inherit them, fail, and write into the outer repository's index.
+    """
+    for name in _GIT_REDIRECT_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _clear_atlas_home(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep a developer ``ATLAS_HOME`` from redirecting tests that pass a home."""
     monkeypatch.delenv("ATLAS_HOME", raising=False)

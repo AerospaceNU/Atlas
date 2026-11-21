@@ -118,8 +118,11 @@ def test_a_file_that_grows_after_fstat_is_refused(
 def test_exact_byte_limits_and_universal_newlines_are_preserved(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     (tmp_path / "exact.txt").write_bytes("é".encode() * (ReadFileTool.max_bytes // 2))
-    assert ReadFileTool().run({"path": "exact.txt"}, store).text == "é" * 50_000
-    assert len(store.read_project_bytes("exact.txt", max_bytes=100_000)) == 100_000
+    exact = ReadFileTool().run({"path": "exact.txt"}, store).text
+    assert exact.startswith("é" * ReadFileTool.max_chars)
+    assert "[line 1 truncated:" in exact
+    limit = ReadFileTool.max_bytes
+    assert len(store.read_project_bytes("exact.txt", max_bytes=limit)) == limit
     (tmp_path / "lines.txt").write_bytes(b"one\r\ntwo\rthree\n")
     assert ReadFileTool().run({"path": "lines.txt"}, store).text == "one\ntwo\nthree\n"
 
@@ -131,3 +134,16 @@ def test_zero_byte_limit_only_accepts_empty_files(tmp_path: Path) -> None:
     assert store.read_project_bytes("empty.txt", max_bytes=0) == b""
     with pytest.raises(ArtifactError, match="read limit"):
         store.read_project_bytes("one.txt", max_bytes=0)
+
+
+def test_line_separators_other_than_newline_do_not_split_lines(tmp_path: Path) -> None:
+    from atlas.agent.tools.read_files import ReadFilesTool
+
+    store = LocalArtifactStore(tmp_path)
+    body = f"a\n{chr(12)}\nb{chr(0x2028)}c\nd\n"
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+
+    text = ReadFileTool().run({"path": "f.py", "offset": 4, "limit": 1}, store).text
+    assert text == "d\n... [lines 4-4 of 4]"
+    multi = ReadFilesTool().run({"files": [{"path": "f.py"}]}, store).text
+    assert "(lines 1-4 of 4)" in multi

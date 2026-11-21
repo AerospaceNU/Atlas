@@ -35,20 +35,35 @@ def test_update_plan_rejects_several_in_progress_items(tmp_path: Path) -> None:
         {"text": "second", "status": "in_progress"},
     ]
 
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(ValueError, match="at most one"):
         UpdatePlanTool().run({"items": items}, store)
 
     assert not (tmp_path / PLAN_RELATIVE).exists()
 
 
-def test_update_plan_rejects_zero_in_progress_items(tmp_path: Path) -> None:
+def test_update_plan_accepts_zero_in_progress_items(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     items = [{"text": "only task", "status": "pending"}]
 
-    with pytest.raises(ValueError, match="exactly one"):
-        UpdatePlanTool().run({"items": items}, store)
+    result = UpdatePlanTool().run({"items": items}, store)
 
-    assert not (tmp_path / PLAN_RELATIVE).exists()
+    assert result.text == "plan: 1 items (0 done)\n[ ] only task"
+    assert (tmp_path / PLAN_RELATIVE).is_file()
+
+
+def test_update_plan_accepts_an_all_completed_plan_and_reads_it_back(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    items = [
+        {"text": "reproduce", "status": "completed"},
+        {"text": "fix", "status": "completed"},
+    ]
+
+    written = UpdatePlanTool().run({"items": items}, store)
+    read = ReadPlanTool().run({}, store)
+
+    expected = "plan: 2 items (2 done)\n[x] reproduce\n[x] fix"
+    assert written.text == expected
+    assert read.text == expected
 
 
 def test_update_plan_rejects_an_empty_list(tmp_path: Path) -> None:

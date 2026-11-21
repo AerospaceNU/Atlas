@@ -33,9 +33,20 @@ The `atlas` command.
 | `catalog` | Source names, kind aliases, and the catalog listing. |
 | `data` | Search: pick sources, run a pull, print scenes. |
 | `download` | Fetch scene assets (previews and thumbnails are refused). Geographic, Web Mercator, and WGS84 UTM COGs are windowed to the request box; a chip is reused for the same AOI via a sibling marker. |
+| `run` | `atlas run`: one headless agent turn with exit codes 0-7; approval defaults to deny. |
+| `models` | `atlas models list`, `info`, `pull`, `verify`: human-run weight management. |
+| `geo` | `atlas geo guide` and `atlas geo stacks`: the satellite analysis guide and the stack listing. |
 | `progress` | Per-source search progress for the data command. |
 | `fs` | Atomic replace with a short retry for a Windows sharing violation. |
 | `tui` | Find or build the Rust `atlas-tui` binary and replace this process with it. |
+
+## `geo`
+
+Stacks and analysis products under the persistent workspace `.atlas/analysis`. `guide.md` is the agent's satellite guide. See `docs/satellite-analysis.md`.
+
+## `archive`
+
+Scene cards and a card store built from catalog results.
 
 ## `compile`
 

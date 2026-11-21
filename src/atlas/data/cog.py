@@ -16,6 +16,7 @@ passes the tile's dimensions, so a compressed tile cannot expand without bound.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import math
 import random
 import struct
@@ -76,6 +77,33 @@ _TAG_GEOKEYS: Final[int] = 34735
 _TAG_NODATA: Final[int] = 42113
 _GEO_GEOGRAPHIC: Final[int] = 2048
 _GEO_PROJECTED: Final[int] = 3072
+_GEO_RASTER_TYPE: Final[int] = 1025
+_RASTER_POINT: Final[int] = 2
+
+COG_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "not_tiff",
+        "bigtiff_header",
+        "not_tiled",
+        "separate_planes",
+        "mixed_bits",
+        "mixed_formats",
+        "sample_layout",
+        "compression",
+        "predictor",
+        "empty_dims",
+        "tile_index",
+        "no_georef",
+        "pixel_scale",
+        "user_defined_crs",
+        "non_http_href",
+        "field_type",
+        "field_truncated",
+        "doubles_field",
+        "multi_value",
+    }
+)
+"""Every ``CogUnsupportedError.reason`` this module sets."""
 _PHOTOMETRIC_PALETTE: Final[int] = 3
 _COMPRESS_NONE: Final[int] = 1
 _COMPRESS_LZW: Final[int] = 5
@@ -121,6 +149,11 @@ _MAX_WINDOW_BYTES: Final[int] = 128 * 1024 * 1024
 # Decoded size of one tile. Real COGs use 256 to 2048 px tiles (io-lulc uses
 # 512), so this only refuses a header that would inflate a small payload.
 _MAX_TILE_BYTES: Final[int] = 64 * 1024 * 1024
+# Local files are the caller's own: legacy chips are one uncompressed tile.
+_MAX_LOCAL_TILE_BYTES: Final[int] = 1024**3
+_MAX_TILE_EDGE: Final[int] = 4096
+_CLASSIC_TIFF_LIMIT: Final[int] = 2**32
+_DEFLATE_LEVEL: Final[int] = 6
 _MAX_FIELD_BYTES: Final[int] = 1024 * 1024
 _COALESCE_GAP: Final[int] = 8192
 _MISS: Final[str] = "AOI does not overlap the COG"
@@ -135,7 +168,15 @@ class CogMissError(CogError):
 
 
 class CogUnsupportedError(CogError):
-    """The object is not a tiled GeoTIFF this reader can window."""
+    """The object is not a tiled GeoTIFF this reader can window.
+
+    Attributes:
+        reason: Short machine-readable cause, or None when none was given.
+    """
+
+    def __init__(self, message: str = "", reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class CogRangeError(CogError):
@@ -164,7 +205,10 @@ class CogRead:
     the source sample type (uint8, uint16, int16, or float32). ``colormap`` is
     the source TIFF ColorMap (all reds, then greens, then blues) when the
     source is a single-band 8-bit palette image, so class rasters keep their
-    colors.
+    colors. ``origin_x`` and ``origin_y`` always describe a PixelIsArea grid:
+    ``source_registration`` is "point" when the source was PixelIsPoint and
+    the origin was shifted half a pixel. ``sparse_tiles`` counts tiles the
+    source stores as absent, which read as nodata (0 when none).
     """
 
     array: CogArray
@@ -179,6 +223,8 @@ class CogRead:
     granule_size: int | None = None
     nodata: str | None = None
     colormap: tuple[int, ...] | None = None
+    source_registration: str = "area"
+    sparse_tiles: int = 0
 
 
 @dataclass
@@ -203,6 +249,7 @@ class _Image:
     nodata: str | None
     colormap: tuple[int, ...] | None = None
     subfile_type: int = 0
+    registration: str = "area"
 
 
 class _ByteReader(Protocol):
@@ -222,8 +269,9 @@ class _FileReader:
     The file is opened for reading only and never written.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, capped: bool = True) -> None:
         self._path = path
+        self._capped = capped
         self.bytes_fetched = 0
         self.granule_size: int | None = path.stat().st_size
 
@@ -231,7 +279,7 @@ class _FileReader:
         if end < start or start < 0:
             raise CogError("invalid byte range")
         expected = end - start + 1
-        if expected > _MAX_RANGE_BYTES:
+        if self._capped and expected > _MAX_RANGE_BYTES:
             raise CogRangeError("requested range exceeds the byte limit")
         with self._path.open("rb") as handle:
             handle.seek(start)
@@ -375,6 +423,8 @@ class CogFile:
         south: float,
         east: float,
         north: float,
+        max_pixels: int | None = None,
+        max_window_bytes: int | None = None,
     ) -> CogRead:
         """Read the pixels that overlap a box in the raster CRS.
 
@@ -383,6 +433,9 @@ class CogFile:
             south: Bottom edge in the raster CRS.
             east: Right edge in the raster CRS.
             north: Top edge in the raster CRS.
+            max_pixels: Pixel cap for this window; None keeps the module default.
+            max_window_bytes: Decoded-byte cap; None derives it from ``max_pixels``
+                (or keeps the module default when that is None too).
 
         Returns:
             The overlapping pixels and the georeferencing of that window.
@@ -400,16 +453,39 @@ class CogFile:
             east=east,
             north=north,
         )
-        return await self._read_pixels(col0, row0, col1, row1)
+        return await self._read_pixels(
+            col0,
+            row0,
+            col1,
+            row1,
+            max_pixels=max_pixels,
+            max_window_bytes=max_window_bytes,
+        )
 
-    async def _read_pixels(self, col0: int, row0: int, col1: int, row1: int) -> CogRead:
+    async def _read_pixels(
+        self,
+        col0: int,
+        row0: int,
+        col1: int,
+        row1: int,
+        *,
+        max_pixels: int | None = None,
+        max_window_bytes: int | None = None,
+    ) -> CogRead:
         """Read the pixel box ``[col0, col1) x [row0, row1)`` of this image."""
         image = self._image
         rows = row1 - row0
         cols = col1 - col0
-        if cols > _MAX_WINDOW_PIXELS or rows > _MAX_WINDOW_PIXELS // cols:
+        pixel_cap = _MAX_WINDOW_PIXELS if max_pixels is None else max_pixels
+        if max_window_bytes is not None:
+            byte_cap = max_window_bytes
+        elif max_pixels is None:
+            byte_cap = _MAX_WINDOW_BYTES
+        else:
+            byte_cap = max_pixels * (image.bits // 8) * image.samples
+        if cols > pixel_cap or rows > pixel_cap // cols:
             raise CogLimitError("window has too many pixels")
-        if rows * cols * image.samples * (image.bits // 8) > _MAX_WINDOW_BYTES:
+        if rows * cols * image.samples * (image.bits // 8) > byte_cap:
             raise CogLimitError("window has too many bytes")
         tiles_x = math.ceil(image.width / image.tile_width)
         tx0 = col0 // image.tile_width
@@ -417,25 +493,33 @@ class CogFile:
         ty0 = row0 // image.tile_height
         ty1 = (row1 - 1) // image.tile_height
         out_dtype = _sample_dtype(image).newbyteorder("=")
-        out: CogArray = np.zeros(
+        out: CogArray = np.full(
             (image.samples, row1 - row0, col1 - col0),
+            _fill_value(image.nodata, out_dtype),
             dtype=out_dtype,
         )
         spans: list[tuple[int, int]] = []
+        present: list[int] = []
+        sparse = 0
         for ty in range(ty0, ty1 + 1):
             for tx in range(tx0, tx1 + 1):
                 index = ty * tiles_x + tx
                 offset = image.tile_offsets[index]
                 count = image.tile_counts[index]
-                if count < 1 or offset < 0:
-                    raise CogError("tile offset is empty")
+                if count < 0 or offset < 0:
+                    raise CogError("tile offset is invalid")
+                if count == 0:
+                    sparse += 1
+                    continue
+                present.append(index)
                 spans.append((offset, offset + count - 1))
-        for start, end in _coalesce(spans, _MAX_RANGE_BYTES):
-            await self._reader.read(start, end)
-        for ty in range(ty0, ty1 + 1):
-            for tx in range(tx0, tx1 + 1):
-                index = ty * tiles_x + tx
-                await _copy_tile(self._reader, image, out, index, tx, ty, col0, row0, col1, row1)
+        # The prefetch only warms the HTTP span cache; a local uncapped file skips it.
+        if not (isinstance(self._reader, _FileReader) and not self._reader._capped):
+            for start, end in _coalesce(spans, _MAX_RANGE_BYTES):
+                await self._reader.read(start, end)
+        for index in present:
+            ty, tx = divmod(index, tiles_x)
+            await _copy_tile(self._reader, image, out, index, tx, ty, col0, row0, col1, row1)
         return CogRead(
             array=out,
             origin_x=image.origin_x + col0 * image.pixel_size_x,
@@ -449,7 +533,25 @@ class CogFile:
             granule_size=self._reader.granule_size,
             nodata=image.nodata,
             colormap=image.colormap,
+            source_registration=image.registration,
+            sparse_tiles=sparse,
         )
+
+
+def _fill_value(nodata: str | None, dtype: np.dtype[np.generic]) -> float:
+    """Return the nodata value when ``dtype`` represents it exactly, else 0."""
+    if nodata is None:
+        return 0.0
+    try:
+        value = float(nodata)
+    except ValueError:
+        return 0.0
+    if math.isnan(value):
+        return value if dtype.kind == "f" else 0.0
+    if not math.isfinite(value):
+        return 0.0
+    with np.errstate(all="ignore"):
+        return value if np.array(value).astype(dtype) == value else 0.0
 
 
 async def open_cog(
@@ -457,6 +559,7 @@ async def open_cog(
     href: str,
     *,
     headers: Mapping[str, str] | None = None,
+    epsg_hint: int | None = None,
 ) -> CogFile:
     """Open a tiled GeoTIFF and read its header, not its pixels.
 
@@ -464,6 +567,8 @@ async def open_cog(
         http: Client used for range requests.
         href: Absolute http(s) URL of the COG.
         headers: Sent with every range request, for example a bearer token.
+        epsg_hint: EPSG code (from STAC proj:epsg) used only when the file declares
+            a user-defined projection; a real EPSG in the file always wins.
 
     Returns:
         A handle that can read one or more windows.
@@ -475,9 +580,11 @@ async def open_cog(
     """
     parsed = urlparse(href)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise CogUnsupportedError("COG href must be an absolute http(s) URL")
+        raise CogUnsupportedError(
+            "COG href must be an absolute http(s) URL", reason="non_http_href"
+        )
     reader = _RangeReader(http, href, headers)
-    image = await _parse_image(reader)
+    image = await _parse_image(reader, epsg_hint=epsg_hint)
     return CogFile(reader, image)
 
 
@@ -489,6 +596,7 @@ async def read_cog_window(
     south: float,
     east: float,
     north: float,
+    epsg_hint: int | None = None,
 ) -> CogRead:
     """Read the pixels of ``href`` that overlap a box in the raster CRS.
 
@@ -502,6 +610,7 @@ async def read_cog_window(
         south: Bottom edge in the raster CRS.
         east: Right edge in the raster CRS.
         north: Top edge in the raster CRS.
+        epsg_hint: EPSG code used only for a user-defined projection.
 
     Returns:
         The windowed pixels and the georeferencing of that window.
@@ -512,11 +621,13 @@ async def read_cog_window(
         CogRangeError: The server did not honor Range.
         httpx.HTTPError: The request failed.
     """
-    cog = await open_cog(http, href)
+    cog = await open_cog(http, href, epsg_hint=epsg_hint)
     return await cog.read_window(west=west, south=south, east=east, north=north)
 
 
-async def read_overview(path: Path, *, min_long_side: int = 1024) -> CogRead:
+async def read_overview(
+    path: Path, *, min_long_side: int = 1024, epsg_hint: int | None = None
+) -> CogRead:
     """Read one whole reduced-resolution level of a local tiled GeoTIFF.
 
     The file is opened read-only and is never modified. Only its header and
@@ -539,7 +650,7 @@ async def read_overview(path: Path, *, min_long_side: int = 1024) -> CogRead:
         CogError: A tile could not be read or decoded.
     """
     reader = _FileReader(path)
-    images = await _parse_levels(reader)
+    images = await _parse_levels(reader, epsg_hint=epsg_hint)
     full = images[0]
     level = _pick_level(images, min_long_side)
     if level is not full:
@@ -550,9 +661,128 @@ async def read_overview(path: Path, *, min_long_side: int = 1024) -> CogRead:
         level.pixel_size_x = full.pixel_size_x * scale_x
         level.pixel_size_y = full.pixel_size_y * scale_y
         level.epsg = full.epsg
+        level.registration = full.registration
         level.nodata = full.nodata
         level.colormap = full.colormap
     return await CogFile(reader, level)._read_pixels(0, 0, level.width, level.height)
+
+
+async def open_cog_file(path: Path, *, epsg_hint: int | None = None) -> CogFile:
+    """Open a local tiled GeoTIFF for reading, without the HTTP byte and tile caps.
+
+    The file is opened read-only. The 8 MiB range cap and the 64 MiB decoded-tile
+    cap are lifted (to 1 GiB per tile), because a local file is the caller's own.
+
+    Args:
+        path: Local tiled GeoTIFF.
+        epsg_hint: EPSG code used only for a user-defined projection.
+
+    Returns:
+        A handle that can read windows of the full-resolution image.
+
+    Raises:
+        OSError: The file cannot be statted or read.
+        CogUnsupportedError: The file is not a tiled TIFF this reader decodes.
+    """
+    reader = _FileReader(path, capped=False)
+    image = await _parse_image(reader, local=True, epsg_hint=epsg_hint)
+    return CogFile(reader, image)
+
+
+async def read_file_window(
+    path: Path,
+    bounds: tuple[float, float, float, float] | None = None,
+    *,
+    max_pixels: int | None = None,
+    max_window_bytes: int | None = None,
+    epsg_hint: int | None = None,
+) -> CogRead:
+    """Read a window of a local tiled GeoTIFF.
+
+    Args:
+        path: Local tiled GeoTIFF.
+        bounds: ``(west, south, east, north)`` in the file's CRS; None reads the
+            whole raster.
+        max_pixels: Pixel cap; None keeps the 16 MP default.
+        max_window_bytes: Decoded-byte cap; None derives it from ``max_pixels``.
+        epsg_hint: EPSG code used only for a user-defined projection.
+
+    Returns:
+        The pixels and their georeferencing.
+
+    Raises:
+        OSError: The file cannot be read.
+        CogLimitError: The window exceeds the caps.
+        CogMissError: ``bounds`` do not overlap the raster.
+        CogError: The file could not be decoded.
+    """
+    cog = await open_cog_file(path, epsg_hint=epsg_hint)
+    if bounds is None:
+        image = cog._image
+        return await cog._read_pixels(
+            0,
+            0,
+            image.width,
+            image.height,
+            max_pixels=max_pixels,
+            max_window_bytes=max_window_bytes,
+        )
+    west, south, east, north = bounds
+    return await cog.read_window(
+        west=west,
+        south=south,
+        east=east,
+        north=north,
+        max_pixels=max_pixels,
+        max_window_bytes=max_window_bytes,
+    )
+
+
+def read_file_window_sync(
+    path: Path,
+    bounds: tuple[float, float, float, float] | None = None,
+    *,
+    max_pixels: int | None = None,
+    max_window_bytes: int | None = None,
+    epsg_hint: int | None = None,
+) -> CogRead:
+    """Blocking :func:`read_file_window`, usable inside or outside an event loop.
+
+    With no running loop this is ``asyncio.run``. Inside a running loop it runs
+    the read on a one-shot worker thread and blocks the calling loop until done.
+
+    Args:
+        path: Local tiled GeoTIFF.
+        bounds: ``(west, south, east, north)`` in the file's CRS; None reads it all.
+        max_pixels: Pixel cap; None keeps the 16 MP default.
+        max_window_bytes: Decoded-byte cap; None derives it from ``max_pixels``.
+        epsg_hint: EPSG code used only for a user-defined projection.
+
+    Returns:
+        The pixels and their georeferencing.
+
+    Raises:
+        OSError: The file cannot be read.
+        CogError: As :func:`read_file_window`.
+    """
+
+    def run() -> CogRead:
+        return asyncio.run(
+            read_file_window(
+                path,
+                bounds,
+                max_pixels=max_pixels,
+                max_window_bytes=max_window_bytes,
+                epsg_hint=epsg_hint,
+            )
+        )
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return run()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(run).result()
 
 
 def _pick_level(images: list[_Image], min_long_side: int) -> _Image:
@@ -622,8 +852,15 @@ def model_bounds(
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def encode_cog(read: CogRead) -> bytes:
-    """Encode ``read`` as a single-tile little-endian GeoTIFF.
+def encode_cog(read: CogRead, *, tile: int | None = None, compress: str | None = None) -> bytes:
+    """Encode ``read`` as a little-endian GeoTIFF.
+
+    By default (``tile=None``, ``compress=None``) the file is one uncompressed
+    tile, the legacy layout. ``tile`` (a multiple of 16 from 16 to 4096) splits
+    the raster into row-major tiles of that edge, and ``compress="deflate"``
+    deflates each tile independently. Compression without ``tile`` writes the
+    one legacy-size tile compressed. Tiled output is built tile by tile; peak
+    extra memory is the list of encoded tiles.
 
     The tile is padded with zeros up to a multiple of 16 on each side, as the
     TIFF spec requires. ImageWidth and ImageLength stay the window size, so
@@ -635,6 +872,8 @@ def encode_cog(read: CogRead) -> bytes:
 
     Args:
         read: Window returned by :func:`read_cog_window`.
+        tile: Tile edge in pixels, or None for one tile.
+        compress: None or "deflate".
 
     Returns:
         A classic TIFF whose first tile is the window.
@@ -642,8 +881,11 @@ def encode_cog(read: CogRead) -> bytes:
     Raises:
         CogError: ``read.array`` is not uint8, uint16, int16, or float32, or
             ``read.colormap`` is set on anything but one uint8 band, or has
-            the wrong length.
+            the wrong length, ``tile`` or ``compress`` is invalid, or the file would
+            not fit a classic TIFF.
     """
+    if tile is not None or compress is not None:
+        return _encode_tiled(read, tile=tile, compress=compress)
     array = read.array
     encoded = _encoded_format(array.dtype)
     if encoded is None:
@@ -660,7 +902,7 @@ def encode_cog(read: CogRead) -> bytes:
     tile_height = _round_up(height, _TILE_MULTIPLE)
     cube = np.zeros((tile_height, tile_width, bands), dtype=dtype)
     cube[:height, :width, :] = np.transpose(array, (1, 2, 0))
-    tile = cube.tobytes()
+    tile_bytes = cube.tobytes()
     scale = struct.pack(endian + "3d", read.pixel_size_x, read.pixel_size_y, 0.0)
     tie = struct.pack(endian + "6d", 0.0, 0.0, 0.0, read.origin_x, read.origin_y, 0.0)
     geokeys = _geokey_bytes(read.epsg, endian)
@@ -701,7 +943,7 @@ def encode_cog(read: CogRead) -> bytes:
         (_TAG_TILE_WIDTH, 4, 1, struct.pack(endian + "I", tile_width)),
         (_TAG_TILE_HEIGHT, 4, 1, struct.pack(endian + "I", tile_height)),
         (_TAG_TILE_OFFSETS, 4, 1, struct.pack(endian + "I", tile_offset)),
-        (_TAG_TILE_COUNTS, 4, 1, struct.pack(endian + "I", len(tile))),
+        (_TAG_TILE_COUNTS, 4, 1, struct.pack(endian + "I", len(tile_bytes))),
         (_TAG_SAMPLE_FORMAT, 3, 1, struct.pack(endian + "H", sample_format) + b"\x00\x00"),
         (_TAG_PIXEL_SCALE, 12, 3, struct.pack(endian + "I", payload_offsets[0])),
         (_TAG_TIEPOINT, 12, 6, struct.pack(endian + "I", payload_offsets[1])),
@@ -734,7 +976,168 @@ def encode_cog(read: CogRead) -> bytes:
     out += struct.pack(endian + "I", 0)
     for payload in payloads:
         out += payload
-    out += tile
+    out += tile_bytes
+    return bytes(out)
+
+
+def _check_tile_args(tile: int | None, compress: str | None) -> None:
+    if tile is not None and (
+        tile % _TILE_MULTIPLE != 0 or not _TILE_MULTIPLE <= tile <= _MAX_TILE_EDGE
+    ):
+        raise CogError(f"tile must be a multiple of 16 from 16 to {_MAX_TILE_EDGE}")
+    if compress not in {None, "deflate"}:
+        raise CogError("compress must be None or 'deflate'")
+
+
+def _tile_blobs(
+    array: NDArray[np.generic],
+    dtype: np.dtype[np.generic],
+    *,
+    tile_width: int,
+    tile_height: int,
+    compress: bool,
+) -> list[bytes]:
+    """Encode zero-padded row-major tiles one at a time."""
+    bands, height, width = (int(array.shape[0]), int(array.shape[1]), int(array.shape[2]))
+    blobs: list[bytes] = []
+    for row0 in range(0, height, tile_height):
+        for col0 in range(0, width, tile_width):
+            part = array[:, row0 : row0 + tile_height, col0 : col0 + tile_width]
+            buffer = np.zeros((tile_height, tile_width, bands), dtype=dtype)
+            buffer[: part.shape[1], : part.shape[2], :] = np.transpose(part, (1, 2, 0))
+            raw = buffer.tobytes()
+            blobs.append(zlib.compress(raw, _DEFLATE_LEVEL) if compress else raw)
+    return blobs
+
+
+def _encode_tiled(read: CogRead, *, tile: int | None, compress: str | None) -> bytes:
+    """Encode a multi-tile and/or deflate GeoTIFF; see :func:`encode_cog`."""
+    _check_tile_args(tile, compress)
+    array = read.array
+    encoded = _encoded_format(array.dtype)
+    if encoded is None:
+        raise CogError(f"cannot encode dtype {array.dtype}")
+    sample_format, bits = encoded
+    if array.ndim != 3:
+        raise CogError("window array must have shape (bands, height, width)")
+    bands, height, width = (int(array.shape[0]), int(array.shape[1]), int(array.shape[2]))
+    if bands < 1 or height < 1 or width < 1:
+        raise CogError("window array is empty")
+    endian = "<"
+    dtype = np.dtype(f"{endian}{_SAMPLE_KINDS[encoded]}{bits // 8}")
+    full_width = _round_up(width, _TILE_MULTIPLE)
+    full_height = _round_up(height, _TILE_MULTIPLE)
+    tile_width = full_width if tile is None else min(tile, full_width)
+    tile_height = full_height if tile is None else min(tile, full_height)
+    n_tiles = math.ceil(width / tile_width) * math.ceil(height / tile_height)
+    raw_size = n_tiles * tile_width * tile_height * bands * (bits // 8)
+    if compress is None and raw_size >= _CLASSIC_TIFF_LIMIT:
+        raise CogError("window too large for a classic TIFF (4 GiB)")
+    blobs = _tile_blobs(
+        array,
+        dtype,
+        tile_width=tile_width,
+        tile_height=tile_height,
+        compress=compress is not None,
+    )
+    scale = struct.pack(endian + "3d", read.pixel_size_x, read.pixel_size_y, 0.0)
+    tie = struct.pack(endian + "6d", 0.0, 0.0, 0.0, read.origin_x, read.origin_y, 0.0)
+    geokeys = _geokey_bytes(read.epsg, endian)
+    nodata_bytes = _nodata_bytes(read.nodata)
+    colormap = _colormap_bytes(
+        read.colormap, bands=bands, bits=bits, sample_format=sample_format, endian=endian
+    )
+    payloads: list[bytes] = [scale, tie]
+    geokeys_index = len(payloads)
+    if geokeys is not None:
+        payloads.append(geokeys)
+    colormap_index = len(payloads)
+    if colormap is not None:
+        payloads.append(colormap)
+    nodata_inline = nodata_bytes is not None and len(nodata_bytes) <= 4
+    nodata_index = len(payloads)
+    if nodata_bytes is not None and not nodata_inline:
+        payloads.append(nodata_bytes)
+    offsets_idx = counts_idx = -1
+    if n_tiles > 1:
+        offsets_idx = len(payloads)
+        payloads.append(bytes(4 * n_tiles))
+        counts_idx = len(payloads)
+        payloads.append(struct.pack(endian + f"{n_tiles}I", *(len(blob) for blob in blobs)))
+    n_entries = (
+        13 + int(geokeys is not None) + int(colormap is not None) + int(nodata_bytes is not None)
+    )
+    cursor = 8 + 2 + n_entries * 12 + 4
+    payload_offsets: list[int] = []
+    for payload in payloads:
+        payload_offsets.append(cursor)
+        cursor += len(payload)
+    tile_start = cursor
+    if tile_start + sum(len(blob) for blob in blobs) >= _CLASSIC_TIFF_LIMIT:
+        raise CogError("window too large for a classic TIFF (4 GiB)")
+    tile_offsets: list[int] = []
+    for blob in blobs:
+        tile_offsets.append(cursor)
+        cursor += len(blob)
+    if n_tiles > 1:
+        payloads[offsets_idx] = struct.pack(endian + f"{n_tiles}I", *tile_offsets)
+        offsets_value = struct.pack(endian + "I", payload_offsets[offsets_idx])
+        counts_value = struct.pack(endian + "I", payload_offsets[counts_idx])
+    else:
+        offsets_value = struct.pack(endian + "I", tile_offsets[0])
+        counts_value = struct.pack(endian + "I", len(blobs[0]))
+    photometric = _PHOTOMETRIC_PALETTE if colormap is not None else (2 if bands == 3 else 1)
+    code = 8 if compress is not None else _COMPRESS_NONE
+    fields: list[tuple[int, int, int, bytes]] = [
+        (_TAG_WIDTH, 4, 1, struct.pack(endian + "I", width)),
+        (_TAG_HEIGHT, 4, 1, struct.pack(endian + "I", height)),
+        (_TAG_BITS, 3, 1, struct.pack(endian + "H", bits) + b"\x00\x00"),
+        (_TAG_COMPRESSION, 3, 1, struct.pack(endian + "H", code) + b"\x00\x00"),
+        (_TAG_PHOTOMETRIC, 3, 1, struct.pack(endian + "H", photometric) + b"\x00\x00"),
+        (_TAG_SAMPLES, 3, 1, struct.pack(endian + "H", bands) + b"\x00\x00"),
+        (_TAG_TILE_WIDTH, 4, 1, struct.pack(endian + "I", tile_width)),
+        (_TAG_TILE_HEIGHT, 4, 1, struct.pack(endian + "I", tile_height)),
+        (_TAG_TILE_OFFSETS, 4, n_tiles, offsets_value),
+        (_TAG_TILE_COUNTS, 4, n_tiles, counts_value),
+        (_TAG_SAMPLE_FORMAT, 3, 1, struct.pack(endian + "H", sample_format) + b"\x00\x00"),
+        (_TAG_PIXEL_SCALE, 12, 3, struct.pack(endian + "I", payload_offsets[0])),
+        (_TAG_TIEPOINT, 12, 6, struct.pack(endian + "I", payload_offsets[1])),
+    ]
+    if geokeys is not None:
+        fields.append(
+            (
+                _TAG_GEOKEYS,
+                3,
+                len(geokeys) // 2,
+                struct.pack(endian + "I", payload_offsets[geokeys_index]),
+            )
+        )
+    if colormap is not None:
+        fields.append(
+            (
+                _TAG_COLORMAP,
+                3,
+                len(colormap) // 2,
+                struct.pack(endian + "I", payload_offsets[colormap_index]),
+            )
+        )
+    if nodata_bytes is not None:
+        if nodata_inline:
+            nodata_value = nodata_bytes + bytes(4 - len(nodata_bytes))
+        else:
+            nodata_value = struct.pack(endian + "I", payload_offsets[nodata_index])
+        fields.append((_TAG_NODATA, 2, len(nodata_bytes), nodata_value))
+    fields.sort(key=lambda item: item[0])
+    out = bytearray(struct.pack(endian + "HHI", 0x4949, 42, 8))
+    out += struct.pack(endian + "H", len(fields))
+    for tag, type_code, count, value in fields:
+        out += struct.pack(endian + "HHI", tag, type_code, count)
+        out += value
+    out += struct.pack(endian + "I", 0)
+    for payload in payloads:
+        out += payload
+    for blob in blobs:
+        out += blob
     return bytes(out)
 
 
@@ -784,6 +1187,22 @@ def _geokey_bytes(epsg: int | None, endian: str) -> bytes | None:
     key = _GEO_GEOGRAPHIC if epsg in GEOGRAPHIC_EPSG else _GEO_PROJECTED
     values = (1, 1, 0, 1, key, 0, 1, epsg)
     return struct.pack(endian + f"{len(values)}H", *values)
+
+
+def project_lonlat(epsg: int, lon: float, lat: float) -> tuple[float, float] | None:
+    """Project WGS84 longitude/latitude to EPSG:``epsg``.
+
+    Supports WGS84 UTM (326xx/327xx, ``|lat| <= 84``) and Web Mercator (3857).
+
+    Args:
+        epsg: Target CRS.
+        lon: Longitude in degrees.
+        lat: Latitude in degrees.
+
+    Returns:
+        ``(x, y)`` in the target CRS, or None when the CRS is unsupported.
+    """
+    return _project_point(epsg, lon, lat)
 
 
 def _project_point(epsg: int, lon: float, lat: float) -> tuple[float, float] | None:
@@ -880,14 +1299,19 @@ _SECONDARY_IFD_ERRORS: Final = (CogError, KeyError, IndexError, struct.error)
 """Parse failures that drop an overview or mask IFD instead of the whole file."""
 
 
-async def _parse_image(reader: _ByteReader) -> _Image:
-    """Read the first IFD of a classic TIFF or a BigTIFF."""
+async def _parse_image(
+    reader: _ByteReader, *, local: bool = False, epsg_hint: int | None = None
+) -> _Image:
+    """Read the first IFD of a classic TIFF or a BigTIFF.
+
+    ``local`` raises the decoded-tile ceiling for files the caller owns.
+    """
     endian, layout, ifd_at = await _read_header(reader)
     entries, _ = await _read_ifd(reader, endian, layout, ifd_at)
-    return await _image_from_entries(reader, endian, entries)
+    return await _image_from_entries(reader, endian, entries, local=local, epsg_hint=epsg_hint)
 
 
-async def _parse_levels(reader: _ByteReader) -> list[_Image]:
+async def _parse_levels(reader: _ByteReader, *, epsg_hint: int | None = None) -> list[_Image]:
     """Read the full-resolution IFD and every reduced-resolution IFD after it.
 
     Transparency-mask IFDs and IFDs this reader cannot decode are skipped.
@@ -899,7 +1323,7 @@ async def _parse_levels(reader: _ByteReader) -> list[_Image]:
     """
     endian, layout, ifd_at = await _read_header(reader)
     entries, next_at = await _read_ifd(reader, endian, layout, ifd_at)
-    images = [await _image_from_entries(reader, endian, entries)]
+    images = [await _image_from_entries(reader, endian, entries, epsg_hint=epsg_hint)]
     seen = {ifd_at}
     while next_at and next_at not in seen and len(seen) < _MAX_IFDS:
         seen.add(next_at)
@@ -933,18 +1357,18 @@ async def _read_header(reader: _ByteReader) -> tuple[str, _IfdLayout, int]:
     elif header[:2] == b"MM":
         endian = ">"
     else:
-        raise CogUnsupportedError("not a TIFF")
+        raise CogUnsupportedError("not a TIFF", reason="not_tiff")
     magic = struct.unpack_from(endian + "H", header, 2)[0]
     if magic == _BIGTIFF_MAGIC:
         offset_size, pad = struct.unpack_from(endian + "HH", header, 4)
         if offset_size != 8 or pad != 0:
-            raise CogUnsupportedError("BigTIFF header is malformed")
+            raise CogUnsupportedError("BigTIFF header is malformed", reason="bigtiff_header")
         ifd_at = struct.unpack(endian + "Q", await reader.read(8, 15))[0]
         return endian, ("Q", "HHQ", 8, 20, 8), ifd_at
     if magic == _CLASSIC_MAGIC:
         ifd_at = struct.unpack_from(endian + "I", header, 4)[0]
         return endian, ("H", "HHI", 2, 12, 4), ifd_at
-    raise CogUnsupportedError("not a classic TIFF or BigTIFF")
+    raise CogUnsupportedError("not a classic TIFF or BigTIFF", reason="not_tiff")
 
 
 async def _read_ifd(
@@ -975,6 +1399,8 @@ async def _image_from_entries(
     entries: dict[int, tuple[int, int, bytes]],
     *,
     georeferenced: bool = True,
+    local: bool = False,
+    epsg_hint: int | None = None,
 ) -> _Image:
     """Build an image from one IFD.
 
@@ -982,7 +1408,7 @@ async def _image_from_entries(
     gets a unit grid at the origin, which the caller replaces.
     """
     if _TAG_TILE_WIDTH not in entries or _TAG_TILE_HEIGHT not in entries:
-        raise CogUnsupportedError("COG is not tiled")
+        raise CogUnsupportedError("COG is not tiled", reason="not_tiled")
     width = _int_value(await _entry_ints(reader, endian, entries[_TAG_WIDTH]))
     height = _int_value(await _entry_ints(reader, endian, entries[_TAG_HEIGHT]))
     samples = 1
@@ -993,26 +1419,31 @@ async def _image_from_entries(
         planar = _int_value(await _entry_ints(reader, endian, entries[_TAG_PLANAR]))
     # With one sample per pixel, separate planes store the same bytes as chunky.
     if planar != 1 and not (planar == 2 and samples == 1):
-        raise CogUnsupportedError("separate-plane TIFFs are not windowed")
+        raise CogUnsupportedError("separate-plane TIFFs are not windowed", reason="separate_planes")
     bits_values = await _entry_ints(reader, endian, entries[_TAG_BITS])
     if len(bits_values) not in {1, samples} or any(bits != bits_values[0] for bits in bits_values):
-        raise CogUnsupportedError("mixed bit depths are not windowed")
+        raise CogUnsupportedError("mixed bit depths are not windowed", reason="mixed_bits")
     bits = bits_values[0]
     sample_format = _FORMAT_UINT
     if _TAG_SAMPLE_FORMAT in entries:
         formats = await _entry_ints(reader, endian, entries[_TAG_SAMPLE_FORMAT])
         if len(formats) not in {1, samples} or any(fmt != formats[0] for fmt in formats):
-            raise CogUnsupportedError("mixed sample formats are not windowed")
+            raise CogUnsupportedError(
+                "mixed sample formats are not windowed", reason="mixed_formats"
+            )
         sample_format = formats[0]
     if (sample_format, bits) not in _SAMPLE_KINDS:
         raise CogUnsupportedError(
-            f"{bits}-bit samples of SampleFormat {sample_format} are not windowed"
+            f"{bits}-bit samples of SampleFormat {sample_format} are not windowed",
+            reason="sample_layout",
         )
     compression = _COMPRESS_NONE
     if _TAG_COMPRESSION in entries:
         compression = _int_value(await _entry_ints(reader, endian, entries[_TAG_COMPRESSION]))
     if compression not in {_COMPRESS_NONE, _COMPRESS_LZW} | _COMPRESS_DEFLATE:
-        raise CogUnsupportedError(f"TIFF compression {compression} is not windowed")
+        raise CogUnsupportedError(
+            f"TIFF compression {compression} is not windowed", reason="compression"
+        )
     predictor = _PREDICTOR_NONE
     if _TAG_PREDICTOR in entries:
         predictor = _int_value(await _entry_ints(reader, endian, entries[_TAG_PREDICTOR]))
@@ -1020,17 +1451,20 @@ async def _image_from_entries(
     tile_width = _int_value(await _entry_ints(reader, endian, entries[_TAG_TILE_WIDTH]))
     tile_height = _int_value(await _entry_ints(reader, endian, entries[_TAG_TILE_HEIGHT]))
     if min(width, height, samples, tile_width, tile_height) < 1:
-        raise CogUnsupportedError("TIFF dimensions are empty")
+        raise CogUnsupportedError("TIFF dimensions are empty", reason="empty_dims")
     tiles_x = math.ceil(width / tile_width)
     tiles_y = math.ceil(height / tile_height)
     if tiles_x > _MAX_TILES or tiles_y > _MAX_TILES or tiles_x > _MAX_TILES // tiles_y:
         raise CogLimitError("too many tiles")
-    if tile_width * tile_height * samples * (bits // 8) > _MAX_TILE_BYTES:
+    tile_limit = _MAX_LOCAL_TILE_BYTES if local else _MAX_TILE_BYTES
+    if tile_width * tile_height * samples * (bits // 8) > tile_limit:
         raise CogLimitError("TIFF tile is too large to decode")
     offsets = await _entry_ints(reader, endian, entries[_TAG_TILE_OFFSETS])
     counts = await _entry_ints(reader, endian, entries[_TAG_TILE_COUNTS])
     if len(offsets) != tiles_x * tiles_y or len(counts) != len(offsets):
-        raise CogUnsupportedError("tile index does not match the raster dimensions")
+        raise CogUnsupportedError(
+            "tile index does not match the raster dimensions", reason="tile_index"
+        )
     subfile_type = 0
     if _TAG_SUBFILE_TYPE in entries:
         subfile_type = _int_value(await _entry_ints(reader, endian, entries[_TAG_SUBFILE_TYPE]))
@@ -1057,20 +1491,36 @@ async def _image_from_entries(
             subfile_type=subfile_type,
         )
     if _TAG_PIXEL_SCALE not in entries or _TAG_TIEPOINT not in entries:
-        raise CogUnsupportedError("COG has no ModelPixelScale and ModelTiepoint")
+        raise CogUnsupportedError(
+            "COG has no ModelPixelScale and ModelTiepoint", reason="no_georef"
+        )
     scale = await _entry_doubles(reader, endian, entries[_TAG_PIXEL_SCALE])
     tie = await _entry_doubles(reader, endian, entries[_TAG_TIEPOINT])
     if len(scale) < 2 or len(tie) < 6:
-        raise CogUnsupportedError("GeoTIFF georeferencing is incomplete")
+        raise CogUnsupportedError("GeoTIFF georeferencing is incomplete", reason="no_georef")
     pixel_size_x = scale[0]
     pixel_size_y = scale[1]
     if pixel_size_x <= 0 or pixel_size_y <= 0 or not math.isfinite(pixel_size_x + pixel_size_y):
-        raise CogUnsupportedError("pixel scale must be finite and positive")
+        raise CogUnsupportedError("pixel scale must be finite and positive", reason="pixel_scale")
     origin_x = tie[3] - tie[0] * pixel_size_x
     origin_y = tie[4] + tie[1] * pixel_size_y
-    epsg = None
+    keys = _GeoKeys(None, False, 1)
     if _TAG_GEOKEYS in entries:
-        epsg = _epsg_from_geokeys(await _entry_ints(reader, endian, entries[_TAG_GEOKEYS]))
+        keys = _geokeys(await _entry_ints(reader, endian, entries[_TAG_GEOKEYS]))
+    registration = "area"
+    if keys.raster_type == _RASTER_POINT:
+        registration = "point"
+        origin_x -= pixel_size_x / 2
+        origin_y += pixel_size_y / 2
+    epsg = keys.epsg
+    if keys.user_defined:
+        if epsg_hint is None:
+            raise CogUnsupportedError(
+                "GeoTIFF uses a user-defined projection (ProjectedCSType 32767) "
+                "and no EPSG hint is available",
+                reason="user_defined_crs",
+            )
+        epsg = epsg_hint
     nodata = await _nodata_text(reader, endian, entries.get(_TAG_NODATA))
     colormap = await _palette(reader, endian, entries, samples=samples, bits=bits)
     return _Image(
@@ -1094,19 +1544,21 @@ async def _image_from_entries(
         nodata=nodata,
         colormap=colormap,
         subfile_type=subfile_type,
+        registration=registration,
     )
 
 
 def _check_predictor(predictor: int, sample_format: int) -> None:
-    """Allow predictor 2 on integer samples and predictor 3 on float samples."""
+    """Allow predictor 2 on every supported format and predictor 3 on float samples."""
     if predictor == _PREDICTOR_NONE:
         return
-    if predictor == _PREDICTOR_HORIZONTAL and sample_format != _FORMAT_FLOAT:
+    if predictor == _PREDICTOR_HORIZONTAL:
         return
     if predictor == _PREDICTOR_FLOAT and sample_format == _FORMAT_FLOAT:
         return
     raise CogUnsupportedError(
-        f"TIFF predictor {predictor} on SampleFormat {sample_format} is not windowed"
+        f"TIFF predictor {predictor} on SampleFormat {sample_format} is not windowed",
+        reason="predictor",
     )
 
 
@@ -1162,23 +1614,45 @@ async def _nodata_text(
     return text or None
 
 
-def _epsg_from_geokeys(values: list[int]) -> int | None:
-    if len(values) < 4:
-        return None
+@dataclass(frozen=True)
+class _GeoKeys:
+    """The GeoKeys this reader uses.
+
+    ``user_defined`` is true only for ProjectedCSType 32767; the geographic code is then
+    not a fallback because the grid is in projected units.
+    """
+
+    epsg: int | None
+    user_defined: bool
+    raster_type: int
+
+
+def _geokeys(values: list[int]) -> _GeoKeys:
+    raster_type = 1
     projected: int | None = None
     geographic: int | None = None
+    if len(values) < 4:
+        return _GeoKeys(None, False, raster_type)
     for index in range(values[3]):
         base = 4 + index * 4
         if base + 3 >= len(values):
             break
         key_id, location, count, value = values[base : base + 4]
-        if location != 0 or count != 1 or value in {0, _USER_DEFINED_EPSG}:
+        if location != 0 or count != 1:
             continue
-        if key_id == _GEO_PROJECTED:
+        if key_id == _GEO_RASTER_TYPE:
+            raster_type = value
+        elif key_id == _GEO_PROJECTED:
             projected = value
         elif key_id == _GEO_GEOGRAPHIC:
             geographic = value
-    return projected if projected is not None else geographic
+    if projected == _USER_DEFINED_EPSG:
+        return _GeoKeys(None, True, raster_type)
+    if projected:
+        return _GeoKeys(projected, False, raster_type)
+    if geographic in {None, 0, _USER_DEFINED_EPSG}:
+        return _GeoKeys(None, False, raster_type)
+    return _GeoKeys(geographic, False, raster_type)
 
 
 async def _entry_ints(
@@ -1197,11 +1671,13 @@ async def _entry_ints(
     elif type_code == 16:
         fmt = "Q"
     else:
-        raise CogUnsupportedError(f"TIFF type {type_code} is not an integer field")
+        raise CogUnsupportedError(
+            f"TIFF type {type_code} is not an integer field", reason="field_type"
+        )
     try:
         return list(struct.unpack(endian + f"{count}{fmt}", raw))
     except struct.error as exc:
-        raise CogUnsupportedError("TIFF field is truncated") from exc
+        raise CogUnsupportedError("TIFF field is truncated", reason="field_truncated") from exc
 
 
 async def _entry_doubles(
@@ -1211,12 +1687,14 @@ async def _entry_doubles(
 ) -> list[float]:
     type_code, count, inline = entry
     if type_code != 12:
-        raise CogUnsupportedError("GeoTIFF scale and tiepoint must be doubles")
+        raise CogUnsupportedError(
+            "GeoTIFF scale and tiepoint must be doubles", reason="doubles_field"
+        )
     raw = await _entry_bytes(reader, endian, type_code, count, inline)
     try:
         return list(struct.unpack(endian + f"{count}d", raw))
     except struct.error as exc:
-        raise CogUnsupportedError("TIFF field is truncated") from exc
+        raise CogUnsupportedError("TIFF field is truncated", reason="field_truncated") from exc
 
 
 async def _entry_bytes(
@@ -1228,7 +1706,7 @@ async def _entry_bytes(
 ) -> bytes:
     size_of = _TYPE_SIZE.get(type_code)
     if size_of is None or count < 1:
-        raise CogUnsupportedError(f"TIFF type {type_code} is not supported")
+        raise CogUnsupportedError(f"TIFF type {type_code} is not supported", reason="field_type")
     if count > _MAX_FIELD_BYTES // size_of:
         raise CogLimitError("TIFF field is too large")
     size = size_of * count
@@ -1241,7 +1719,7 @@ async def _entry_bytes(
 
 def _int_value(values: list[int]) -> int:
     if len(values) != 1:
-        raise CogUnsupportedError("expected a single TIFF value")
+        raise CogUnsupportedError("expected a single TIFF value", reason="multi_value")
     return values[0]
 
 
@@ -1375,7 +1853,7 @@ async def _copy_tile(
     offset = image.tile_offsets[index]
     count = image.tile_counts[index]
     if count < 1 or offset < 0:
-        raise CogError("tile offset is empty")
+        raise CogError("tile offset is invalid")
     payload = await reader.read(offset, offset + count - 1)
     cube = _decode_tile(payload, image)
     tile_col0 = tx * image.tile_width
@@ -1415,6 +1893,11 @@ def _decode_tile(payload: bytes, image: _Image) -> NDArray[np.generic]:
     cube = np.frombuffer(raw[:expected], dtype=_sample_dtype(image)).reshape(shape)
     if image.predictor == _PREDICTOR_HORIZONTAL:
         # Integer sums wrap modulo 2**bits, which is what the encoder assumed.
+        if image.sample_format == _FORMAT_FLOAT:
+            # libtiff differences the raw 32-bit words in file byte order.
+            words = np.frombuffer(raw[:expected], dtype=f"{image.endian}u4").reshape(shape)
+            summed = np.cumsum(words.astype("=u4"), axis=1, dtype=np.uint32)
+            return summed.view("=f4")
         native = cube.astype(cube.dtype.newbyteorder("="))
         return np.cumsum(native, axis=1, dtype=native.dtype)
     return np.array(cube, copy=True)

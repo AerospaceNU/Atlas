@@ -1,6 +1,35 @@
 # Install Atlas on Windows
 
-Use **PowerShell**. If you develop in WSL, follow [INSTALL-LINUX.md](INSTALL-LINUX.md) inside WSL instead.
+The Atlas agent (the TUI and `atlas run`) needs a POSIX shell and process
+groups. Its tools start `bash` (or `/bin/sh`) in its own session and kill the
+process group on cancel. Native Windows has neither, so it cannot run the
+agent. Use WSL2 and follow [INSTALL-LINUX.md](INSTALL-LINUX.md) inside WSL.
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+Reboot if Windows asks, open **Ubuntu** from the Start menu, then follow
+INSTALL-LINUX.md there. Keep the checkout and your workspaces on the WSL file
+system (for example under `~`), not under `/mnt/c`.
+
+`atlas` on native Windows refuses to open the TUI and prints:
+
+> atlas: the Atlas agent needs a POSIX shell and process groups; native Windows is not
+> supported. Install WSL2 (`wsl --install -d Ubuntu`) and run atlas inside it
+> (see install-instructions/INSTALL-LINUX.md). Set ATLAS_ALLOW_NATIVE_WINDOWS=1
+> to try anyway (unsupported).
+
+`atlas run` exits 7 (not configured) with the same message.
+
+`ATLAS_ALLOW_NATIVE_WINDOWS=1` bypasses that refusal. It is unsupported and
+untested: bash tools and process-group kills will not work.
+
+## Native Windows (data tooling only, not exercised in CI)
+
+The rest of this page covers native PowerShell for the data tooling only. The
+supported native commands are `atlas data` and `atlas indices`. Nothing here
+is exercised in CI.
 
 These steps assume `git` is already on your `PATH`.
 
@@ -24,14 +53,6 @@ winget install --id Gitleaks.Gitleaks -e --source winget
 
 Alternatives: `scoop install gitleaks` or `choco install gitleaks`.
 
-Rust, for the agent TUI. `atlas data` does not need it. [rustup](https://rustup.rs) installs `cargo` into `%USERPROFILE%\.cargo\bin`. Atlas looks there even when that directory is not on `PATH`:
-
-```powershell
-winget install Rustlang.Rustup
-```
-
-Open a new PowerShell window after rustup finishes so it can install the stable toolchain.
-
 ## 2. Clone and install the project
 
 ```powershell
@@ -46,7 +67,7 @@ Copy-Item .env.example .env
 
 Edit `.env`:
 
-- `OPENROUTER_API_KEY` — required to run the agent. Create a key at https://openrouter.ai/keys
+- `OPENROUTER_API_KEY` — used by the agent, which runs in WSL (see above). Create a key at https://openrouter.ai/keys
 - `FIRMS_MAP_KEY` — optional; required only for FIRMS fire sources. Free key from https://firms.modaps.eosdis.nasa.gov/api/map_key/
 
 Put `atlas` on `PATH`, pointed at this checkout:
@@ -71,24 +92,27 @@ uv run pre-commit install
 ```powershell
 atlas --help
 atlas data --list
+atlas indices
 uv run pytest
 ```
 
-`atlas` with no arguments opens the agent TUI in the current directory. The first launch compiles the Rust client under `tui\target\`, which can take a few minutes. Later launches reuse that binary and rebuild only after Rust changes.
-
 `atlas data` lists satellites and downloads scenes. `atlas sentinel2 optical ...` is shorthand for `atlas data sentinel2 optical ...`.
 
-The TUI reads `OPENROUTER_API_KEY` from the environment or from this repo's `.env`. The first `atlas` launch writes `<workspace>/.atlas/agent.toml` when that file is missing, with `model` set to `deepseek/deepseek-v4.1-flash`. Edit that file to change the model. `ATLAS_MODEL` or `--model` overrides it for one launch.
+The agent, its `agent.toml` and the `/key` commands run inside WSL; see
+[INSTALL-LINUX.md](INSTALL-LINUX.md).
 
-`/key user` stores a key at `%USERPROFILE%\.atlas\keys\openrouter_api_key`. `/key session` keeps one for this process only, and `/key delete` removes the saved file and stops using a key in this process. `OPENROUTER_API_KEY` in the environment will still be used on the next launch. `/key earthdata` and `/key firms` store `EARTHDATA_TOKEN` and `FIRMS_MAP_KEY` the same way (`session`, `user`, or `delete`). A session value stays in memory and wins over the environment, which wins over the file. The value is not printed and is not written into the checkout. Atlas asks for directory mode `0700` and file mode `0600`, and it replaces the file by writing a new private file and renaming it into place. On POSIX the keys directory is fsynced after that rename so the new name survives a crash. Windows does not enforce those Unix modes, and it has no directory fsync, so that step is skipped: `chmod` is still attempted, but the file ACL is what actually restricts access. Windows also has no `O_NOFOLLOW`, so a symlink at the key path is rejected by name instead. A key must be a single line. One that does not start with `sk-or-` is kept, and Atlas warns.
+### Key files on native Windows
+
+Key files request mode `0600` and the keys directory `0700`. Windows does not
+enforce those Unix bits, and it has no directory fsync (that step is skipped), so
+the file ACL is what restricts access to `%USERPROFILE%\.atlas\keys`. Windows
+also has no `O_NOFOLLOW`, so a symlink at the key path is rejected by name.
 
 ## Troubleshooting
 
 - **`uv` is not recognized** — close PowerShell and open a new window. Confirm `%USERPROFILE%\.local\bin` is on your user `PATH`.
 - **`atlas` is not recognized** — same `PATH` fix, then run `uv tool install --editable --force .` from the repo.
-- **The TUI says cargo was not found** — install rustup from step 1, open a new window, and run `atlas` again.
-- **The first `atlas` prints `Building the Atlas TUI...` and waits** — that compile is once per Rust change. Leave it running.
-- **`OPENROUTER_API_KEY is not set`** — fill in `.env`. The TUI loads it when it can find this checkout.
+- **`atlas` says the agent needs a POSIX shell** — expected on native Windows. Use WSL2 (top of this page).
 - **`gitleaks` hook fails** — open a new terminal after installing, then run `gitleaks version`.
 - **pre-commit cannot install hook environments (401 / missing setuptools)** — pip is using a private index. Bootstrap once from PyPI:
 

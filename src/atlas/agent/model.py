@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import threading
 import time
@@ -25,6 +26,7 @@ from atlas.agent.contracts import (
     ToolDefinition,
 )
 from atlas.agent.images import apply_image_budget
+from atlas.agent.scope import ModelCancelled, cancel_requested
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
@@ -32,9 +34,46 @@ _ERROR_BODY_LIMIT = 180
 # Transient provider failures worth another attempt: rate limits, gateway
 # hiccups, and timeouts. Everything else (bad request, auth, billing) is final.
 _RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
-_MAX_ATTEMPTS = 3
+_MAX_ATTEMPTS = 4
 _RETRY_BASE_DELAY = 0.5
 _RETRY_BACKOFF = 2.0
+_RETRY_AFTER_CAP = 30.0
+_CANCEL_SLICE = 0.1
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep up to seconds in short slices, returning early once the run is cancelled.
+
+    Returns silently on cancel; the caller raises. Cooperative: it never kills a thread.
+    """
+    deadline = time.monotonic() + seconds
+    while not cancel_requested():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(_CANCEL_SLICE, remaining))
+
+
+_sleep = _interruptible_sleep
+_OVERFLOW_STATUS = frozenset({400, 413, 422})
+_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "context length",
+    "context window",
+    "maximum context",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+    "reduce the length",
+    "context limit",
+    "context size",
+    "exceed context",
+    "exceeds the maximum number of tokens",
+    "input length and max_tokens",
+    "reduce your input",
+)
+_OVERFLOW_COUNT_RE = re.compile(r"\b(?:tokens?|prompt|input)\b[^.\n]{0,60}exceed")
+_MIN_RETRY_AFTER = 0.25
 _CATALOG_PAGE_LIMIT = 20
 _CATALOG_TIME_LIMIT = 15.0
 _CATALOG_CACHE_SECONDS = 30.0
@@ -64,12 +103,31 @@ class OpenRouterHTTPError(RuntimeError):
         body: str,
         elapsed_seconds: float,
         time_to_first_token_seconds: float | None = None,
+        *,
+        retry_after: float | None = None,
+        context_overflow: bool = False,
     ) -> None:
         self.status_code = status_code
         self.body = body
+        self.retry_after = retry_after
+        self.is_context_overflow = context_overflow
         self.elapsed_seconds = elapsed_seconds
         self.time_to_first_token_seconds = time_to_first_token_seconds
         super().__init__(f"OpenRouter HTTP {status_code}: {body}")
+
+
+REASONING_EFFORTS = ("max", "xhigh", "high", "medium", "low", "minimal", "none")
+
+
+def validate_reasoning_effort(value: str | None) -> str | None:
+    """Return ``value`` if it is None or an OpenRouter effort level.
+
+    Raises:
+        ValueError: The value is not one of ``REASONING_EFFORTS``.
+    """
+    if value is not None and value not in REASONING_EFFORTS:
+        raise ValueError(f"reasoning_effort must be one of {', '.join(REASONING_EFFORTS)}")
+    return value
 
 
 @dataclass
@@ -79,6 +137,29 @@ class ModelConfig:
     reasoning: bool = True
     max_new_tokens: int = 64 * 1024
     timeout: float = 60.0
+    reasoning_effort: str | None = None
+    provider_order: tuple[str, ...] = ()
+    temperature: float | None = None
+    top_p: float | None = None
+
+    def __post_init__(self) -> None:
+        validate_reasoning_effort(self.reasoning_effort)
+
+    def provider_payload(self) -> dict[str, Any] | None:
+        """Return the OpenRouter ``provider`` routing object, or None for default routing.
+
+        A non-empty ``provider_order`` pins requests to those providers in order
+        with no fallback, so every call of a run is served the same way.
+        """
+        if not self.provider_order:
+            return None
+        return {"order": list(self.provider_order), "allow_fallbacks": False}
+
+    def reasoning_payload(self) -> dict[str, Any]:
+        """Return the OpenRouter ``reasoning`` object for this config."""
+        if self.reasoning and self.reasoning_effort is not None:
+            return {"effort": self.reasoning_effort}
+        return {"enabled": self.reasoning}
 
 
 class OpenRouterModel:
@@ -106,14 +187,25 @@ class OpenRouterModel:
 
         Older image attachments are removed until the newest ones fit in the
         request budget. Those bytes are not sent again on a later call.
+
+        Raises:
+            ModelCancelled: The run was cancelled before or during the request.
         """
+        _raise_if_cancelled()
         apply_image_budget(messages)
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": [_serialize_message(message) for message in messages],
-            "reasoning": {"enabled": self.config.reasoning},
+            "reasoning": self.config.reasoning_payload(),
             "max_tokens": self.config.max_new_tokens,
         }
+        provider = self.config.provider_payload()
+        if provider is not None:
+            payload["provider"] = provider
+        if self.config.temperature is not None:
+            payload["temperature"] = self.config.temperature
+        if self.config.top_p is not None:
+            payload["top_p"] = self.config.top_p
         if tools:
             payload["tools"] = [
                 {
@@ -139,6 +231,7 @@ class OpenRouterModel:
         if not isinstance(message, dict):
             raise TypeError(f"Expected response message object, got {type(message)}")
         parsed = _parse_response(message)
+        parsed.finish_reason = _finish_reason_of(response)
         parsed.usage = parse_usage(response.get("usage"))
         parsed.timing = timing
         return parsed
@@ -183,8 +276,9 @@ class OpenRouterModel:
 
         A rate limit, a gateway error, a timeout, or a transport failure is
         not a reason to end the turn: the same request is sent again, at most
-        :data:`_MAX_ATTEMPTS` times, doubling the wait between attempts.
-        Every other failure is final on the first response.
+        :data:`_MAX_ATTEMPTS` times. The wait is the server's ``Retry-After``
+        (capped) or a jittered doubling delay. A context overflow and every
+        other failure is final on the first response.
 
         Args:
             payload: The chat-completions request body.
@@ -199,17 +293,33 @@ class OpenRouterModel:
         """
         delay = _RETRY_BASE_DELAY
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            retry_after: float | None = None
+            _raise_if_cancelled()
             try:
                 return self._complete(payload)
             except OpenRouterHTTPError as exc:
-                if exc.status_code not in _RETRY_STATUS or attempt == _MAX_ATTEMPTS:
+                if (
+                    exc.is_context_overflow
+                    or exc.status_code not in _RETRY_STATUS
+                    or attempt == _MAX_ATTEMPTS
+                ):
                     raise
+                retry_after = exc.retry_after
             except (httpx.TimeoutException, httpx.TransportError):
                 if attempt == _MAX_ATTEMPTS:
                     raise
-            time.sleep(delay)
+            backoff = delay * _jitter()
+            wait = retry_after if retry_after is not None else backoff
+            if wait < _MIN_RETRY_AFTER:
+                wait = backoff
+            _sleep(min(wait, _RETRY_AFTER_CAP))
             delay *= _RETRY_BACKOFF
         raise AssertionError("retry loop ended without a result")
+
+
+def _jitter() -> float:
+    """Return a multiplier applied to the exponential delay; tests pin it."""
+    return random.uniform(0.75, 1.25)
 
 
 def _chunk_timeout(seconds: float) -> httpx.Timeout:
@@ -236,6 +346,22 @@ class _StreamAcc:
     details: list[dict[str, Any]]
     calls: dict[int, _ToolAcc]
     usage: dict[str, Any] | None = None
+    finish_reason: str | None = None
+
+
+def _json_type_name(value: object) -> str:
+    """Name a decoded JSON value by its JSON type, not its Python type."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
 
 
 def _read_completion(resp: Any, started: float) -> tuple[dict[str, Any], CallTiming]:
@@ -244,9 +370,9 @@ def _read_completion(resp: Any, started: float) -> tuple[dict[str, Any], CallTim
     ttft = _completion_ttft(resp, None)
     if status < 200 or status >= 300:
         _buffer_body(resp)
-        raise OpenRouterHTTPError(status, _short_error_body(resp), elapsed, ttft)
+        raise _http_error(status, resp, elapsed, ttft)
     measured: list[float] = []
-    message, usage = _assemble_completion(resp, started, measured)
+    message, usage, finish_reason = _assemble_completion(resp, started, measured)
     elapsed = _completion_elapsed(resp, started)
     ttft = _completion_ttft(resp, measured[0] if measured else None)
     timing = CallTiming(
@@ -254,7 +380,8 @@ def _read_completion(resp: Any, started: float) -> tuple[dict[str, Any], CallTim
         elapsed_seconds=elapsed,
         time_to_first_token_seconds=ttft,
     )
-    return {"choices": [{"message": message}], "usage": usage}, timing
+    choice = {"message": message, "finish_reason": finish_reason}
+    return {"choices": [choice], "usage": usage}, timing
 
 
 def _completion_elapsed(resp: Any, started: float) -> float:
@@ -295,10 +422,10 @@ def _buffer_body(resp: Any) -> None:
 
 def _assemble_completion(
     resp: Any, started: float, measured: list[float]
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
+) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
     acc = _StreamAcc(content=[], reasoning=[], reasoning_content=[], details=[], calls={})
     for payload in _iter_events(resp):
-        if "error" in payload and "choices" not in payload:
+        if isinstance(payload.get("error"), (dict, str)):
             raise _stream_error(payload, resp, started)
         usage = payload.get("usage")
         if isinstance(usage, dict):
@@ -309,6 +436,9 @@ def _assemble_completion(
         for choice in choices:
             if isinstance(choice, dict):
                 _apply_choice(acc, choice, started, measured)
+                if choice.get("finish_reason") == "error":
+                    detail = choice.get("error") or payload.get("error")
+                    raise _stream_error({"error": detail}, resp, started)
     if (
         not acc.content
         and not acc.calls
@@ -335,21 +465,24 @@ def _assemble_completion(
             }
             for index in sorted(acc.calls)
         ]
-    return message, acc.usage
+    return message, acc.usage, acc.finish_reason
 
 
 def _stream_error(payload: dict[str, Any], resp: Any, started: float) -> OpenRouterHTTPError:
     err = payload.get("error")
     message = ""
+    full = ""
     code = 502
     if isinstance(err, dict):
         text = err.get("message")
         if isinstance(text, str):
+            full = text
             message = text[:_ERROR_BODY_LIMIT]
         raw_code = err.get("code")
         if isinstance(raw_code, int) and not isinstance(raw_code, bool) and 400 <= raw_code <= 599:
             code = raw_code
     elif isinstance(err, str):
+        full = err
         message = err[:_ERROR_BODY_LIMIT]
     if not message:
         message = "request failed"
@@ -358,7 +491,14 @@ def _stream_error(payload: dict[str, Any], resp: Any, started: float) -> OpenRou
         message,
         _completion_elapsed(resp, started),
         _completion_ttft(resp, None),
+        retry_after=_retry_after(resp),
+        context_overflow=_is_overflow(code, full),
     )
+
+
+def _raise_if_cancelled() -> None:
+    if cancel_requested():
+        raise ModelCancelled("model request cancelled")
 
 
 def _iter_events(resp: Any) -> Iterator[dict[str, Any]]:
@@ -376,6 +516,7 @@ def _iter_events(resp: Any) -> Iterator[dict[str, Any]]:
         body = resp.json()
         raw_lines = (json.dumps(body), "[DONE]")
     for raw in raw_lines:
+        _raise_if_cancelled()
         text = raw.decode() if isinstance(raw, bytes) else raw
         if not isinstance(text, str):
             continue
@@ -397,6 +538,11 @@ def _iter_events(resp: Any) -> Iterator[dict[str, Any]]:
 def _apply_choice(
     acc: _StreamAcc, choice: dict[str, Any], started: float, measured: list[float]
 ) -> None:
+    reason = choice.get("finish_reason")
+    if not (isinstance(reason, str) and reason):
+        reason = choice.get("native_finish_reason")
+    if isinstance(reason, str) and reason:
+        acc.finish_reason = reason
     for key in ("delta", "message"):
         piece = choice.get(key)
         if isinstance(piece, dict):
@@ -803,7 +949,7 @@ def _interpret_response(resp: Any, started: float) -> tuple[dict[str, Any], Call
         time_to_first_token_seconds=ttft,
     )
     if status < 200 or status >= 300:
-        raise OpenRouterHTTPError(status, _short_error_body(resp), elapsed, ttft)
+        raise _http_error(status, resp, elapsed, ttft)
     response = resp.json()
     if not isinstance(response, dict):
         raise TypeError(f"Expected OpenRouter response object, got {type(response)}")
@@ -827,6 +973,67 @@ def _elapsed_seconds(resp: Any, started: float) -> float:
     if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) and elapsed >= 0:
         return float(elapsed)
     return max(0.0, time.perf_counter() - started)
+
+
+def _is_overflow(status: int, text: str) -> bool:
+    """True for a 400/413/422 whose full message says the prompt is too long."""
+    if status not in _OVERFLOW_STATUS:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _OVERFLOW_MARKERS) or bool(
+        _OVERFLOW_COUNT_RE.search(lowered)
+    )
+
+
+def _retry_after(resp: Any) -> float | None:
+    """Read a numeric ``Retry-After`` in seconds; fakes without headers give None."""
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+        value = float(raw) if raw is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if value is None or value != value or value < 0:
+        return None
+    return value
+
+
+def _http_error(status: int, resp: Any, elapsed: float, ttft: float | None) -> OpenRouterHTTPError:
+    return OpenRouterHTTPError(
+        status,
+        _short_error_body(resp),
+        elapsed,
+        ttft,
+        retry_after=_retry_after(resp),
+        context_overflow=_is_overflow(status, _full_error_text(resp)),
+    )
+
+
+def _full_error_text(resp: Any) -> str:
+    """The untruncated error message, used only for classification."""
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        message = err.get("message") if isinstance(err, dict) else None
+        if isinstance(message, str):
+            return message
+        if isinstance(err, str):
+            return err
+    text = getattr(resp, "text", "")
+    return text if isinstance(text, str) else ""
+
+
+def _finish_reason_of(response: dict[str, Any]) -> str | None:
+    try:
+        reason = response["choices"][0].get("finish_reason")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return None
+    return reason if isinstance(reason, str) and reason else None
 
 
 def _short_error_body(resp: Any) -> str:
@@ -856,6 +1063,8 @@ def _serialize_message(message: ChatMessage) -> dict[str, Any]:
         data["content"] = _content_with_images(message.content, images)
     elif message.content is not None:
         data["content"] = message.content
+    elif message.role is Role.ASSISTANT and not message.tool_calls:
+        data["content"] = ""
     if message.tool_call_id is not None:
         data["tool_call_id"] = message.tool_call_id
     if message.tool_calls:
@@ -948,23 +1157,48 @@ def _parse_response(message: dict[str, Any]) -> ModelResponse:
     raw_calls = message.get("tool_calls", [])
     if not isinstance(raw_calls, list):
         raise TypeError(f"Expected list tool_calls, got {type(raw_calls)}")
+    argument_errors: dict[str, str] = {}
     for raw_call in raw_calls:
         try:
             function = raw_call["function"]
-            raw_arguments = function["arguments"]
-            arguments = (
-                json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
-            )
-            calls.append(ToolCall(id=raw_call["id"], name=function["name"], arguments=arguments))
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            call_id = raw_call["id"]
+            name = function["name"]
+            raw_arguments = function.get("arguments")
+        except (KeyError, TypeError, AttributeError) as exc:
             raise ValueError(f"Unexpected OpenRouter tool call: {raw_call!r}") from exc
+        arguments, problem = _decode_arguments(raw_arguments)
+        if problem is not None:
+            argument_errors[call_id] = problem
+        calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
     reasoning, reasoning_details = _parse_reasoning(message)
     return ModelResponse(
         content=content,
         tool_calls=calls,
         reasoning=reasoning,
         reasoning_details=reasoning_details,
+        argument_errors=argument_errors,
     )
+
+
+def _decode_arguments(raw: object) -> tuple[dict[str, Any], str | None]:
+    """Decode tool-call arguments to an object, or ({}, reason) when impossible."""
+    if raw is None:
+        return {}, None
+    if isinstance(raw, dict):
+        return raw, None
+    value: object = raw
+    for _ in range(2):
+        if not isinstance(value, str):
+            break
+        if not value.strip():
+            return {}, None
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            return {}, f"arguments were not valid JSON ({exc.msg})."
+    if isinstance(value, dict):
+        return value, None
+    return {}, f"arguments must be a JSON object, got {_json_type_name(value)}."
 
 
 def _as_int(value: object) -> int:

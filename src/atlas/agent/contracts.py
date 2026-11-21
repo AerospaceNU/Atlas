@@ -106,6 +106,7 @@ class ModelCall(BaseModel):
 
     usage: TokenUsage = Field(default_factory=TokenUsage)
     timing: CallTiming | None = None
+    finish_reason: str | None = None
 
 
 class CatalogModel(BaseModel):
@@ -143,6 +144,11 @@ class ModelResponse(BaseModel):
     timing: CallTiming | None = None
     reasoning: str | None = None
     reasoning_details: list[dict[str, Any]] = Field(default_factory=list)
+    # Why the provider stopped: "stop", "tool_calls", "length", or None when unreported.
+    finish_reason: str | None = None
+    # Tool-call id -> why its arguments could not be parsed. Such a call keeps
+    # empty arguments and is answered with a validation error, never executed.
+    argument_errors: dict[str, str] = Field(default_factory=dict)
 
 
 class ToolCapableModel(Protocol):
@@ -166,6 +172,8 @@ class Tool(ABC):
     name: str
     description: str
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
+    # Capability family used by tool profiles; "satellite" marks remote-sensing tools.
+    domain: ClassVar[str] = ""
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -180,16 +188,63 @@ class Tool(ABC):
         raise NotImplementedError
 
     def definition(self) -> ToolDefinition:
+        """Return the schema advertised to the model, without Pydantic titles."""
         return ToolDefinition(
             name=self.name,
             description=self.description,
-            parameters=self.input_model.model_json_schema(),
+            parameters=_without_titles(self.input_model.model_json_schema()),
         )
 
     @abstractmethod
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         """Validate and execute a tool call within ``store``."""
         raise NotImplementedError
+
+
+_SCHEMA_MAPS = frozenset({"properties", "$defs", "definitions", "patternProperties"})
+_SCHEMA_VALUES = frozenset({"default", "const", "enum", "examples"})
+
+
+def _without_titles(schema: Any) -> Any:
+    """Return a JSON schema without generated ``title`` annotations.
+
+    Pydantic adds a title to every model and field. They repeat the property
+    names and are sent with every request, so they are dropped. A property
+    that is itself named ``title`` is kept, and literal values are untouched.
+    """
+    if isinstance(schema, list):
+        return [_without_titles(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    cleaned: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == "title" and isinstance(value, str):
+            continue
+        if key in _SCHEMA_MAPS and isinstance(value, dict):
+            cleaned[key] = {name: _without_titles(item) for name, item in value.items()}
+        elif key in _SCHEMA_VALUES:
+            cleaned[key] = value
+        else:
+            cleaned[key] = _without_titles(value)
+    return cleaned
+
+
+class UnknownToolError(KeyError):
+    """A requested tool name that is not on the registry.
+
+    It stays a ``KeyError`` so callers that catch that keep working. Nothing is
+    executed for an unknown name: the registry is the only source of
+    capabilities.
+
+    Attributes:
+        name: The name the caller asked for.
+        available: The registered names, in registration order.
+    """
+
+    def __init__(self, name: str, available: Sequence[str] = ()) -> None:
+        super().__init__(f"Unknown tool: {name}")
+        self.name = name
+        self.available = tuple(available)
 
 
 class ToolRegistry:
@@ -212,13 +267,21 @@ class ToolRegistry:
     def definitions(self) -> list[ToolDefinition]:
         return [tool.definition() for tool in self._tools.values()]
 
+    @property
+    def names(self) -> list[str]:
+        """Registered tool names, in registration order."""
+        return list(self._tools)
+
+    def get(self, name: str) -> Tool | None:
+        """Return the registered tool, or None for an unknown name."""
+        return self._tools.get(name)
+
     def execute(
         self, name: str, arguments: dict[str, Any], store: LocalArtifactStore
     ) -> ToolResult:
-        try:
-            tool = self._tools[name]
-        except KeyError as exc:
-            raise KeyError(f"Unknown tool: {name}") from exc
+        tool = self._tools.get(name)
+        if tool is None:
+            raise UnknownToolError(name, self.names)
         return tool.run(arguments, store)
 
 

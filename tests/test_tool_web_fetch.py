@@ -731,3 +731,31 @@ def test_sni_hostname_reaches_start_tls(tmp_path: Path, monkeypatch: pytest.Monk
     assert seen["connect_port"] == 443
     assert seen["sni"] == "example.com"
     assert "ok" in result.text
+
+
+def test_unresolved_name_says_not_to_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake(*_args: Any, **_kwargs: Any) -> list[Any]:
+        raise socket.gaierror(8, "nope")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
+
+    with pytest.raises(ValueError) as exc:
+        _tool(_handler(_html("never"))).run(
+            {"url": "https://missing.example/a"}, LocalArtifactStore(tmp_path)
+        )
+
+    message = str(exc.value)
+    assert message.startswith("Could not resolve 'missing.example'")
+    assert "network may be unavailable" in message
+    assert "Do not retry; work from local files." in message
+
+
+def test_empty_resolution_says_not_to_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_a, **_k: [])
+
+    with pytest.raises(ValueError, match="Do not retry"):
+        _tool(_handler(_html("never"))).run(
+            {"url": "https://missing.example/a"}, LocalArtifactStore(tmp_path)
+        )

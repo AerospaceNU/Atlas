@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
-from atlas.models.base import PluginSpec, load_rgb_array
+from atlas.models.base import HEURISTIC_PREFIX, PluginSpec, load_rgb_array
 
 
 class MaskInput(BaseModel):
@@ -167,6 +167,6 @@ class BinaryMaskTool(Tool):
         }
         json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return ToolResult(
-            text=f"{self.name}: {width}x{height} ({positive}={fraction:.2f})",
+            text=f"{HEURISTIC_PREFIX} {self.name}: {width}x{height} ({positive}={fraction:.2f})",
             artifacts=[store.relative(mask_path), store.relative(json_path)],
         )

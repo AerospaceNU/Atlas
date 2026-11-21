@@ -5,7 +5,9 @@ Project root (the workspace, the current directory):
 - ``sessions/<id>/`` — one directory per session. ``meta.json`` records the
   id and model. No keys.
 - ``artifacts/<id>/`` — files that belong to that session id
-- ``data/`` — pulls from the data CLI (existing ``.atlas/data``)
+- ``analysis/`` — stacks, figures, tables, exports, scripts and ``runs.jsonl`` from the
+  satellite tools. Persistent and shared across sessions; removing a session keeps them.
+- ``data/`` — pulls from the data CLI and from ``get_satellite_data`` (persistent)
 - ``skills/`` and ``skills-drafts/`` — vetted skills and drafts that are not
   loaded until a person enables them
 - ``agent.toml`` — workspace model and tool-call budget
@@ -343,6 +345,25 @@ def user_defaults_dir(home: Path | None = None) -> Path:
     return user_atlas_root(home) / "defaults"
 
 
+_ATLAS_GITIGNORE = (
+    "# Atlas local state: sessions, artifacts, checkpoints. Not for version control.\n*\n"
+)
+
+
+def ensure_atlas_gitignore(workspace: Path) -> None:
+    """Write ``.atlas/.gitignore`` ignoring everything, only when missing.
+
+    Invariant: an existing file is never rewritten; OSError is swallowed so a
+    read-only workspace still starts.
+    """
+    target = project_atlas_root(workspace) / ".gitignore"
+    try:
+        if not target.exists():
+            target.write_text(_ATLAS_GITIGNORE, encoding="utf-8")
+    except OSError:
+        return
+
+
 def ensure_project_layout(workspace: Path) -> Path:
     """Create project session, artifact, and data directories if missing.
 
@@ -355,6 +376,7 @@ def ensure_project_layout(workspace: Path) -> Path:
         project_data_dir(workspace),
     ):
         directory.mkdir(parents=True, exist_ok=True)
+    ensure_atlas_gitignore(workspace)
     return root
 
 

@@ -214,6 +214,9 @@ def test_refuses_a_blank_final_response(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
             ModelResponse(tool_calls=[ToolCall(id="1", name="echo", arguments={"value": 1})]),
+            # Blank replies are nudged twice; the third one ends the turn.
+            ModelResponse(content="   "),
+            ModelResponse(content="   "),
             ModelResponse(content="   "),
         ]
     )
@@ -656,7 +659,7 @@ def test_start_fresh_keeps_the_skill_catalog(tmp_path: Path) -> None:
     ]
     session.start_fresh()
     prompt = session.messages[0].content
-    assert prompt == session.agent.system_prompt()
+    assert prompt == f"{session.agent.system_prompt()}\n\n{session.agent.environment_context()}"
     assert "coast-check" in prompt
     assert "compare the coast" in prompt
 

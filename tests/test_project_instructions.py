@@ -43,7 +43,8 @@ def test_session_loads_agents_md_on_start(tmp_path: Path) -> None:
     model = ScriptedModel([ModelResponse(content="ok")])
     session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
 
-    assert session.messages[0].content == load_system_prompt()
+    expected = f"{load_system_prompt()}\n\n{session.agent.environment_context()}"
+    assert session.messages[0].content == expected
     assert rule not in (session.messages[0].content or "")
     assert session.messages[1].role == "user"
     assert rule in (session.messages[1].content or "")
@@ -418,7 +419,9 @@ def test_start_fresh_reloads_the_workspace_file(tmp_path: Path) -> None:
     assert "rule beta" in (session.messages[1].content or "")
     assert "rule alpha" not in (session.messages[1].content or "")
     assert "from sandbox" not in (session.messages[1].content or "")
-    assert session.messages[0].content == session.agent.system_prompt()
+    assert session.messages[0].content == (
+        f"{session.agent.system_prompt()}\n\n{session.agent.environment_context()}"
+    )
     session.turn("again")
     assert model.requests[0][0][1].content is not None
     assert "rule beta" in model.requests[0][0][1].content

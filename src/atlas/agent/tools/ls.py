@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.tools._walk import load_ignore_set, prune_dirs
 
 
 class LsInput(BaseModel):
@@ -22,6 +23,10 @@ class LsInput(BaseModel):
     max_entries: int = Field(
         default=500, ge=1, le=10_000, description="Maximum number of entries to return."
     )
+    include_ignored: bool = Field(
+        default=False,
+        description="Also list inside .git, virtualenvs, caches and git-ignored paths.",
+    )
 
 
 def _display_path(store: LocalArtifactStore, path: Path) -> str:
@@ -29,21 +34,42 @@ def _display_path(store: LocalArtifactStore, path: Path) -> str:
     return store.relative(path)
 
 
-def _entries(store: LocalArtifactStore, base: Path, *, recursive: bool) -> list[str]:
-    """Collect entries under ``base`` with directories suffixed by ``/``."""
+def _entries(
+    store: LocalArtifactStore,
+    base: Path,
+    *,
+    recursive: bool,
+    include_ignored: bool = False,
+    notes: list[str] | None = None,
+) -> list[str]:
+    """Collect entries under ``base`` with directories suffixed by ``/``.
+
+    A recursive listing appends a line to ``notes`` when git-ignored paths were left out.
+    """
     entries: list[str] = []
     if not recursive:
         for child in base.iterdir():
             name = _display_path(store, child)
             entries.append(f"{name}/" if child.is_dir() else name)
         return sorted(entries)
+    ignore = None if include_ignored else load_ignore_set(base, root=store.root)
+    hidden = 0
     for root, dir_names, file_names in os.walk(base, followlinks=False):
         current = Path(root)
-        dir_names[:] = sorted(dir_names)
+        if ignore is not None:
+            hidden += sum(ignore.hides_dir(current, name) for name in dir_names)
+            hidden += sum(ignore.hides_file(current, name) for name in file_names)
+        prune_dirs(
+            current, dir_names, root=store.root, include_ignored=include_ignored, ignore=ignore
+        )
         for name in dir_names:
             entries.append(f"{_display_path(store, current / name)}/")
         for name in sorted(file_names):
+            if ignore is not None and ignore.hides_file(current, name):
+                continue
             entries.append(_display_path(store, current / name))
+    if ignore is not None and hidden and notes is not None:
+        notes.append(f"(git-ignored paths not listed: {ignore.summary()})")
     return sorted(entries)
 
 
@@ -59,7 +85,9 @@ class LsTool(Tool):
     name = "ls"
     description = (
         "List files and directories in a local artifact workspace directory, one "
-        "workspace-relative entry per line with directories suffixed by '/'."
+        "workspace-relative entry per line with directories suffixed by '/'. Recursive "
+        "listings skip git-ignored paths, .git, virtualenvs and caches unless include_ignored "
+        "is true."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
 
@@ -75,9 +103,16 @@ class LsTool(Tool):
         if not base.is_dir():
             raise ValueError(f"Path is not a directory: {request.path}")
 
-        entries = _entries(store, base, recursive=request.recursive)
+        notes: list[str] = []
+        entries = _entries(
+            store,
+            base,
+            recursive=request.recursive,
+            include_ignored=request.include_ignored,
+            notes=notes,
+        )
         overflow = len(entries) - request.max_entries
         if overflow > 0:
             entries = entries[: request.max_entries]
             entries.append(f"... [truncated {overflow} more entries]")
-        return ToolResult(text="\n".join(entries))
+        return ToolResult(text="\n".join([*entries, *notes]))

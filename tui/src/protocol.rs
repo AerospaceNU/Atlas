@@ -46,6 +46,38 @@ impl Compaction {
     }
 }
 
+/// One replayed transcript item of a resumed session.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct ReplayItem {
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub summary: String,
+}
+
+/// One saved session in a `sessions` listing.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct SessionInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub saved: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub messages: i64,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub interrupted: bool,
+    #[serde(default)]
+    pub stopped_for_limit: bool,
+}
+
 /// A single server -> client message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerMessage {
@@ -63,6 +95,8 @@ pub enum ServerMessage {
         error: Option<String>,
         error_kind: Option<String>,
         artifacts: Vec<String>,
+        summary: String,
+        notes: Vec<String>,
     },
     Thought {
         text: String,
@@ -72,7 +106,12 @@ pub enum ServerMessage {
         response: String,
         stopped_for_limit: bool,
         stopped_for_budget: bool,
+        stopped_for_context: bool,
         cancelled: bool,
+        compaction: Compaction,
+        status: StatusSnapshot,
+    },
+    Compacted {
         compaction: Compaction,
         status: StatusSnapshot,
     },
@@ -113,6 +152,22 @@ pub enum ServerMessage {
         scope: String,
         kind: String,
         names: Vec<String>,
+        sessions: Vec<SessionInfo>,
+    },
+    SessionLoaded {
+        id: String,
+        goal: String,
+        messages: i64,
+        saved_model: String,
+        stopped_for_limit: bool,
+        interrupted: bool,
+        replay: Vec<ReplayItem>,
+        omitted: i64,
+        status: StatusSnapshot,
+    },
+    Undo {
+        restored: Option<String>,
+        message: String,
     },
     Removed {
         scope: String,
@@ -272,6 +327,10 @@ enum RawMessage {
         error_kind: Option<String>,
         #[serde(default)]
         artifacts: Vec<String>,
+        #[serde(default)]
+        summary: String,
+        #[serde(default)]
+        notes: Vec<String>,
     },
     #[serde(rename = "done")]
     Done {
@@ -282,7 +341,16 @@ enum RawMessage {
         #[serde(default)]
         stopped_for_budget: bool,
         #[serde(default)]
+        stopped_for_context: bool,
+        #[serde(default)]
         cancelled: bool,
+        #[serde(default)]
+        compaction: Compaction,
+        #[serde(flatten)]
+        status: StatusSnapshot,
+    },
+    #[serde(rename = "compacted")]
+    Compacted {
         #[serde(default)]
         compaction: Compaction,
         #[serde(flatten)]
@@ -351,6 +419,36 @@ enum RawMessage {
         kind: String,
         #[serde(default)]
         names: Vec<String>,
+        #[serde(default)]
+        sessions: Vec<SessionInfo>,
+    },
+    #[serde(rename = "session_loaded")]
+    SessionLoaded {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        goal: String,
+        #[serde(default)]
+        messages: i64,
+        #[serde(default)]
+        saved_model: String,
+        #[serde(default)]
+        stopped_for_limit: bool,
+        #[serde(default)]
+        interrupted: bool,
+        #[serde(default)]
+        replay: Vec<ReplayItem>,
+        #[serde(default)]
+        omitted: i64,
+        #[serde(flatten)]
+        status: StatusSnapshot,
+    },
+    #[serde(rename = "undo")]
+    Undo {
+        #[serde(default)]
+        restored: Option<String>,
+        #[serde(default)]
+        message: String,
     },
     #[serde(rename = "phase")]
     Phase {
@@ -483,6 +581,8 @@ impl From<RawMessage> for ServerMessage {
                 error,
                 error_kind,
                 artifacts,
+                summary,
+                notes,
             } => ServerMessage::Step {
                 name,
                 call_id,
@@ -492,11 +592,14 @@ impl From<RawMessage> for ServerMessage {
                 error,
                 error_kind,
                 artifacts,
+                summary,
+                notes,
             },
             RawMessage::Done {
                 response,
                 stopped_for_limit,
                 stopped_for_budget,
+                stopped_for_context,
                 cancelled,
                 compaction,
                 status,
@@ -504,10 +607,14 @@ impl From<RawMessage> for ServerMessage {
                 response,
                 stopped_for_limit,
                 stopped_for_budget,
+                stopped_for_context,
                 cancelled,
                 compaction,
                 status,
             },
+            RawMessage::Compacted { compaction, status } => {
+                ServerMessage::Compacted { compaction, status }
+            }
             RawMessage::PermissionRequest {
                 id,
                 tool,
@@ -563,9 +670,39 @@ impl From<RawMessage> for ServerMessage {
                 warning,
                 name,
             },
-            RawMessage::Listing { scope, kind, names } => {
-                ServerMessage::Listing { scope, kind, names }
-            }
+            RawMessage::Listing {
+                scope,
+                kind,
+                names,
+                sessions,
+            } => ServerMessage::Listing {
+                scope,
+                kind,
+                names,
+                sessions,
+            },
+            RawMessage::SessionLoaded {
+                id,
+                goal,
+                messages,
+                saved_model,
+                stopped_for_limit,
+                interrupted,
+                replay,
+                omitted,
+                status,
+            } => ServerMessage::SessionLoaded {
+                id,
+                goal,
+                messages,
+                saved_model,
+                stopped_for_limit,
+                interrupted,
+                replay,
+                omitted,
+                status,
+            },
+            RawMessage::Undo { restored, message } => ServerMessage::Undo { restored, message },
             RawMessage::Removed { scope, kind, name } => {
                 ServerMessage::Removed { scope, kind, name }
             }
@@ -795,6 +932,37 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_done_stopped_for_context() {
+        let line = r#"{"type":"done","response":"","stopped_for_context":true}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::Done {
+                stopped_for_context,
+                ..
+            }) => assert!(stopped_for_context),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_compacted() {
+        let line = r#"{"type":"compacted","compaction":{"occurred":true,"tokens_reclaimed":50,"tool_results_shortened":1,"messages_dropped":2,"digest_inserted":true,"digest_chars":10},"context_used":7,"context_limit":1000}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::Compacted { compaction, status }) => {
+                assert!(compaction.occurred);
+                assert_eq!(compaction.tokens_reclaimed, 50);
+                assert_eq!(compaction.messages_dropped, 2);
+                assert_eq!(status.context_used, 7);
+                assert_eq!(status.context_limit, Some(1000));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            parse_line(r#"{"type":"compacted"}"#).unwrap(),
+            Some(ServerMessage::Compacted { .. })
+        ));
     }
 
     #[test]

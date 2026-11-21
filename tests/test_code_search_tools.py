@@ -182,3 +182,35 @@ def test_code_search_tools_are_registered() -> None:
     names = {definition.name for definition in registry.definitions}
 
     assert {"grep", "glob", "ls"} <= names
+
+
+def _numbered(tmp_path: Path, count: int = 100) -> LocalArtifactStore:
+    (tmp_path / "f.txt").write_text("".join(f"line {i}\n" for i in range(count)), encoding="utf-8")
+    return LocalArtifactStore(tmp_path)
+
+
+def test_grep_clamps_large_context_with_a_note(tmp_path: Path) -> None:
+    store = _numbered(tmp_path)
+    for value in (20, 1000):
+        text = GrepTool().run({"pattern": "line 50", "context": value}, store).text
+        if value == 20:
+            assert not text.startswith("note:")
+            assert "f.txt-31-line 30" in text
+        else:
+            assert text.startswith("note: context clamped to 30\n")
+            assert "f.txt-21-line 20" in text
+            assert "f.txt-20-line 19" not in text
+
+
+def test_grep_rejects_negative_context(tmp_path: Path) -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        GrepTool().run({"pattern": "x", "context": -1}, _numbered(tmp_path))
+
+
+def test_grep_clamps_max_matches_and_notes_both(tmp_path: Path) -> None:
+    store = _numbered(tmp_path)
+    text = GrepTool().run({"pattern": "line", "max_matches": 5000, "context": 99}, store).text
+    assert text.startswith("note: context clamped to 30\nnote: max_matches clamped to 1000\n")

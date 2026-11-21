@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import queue
 import sys
 import threading
+import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Literal
 
 from pydantic import ValidationError
 
@@ -31,7 +34,14 @@ from atlas.agent.analysis_skill import (
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.audit import record as audit_event
 from atlas.agent.checkpoints import restore_latest
-from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
+from atlas.agent.contracts import (
+    CatalogModel,
+    ChatMessage,
+    Role,
+    ToolCapableModel,
+    ToolRegistry,
+    default_registry,
+)
 from atlas.agent.images import ingest_images
 from atlas.agent.layout import (
     ATLAS_SKILLS_RELATIVE,
@@ -83,6 +93,9 @@ from atlas.agent.runtime import (
     Agent,
     AgentRun,
     AgentStep,
+    ContextCompaction,
+    _compact,
+    _estimate_tokens,
     ensure_agent_config,
     load_approval,
     load_home_skills_enabled,
@@ -90,7 +103,18 @@ from atlas.agent.runtime import (
     load_model,
     load_optional_tokens,
     load_read_only,
+    load_reasoning_effort,
     load_spend_limit,
+)
+from atlas.agent.sessions import (
+    call_summary,
+    discard_unused_session,
+    first_prompt,
+    list_sessions,
+    newest_session,
+    repair_history,
+    replay_items,
+    write_meta,
 )
 from atlas.agent.skill_author import normalize_skill_name
 from atlas.agent.skills import Skill, load_skills, register_skill_tool
@@ -132,10 +156,14 @@ class AgentSession:
     two user messages in a row. Those messages stay separate.
     """
 
+    AUTOSAVE_SECONDS: float = 5.0
+
     def __init__(self, agent: Agent) -> None:
         self.agent = agent
         self.messages: list[ChatMessage] = self.agent.opening_messages()
         self.stopped_for_limit = False
+        self.interrupted = False
+        self._last_autosave: float | None = None
         self.session_key: str | None = None
         self.credential_keys: dict[str, str] = {}
         self.home: Path | None = None
@@ -161,6 +189,8 @@ class AgentSession:
             self.active_key = key or None
             if key:
                 self.secrets.append(key)
+        # Bound to the live list, so a key added later through set_key is covered too.
+        self.agent.redact_output = lambda text: _redact_value(text, self.secrets)
         self.skill_catalog_note = ""
         self._skill_previews: dict[tuple[str, str], str] = {}
         self._analysis_turns: list[AnalysisTurn] = []
@@ -172,6 +202,10 @@ class AgentSession:
         # rounds and before a tool batch, so a turn can be stopped without
         # killing the process that holds the history.
         self.cancel_event = threading.Event()
+        # A ``quit`` read while turn N runs stops turn N only; later turns run.
+        self.quit_turn: int | None = None
+        self._turn_no = 0
+        self.loaded_at_launch = False
         # Set when this session has a directory under .atlas/sessions.
         self.session_id: str | None = None
         # Approval round-trip. The reader thread fills a slot when a
@@ -218,17 +252,9 @@ class AgentSession:
             message.images = ingest_images(self.agent.artifacts, list(images))
         self._begin_analysis(request)
         self.messages.append(message)
-        run = self.agent.advance(
-            self.messages,
-            on_step=on_step,
-            on_phase=on_phase,
-            on_thought=on_thought,
-            should_cancel=self.cancel_event.is_set,
-        )
-        self.stopped_for_limit = run.stopped_for_limit
-        self._note(run)
-        self._capture_analysis(run)
-        return run
+        self.interrupted = True
+        self._autosave(force=True)
+        return self._advance(on_step, on_phase, on_thought)
 
     def resume(
         self,
@@ -239,19 +265,87 @@ class AgentSession:
     ) -> AgentRun:
         """Continue a turn that stopped at the tool-call limit, with a fresh budget."""
         self._require_key()
-        if not self.stopped_for_limit:
+        if not (self.stopped_for_limit or self.interrupted):
             raise RuntimeError("Session is not stopped for the tool-call limit")
-        run = self.agent.advance(
-            self.messages,
-            on_step=on_step,
-            on_phase=on_phase,
-            on_thought=on_thought,
-            should_cancel=self.cancel_event.is_set,
-        )
+        self.interrupted = True
+        self._autosave(force=True)
+        return self._advance(on_step, on_phase, on_thought)
+
+    def _advance(
+        self,
+        on_step: Callable[[AgentStep], None] | None,
+        on_phase: Callable[[str, str | None], None] | None,
+        on_thought: Callable[[str, float | None], None] | None,
+    ) -> AgentRun:
+        """Advance the history one turn; usage of a failed turn is still counted.
+
+        When the model raises, the work collected before the failure
+        (``agent.partial_run``) is accounted like a finished run and the same
+        exception propagates.
+        """
+        self._turn_no += 1
+        try:
+            run = self.agent.advance(
+                self.messages,
+                on_step=on_step,
+                on_phase=self._autosaving_phase(on_phase),
+                on_thought=on_thought,
+                should_cancel=self._should_cancel,
+            )
+        except BaseException:
+            partial = self.agent.partial_run
+            if partial is not None:
+                # Accounting must never replace the failure being reported.
+                with contextlib.suppress(Exception):
+                    self._note(partial)
+            raise
         self.stopped_for_limit = run.stopped_for_limit
+        self.interrupted = False
         self._note(run)
         self._capture_analysis(run)
         return run
+
+    def _should_cancel(self) -> bool:
+        quit_turn = self.quit_turn
+        return self.cancel_event.is_set() or (quit_turn is not None and quit_turn >= self._turn_no)
+
+    def has_conversation(self) -> bool:
+        """Return whether any real user message has been added."""
+        return any(m.role is Role.USER and not m.tool_observation for m in self.messages)
+
+    def _autosaving_phase(
+        self, on_phase: Callable[[str, str | None], None] | None
+    ) -> Callable[[str, str | None], None]:
+        def wrapped(phase: str, detail: str | None = None) -> None:
+            if phase in ("thinking", "working"):
+                self._autosave()
+            if on_phase is not None:
+                on_phase(phase, detail)
+
+        return wrapped
+
+    def _autosave(self, *, force: bool = False) -> None:
+        """Save at a round boundary, at most every AUTOSAVE_SECONDS; never raises."""
+        now = time.monotonic()
+        last = self._last_autosave
+        if not force and last is not None and now - last < self.AUTOSAVE_SECONDS:
+            return
+        self._last_autosave = now
+        with contextlib.suppress(Exception):
+            self.save_state(only_if_dir_exists=True)
+
+    def compact(self) -> ContextCompaction:
+        """Halve the estimated context when possible, keeping protected messages.
+
+        The trigger is half the current estimate, passed as an explicit limit;
+        ``MAX_CONTEXT_TOKENS`` is never changed. The system prompt, project
+        instructions, the goal message and every real user message stay.
+        """
+        limit = max(1, _estimate_tokens(self.messages) // 2)
+        change = _compact(self.messages, root=self.agent.artifacts.root, limit=limit)
+        if change.occurred:
+            self.totals.context_used = _estimate_tokens(self.messages)
+        return change
 
     def start_fresh(self) -> None:
         """Start a new conversation without reopening the process.
@@ -266,10 +360,14 @@ class AgentSession:
         workspace. Reads keep the previous read root, so this never widens
         write access to the workspace.
         """
+        _stop_jobs("new conversation")
+        old_id = self.session_id
         self.goal = ""
         self._goal_message = None
         self.active_skills = []
         self.stopped_for_limit = False
+        self.interrupted = False
+        self._last_autosave = None
         self.totals = SessionTotals(
             model=self.model_id or self.totals.model,
             context_limit=self.totals.context_limit,
@@ -280,6 +378,8 @@ class AgentSession:
             self.session_id = session_id
             artifact_root = project_artifact_dir(self.workspace, session_id)
             self.agent.artifacts = LocalArtifactStore(self.workspace, artifact_root=artifact_root)
+            if isinstance(old_id, str) and old_id != session_id:
+                discard_unused_session(self.workspace, old_id)
         self.messages = self.agent.opening_messages()
 
     def set_goal(self, text: str) -> None:
@@ -401,7 +501,7 @@ class AgentSession:
         self.active_skills.append(skill.name)
         return skill
 
-    def save_state(self) -> None:
+    def save_state(self, *, only_if_dir_exists: bool = False) -> None:
         """Write this conversation to ``.atlas/sessions/<id>/state.json``.
 
         The file holds the model id, the goal, the message history, and the
@@ -413,9 +513,12 @@ class AgentSession:
         if self.workspace is None or self.session_id is None:
             return
         directory = project_session_dir(self.workspace, self.session_id)
+        if only_if_dir_exists and not directory.is_dir():
+            return
         directory.mkdir(parents=True, exist_ok=True)
+        snapshot = list(self.messages)
         messages = []
-        for message in self.messages:
+        for message in snapshot:
             dumped = message.model_dump(mode="json")
             dumped["images"] = []
             messages.append(dumped)
@@ -426,6 +529,8 @@ class AgentSession:
             "messages": messages,
             "totals": self.totals.model_dump(mode="json"),
             "saved": datetime.now(UTC).isoformat(),
+            "interrupted": self.interrupted,
+            "stopped_for_limit": self.stopped_for_limit,
         }
         text = json.dumps(payload, indent=2)
         for secret in self.secrets:
@@ -435,12 +540,28 @@ class AgentSession:
         temporary = directory / ".state.json.tmp"
         temporary.write_text(text + "\n", encoding="utf-8")
         os.replace(temporary, target)
+        prompt = first_prompt(snapshot)
+        for secret in self.secrets:
+            if secret:
+                prompt = prompt.replace(secret, "[redacted]")
+        with contextlib.suppress(OSError):
+            write_meta(
+                directory,
+                session_id=self.session_id,
+                model=self.model_id,
+                messages=sum(1 for item in snapshot if item.role is not Role.SYSTEM),
+                saved=str(payload["saved"]),
+                interrupted=self.interrupted,
+                stopped_for_limit=self.stopped_for_limit,
+                prompt=prompt,
+            )
 
-    def load_state(self, session_id: str) -> bool:
+    def load_state(self, session_id: str, *, adopt_model: bool = True) -> bool:
         """Restore a saved conversation into this session.
 
         Args:
             session_id: Directory name under ``.atlas/sessions``.
+            adopt_model: Take the saved model id; False keeps the current one.
 
         Returns:
             True when a saved state was loaded. A missing file leaves the
@@ -460,6 +581,7 @@ class AgentSession:
         if not isinstance(payload, dict):
             raise ValueError("saved session must be a JSON object")
         messages = [ChatMessage.model_validate(item) for item in payload.get("messages", [])]
+        inserted = repair_history(messages)
         self.session_id = session_id
         self.messages = messages
         self.goal = str(payload.get("goal") or "")
@@ -467,11 +589,24 @@ class AgentSession:
         if isinstance(totals, dict):
             self.totals = SessionTotals.model_validate(totals)
         model = payload.get("model")
-        if isinstance(model, str) and model.strip():
+        if adopt_model and isinstance(model, str) and model.strip():
             self.model_id = model.strip()
             self.totals.model = self.model_id
         artifact_root = project_artifact_dir(self.workspace, session_id)
         self.agent.artifacts = LocalArtifactStore(self.workspace, artifact_root=artifact_root)
+        if messages and messages[0].role is Role.SYSTEM:
+            messages[0] = self.agent.opening_messages()[0]
+        goal_text = session_goal_text(self.goal) if self.goal else None
+        self._goal_message = next(
+            (m for m in messages if goal_text and m.role is Role.USER and m.content == goal_text),
+            None,
+        )
+        self.stopped_for_limit = bool(payload.get("stopped_for_limit"))
+        self.interrupted = bool(payload.get("interrupted")) or inserted > 0
+        last = messages[-1] if messages else None
+        if last is not None and last.role is Role.ASSISTANT and not last.tool_calls:
+            self.interrupted = False
+        self._last_autosave = None
         return True
 
     def ask_permission(self, request: Any, emit: Callable[[dict[str, Any]], None]) -> bool:
@@ -680,7 +815,7 @@ def _write_line(stdout: IO[str], payload: dict[str, Any], secrets: list[str]) ->
         stdout.flush()
 
 
-def _redact_value(value: Any, secrets: list[str]) -> Any:
+def redact_value(value: Any, secrets: list[str]) -> Any:
     if isinstance(value, str):
         for secret in secrets:
             if secret:
@@ -693,7 +828,7 @@ def _redact_value(value: Any, secrets: list[str]) -> Any:
     return value
 
 
-def _step_event(step: AgentStep) -> dict[str, Any]:
+def step_event(step: AgentStep) -> dict[str, Any]:
     result = step.result
     return {
         "type": "step",
@@ -705,7 +840,37 @@ def _step_event(step: AgentStep) -> dict[str, Any]:
         "error": step.error,
         "error_kind": step.error_kind,
         "artifacts": result.artifacts if result is not None else [],
+        "notes": step.notes,
+        "summary": _safe_summary(step),
     }
+
+
+@contextlib.contextmanager
+def session_bound(session: AgentSession) -> Iterator[None]:
+    """Bind the session credential and secret maps for the duration of the block."""
+    bind_session_credentials(session.credential_keys)
+    bind_session_secrets(session.secrets)
+    quiet_http_client_logs()
+    try:
+        yield
+    finally:
+        unbind_session_credentials()
+        unbind_session_secrets()
+
+
+def _safe_summary(step: AgentStep) -> str:
+    try:
+        return call_summary(step.call.name, step.call.arguments)
+    except Exception:
+        return ""
+
+
+def _stop_jobs(reason: str) -> None:
+    """Stop background bash jobs this process started; never raises."""
+    with contextlib.suppress(Exception):
+        from atlas.agent.tools._jobs import stop_all
+
+        stop_all(reason)
 
 
 def serve(
@@ -727,20 +892,24 @@ def serve(
         request,
         lambda event: _write_line(stdout, event, session.secrets),
     )
-    bind_session_credentials(session.credential_keys)
-    bind_session_secrets(session.secrets)
-    quiet_http_client_logs()
-    try:
+    with session_bound(session):
         _remember_resolved_credentials(session)
-        return _serve_bound(session, stdin, stdout)
-    finally:
-        unbind_session_credentials()
-        unbind_session_secrets()
+        try:
+            code = _serve_bound(session, stdin, stdout)
+        finally:
+            _stop_jobs("session ended")
+        if session.has_conversation():
+            with contextlib.suppress(Exception):
+                session.save_state(only_if_dir_exists=True)
+        return code
 
 
 def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
     """Read the protocol after the session credential map is bound."""
     _write_line(stdout, _ready_event(session), session.secrets)
+    if session.loaded_at_launch:
+        session.loaded_at_launch = False
+        _write_line(stdout, _session_loaded_event(session), session.secrets)
     lines: queue.Queue[str | None] = queue.Queue()
     reader = threading.Thread(
         target=_read_protocol, args=(stdin, lines, session, stdout), daemon=True
@@ -772,6 +941,9 @@ def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
             continue
         if kind == "resume":
             _handle_resume(session, stdout)
+            continue
+        if kind == "compact":
+            _handle_compact(session, stdout)
             continue
         if kind == "undo":
             _handle_undo(session, stdout)
@@ -843,6 +1015,10 @@ def _read_protocol(
         if isinstance(message, dict) and message.get("type") == "cancel":
             session.cancel_event.set()
             continue
+        if isinstance(message, dict) and message.get("type") == "quit":
+            session.quit_turn = session._turn_no
+            lines.put(text)
+            return
         if isinstance(message, dict) and message.get("type") == "permission":
             request_id = message.get("id")
             if isinstance(request_id, str):
@@ -872,10 +1048,15 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
     except MissingOpenRouterKey as exc:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
+    except KeyboardInterrupt:
+        _save_after_failure(session)
+        raise
     except OpenRouterHTTPError as exc:
+        _save_after_failure(session)
         _write_http_error(session, stdout, exc)
         return
     except Exception as exc:
+        _save_after_failure(session)
         _write_line(
             stdout,
             {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
@@ -884,6 +1065,29 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
         return
     session.save_state()
     _write_line(stdout, _done_event(session, run), session.secrets)
+
+
+def _save_after_failure(session: AgentSession) -> None:
+    """Persist history appended before a failed turn; a save error never masks the cause."""
+    with contextlib.suppress(Exception):
+        session.save_state()
+
+
+def _handle_compact(session: AgentSession, stdout: IO[str]) -> None:
+    """Compact the history on request and report the result."""
+    try:
+        compaction = session.compact()
+        session.save_state()
+    except Exception as exc:
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
+            session.secrets,
+        )
+        return
+    payload: dict[str, Any] = {"type": "compacted", "compaction": compaction.model_dump()}
+    payload.update(_status_fields(session))
+    _write_line(stdout, payload, session.secrets)
 
 
 def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
@@ -895,10 +1099,15 @@ def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
     except MissingOpenRouterKey as exc:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
+    except KeyboardInterrupt:
+        _save_after_failure(session)
+        raise
     except OpenRouterHTTPError as exc:
+        _save_after_failure(session)
         _write_http_error(session, stdout, exc)
         return
     except Exception as exc:
+        _save_after_failure(session)
         _write_line(
             stdout,
             {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
@@ -932,8 +1141,16 @@ def _handle_load_session(session: AgentSession, stdout: IO[str], message: dict[s
             session.secrets,
         )
         return
+    wanted = session_id.strip()
+    previous = session.session_id
+    if wanted == "last" and session.workspace is not None:
+        newest = newest_session(session.workspace, exclude=previous)
+        if newest is None:
+            _write_line(stdout, {"type": "error", "message": "No saved session"}, session.secrets)
+            return
+        wanted = newest
     try:
-        loaded = session.load_state(session_id.strip())
+        loaded = session.load_state(wanted)
     except (OSError, ValueError, ValidationError) as exc:
         _write_line(
             stdout,
@@ -944,21 +1161,33 @@ def _handle_load_session(session: AgentSession, stdout: IO[str], message: dict[s
     if not loaded:
         _write_line(
             stdout,
-            {"type": "error", "message": f"No saved session {session_id.strip()}"},
+            {"type": "error", "message": f"No saved session {wanted}"},
             session.secrets,
         )
         return
-    _write_line(
-        stdout,
-        {
-            "type": "session_loaded",
-            "id": session.session_id,
-            "goal": session.goal,
-            "messages": len(session.messages),
-            **_status_fields(session),
-        },
-        session.secrets,
-    )
+    if (
+        session.workspace is not None
+        and isinstance(previous, str)
+        and previous != session.session_id
+    ):
+        discard_unused_session(session.workspace, previous)
+    _write_line(stdout, _session_loaded_event(session), session.secrets)
+
+
+def _session_loaded_event(session: AgentSession) -> dict[str, Any]:
+    replay, omitted = replay_items(session.messages, limit=40, max_chars=1500)
+    return {
+        "type": "session_loaded",
+        "id": session.session_id,
+        "goal": session.goal,
+        "messages": len(session.messages),
+        "saved_model": session.model_id,
+        "stopped_for_limit": session.stopped_for_limit,
+        "interrupted": session.interrupted,
+        "replay": replay,
+        "omitted": omitted,
+        **_status_fields(session),
+    }
 
 
 def _handle_new(session: AgentSession, stdout: IO[str]) -> None:
@@ -1414,16 +1643,31 @@ def _handle_list(session: AgentSession, stdout: IO[str], message: dict[str, Any]
     except (AtlasPathError, TypeError) as exc:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
-    _write_line(
-        stdout,
-        {
-            "type": "listing",
-            "scope": message.get("scope"),
-            "kind": message.get("kind"),
-            "names": names,
-        },
-        session.secrets,
-    )
+    payload: dict[str, Any] = {
+        "type": "listing",
+        "scope": message.get("scope"),
+        "kind": message.get("kind"),
+        "names": names,
+    }
+    if message.get("kind") == "sessions" and message.get("scope") == "project":
+        payload["sessions"] = _session_rows(session)
+    _write_line(stdout, payload, session.secrets)
+
+
+def _session_rows(session: AgentSession) -> list[dict[str, Any]]:
+    if session.workspace is None:
+        return []
+    try:
+        found = list_sessions(session.workspace, limit=50)
+    except OSError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in found:
+        row = item.model_dump()
+        prompt = str(row.get("prompt", ""))
+        row["prompt"] = prompt if len(prompt) <= 120 else prompt[:117] + "..."
+        rows.append(row)
+    return rows
 
 
 def _handle_remove(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
@@ -1737,7 +1981,7 @@ def _apply_known_context_limit(session: AgentSession) -> None:
         session.totals.context_limit = context_length
 
 
-def _status_fields(session: AgentSession) -> dict[str, Any]:
+def status_fields(session: AgentSession) -> dict[str, Any]:
     _apply_known_context_limit(session)
     totals = session.totals
     return {
@@ -1771,7 +2015,7 @@ def _ready_event(session: AgentSession) -> dict[str, Any]:
     return payload
 
 
-def _done_event(session: AgentSession, run: AgentRun) -> dict[str, Any]:
+def done_event(session: AgentSession, run: AgentRun) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "done",
         "response": run.response,
@@ -1780,6 +2024,8 @@ def _done_event(session: AgentSession, run: AgentRun) -> dict[str, Any]:
         "stopped_for_context": run.stopped_for_context,
         "cancelled": run.cancelled,
         "compaction": run.compaction.model_dump(),
+        "empty_replies": run.empty_replies,
+        "intent_nudges": run.intent_nudges,
     }
     payload.update(_status_fields(session))
     return payload
@@ -1827,6 +2073,175 @@ def _remember_session(workspace: Path, model_id: str) -> str:
     return session_id
 
 
+_redact_value = redact_value
+_step_event = step_event
+_status_fields = status_fields
+_done_event = done_event
+
+
+class SessionNotFound(LookupError):
+    """A requested saved session does not exist (``str(exc)`` names the id)."""
+
+
+@dataclass
+class SessionBundle:
+    """An assembled session plus the resources its caller must release."""
+
+    session: AgentSession
+    model: ToolCapableModel
+    api_key: str
+    session_id: str
+    workspace: Path
+    home: Path
+    owned_model: bool = True
+
+    def close(self) -> None:
+        """Close the model when this bundle built it; safe to call twice."""
+        if not self.owned_model:
+            return
+        self.owned_model = False
+        close = getattr(self.model, "close", None)
+        if callable(close):
+            close()
+
+
+def _check_resume(workspace: Path, resume: str) -> None:
+    """Raise SessionNotFound unless ``resume`` names a saved session; writes nothing."""
+    if not resume or resume in {".", ".."} or "/" in resume or "\\" in resume:
+        raise SessionNotFound(f"no saved session {resume}")
+    if not (project_session_dir(workspace, resume) / "state.json").is_file():
+        raise SessionNotFound(f"no saved session {resume}")
+
+
+def build_session(
+    workspace: Path,
+    *,
+    model_id: str | None = None,
+    approval: Literal["allow", "ask", "deny"] | None = None,
+    max_tool_calls: int | None = None,
+    max_spend_usd: float | None = None,
+    resume: str | None = None,
+    write_config: bool = True,
+    home: Path | None = None,
+    model: ToolCapableModel | None = None,
+) -> SessionBundle:
+    """Assemble an :class:`AgentSession` without serving it.
+
+    Explicit arguments win over ``agent.toml``. A ``resume`` id is validated before
+    anything is written, and the session is bound to its workspace before its saved
+    state loads. An injected ``model`` is not closed by the bundle. Never serves.
+
+    Raises:
+        SessionNotFound: ``resume`` names no saved session.
+    """
+    workspace = workspace.resolve()
+    home = home or Path.home()
+    if resume is not None:
+        _check_resume(workspace, resume)
+    if write_config:
+        ensure_agent_config(workspace)
+    ensure_user_layout(home)
+    api_key = ""
+    if model is None:
+        api_key = (
+            resolve_openrouter_key(
+                session_key=None,
+                env_key=os.environ.get("OPENROUTER_API_KEY"),
+                home=home,
+            )
+            or ""
+        )
+    model_id = resolve_model(workspace, model_id)
+    session_id = resume or _remember_session(workspace, model_id)
+    # Relative tool paths resolve against the workspace the person pointed the
+    # session at, which does not have to be a git checkout; absolute paths are
+    # allowed. Tool outputs land in this session's artifact directory, inside
+    # the workspace, so removing the session removes them.
+    artifact_root = project_artifact_dir(workspace, session_id)
+    store = LocalArtifactStore(workspace, artifact_root=artifact_root)
+    # Home skills are opt-in. The default session sees only the workspace.
+    skill_home = home if load_home_skills_enabled(workspace) else None
+    skills = load_skills(store, home=skill_home)
+    registry = default_registry()
+    register_skill_tool(registry, skills)
+    owned = model is None
+    active: ToolCapableModel
+    if model is None:
+        active = OpenRouterModel(
+            ModelConfig(
+                model=model_id,
+                api_key=api_key,
+                reasoning_effort=load_reasoning_effort(workspace),
+            )
+        )
+    else:
+        active = model
+    try:
+        agent = Agent(
+            active,
+            registry,
+            store,
+            # Budgets live in the workspace .atlas/agent.toml unless given.
+            max_tool_calls=(
+                max_tool_calls if max_tool_calls is not None else load_max_tool_calls(workspace)
+            ),
+            max_tokens=load_optional_tokens(workspace),
+            max_spend_usd=(
+                max_spend_usd if max_spend_usd is not None else load_spend_limit(workspace)
+            ),
+            read_only=load_read_only(workspace),
+            approval=approval or load_approval(workspace),
+            skills=skills,
+        )
+        from atlas.agent.tools._subagent import SubagentTool
+
+        def build_child(child_store: LocalArtifactStore, allow_writes: bool, budget: int) -> Agent:
+            child_registry = default_registry()
+            register_skill_tool(child_registry, skills)
+            return Agent(
+                active,
+                child_registry,
+                child_store,
+                max_tool_calls=budget,
+                max_tokens=agent.max_tokens,
+                max_spend_usd=None,
+                read_only=agent.read_only or not allow_writes,
+                approval=agent.approval,
+                on_permission=agent.on_permission,
+                skills=skills,
+            )
+
+        registry.register(SubagentTool(build_child))
+        session = AgentSession(agent)
+        session.session_id = session_id
+        session.home = home
+        session.workspace = workspace
+        session.active_key = api_key or None
+        session.requires_api_key = owned
+        list_models = getattr(active, "list_models", None)
+        if list_models is not None:
+            session.fetch_models = list_models
+        if resume is not None:
+            if not session.load_state(resume):
+                raise SessionNotFound(f"no saved session {resume}")
+            session.loaded_at_launch = True
+    except BaseException:
+        if owned:
+            close = getattr(active, "close", None)
+            if callable(close):
+                close()
+        raise
+    return SessionBundle(
+        session=session,
+        model=active,
+        api_key=api_key,
+        session_id=session_id,
+        workspace=workspace,
+        home=home,
+        owned_model=owned,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Console entry for ``python -m atlas.agent.session``."""
     parser = argparse.ArgumentParser(prog="atlas.agent.session")
@@ -1846,82 +2261,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    workspace = Path(args.workspace).resolve()
-    home = Path.home()
-    repo_root = _find_repo_root(workspace) or _find_repo_root(Path.cwd())
+    # Never the workspace: a workspace .env must not inject environment.
+    repo_root = _find_repo_root(Path.cwd())
     if repo_root is not None:
         from dotenv import load_dotenv
 
         load_dotenv(repo_root / ".env", override=False)
 
-    ensure_agent_config(workspace)
-    ensure_user_layout(home)
-    api_key = (
-        resolve_openrouter_key(
-            session_key=None,
-            env_key=os.environ.get("OPENROUTER_API_KEY"),
-            home=home,
-        )
-        or ""
-    )
-    model_id = resolve_model(workspace, args.model)
-    session_id = _remember_session(workspace, model_id)
-    # Relative tool paths resolve against the workspace the person pointed the
-    # session at, which does not have to be a git checkout; absolute paths are
-    # allowed. Tool outputs land in this session's artifact directory, inside
-    # the workspace, so removing the session removes them.
-    artifact_root = project_artifact_dir(workspace, session_id)
-    store = LocalArtifactStore(workspace, artifact_root=artifact_root)
-    # Home skills are opt-in. The default session sees only the workspace.
-    skill_home = home if load_home_skills_enabled(workspace) else None
-    skills = load_skills(store, home=skill_home)
-    registry = default_registry()
-    register_skill_tool(registry, skills)
-    model = OpenRouterModel(ModelConfig(model=model_id, api_key=api_key))
     try:
-        agent = Agent(
-            model,
-            registry,
-            store,
-            # Budgets live in the workspace .atlas/agent.toml.
-            max_tool_calls=load_max_tool_calls(workspace),
-            max_tokens=load_optional_tokens(workspace),
-            max_spend_usd=load_spend_limit(workspace),
-            read_only=load_read_only(workspace),
-            approval=args.approval or load_approval(workspace),
-            skills=skills,
+        bundle = build_session(
+            Path(args.workspace),
+            model_id=args.model,
+            approval=args.approval,
+            resume=args.resume,
         )
-        from atlas.agent.tools._subagent import SubagentTool
-
-        def build_child(child_store: LocalArtifactStore, allow_writes: bool, budget: int) -> Agent:
-            child_registry = default_registry()
-            register_skill_tool(child_registry, skills)
-            return Agent(
-                model,
-                child_registry,
-                child_store,
-                max_tool_calls=budget,
-                max_tokens=agent.max_tokens,
-                max_spend_usd=None,
-                read_only=not allow_writes,
-                approval=agent.approval,
-                on_permission=agent.on_permission,
-                skills=skills,
-            )
-
-        registry.register(SubagentTool(build_child))
-        session = AgentSession(agent)
-        session.session_id = session_id
-        if args.resume:
-            session.load_state(args.resume)
-        session.requires_api_key = True
-        session.home = home
-        session.workspace = workspace
-        session.active_key = api_key or None
-        session.fetch_models = model.list_models
-        return serve(session, sys.stdin, sys.stdout, redact=api_key or None)
+    except SessionNotFound as exc:
+        print(f"atlas: {exc}", file=sys.stderr)
+        return 2
+    except (ValueError, ValidationError, OSError) as exc:
+        if args.resume is None:
+            raise
+        print(f"atlas: cannot resume {args.resume}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return serve(bundle.session, sys.stdin, sys.stdout, redact=bundle.api_key or None)
     finally:
-        model.close()
+        if bundle.session.session_id:
+            discard_unused_session(bundle.workspace, bundle.session.session_id)
+        bundle.close()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,9 @@ _MAX_PIXELS = 8_000_000
 
 _WEIGHTS_ENV = "ATLAS_WEIGHTS_DIR"
 
+HEURISTIC_PREFIX = "HEURISTIC preview rule on an 8-bit RGB PNG, not a trained model."
+"""Leads the description and every result of a v1 heuristic RGB tool."""
+
 
 class PluginInput(BaseModel):
     """Declared tensor / image contract for one plugin."""
@@ -43,6 +46,7 @@ class PluginSpec(BaseModel):
     name: str
     description: str
     runtime: str
+    tier: str = ""
     weight: str = ""
     sha256: str = ""
     rule: str = ""

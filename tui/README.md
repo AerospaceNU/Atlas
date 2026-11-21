@@ -3,8 +3,10 @@
 A small terminal client for the Atlas Python agent session. The screen follows
 the Grok Build default: a `#141414` canvas, an open transcript, a rounded
 composer, and a one-line status row. It spawns
-`uv run python -m atlas.agent` as a child process and speaks the
-line-delimited JSON protocol on its stdin/stdout. The Python agent remains the
+`python -P -m atlas.agent --approval ask [--resume ID] --workspace W` as a child
+process and speaks the line-delimited JSON protocol on its stdin/stdout. `-P`
+keeps modules in the current directory from shadowing `atlas`, so it works from
+any repository. The Python agent remains the
 authority; this crate only renders and forwards messages.
 
 ## Run
@@ -23,13 +25,19 @@ The first launch builds `tui/target/release/atlas-tui` when `cargo` is on
 `atlas tui --workspace PATH` forwards the extra arguments. `ATLAS_TUI` can
 point at a binary you built yourself.
 
+Usage: `atlas-tui [--workspace PATH] [--repo PATH] [--python PATH] [--resume ID]`
+
 Options:
 
 - `--workspace PATH` — artifact workspace handed to the agent (default: the
   current directory; resolved to an absolute path).
-- `--repo PATH` — Atlas repo root used as the child process `current_dir`
-  (default: walk the current directory's parents for a `pyproject.toml` whose
-  text contains `name = "atlas"`).
+- `--python PATH` — interpreter with atlas installed (default: env
+  `ATLAS_PYTHON`). The `atlas` launcher sets it.
+- `--repo PATH` — optional Atlas checkout used as the child's working
+  directory and `.env` source (default: walk the current directory's parents for
+  a `pyproject.toml` whose text contains `name = "atlas"`). With neither
+  `--python` nor a found repo the error names both options.
+- `--resume ID` — resume a saved session; `last` is the newest.
 
 `OPENROUTER_API_KEY` is read from the environment, or from `<repo>/.env` when
 the repo root is found. The first session writes `<workspace>/.atlas/agent.toml`
@@ -47,10 +55,19 @@ works where the terminal supports it). `Left` / `Right` move the cursor, and
 of the current line; `Ctrl+W` deletes the previous word. `Up` / `Down` move
 through draft lines, then recall sent prompts at the boundaries. `PageUp` /
 `PageDown` scroll the transcript. `Shift+Up` / `Shift+Down` select tool rows.
-`Esc` keeps an unfinished ordinary draft; during a running turn it stops the
-turn and keeps the draft. `Ctrl+R` resumes a turn stopped at the tool-call limit,
-and `Ctrl+C` copies selected text or quits when nothing is selected. `/new`
-starts a fresh conversation and clears the transcript. `/skill <name>` applies
+`Esc` keeps an unfinished ordinary draft. During a running turn the first `Esc`
+requests a stop and keeps the draft. A tool that cannot be interrupted keeps
+running: the status says so and the turn ends when it returns (`bash` and
+`run_tests` report "cancelling"). A second `Esc` prints "Still stopping. Ctrl+C
+quits; the conversation is saved up to the last finished step." `Ctrl+R`
+resumes a turn that stopped at the tool-call limit or was interrupted, and
+`Ctrl+C` copies selected text or quits when nothing is selected. `/new`
+starts a fresh conversation and clears the transcript. `/resume [ID]` (default
+`last`) loads a saved session and replays its earlier transcript, noting "N
+earlier items not shown" when it is cut; the status is Stopped when the session
+was interrupted or stopped at the limit. `/undo` restores the files of the last
+checkpointed turn. `/compact` shrinks the
+model context on demand. `/skill <name>` applies
 a workspace skill for the rest of this conversation. The `.atlas` copy wins
 over `.agents` when both exist.
 
@@ -72,12 +89,38 @@ starts off; while it is on, tool calls proceed without per-tool prompts, and
 `/yolo` turns prompting back on. The status row shows `YOLO on` while enabled.
 You can enter `/yolo` at the approval prompt as well.
 
+## Tool rows
+
+A tool row reads `<tool> - <summary>` (summary clipped to 60 characters). An
+expanded row adds a `notes` section with harness feedback (a repeated call, the
+budget note); raw results stay hidden. A tool that has run for 5 seconds or more
+shows its elapsed time, for example `1m12s`.
+
+## Sessions
+
+A session autosaves during a turn at most every 5 seconds and at round
+boundaries. On shutdown the TUI sends `quit`, waits 1 second (20 polls of 50 ms),
+then kills the Python process. In-flight tools and jobs are cancelled, but a
+kill can orphan background jobs until their lifetime cap.
+
+## Foreign repositories
+
+Run `atlas` inside any repository. `.atlas/` writes its own `.gitignore`, so it
+stays out of `git status`. That repository's `AGENTS.md` and `.atlas/skills` are
+untrusted guidance, not instructions the agent must obey.
+
+## Windows
+
+The agent needs a POSIX shell and process groups; use WSL2. See
+[INSTALL-WINDOWS.md](../install-instructions/INSTALL-WINDOWS.md).
+
 ## Adding a tool
 
 A new safe tool is a concrete `Tool` subclass in a module directly inside
 `src/atlas/agent/tools/`. It needs a string `name`, a description, a
 Pydantic `input_model`, a `run` method, and a constructor with no arguments.
-Discovery picks it up without editing `default_registry()`. The session
+Discovery picks it up without editing `default_registry()`. Tools with
+`domain = "satellite"` are dropped under the `coding` tool profile. The session
 advertises it on the `ready` message. `src/atlas/agent/tools/read_file.py` is the
 worked example to copy.
 

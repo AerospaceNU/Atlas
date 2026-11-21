@@ -1,15 +1,30 @@
 # Model-as-tool plugins
 
-Local CPU inference on session RGB PNGs (mosaics, GIBS snapshots, chips).
-No GPU. Tile large mosaics at 256–512; do not run detectors on a full mosaic
-in one pass. Spectral / SAR / foundation models are out of scope.
+Scope is no longer RGB-only: plugins run on prepared analysis stacks
+(reflectance, dB) as well as session RGB PNGs. CPU only, no GPU. Large rasters
+are tiled by the runtime; never run a detector on a full mosaic in one pass.
 
-The input and output specs live in each package README:
+Plugins follow the `model.toml` schema 2: tiers `baseline`, `learned`,
+`heuristic`; runtimes `rules` and `onnx`; pinned weights installed by a human with
+`atlas models pull`. The contract is in
+[docs/satellite-analysis.md](docs/satellite-analysis.md).
 
-- `src/atlas/models/segment_landcover/README.md`
-- `src/atlas/models/rgb_change/README.md`
-- `src/atlas/models/mask_clouds/README.md`
-- `src/atlas/models/burn_scar/README.md`
-- `src/atlas/models/flood_mask/README.md`
-- `src/atlas/models/unet_water/README.md`
-- `src/atlas/models/lgbm_clouds/README.md`
+Packs today:
+
+- `cloud_mask` (OmniCloudMask V4, ONNX; local weight in `~/.atlas/weights`, installed with
+  `atlas models pull cloud_mask --from PATH --accept-license`; registers when the verified weight
+  is present and `onnxruntime` imports)
+- `burn_severity` (rules)
+- `water_extent` (rules)
+- `sar_flood` (rules)
+
+Next:
+
+- Fields of The World U-Net and HOT fAIr buildings, both ONNX. Each needs a
+  maintainer export and a licence check before it ships.
+- Prithvi is deferred.
+- `remote` and `torch` runtimes parse in the manifest but do not run.
+
+The RGB-preview heuristics (`segment_landcover`, `rgb_change`, `mask_clouds`,
+`burn_scar`, `flood_mask`, `unet_water`, `lgbm_clouds`) keep their package
+READMEs under `src/atlas/models/` and need `ATLAS_HEURISTIC_MODELS=1`.

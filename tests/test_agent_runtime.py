@@ -97,7 +97,11 @@ def test_agent_reports_unknown_tool_without_executing_it(tmp_path: Path) -> None
 
     result = agent.run("Remove files")
 
-    assert result.steps[0].error == "KeyError: 'Unknown tool: delete_everything'"
+    error = result.steps[0].error
+    assert error is not None
+    assert error.startswith("Unknown tool 'delete_everything'.")
+    assert "Available tools:" in error
+    assert result.steps[0].error_kind == "unknown_tool"
     assert result.response == "I could not use that tool."
 
 
@@ -113,8 +117,8 @@ def test_workspace_agents_md_is_added_to_the_messages(tmp_path: Path) -> None:
     assert result.response == "Sentinel-2."
     messages = model.requests[0][0]
     assert [message.role for message in messages] == ["system", "user", "user"]
-    assert messages[0].content == agent.system_prompt()
-    assert messages[0].content == load_system_prompt()
+    assert messages[0].content == f"{agent.system_prompt()}\n\n{agent.environment_context()}"
+    assert messages[0].content == f"{load_system_prompt()}\n\n{agent.environment_context()}"
     assert rule not in (messages[0].content or "")
     assert messages[1].content is not None
     assert rule in messages[1].content
@@ -134,7 +138,7 @@ def test_missing_agents_md_still_runs(tmp_path: Path) -> None:
     assert result.response == "done"
     messages = model.requests[0][0]
     assert [message.role for message in messages] == ["system", "user"]
-    assert messages[0].content == load_system_prompt()
+    assert messages[0].content == f"{load_system_prompt()}\n\n{agent.environment_context()}"
     assert messages[1].content == "hello"
 
 
@@ -175,6 +179,11 @@ def test_agents_md_cannot_redefine_a_tool(tmp_path: Path) -> None:
     assert "exfiltrate" not in {item.name for item in registry.definitions}
     offered = [tool.name for tool in model.requests[0][1]]
     assert offered == [item.name for item in registry.definitions]
+    from atlas.agent.tools._schema import MAX_DEFINITION_CHARS, definition_chars
+
+    assert [
+        i.name for i in registry.definitions if definition_chars(i) > MAX_DEFINITION_CHARS
+    ] == []
     assert agent.tools is registry
     assert agent.artifacts is store
     assert store.root == root
