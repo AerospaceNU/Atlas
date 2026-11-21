@@ -9,10 +9,11 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Literal
 
 from pydantic import ValidationError
 
@@ -33,7 +34,14 @@ from atlas.agent.analysis_skill import (
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.audit import record as audit_event
 from atlas.agent.checkpoints import restore_latest
-from atlas.agent.contracts import CatalogModel, ChatMessage, Role, ToolRegistry, default_registry
+from atlas.agent.contracts import (
+    CatalogModel,
+    ChatMessage,
+    Role,
+    ToolCapableModel,
+    ToolRegistry,
+    default_registry,
+)
 from atlas.agent.images import ingest_images
 from atlas.agent.layout import (
     ATLAS_SKILLS_RELATIVE,
@@ -789,7 +797,7 @@ def _write_line(stdout: IO[str], payload: dict[str, Any], secrets: list[str]) ->
         stdout.flush()
 
 
-def _redact_value(value: Any, secrets: list[str]) -> Any:
+def redact_value(value: Any, secrets: list[str]) -> Any:
     if isinstance(value, str):
         for secret in secrets:
             if secret:
@@ -802,7 +810,7 @@ def _redact_value(value: Any, secrets: list[str]) -> Any:
     return value
 
 
-def _step_event(step: AgentStep) -> dict[str, Any]:
+def step_event(step: AgentStep) -> dict[str, Any]:
     result = step.result
     return {
         "type": "step",
@@ -816,6 +824,19 @@ def _step_event(step: AgentStep) -> dict[str, Any]:
         "artifacts": result.artifacts if result is not None else [],
         "notes": step.notes,
     }
+
+
+@contextlib.contextmanager
+def session_bound(session: AgentSession) -> Iterator[None]:
+    """Bind the session credential and secret maps for the duration of the block."""
+    bind_session_credentials(session.credential_keys)
+    bind_session_secrets(session.secrets)
+    quiet_http_client_logs()
+    try:
+        yield
+    finally:
+        unbind_session_credentials()
+        unbind_session_secrets()
 
 
 def serve(
@@ -837,15 +858,9 @@ def serve(
         request,
         lambda event: _write_line(stdout, event, session.secrets),
     )
-    bind_session_credentials(session.credential_keys)
-    bind_session_secrets(session.secrets)
-    quiet_http_client_logs()
-    try:
+    with session_bound(session):
         _remember_resolved_credentials(session)
         return _serve_bound(session, stdin, stdout)
-    finally:
-        unbind_session_credentials()
-        unbind_session_secrets()
 
 
 def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
@@ -1883,7 +1898,7 @@ def _apply_known_context_limit(session: AgentSession) -> None:
         session.totals.context_limit = context_length
 
 
-def _status_fields(session: AgentSession) -> dict[str, Any]:
+def status_fields(session: AgentSession) -> dict[str, Any]:
     _apply_known_context_limit(session)
     totals = session.totals
     return {
@@ -1917,7 +1932,7 @@ def _ready_event(session: AgentSession) -> dict[str, Any]:
     return payload
 
 
-def _done_event(session: AgentSession, run: AgentRun) -> dict[str, Any]:
+def done_event(session: AgentSession, run: AgentRun) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "done",
         "response": run.response,
@@ -1975,6 +1990,173 @@ def _remember_session(workspace: Path, model_id: str) -> str:
     return session_id
 
 
+_redact_value = redact_value
+_step_event = step_event
+_status_fields = status_fields
+_done_event = done_event
+
+
+class SessionNotFound(LookupError):
+    """A requested saved session does not exist (``str(exc)`` names the id)."""
+
+
+@dataclass
+class SessionBundle:
+    """An assembled session plus the resources its caller must release."""
+
+    session: AgentSession
+    model: ToolCapableModel
+    api_key: str
+    session_id: str
+    workspace: Path
+    home: Path
+    owned_model: bool = True
+
+    def close(self) -> None:
+        """Close the model when this bundle built it; safe to call twice."""
+        if not self.owned_model:
+            return
+        self.owned_model = False
+        close = getattr(self.model, "close", None)
+        if callable(close):
+            close()
+
+
+def _check_resume(workspace: Path, resume: str) -> None:
+    """Raise SessionNotFound unless ``resume`` names a saved session; writes nothing."""
+    if not resume or resume in {".", ".."} or "/" in resume or "\\" in resume:
+        raise SessionNotFound(f"no saved session {resume}")
+    if not (project_session_dir(workspace, resume) / "state.json").is_file():
+        raise SessionNotFound(f"no saved session {resume}")
+
+
+def build_session(
+    workspace: Path,
+    *,
+    model_id: str | None = None,
+    approval: Literal["allow", "ask", "deny"] | None = None,
+    max_tool_calls: int | None = None,
+    max_spend_usd: float | None = None,
+    resume: str | None = None,
+    write_config: bool = True,
+    home: Path | None = None,
+    model: ToolCapableModel | None = None,
+) -> SessionBundle:
+    """Assemble an :class:`AgentSession` without serving it.
+
+    Explicit arguments win over ``agent.toml``. A ``resume`` id is validated before
+    anything is written, and the session is bound to its workspace before its saved
+    state loads. An injected ``model`` is not closed by the bundle. Never serves.
+
+    Raises:
+        SessionNotFound: ``resume`` names no saved session.
+    """
+    workspace = workspace.resolve()
+    home = home or Path.home()
+    if resume is not None:
+        _check_resume(workspace, resume)
+    if write_config:
+        ensure_agent_config(workspace)
+    ensure_user_layout(home)
+    api_key = ""
+    if model is None:
+        api_key = (
+            resolve_openrouter_key(
+                session_key=None,
+                env_key=os.environ.get("OPENROUTER_API_KEY"),
+                home=home,
+            )
+            or ""
+        )
+    model_id = resolve_model(workspace, model_id)
+    session_id = resume or _remember_session(workspace, model_id)
+    # Relative tool paths resolve against the workspace the person pointed the
+    # session at, which does not have to be a git checkout; absolute paths are
+    # allowed. Tool outputs land in this session's artifact directory, inside
+    # the workspace, so removing the session removes them.
+    artifact_root = project_artifact_dir(workspace, session_id)
+    store = LocalArtifactStore(workspace, artifact_root=artifact_root)
+    # Home skills are opt-in. The default session sees only the workspace.
+    skill_home = home if load_home_skills_enabled(workspace) else None
+    skills = load_skills(store, home=skill_home)
+    registry = default_registry()
+    register_skill_tool(registry, skills)
+    owned = model is None
+    active: ToolCapableModel
+    if model is None:
+        active = OpenRouterModel(
+            ModelConfig(
+                model=model_id,
+                api_key=api_key,
+                reasoning_effort=load_reasoning_effort(workspace),
+            )
+        )
+    else:
+        active = model
+    try:
+        agent = Agent(
+            active,
+            registry,
+            store,
+            # Budgets live in the workspace .atlas/agent.toml unless given.
+            max_tool_calls=(
+                max_tool_calls if max_tool_calls is not None else load_max_tool_calls(workspace)
+            ),
+            max_tokens=load_optional_tokens(workspace),
+            max_spend_usd=(
+                max_spend_usd if max_spend_usd is not None else load_spend_limit(workspace)
+            ),
+            read_only=load_read_only(workspace),
+            approval=approval or load_approval(workspace),
+            skills=skills,
+        )
+        from atlas.agent.tools._subagent import SubagentTool
+
+        def build_child(child_store: LocalArtifactStore, allow_writes: bool, budget: int) -> Agent:
+            child_registry = default_registry()
+            register_skill_tool(child_registry, skills)
+            return Agent(
+                active,
+                child_registry,
+                child_store,
+                max_tool_calls=budget,
+                max_tokens=agent.max_tokens,
+                max_spend_usd=None,
+                read_only=agent.read_only or not allow_writes,
+                approval=agent.approval,
+                on_permission=agent.on_permission,
+                skills=skills,
+            )
+
+        registry.register(SubagentTool(build_child))
+        session = AgentSession(agent)
+        session.session_id = session_id
+        session.home = home
+        session.workspace = workspace
+        session.active_key = api_key or None
+        session.requires_api_key = owned
+        list_models = getattr(active, "list_models", None)
+        if list_models is not None:
+            session.fetch_models = list_models
+        if resume is not None and not session.load_state(resume):
+            raise SessionNotFound(f"no saved session {resume}")
+    except BaseException:
+        if owned:
+            close = getattr(active, "close", None)
+            if callable(close):
+                close()
+        raise
+    return SessionBundle(
+        session=session,
+        model=active,
+        api_key=api_key,
+        session_id=session_id,
+        workspace=workspace,
+        home=home,
+        owned_model=owned,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Console entry for ``python -m atlas.agent.session``."""
     parser = argparse.ArgumentParser(prog="atlas.agent.session")
@@ -1994,91 +2176,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    workspace = Path(args.workspace).resolve()
-    home = Path.home()
-    repo_root = _find_repo_root(workspace) or _find_repo_root(Path.cwd())
+    # Never the workspace: a workspace .env must not inject environment.
+    repo_root = _find_repo_root(Path.cwd())
     if repo_root is not None:
         from dotenv import load_dotenv
 
         load_dotenv(repo_root / ".env", override=False)
 
-    ensure_agent_config(workspace)
-    ensure_user_layout(home)
-    api_key = (
-        resolve_openrouter_key(
-            session_key=None,
-            env_key=os.environ.get("OPENROUTER_API_KEY"),
-            home=home,
-        )
-        or ""
-    )
-    model_id = resolve_model(workspace, args.model)
-    session_id = _remember_session(workspace, model_id)
-    # Relative tool paths resolve against the workspace the person pointed the
-    # session at, which does not have to be a git checkout; absolute paths are
-    # allowed. Tool outputs land in this session's artifact directory, inside
-    # the workspace, so removing the session removes them.
-    artifact_root = project_artifact_dir(workspace, session_id)
-    store = LocalArtifactStore(workspace, artifact_root=artifact_root)
-    # Home skills are opt-in. The default session sees only the workspace.
-    skill_home = home if load_home_skills_enabled(workspace) else None
-    skills = load_skills(store, home=skill_home)
-    registry = default_registry()
-    register_skill_tool(registry, skills)
-    model = OpenRouterModel(
-        ModelConfig(
-            model=model_id, api_key=api_key, reasoning_effort=load_reasoning_effort(workspace)
-        )
-    )
-    active_id = session_id
     try:
-        agent = Agent(
-            model,
-            registry,
-            store,
-            # Budgets live in the workspace .atlas/agent.toml.
-            max_tool_calls=load_max_tool_calls(workspace),
-            max_tokens=load_optional_tokens(workspace),
-            max_spend_usd=load_spend_limit(workspace),
-            read_only=load_read_only(workspace),
-            approval=args.approval or load_approval(workspace),
-            skills=skills,
+        bundle = build_session(
+            Path(args.workspace),
+            model_id=args.model,
+            approval=args.approval,
+            resume=args.resume,
         )
-        from atlas.agent.tools._subagent import SubagentTool
-
-        def build_child(child_store: LocalArtifactStore, allow_writes: bool, budget: int) -> Agent:
-            child_registry = default_registry()
-            register_skill_tool(child_registry, skills)
-            return Agent(
-                model,
-                child_registry,
-                child_store,
-                max_tool_calls=budget,
-                max_tokens=agent.max_tokens,
-                max_spend_usd=None,
-                read_only=agent.read_only or not allow_writes,
-                approval=agent.approval,
-                on_permission=agent.on_permission,
-                skills=skills,
-            )
-
-        registry.register(SubagentTool(build_child))
-        session = AgentSession(agent)
-        session.session_id = session_id
-        launch_id = session_id
-        loaded = bool(args.resume) and session.load_state(args.resume)
-        if loaded and launch_id != session.session_id:
-            discard_unused_session(workspace, launch_id)
-            active_id = session.session_id or launch_id
-        session.requires_api_key = True
-        session.home = home
-        session.workspace = workspace
-        session.active_key = api_key or None
-        session.fetch_models = model.list_models
-        return serve(session, sys.stdin, sys.stdout, redact=api_key or None)
+    except SessionNotFound as exc:
+        print(f"atlas: {exc}", file=sys.stderr)
+        return 2
+    except (ValueError, ValidationError, OSError) as exc:
+        if args.resume is None:
+            raise
+        print(f"atlas: cannot resume {args.resume}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return serve(bundle.session, sys.stdin, sys.stdout, redact=bundle.api_key or None)
     finally:
-        discard_unused_session(workspace, active_id)
-        model.close()
+        if bundle.session.session_id:
+            discard_unused_session(bundle.workspace, bundle.session.session_id)
+        bundle.close()
 
 
 if __name__ == "__main__":
