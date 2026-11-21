@@ -16,7 +16,6 @@ from atlas.geo.results import json_safe
 
 __all__ = [
     "append_run",
-    "bytes_fetched_total",
     "citations",
     "file_sha256",
     "finish",
@@ -154,11 +153,6 @@ def append_run(analysis_dir: Path, record: dict[str, Any]) -> str:
 def read_runs(analysis_dir: Path) -> list[dict[str, Any]]:
     """Return valid run records in file order; bad lines are skipped."""
     return _parse_lines(runs_path(analysis_dir))
-
-
-def bytes_fetched_total(analysis_dir: Path) -> int:
-    """Return the total bytes fetched over all recorded runs."""
-    return sum(int(r.get("bytes_fetched") or 0) for r in read_runs(analysis_dir))
 
 
 def _script_arguments(root: Path) -> dict[str, Any]:

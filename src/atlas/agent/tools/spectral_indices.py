@@ -23,26 +23,26 @@ _LABELS = {
 class SpectralIndicesInput(BaseModel):
     """Paths to surface-reflectance arrays and optional calibration."""
 
-    red: str = Field(description="Workspace path of the red .npy array.")
+    red: str = Field(description="Red .npy path.")
     nir: str = Field(description="NIR .npy array.")
     green: str | None = Field(default=None, description="Green .npy array; needed for NDWI.")
     swir22: str | None = Field(default=None, description="SWIR2.2 .npy array; needed for NBR.")
-    out: str = Field(default="indices", description="Directory for the index .npy files.")
+    out: str = Field(default="indices", description="Output directory.")
     nodata: float | dict[str, float] | None = Field(
-        default=None, description="Fill value (or {band: value}); matches become NaN."
+        default=None, description="Fill value (or {band: v}) to NaN."
     )
     mask: str | None = Field(default=None, description="Boolean .npy mask; True = nodata.")
     scale: float | dict[str, float] | None = Field(
         default=None,
-        description="Multiplier (or {band: value}): reflectance = stored*scale+offset.",
+        description="Multiplier (or {band: v}): stored*scale+offset.",
     )
     offset: float | dict[str, float] | None = Field(
-        default=None, description="Added after scale (or {band: value})."
+        default=None, description="Added after scale (or {band: v})."
     )
     overwrite: bool = Field(default=False, description="Replace existing index files.")
     preset: Literal["s2-l2a", "landsat-c2"] | None = Field(
         default=None,
-        description="Sets scale and offset: s2-l2a 1e-4/-0.1, landsat-c2 2.75e-5/-0.2. Not with scale/offset.",
+        description="Sets scale and offset: s2-l2a 1e-4/-0.1, landsat-c2 2.75e-5/-0.2.",
     )
 
 
@@ -53,8 +53,8 @@ class SpectralIndicesTool(Tool):
     domain: ClassVar[str] = "satellite"
     description = (
         "Legacy NDVI, NDWI (ndwi_mcfeeters) and NBR from surface-reflectance .npy arrays; for "
-        "stacks use band_math (index=...). Needs red and NIR. Each input is at most 16777216 "
-        "elements and 64 MiB."
+        "stacks use band_math (index=...). Needs red and NIR. Inputs "
+        "are capped at 16777216 elements (memory guard)."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
 

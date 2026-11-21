@@ -179,6 +179,11 @@ def test_agents_md_cannot_redefine_a_tool(tmp_path: Path) -> None:
     assert "exfiltrate" not in {item.name for item in registry.definitions}
     offered = [tool.name for tool in model.requests[0][1]]
     assert offered == [item.name for item in registry.definitions]
+    from atlas.agent.tools._schema import MAX_DEFINITION_CHARS, definition_chars
+
+    assert [
+        i.name for i in registry.definitions if definition_chars(i) > MAX_DEFINITION_CHARS
+    ] == []
     assert agent.tools is registry
     assert agent.artifacts is store
     assert store.root == root

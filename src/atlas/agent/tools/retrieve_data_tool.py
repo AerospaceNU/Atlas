@@ -52,22 +52,20 @@ class GetDataToolInput(BaseModel):
     end_date: date
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
-    radius_km: float = Field(default=2.0, gt=0.0, le=100.0, description="Half-width, km.")
+    radius_km: float = Field(default=2.0, gt=0.0, le=100.0)
     bbox: BBox | None = Field(default=None, description="{west,south,east,north}")
     polygon: list[list[float]] | None = Field(
         default=None, min_length=4, max_length=500, description="[lon, lat] ring."
     )
-    sources: list[str] | None = Field(default=None, description="Registry keys; default all.")
+    sources: list[str] | None = Field(default=None, description="Source keys.")
     max_cloud_cover: float | None = Field(default=None, ge=0.0, le=100.0)
     limit: int = Field(default=3, ge=1, le=30)
-    select: SelectMode | None = Field(default=None, description="Choose among up to 200.")
+    select: SelectMode | None = Field(default=None)
     period: Period = Field(default="month")
-    orbit: str | None = Field(default=None, description="SAR: 8, ascending, 8:descending.")
-    assets: list[str] | None = Field(
-        default=None, max_length=12, description="Aliases to cut, e.g. red, nir."
-    )
+    orbit: str | None = Field(default=None, description="SAR: ascending or descending.")
+    assets: list[str] | None = Field(default=None, max_length=12, description="e.g. red, nir.")
     include_qa: bool = True
-    download: bool = Field(default=False, description="True pulls.")
+    download: bool = Field(default=False)
 
     @field_validator("polygon")
     @classmethod

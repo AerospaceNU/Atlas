@@ -7,7 +7,8 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.contracts import Tool, ToolDefinition, ToolResult
+from atlas.agent.tools._schema import slim_definition
 
 _SHOWN = 12
 
@@ -50,6 +51,10 @@ class ClassifyTool(Tool):
     @property
     def input_model(self) -> type[BaseModel]:
         return ClassifyInput
+
+    def definition(self) -> ToolDefinition:
+        """Return the advertised schema without null branches or the model docstring."""
+        return slim_definition(super().definition())
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         req = ClassifyInput.model_validate(arguments)

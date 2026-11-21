@@ -7,13 +7,14 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.contracts import Tool, ToolDefinition, ToolResult
+from atlas.agent.tools._schema import slim_definition
 
 _SHOWN = 12
 
 
 class ChangeDetectInput(BaseModel):
-    stack: str = Field(description="Multi-date stack id, or the pre stack.")
+    stack: str = Field(description="Stack id (multi-date, or pre).")
     layer: str = Field(description="Layer name, e.g. nbr.")
     method: Literal["difference", "ratio", "log_ratio_db", "transitions"] = Field(
         description="transitions: categorical layers."
@@ -21,7 +22,7 @@ class ChangeDetectInput(BaseModel):
     stack_b: str = Field(default="", description="Post stack on the same grid.")
     delta: float = Field(default=0, description="Size (dB or abs), or ratio factor >1.")
     rules: list[dict[str, Any]] = Field(default_factory=list, description="[{name,min,max}]")
-    min_blob_px: int = Field(default=0, ge=0, description="Drop blobs smaller than this.")
+    min_blob_px: int = Field(default=0, ge=0, description="Drop smaller blobs.")
     pre: str = Field(default="", description="YYYYMMDD, default earliest.")
     post: str = Field(default="", description="YYYYMMDD, default latest.")
     mask: str | list[str] = Field(default="clear", description="clear, none or semantics.")
@@ -40,8 +41,8 @@ class ChangeDetectTool(Tool):
     name = "change_detect"
     description = (
         "Compare a layer between two dates (multi-date stack, or stack + stack_b): "
-        "difference (post minus pre; dNBR is pre minus post), ratio, log_ratio_db (need delta) or "
-        "transitions. Gain/loss/stable hectares over pixels valid in both dates."
+        "difference (post minus pre; dNBR is pre minus post), ratio, log_ratio_db (needs delta) "
+        "or transitions. Reports gain/loss/stable hectares."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     domain: ClassVar[str] = "satellite"
@@ -49,6 +50,10 @@ class ChangeDetectTool(Tool):
     @property
     def input_model(self) -> type[BaseModel]:
         return ChangeDetectInput
+
+    def definition(self) -> ToolDefinition:
+        """Return the advertised schema without null branches or the model docstring."""
+        return slim_definition(super().definition())
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         req = ChangeDetectInput.model_validate(arguments)

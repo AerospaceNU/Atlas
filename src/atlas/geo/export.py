@@ -2,7 +2,7 @@
 
 Invariants: rasterio and pyproj load lazily; without rasterio the GeoTIFF is encoded by
 `atlas.data.cog.encode_cog` (no band descriptions); files are written to a temporary
-name and renamed into place; an export over 3.5 GiB is refused.
+name and renamed into place; an export whose in-memory arrays would exceed 3.5 GiB is refused (a memory guard, not a download limit).
 """
 
 from __future__ import annotations
@@ -121,7 +121,7 @@ def _guard_size(stack: Stack, count: int, itemsize: int) -> None:
     if count * height * width * itemsize > MAX_BYTES:
         raise GeoError(
             fix(
-                f"{count} layers of {width}x{height} exceed the 3.5 GiB export limit.",
+                f"{count} layers of {width}x{height} exceed the 3.5 GiB in-memory export guard (memory protection, not a download limit).",
                 "export_geotiff layers=[one layer] or shrink with prepare_stack bbox",
             )
         )

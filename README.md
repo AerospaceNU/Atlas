@@ -83,7 +83,7 @@ atlas models verify
 ```
 
 Pull is human-run; no agent tool downloads weights. Exit codes: 0 ok, 3
-checksum mismatch, 4 network, 5 unpublished (no pin in the manifest). Weights
+checksum mismatch, 4 network, 5 weight not installed (missing, local, or no pin). Weights
 are installed in `~/.atlas/weights` (or `ATLAS_WEIGHTS_DIR`). `cloud_mask`
 (OmniCloudMask V4) is a local weight with no public URL. Install it from a file:
 
