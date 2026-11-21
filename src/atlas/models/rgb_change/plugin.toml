@@ -1,5 +1,6 @@
 name = "rgb_change"
-description = "Visual before/after hotspots on an RGB PNG pair. Writes a float32 heatmap in [0, 1] and polygons for blobs at or above 0.2 covering at least 16 pixels. Not NDVI or NBR."
+description = "HEURISTIC preview rule on an 8-bit RGB PNG, not a trained model. Visual before/after hotspots on an RGB PNG pair. Writes a float32 heatmap in [0, 1] and polygons for blobs at or above 0.2 covering at least 16 pixels. Not NDVI or NBR."
+tier = "heuristic"
 runtime = "rgb_delta"
 weight = ""
 sha256 = ""

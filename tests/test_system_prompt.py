@@ -100,6 +100,7 @@ def test_scripted_model_cites_a_registry_model_tool(
 ) -> None:
     """The model cites a registry model tool as its name plus each artifact path."""
     monkeypatch.setenv("ATLAS_WEIGHTS_DIR", str(tmp_path / "empty-weights"))
+    monkeypatch.setenv("ATLAS_HEURISTIC_MODELS", "1")
     store = LocalArtifactStore(tmp_path / "workspace")
     tile = np.empty((256, 256, 3), dtype=np.uint8)
     tile[:, :] = (30, 90, 180)

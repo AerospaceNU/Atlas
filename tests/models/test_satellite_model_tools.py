@@ -35,6 +35,11 @@ _LEARNED = {"unet_water", "lgbm_clouds"}
 _HEURISTICS = ("mask_clouds", "burn_scar", "flood_mask")
 
 
+@pytest.fixture(autouse=True)
+def _heuristics_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATLAS_HEURISTIC_MODELS", "1")
+
+
 def _plugin(name: str) -> Path:
     return _ROOT / "src" / "atlas" / "models" / name / "plugin.toml"
 

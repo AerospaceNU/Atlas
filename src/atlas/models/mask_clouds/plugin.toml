@@ -1,5 +1,6 @@
 name = "mask_clouds"
-description = "Heuristic cloud mask on a true-color PNG. Bright, low-chroma pixels are cloud (1); everything else is clear (0). Large mosaics are tiled at 512 and stitched. Not a trained model."
+description = "HEURISTIC preview rule on an 8-bit RGB PNG, not a trained model. Cloud mask on a true-color PNG. Bright, low-chroma pixels are cloud (1); everything else is clear (0). Large mosaics are tiled at 512 and stitched. Not a trained model."
+tier = "heuristic"
 runtime = "binary_mask"
 rule = "cloud"
 weight = ""

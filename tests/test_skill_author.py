@@ -705,7 +705,10 @@ def _tool_arguments(**overrides: object) -> dict[str, object]:
     return arguments
 
 
-def test_author_skill_tool_does_not_change_the_default_registry() -> None:
+def test_author_skill_tool_does_not_change_the_default_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATLAS_HEURISTIC_MODELS", "1")
     names = [tool.name for tool in default_registry().definitions]
 
     core = {

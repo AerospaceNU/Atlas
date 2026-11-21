@@ -21,6 +21,11 @@ _CENTROIDS = {
 _PLUGIN = Path("src/atlas/models/segment_landcover/plugin.toml")
 
 
+@pytest.fixture(autouse=True)
+def _heuristics_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATLAS_HEURISTIC_MODELS", "1")
+
+
 def _write_weight(root: Path) -> Path:
     path = root / "segment_landcover" / "model.json"
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 from atlas.models.base import (
+    HEURISTIC_PREFIX,
     PluginSpec,
     class_fractions,
     colorize_labels,
@@ -105,7 +106,7 @@ class SegmentLandcoverTool(Tool):
         json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         frac_text = ", ".join(f"{name}={fractions[name]:.2f}" for name in classes)
         return ToolResult(
-            text=f"{self.name}: {width}x{height} ({frac_text})",
+            text=f"{HEURISTIC_PREFIX} {self.name}: {width}x{height} ({frac_text})",
             artifacts=[
                 store.relative(labels_path),
                 store.relative(overlay_path),

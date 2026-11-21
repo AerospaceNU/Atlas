@@ -1,5 +1,6 @@
 name = "segment_landcover"
-description = "Per-pixel land cover on an RGB scene: bare, built-up, water, vegetation, cloud."
+description = "HEURISTIC preview rule on an 8-bit RGB PNG, not a trained model. Per-pixel land cover on an RGB scene: bare, built-up, water, vegetation, cloud."
+tier = "heuristic"
 runtime = "centroid_pixels"
 weight = "segment_landcover/model.json"
 sha256 = ""
