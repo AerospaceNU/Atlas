@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -12,6 +14,7 @@ from pydantic import BaseModel, Field
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 from atlas.agent.tools._process import OUTPUT_LIMIT_NOTE, run_captured
+from atlas.agent.tools._project_env import project_python
 
 MAX_TIMEOUT = 900
 _PYTEST_COUNT_RE = re.compile(
@@ -20,6 +23,8 @@ _PYTEST_COUNT_RE = re.compile(
 _CARGO_RESULT_RE = re.compile(
     r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored"
 )
+_GO_PKG_RE = re.compile(r"^(ok|FAIL)[ \t]+(\S+)[ \t]+(?:[\d.]+s|\(cached\)|\[)", re.MULTILINE)
+_GO_FAIL_RE = re.compile(r"^\s*--- FAIL: (\S+)")
 _UNITTEST_RAN_RE = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
 _UNITTEST_FAILED_RE = re.compile(r"^FAILED \((.*)\)\s*$", re.MULTILINE)
 _UNITTEST_OK_RE = re.compile(r"^OK(?: \((.*)\))?\s*$", re.MULTILINE)
@@ -57,6 +62,36 @@ def _resolve_executable(name: str, cwd: Path) -> str | None:
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
     return None
+
+
+def _node_test_script(root: Path) -> bool:
+    """True when package.json defines a real ``scripts.test`` (not the npm-init stub)."""
+    try:
+        data = json.loads((root / "package.json").read_text(errors="ignore"))
+    except (OSError, ValueError):
+        return False
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    script = scripts.get("test") if isinstance(scripts, dict) else None
+    return isinstance(script, str) and bool(script.strip()) and "no test specified" not in script
+
+
+def _mentions_pytest(path: Path) -> bool:
+    """True when the file text contains "pytest"; False when unreadable."""
+    try:
+        return "pytest" in path.read_text(errors="ignore")
+    except OSError:
+        return False
+
+
+def _node_runner(root: Path) -> list[str]:
+    """Pick the package-manager test argv from the first lockfile present."""
+    if (root / "pnpm-lock.yaml").is_file():
+        return ["pnpm", "test"]
+    if (root / "yarn.lock").is_file():
+        return ["yarn", "test"]
+    if (root / "bun.lock").is_file() or (root / "bun.lockb").is_file():
+        return ["bun", "run", "test"]  # not bare "bun test": that is bun's own runner
+    return ["npm", "test"]
 
 
 def _unittest_stats(summary: str) -> dict[str, int]:
@@ -109,8 +144,9 @@ class RunTestsInput(BaseModel):
 class RunTestsTool(Tool):
     """Run the project's test command and summarise the result.
 
-    The command is detected from the workspace (pyproject/pytest config,
-    ``Cargo.toml``, then ``package.json``) unless an explicit argv is given.
+    The command is detected from the workspace (pytest config or ``pyproject.toml``,
+    ``go.mod``, ``Cargo.toml``, then a ``package.json`` test script) unless an explicit
+    argv is given.
     A non-zero exit is a result, not an exception. Output is capped, and the
     command runs without a shell.
     """
@@ -118,7 +154,8 @@ class RunTestsTool(Tool):
     name = "run_tests"
     description = (
         "Run tests and summarise the result: exit code, pass/fail counts, failing test names "
-        "and the tail of the output. With no command it detects pytest, cargo test or npm test; "
+        "and the tail of the output. With no command it detects pytest (via uv, the project .venv "
+        "or PATH python), go test, cargo test or the package.json test script; "
         "pass command=[...] (an argv list, no shell) for any other runner or to select tests. "
         "timeout up to 900 seconds."
     )
@@ -143,8 +180,8 @@ class RunTestsTool(Tool):
             if detected is None:
                 return ToolResult(
                     text=(
-                        "no test command detected; pass command=[...] "
-                        "(looked for pyproject.toml, Cargo.toml, package.json)"
+                        "no test command detected; pass command=[...] (looked for pytest "
+                        "config, go.mod, Cargo.toml, package.json with a test script)"
                     )
                 )
             argv, source = detected
@@ -155,11 +192,18 @@ class RunTestsTool(Tool):
 
         timeout = min(request.timeout, MAX_TIMEOUT)
         note = f"note: timeout clamped to {MAX_TIMEOUT}s" if timeout != request.timeout else None
+        started = time.monotonic()
         captured = run_captured(argv, cwd=cwd, timeout=timeout)
         combined = f"{captured.stdout}\n{captured.stderr}".strip()
         if captured.timed_out:
             report = self._timeout_report(argv=argv, timeout=timeout, output=combined)
             return ToolResult(text=f"{note}\n{report}" if note else report)
+        if captured.cancelled:
+            elapsed = int(time.monotonic() - started)
+            tail = combined[-_TAIL_CHARS:] if combined else "(no output)"
+            return ToolResult(
+                text=f"test command cancelled after {elapsed}s: {' '.join(argv)}\ntail:\n{tail}"
+            )
         report = self._report(
             argv=argv,
             source=source,
@@ -174,21 +218,34 @@ class RunTestsTool(Tool):
 
     def _detect(self, root: Path) -> tuple[list[str], str] | None:
         """Return the test argv and its source, or None when nothing matches."""
-        python_config = (
-            (root / "pytest.ini").is_file()
-            or (root / "tox.ini").is_file()
-            or (root / "pyproject.toml").is_file()
+        has_ini = (root / "pytest.ini").is_file() or (root / "tox.ini").is_file()
+        pyproject = root / "pyproject.toml"
+        other = (
+            (root / "go.mod").is_file()
+            or (root / "Cargo.toml").is_file()
+            or _node_test_script(root)
         )
-        if python_config:
-            if (root / "uv.lock").is_file() and shutil.which("uv") is not None:
-                return (["uv", "run", "pytest", "-q"], "pyproject.toml/pytest")
-            python = shutil.which("python") or shutil.which("python3") or sys.executable
-            return ([python, "-m", "pytest", "-q"], "pyproject.toml/pytest")
+        if has_ini or (pyproject.is_file() and (not other or _mentions_pytest(pyproject))):
+            return self._detect_python(root)
+        if (root / "go.mod").is_file():
+            return (["go", "test", "./..."], "go.mod")
         if (root / "Cargo.toml").is_file():
             return (["cargo", "test", "--quiet"], "Cargo.toml")
-        if (root / "package.json").is_file():
-            return (["npm", "test"], "package.json")
+        if _node_test_script(root):
+            argv = _node_runner(root)
+            return (argv, f"package.json ({argv[0]})")
+        # No make/gradle/maven/ctest by design: they run un-gated build scripts (owner decision).
         return None
+
+    def _detect_python(self, root: Path) -> tuple[list[str], str]:
+        """Pick the pytest argv: uv, then the project venv, then PATH python."""
+        if (root / "uv.lock").is_file() and shutil.which("uv") is not None:
+            return (["uv", "run", "pytest", "-q"], "pyproject.toml/pytest")
+        venv_python = project_python(root)
+        if venv_python is not None:
+            return ([venv_python, "-m", "pytest", "-q"], "pyproject.toml/pytest (project venv)")
+        python = shutil.which("python") or shutil.which("python3") or sys.executable
+        return ([python, "-m", "pytest", "-q"], "pyproject.toml/pytest")
 
     def _timeout_report(self, *, argv: list[str], timeout: int, output: str) -> str:
         """Report a timeout together with whatever was recorded before the kill."""
@@ -240,6 +297,10 @@ class RunTestsTool(Tool):
         if cargo:
             passed, failed, ignored = (sum(int(row[i]) for row in cargo) for i in range(3))
             return f"passed={passed} failed={failed} ignored={ignored}"
+        packages = _GO_PKG_RE.findall(output)
+        if packages:
+            failed_pkgs = sum(1 for status, _ in packages if status == "FAIL")
+            return f"packages={len(packages)} failed_packages={failed_pkgs}"
         unittest = self._unittest_counts(output)
         if unittest:
             return unittest
@@ -293,7 +354,7 @@ class RunTestsTool(Tool):
         failures = [
             line.strip()
             for line in (section or lines)
-            if _is_failure_line(line) or _UNITTEST_NAME_RE.match(line)
+            if _is_failure_line(line) or _UNITTEST_NAME_RE.match(line) or _GO_FAIL_RE.match(line)
         ][:_MAX_FAILURES]
         if failures:
             return failures
