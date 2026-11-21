@@ -9,6 +9,7 @@ import platform
 import re
 import secrets
 import sys
+import threading
 import time
 import tomllib
 from collections.abc import Callable, Sequence
@@ -39,6 +40,7 @@ from atlas.agent.instructions import load_project_instructions
 from atlas.agent.layout import project_agent_config_path, project_atlas_root
 from atlas.agent.metrics import observe_model_call, output_tokens_per_second
 from atlas.agent.model import validate_reasoning_effort
+from atlas.agent.scope import Cancelled, RunScope, current_scope, use_scope
 from atlas.agent.skills import (
     Skill,
     render_system_prompt,
@@ -113,8 +115,23 @@ _DIGEST_CAPS = {"edited": 24, "read": 24, "commands": 12, "errors": 12, "notes":
 # The cap keeps a model that emits twenty calls from opening twenty shells.
 _MAX_PARALLEL_TOOLS = 4
 
+# Read-only tools whose in-process work cannot be killed. A call that outlives its limit is
+# abandoned (the daemon thread keeps running) and the model gets an error instead of a hang.
+_READ_ONLY_TIMEOUTS = {
+    "grep": 60.0,
+    "glob": 60.0,
+    "ls": 60.0,
+    "outline": 60.0,
+    "find_references": 90.0,
+    "read_file": 30.0,
+    "read_files": 60.0,
+}
+_WATCH_SLICE = 0.1
+
 # Tools that change the workspace. A read-only session refuses them, and each
 # one is checkpointed before it runs so /undo can put the file back.
+# `jobs` and `satellite_guide` are absent on purpose: jobs only reads or signals jobs that an
+# approved bash call started.
 MUTATING_TOOLS = frozenset(
     {"apply_patch", "bash", "edit_file", "git_commit", "patch_file", "write_file"}
 )
@@ -124,10 +141,19 @@ MUTATING_TOOLS = frozenset(
 _PATH_WRITING_TOOLS = frozenset({"render_map", "export_geotiff"})
 
 
+_FALSE_WORDS = frozenset({"false", "0", "no", "off", "f", "n"})
+
+
 def _truthy(value: object) -> bool:
+    """Return false only for explicit falsy values; anything else counts as true.
+
+    Fail safe: a value a lax pydantic bool would accept as true must never read as false here.
+    """
+    if value is None or value is False or (value == 0 and not isinstance(value, str)):
+        return False
     if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes"}
-    return value is True or (type(value) is int and value == 1)
+        return value.strip().lower() not in _FALSE_WORDS | {""}
+    return True
 
 
 def _writes_to_path(call: ToolCall) -> bool:
@@ -506,13 +532,20 @@ class Agent:
         self._empty_replies = 0
         self._intent_nudges = 0
         self._intent_text = ""
-        run = self._advance_turn(
-            messages,
-            on_step=on_step,
-            on_phase=on_phase,
-            on_thought=on_thought,
+        scope = RunScope(
             should_cancel=should_cancel,
+            max_tokens=self.max_tokens,
+            max_spend_usd=self.max_spend_usd,
+            parent=current_scope(),
         )
+        with use_scope(scope):
+            run = self._advance_turn(
+                messages,
+                on_step=on_step,
+                on_phase=on_phase,
+                on_thought=on_thought,
+                scope=scope,
+            )
         run.empty_replies = self._empty_replies
         run.intent_nudges = self._intent_nudges
         return run
@@ -524,9 +557,9 @@ class Agent:
         on_step: Callable[[AgentStep], None] | None,
         on_phase: Callable[[str, str | None], None] | None,
         on_thought: Callable[[str, float | None], None] | None,
-        should_cancel: Callable[[], bool] | None,
+        scope: RunScope,
     ) -> AgentRun:
-        """Run the loop for :meth:`advance`."""
+        """Run the loop for :meth:`advance`; ``scope`` carries cancel and budget."""
         nudges = 0
         steps: list[AgentStep] = []
         calls: list[ModelCall] = []
@@ -541,7 +574,7 @@ class Agent:
                 on_phase(phase, name)
 
         while executed < self.max_tool_calls:
-            if should_cancel is not None and should_cancel():
+            if scope.cancelled():
                 return AgentRun(
                     response=_STOPPED_CANCELLED,
                     steps=steps,
@@ -570,6 +603,7 @@ class Agent:
             observed = observe_model_call(response)
             if observed is not None:
                 calls.append(observed)
+                scope.charge(observed)
             empty = not response.tool_calls and not (response.content or "").strip()
             if empty:
                 self._empty_replies += 1
@@ -595,7 +629,7 @@ class Agent:
                     )
                     on_thought(response.reasoning, speed)
                 if discard:
-                    if self._over_budget(calls):
+                    if scope.over_budget():
                         return AgentRun(
                             response=_STOPPED_BUDGET,
                             steps=steps,
@@ -615,7 +649,7 @@ class Agent:
                     and self._intent_nudges < _MAX_INTENT_NUDGES
                     and _announces_next_step(response.content or "")
                 ):
-                    if self._over_budget(calls):
+                    if scope.over_budget():
                         return AgentRun(
                             response=_STOPPED_BUDGET,
                             steps=steps,
@@ -636,11 +670,11 @@ class Agent:
                         calls=calls,
                         compaction=compaction,
                     )
-                if should_cancel is not None and should_cancel():
+                if scope.cancelled():
                     run = self._stop_cancelled(messages, steps, calls, response.tool_calls)
                     run.compaction = compaction
                     return run
-                if self._over_budget(calls):
+                if scope.over_budget():
                     self._answer_pending(
                         messages,
                         steps,
@@ -678,6 +712,7 @@ class Agent:
                         f"{self.max_tool_calls - executed} left. Finish the current change, verify "
                         "it, and give your final answer before the budget runs out."
                     )
+                scope.charge_tool_calls(len(pending))
                 self._tool_phase(
                     messages,
                     steps,
@@ -689,9 +724,19 @@ class Agent:
                     emit=emit,
                     on_step=on_step,
                 )
+                executed += scope.take_descendant_tool_calls()
+                calls.extend(scope.take_descendant_calls())
+                if scope.over_budget():
+                    return AgentRun(
+                        response=_STOPPED_BUDGET,
+                        steps=steps,
+                        stopped_for_budget=True,
+                        calls=calls,
+                        compaction=compaction,
+                    )
             except BaseException as exc:
                 self._close_interrupted_round(
-                    messages, steps, calls, compaction, response.tool_calls, exc
+                    messages, steps, calls, compaction, response.tool_calls, exc, scope
                 )
                 raise
             if executed >= self.max_tool_calls or limited:
@@ -778,6 +823,7 @@ class Agent:
         compaction: ContextCompaction,
         tool_calls: Sequence[ToolCall],
         exc: BaseException,
+        scope: RunScope | None = None,
     ) -> None:
         """Answer every tool call still unanswered after an exception; never swallows it.
 
@@ -792,6 +838,8 @@ class Agent:
             error=f"interrupted: {type(exc).__name__}",
             error_kind="cancelled",
         )
+        if scope is not None:
+            calls.extend(scope.take_descendant_calls())
         if isinstance(exc, Exception):
             self._store_partial(steps, calls, compaction, exc)
 
@@ -832,6 +880,14 @@ class Agent:
             try:
                 return self.model.complete(messages, self.tools.definitions)
             except BaseException as exc:
+                if isinstance(exc, Cancelled):
+                    return AgentRun(
+                        response=_STOPPED_CANCELLED,
+                        steps=steps,
+                        cancelled=True,
+                        calls=calls,
+                        compaction=compaction,
+                    )
                 if not (isinstance(exc, Exception) and getattr(exc, "is_context_overflow", False)):
                     self._store_partial(steps, calls, compaction, exc)
                     raise
@@ -889,8 +945,16 @@ class Agent:
                 on_phase("tool_executing", call.name)
         if serial:
             return [self._execute(call) for call in calls]
+        scope = current_scope()
         with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_TOOLS, len(calls))) as pool:
-            return list(pool.map(self._execute, calls))
+            return list(pool.map(lambda call: self._execute_scoped(call, scope), calls))
+
+    def _execute_scoped(self, call: ToolCall, scope: RunScope | None) -> AgentStep:
+        """Run one call with the run scope installed; pool threads start with no context."""
+        if scope is None:
+            return self._execute(call)
+        with use_scope(scope):
+            return self._execute(call)
 
     def _stop_cancelled(
         self,
@@ -1043,7 +1107,16 @@ class Agent:
         self._checkpoint(call)
         started = time.perf_counter()
         try:
-            result = self.tools.execute(call.name, call.arguments, self.artifacts)
+            result = self._run_tool(call)
+        except Cancelled:
+            audit_event(
+                self.artifacts,
+                "tool",
+                tool=call.name,
+                outcome="cancelled",
+                duration_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
+            return AgentStep(call=call, error="cancelled by the user", error_kind="cancelled")
         except Exception as exc:
             if isinstance(exc, UnknownToolError):
                 error = self._unknown_tool_message(call.name)
@@ -1068,6 +1141,50 @@ class Agent:
             duration_ms=round((time.perf_counter() - started) * 1000, 1),
         )
         return AgentStep(call=call, result=result)
+
+    def _run_tool(self, call: ToolCall) -> ToolResult:
+        """Execute a tool; read-only in-process tools run under a watchdog."""
+        limit = _READ_ONLY_TIMEOUTS.get(call.name)
+        if limit is None or _is_mutating(call):
+            return self.tools.execute(call.name, call.arguments, self.artifacts)
+        return self._execute_watched(call, limit)
+
+    def _execute_watched(self, call: ToolCall, limit: float) -> ToolResult:
+        """Run a read-only tool in a daemon thread; abandon it after ``limit`` seconds.
+
+        The abandoned thread keeps running (it cannot be killed); the caller gets a
+        :class:`TimeoutError`. A cancel on the run scope raises :class:`Cancelled`.
+        """
+        scope = current_scope()
+        outcome: list[tuple[str, Any]] = []
+
+        def work() -> None:
+            try:
+                with use_scope(scope):
+                    result = self.tools.execute(call.name, call.arguments, self.artifacts)
+                outcome.append(("ok", result))
+            except BaseException as exc:
+                outcome.append(("err", exc))
+
+        thread = threading.Thread(target=work, name=f"atlas-{call.name}", daemon=True)
+        deadline = time.monotonic() + limit
+        thread.start()
+        while thread.is_alive():
+            thread.join(_WATCH_SLICE)
+            if not thread.is_alive():
+                break
+            if scope is not None and scope.cancelled():
+                raise Cancelled()
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"{call.name} did not finish in {limit:g}s and was abandoned; "
+                    "narrow the path or pattern."
+                )
+        kind, value = outcome[0]
+        if kind == "err":
+            raise value
+        result: ToolResult = value
+        return result
 
     def _unknown_tool_message(self, name: str) -> str:
         """Name the registered tools and the closest match; nothing is aliased."""
@@ -1109,9 +1226,12 @@ class Agent:
 
     def _preview(self, call: ToolCall) -> str:
         """Return a short, human-readable preview of what the call would change."""
+        if call.name == "spawn_agent":
+            return str(call.arguments.get("task") or "")[:_PREVIEW_LIMIT]
         if call.name == "bash":
             command = call.arguments.get("command")
-            return str(command or "")[:_PREVIEW_LIMIT]
+            prefix = "[background] " if _truthy(call.arguments.get("run_in_background")) else ""
+            return (prefix + str(command or ""))[:_PREVIEW_LIMIT]
         if call.name == "run_tests":
             return _argv_text(call.arguments)[:_PREVIEW_LIMIT]
         if call.name == "git_commit":
@@ -1148,6 +1268,10 @@ class Agent:
 
 def _summary(call: ToolCall) -> str:
     """Return a one-line description of a mutating call for the approver."""
+    if call.name == "spawn_agent":
+        return f"spawn writing subagent: {str(call.arguments.get('task') or '')[:200]}"
+    if call.name == "bash" and _truthy(call.arguments.get("run_in_background")):
+        return f"run in background: {str(call.arguments.get('command') or '')[:200]}"
     if call.name == "bash":
         return f"run: {str(call.arguments.get('command') or '')[:200]}"
     if call.name == "run_tests":
@@ -1177,10 +1301,15 @@ def _is_mutating(call: ToolCall) -> bool:
 
     ``run_tests`` is only mutating with an explicit ``command``, which runs any argv. Any call
     with a truthy ``overwrite``, and ``render_map``/``export_geotiff`` with a non-empty
-    ``path``, also count; ``get_satellite_data`` downloads stay ungated.
+    ``path``, also count; ``get_satellite_data`` downloads stay ungated. ``spawn_agent`` with a
+    truthy ``allow_writes`` is mutating: the child can write, so the call is approval-gated
+    (refused under deny and read-only sessions) and forces the serial path. Read-only children
+    are not.
     """
     if call.name in MUTATING_TOOLS:
         return True
+    if call.name == "spawn_agent":
+        return _truthy(call.arguments.get("allow_writes"))
     if _truthy(call.arguments.get("overwrite")):
         return True
     if _writes_to_path(call):
