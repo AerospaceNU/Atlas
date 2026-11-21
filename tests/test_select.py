@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from atlas.compile.select import coverage_fraction, filter_cloud, representative_cloud, select
+from atlas.compile.select import (
+    coverage_fraction,
+    filter_cloud,
+    filter_orbit,
+    representative_cloud,
+    select,
+    select_per_period,
+    select_scenes,
+)
 from atlas.data.base import BBox, GeometryKind, LimitMode, Scene, SceneKind
 
 AOI = BBox(west=-71.12, south=42.32, east=-71.02, north=42.40)
@@ -150,3 +158,73 @@ def test_coverage_of_antimeridian_aoi_by_scene_on_one_side() -> None:
     pacific = BBox(west=170, south=-20, east=-170, north=-10)
     east_half = _scene(id="west", bbox=BBox(west=-180, south=-20, east=-170, north=-10))
     assert coverage_fraction([east_half], pacific) == 0.5
+
+
+def _at(id: str, month: int, day: int = 10, year: int = 2024, **kwargs: object) -> Scene:
+    return _scene(id=id, datetime=datetime(year, month, day, tzinfo=UTC), **kwargs)
+
+
+def test_per_month_keeps_the_clearest_acquisition_with_all_its_tiles() -> None:
+    scenes = [_at(f"m{m}", m, cloud_cover=50 - m) for m in range(1, 13)]
+    scenes += [_at("m3-low", 3, cloud_cover=10), _at("m3-late", 3, day=20, cloud_cover=5)]
+    scenes[2] = _at("m3", 3, cloud_cover=30)
+    picked = [s.id for s in select_per_period(scenes, "month")]
+    # day 10: tiles m3 (30) and m3-low (10) average 20; day 20 (5) is clearer
+    assert picked == [
+        "m1",
+        "m2",
+        "m3-late",
+        "m4",
+        "m5",
+        "m6",
+        "m7",
+        "m8",
+        "m9",
+        "m10",
+        "m11",
+        "m12",
+    ]
+    tied = [_at("a", 3, cloud_cover=10), _at("b", 3, cloud_cover=30)]
+    assert [s.id for s in select_per_period(tied, "month")] == ["a", "b"]
+
+
+def test_season_groups_december_with_the_next_january_and_february() -> None:
+    scenes = [
+        _at("dec", 12, year=2023, cloud_cover=5),
+        _at("jan", 1, cloud_cover=3),
+        _at("feb", 2, cloud_cover=9),
+        _at("mar", 3, cloud_cover=1),
+    ]
+    assert [s.id for s in select_per_period(scenes, "season")] == ["jan", "mar"]
+    assert [s.id for s in select_per_period(scenes, "year")] == ["dec", "mar"]
+
+
+def test_per_period_keeps_sar_and_ranks_unknown_cloud_last() -> None:
+    sar = _at("sar", 5, kind=SceneKind.sar)
+    unknown = _at("unknown", 5, day=2, cloud_cover=None)
+    known = _at("known", 5, day=3, cloud_cover=60)
+    assert [s.id for s in select_per_period([sar], "month")] == ["sar"]
+    assert [s.id for s in select_per_period([unknown, known], "month")] == ["known"]
+
+
+def test_select_scenes_modes() -> None:
+    scenes = [_at(f"m{m}", m, cloud_cover=m * 10) for m in range(1, 6)]
+    assert [s.id for s in select_scenes(scenes, "clearest", limit=2)] == ["m1", "m2"]
+    assert [s.id for s in select_scenes(scenes, "newest", limit=2)] == ["m5", "m4"]
+    assert [s.id for s in select_scenes(scenes, "oldest", limit=2)] == ["m1", "m2"]
+    assert [s.id for s in select_scenes(scenes, "even", limit=3)] == ["m1", "m3", "m5"]
+    assert len(select_scenes(scenes, "per_month", limit=1)) == 5
+
+
+def test_filter_orbit_drops_scenes_without_the_property() -> None:
+    props = [
+        {"sat:relative_orbit": 8, "sat:orbit_state": "descending"},
+        {"sat:relative_orbit": "8", "sat:orbit_state": "ascending"},
+        {"sat:relative_orbit": 9, "sat:orbit_state": "descending"},
+        {},
+    ]
+    scenes = [_at(f"s{i}", 6, i + 1, kind=SceneKind.sar, properties=p) for i, p in enumerate(props)]
+    kept, dropped = filter_orbit(scenes, "8:descending")
+    assert [s.id for s in kept] == ["s0"] and len(dropped) == 3
+    assert [s.id for s in filter_orbit(scenes, "8")[0]] == ["s0", "s1"]
+    assert [s.id for s in filter_orbit(scenes, "desc")[0]] == ["s0", "s2"]
