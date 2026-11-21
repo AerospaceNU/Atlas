@@ -211,6 +211,8 @@ fn completed_or_failed_turns_remove_stale_approval_prompts() {
             error: Some("approval timed out".to_string()),
             error_kind: None,
             artifacts: Vec::new(),
+            summary: String::new(),
+            notes: Vec::new(),
         },
     ];
     for event in terminal_events {
