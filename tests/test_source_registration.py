@@ -171,6 +171,9 @@ async def test_earthsearch_sentinel2_l2a_reads_band_assets() -> None:
         "green": "green",
         "nir": "nir08",
         "swir22": "swir22",
+        "blue": "blue",
+        "swir16": "swir16",
+        "nir_broad": "nir",
     }
     assert scene.assets["red"].scale == pytest.approx(0.0001)
     assert scene.assets["red"].offset == pytest.approx(-0.1)

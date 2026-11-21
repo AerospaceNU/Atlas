@@ -30,11 +30,24 @@ class Candidate(NamedTuple):
 #   green  admits S2 B03 at 0.560, rejects S2 blue at 0.490 (0.070)
 #   nir    admits S30 B08 at 0.8351 (0.030), rejects S30 B05 at 0.7039 (0.161)
 #   swir22 admits S2 B12 at 2.190, rejects S2 B11 at 1.610 (0.580)
+#   nir_broad admits S2 B08 at 0.842 and S30 B08 at 0.8351, rejects B8A at
+#          0.8648 (0.023) and Landsat B5 at 0.86
+#   rededge1-3 are +-0.012 around S2 B05-B07 (0.704, 0.740, 0.783)
+#   swir16 admits S2 B11 / Landsat B6 at 1.610 and rejects swir22
+# Each alias resolves on its own, so `nir` stays the narrow band.
 BANDS: Final[Mapping[str, BandSpec]] = {
     "red": BandSpec(0.665, 0.03, frozenset({"red"})),
     "green": BandSpec(0.560, 0.03, frozenset({"green"})),
     "nir": BandSpec(0.865, 0.05, frozenset({"nir", "nir08"})),
     "swir22": BandSpec(2.190, 0.15, frozenset({"swir22"})),
+    "blue": BandSpec(0.490, 0.03, frozenset({"blue"})),
+    "coastal": BandSpec(0.443, 0.02, frozenset({"coastal"})),
+    "rededge1": BandSpec(0.704, 0.012, frozenset({"rededge1"})),
+    "rededge2": BandSpec(0.740, 0.012, frozenset({"rededge2"})),
+    "rededge3": BandSpec(0.783, 0.012, frozenset({"rededge3"})),
+    "nir_broad": BandSpec(0.842, 0.012, frozenset()),
+    "swir16": BandSpec(1.610, 0.08, frozenset({"swir16"})),
+    "lwir": BandSpec(10.9, 0.6, frozenset({"lwir", "lwir11"})),
 }
 
 

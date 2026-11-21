@@ -278,7 +278,7 @@ def test_item_to_scene_populates_band_aliases() -> None:
     }
     scene = item_to_scene(feature, collection="hls2-s30")
     assert scene is not None
-    assert scene.band_aliases == {"red": "B04", "nir": "B8A"}
+    assert scene.band_aliases == {"red": "B04", "nir": "B8A", "nir_broad": "B08"}
     assert scene.assets[scene.band_aliases["nir"]].href.endswith("B8A.tif")
 
 

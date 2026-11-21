@@ -9,7 +9,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import httpx
 
-from atlas.data.bands import resolve_bands
+from atlas.data.bands import _common_name, _micrometres, resolve_bands
 from atlas.data.base import (
     Asset,
     BBox,
@@ -583,6 +583,30 @@ def _raster_calibration(raw: object) -> tuple[float | None, float | None]:
     return _finite_float(entry.get("scale")), _finite_float(entry.get("offset"))
 
 
+def _raster_facts(raw: object) -> tuple[float | None, str | None, float | None]:
+    """Return nodata, data type and resolution from the first ``raster:bands`` entry."""
+    if not isinstance(raw, list) or not raw or not isinstance(raw[0], dict):
+        return None, None, None
+    entry = raw[0]
+    data_type = entry.get("data_type")
+    return (
+        _finite_float(entry.get("nodata")),
+        data_type if isinstance(data_type, str) else None,
+        _finite_float(entry.get("spatial_resolution")),
+    )
+
+
+def _eo_facts(raw: object) -> tuple[str | None, float | None]:
+    """Return common name and wavelength from a lone ``eo:bands`` entry.
+
+    A multi-band asset (Sentinel-2 ``visual``) yields None, matching
+    :func:`atlas.data.bands.resolve_bands`.
+    """
+    if not isinstance(raw, list) or len(raw) != 1 or not isinstance(raw[0], dict):
+        return None, None
+    return _common_name(raw[0].get("common_name")), _micrometres(raw[0].get("center_wavelength"))
+
+
 def _finite_float(raw: object) -> float | None:
     """Return a finite float, or None for anything else."""
     if isinstance(raw, bool) or not isinstance(raw, int | float):
@@ -637,6 +661,8 @@ def item_to_scene(
                 continue
             roles = spec.get("roles")
             scale, offset = _raster_calibration(spec.get("raster:bands"))
+            nodata, data_type, resolution = _raster_facts(spec.get("raster:bands"))
+            common_name, wavelength = _eo_facts(spec.get("eo:bands"))
             asset = Asset.try_new(
                 href=_asset_href(spec),
                 media_type=spec.get("type") if isinstance(spec.get("type"), str) else None,
@@ -645,6 +671,13 @@ def item_to_scene(
                 scale=scale,
                 offset=offset,
                 size_bytes=_file_size(spec.get("file:size")),
+                nodata=nodata,
+                data_type=data_type,
+                spatial_resolution=resolution
+                if resolution is not None
+                else _finite_float(spec.get("gsd")),
+                common_name=common_name,
+                center_wavelength=wavelength,
             )
             if asset is not None:
                 assets[str(name)] = asset
