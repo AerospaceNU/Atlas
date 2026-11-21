@@ -72,7 +72,8 @@ def test_long_output_keeps_the_last_line_and_a_marker(tmp_path: Path) -> None:
 
     assert "THE-LAST-LINE" in result.text
     assert "... [truncated" in result.text
-    assert result.text.startswith("exit_code: 0\nstdout:\n1\n")
+    assert "exit_code: 0\nstdout:\n1\n" in result.text
+    assert "redirect to a file" in result.text
 
 
 def test_run_captured_handles_non_utf8_and_small_cap(tmp_path: Path) -> None:
