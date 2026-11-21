@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolDefinition, ToolResult
+from atlas.agent.layout import project_data_dir
 from atlas.cli.download import DownloadOutcome, DownloadReport, download_assets
 from atlas.cli.estimate import estimate_pull, render_pull_estimate
 from atlas.compile import SceneCatalog, SourceScenes, aggregate
@@ -32,14 +33,12 @@ from atlas.data.profiles import AssetNotFound, list_aliases, resolve_asset
 from atlas.data.registry import SOURCES, sources
 
 SEARCH_CAP = 200  # scenes asked of each source when a select mode picks among them
-MAX_WINDOW_PIXELS = 36_000_000  # one window; larger AOIs are refused with advice
-CHUNK_SCENES = 8  # scenes per download_assets call, so budget and cancel are checked between
+MAX_WINDOW_PIXELS = 36_000_000  # memory guard for one decoded window, not a download limit
+CHUNK_SCENES = 8  # scenes per download_assets call, so cancel and the clock are checked between
 WALL_CLOCK_S = 600.0  # cap for one download call of the tool
 PER_PERIOD_CAP = 120  # total scenes a per_month / per_period selection may return
 LISTED_PER_SOURCE = 12  # scene lines shown per source before the per-year digest
 TEXT_CAP = 12_000
-DEFAULT_CAP_MB = 2048.0
-MIB = 1024 * 1024
 _SEARCH_ONLY_PREFIXES = ("firms_", "gibs_")
 _ITEMSIZE = {"uint8": 1, "int8": 1, "int16": 2, "uint16": 2, "int32": 4, "uint32": 4}
 _BOUND_KEYS = ("maximum", "minimum", "exclusiveMinimum", "maxItems", "minItems", "format")
@@ -48,43 +47,27 @@ _ORBIT_STATE = {"ascending": "asc", "descending": "desc"}
 
 # pydantic model for the inputs to the tool
 class GetDataToolInput(BaseModel):
-    data_type: SceneKind = Field(description="Kind of data.")
-    start_date: date = Field(description="UTC YYYY-MM-DD; optical needs a week of margin.")
-    end_date: date = Field(description="UTC YYYY-MM-DD, inclusive.")
-    latitude: float | None = Field(default=None, ge=-90, le=90, description="Degrees north.")
-    longitude: float | None = Field(default=None, ge=-180, le=180, description="Degrees east.")
-    radius_km: float = Field(
-        default=2.0, gt=0.0, le=100.0, description="Half-width in km around lat/lon (max 100)."
-    )
-    bbox: BBox | None = Field(
-        default=None, description="Object with west, south, east, north in degrees."
-    )
+    data_type: SceneKind
+    start_date: date = Field(description="Optical needs a week of margin.")
+    end_date: date
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    radius_km: float = Field(default=2.0, gt=0.0, le=100.0, description="Half-width, km.")
+    bbox: BBox | None = Field(default=None, description="{west,south,east,north}")
     polygon: list[list[float]] | None = Field(
-        default=None,
-        min_length=4,
-        max_length=500,
-        description="Closed [lon, lat] ring, 4-500 vertices; pulls its envelope.",
+        default=None, min_length=4, max_length=500, description="[lon, lat] ring."
     )
-    sources: list[str] | None = Field(
-        default=None, description="Registry keys, e.g. sentinel2; default all."
-    )
-    max_cloud_cover: float | None = Field(default=None, ge=0.0, le=100.0, description="Percent.")
-    limit: int = Field(default=3, ge=1, le=30, description="Scenes per source, max 30.")
-    select: SelectMode | None = Field(
-        default=None, description="Pick among up to 200 found; per_* keep the best per period."
-    )
-    period: Period = Field(default="month", description="Bucket for per_period.")
-    orbit: str | None = Field(default=None, description="SAR only: 8, ascending, or 8:descending.")
+    sources: list[str] | None = Field(default=None, description="Registry keys; default all.")
+    max_cloud_cover: float | None = Field(default=None, ge=0.0, le=100.0)
+    limit: int = Field(default=3, ge=1, le=30)
+    select: SelectMode | None = Field(default=None, description="Choose among up to 200.")
+    period: Period = Field(default="month")
+    orbit: str | None = Field(default=None, description="SAR: 8, ascending, 8:descending.")
     assets: list[str] | None = Field(
-        default=None,
-        max_length=12,
-        description="Aliases or keys to cut as chips, e.g. red, nir. Needed for analysis.",
+        default=None, max_length=12, description="Aliases to cut, e.g. red, nir."
     )
-    allow_whole_file: bool = Field(
-        default=False, description="Allow whole-file fetches over 200 MB."
-    )
-    include_qa: bool = Field(default=True, description="Add the quality layer to assets.")
-    download: bool = Field(default=False, description="False: search and estimate. True: pull.")
+    include_qa: bool = True
+    download: bool = Field(default=False, description="True pulls.")
 
     @field_validator("polygon")
     @classmethod
@@ -281,7 +264,7 @@ def _oversized(scene: Scene, names: Sequence[str], bbox: BBox) -> str | None:
         if width * height > MAX_WINDOW_PIXELS:
             return (
                 f"refused: window for {alias} is ~{width}x{height} px "
-                f"({width * height / 1e6:.3g} MP), over the {MAX_WINDOW_PIXELS // 10**6} MP limit. "
+                f"({width * height / 1e6:.3g} MP), over the {MAX_WINDOW_PIXELS // 10**6} MP memory guard for one window. "
                 "Fix: shrink bbox/polygon (or radius_km) and call again"
             )
     return None
@@ -354,23 +337,20 @@ def _scene_status(outcomes: Sequence[DownloadOutcome], scene_id: str) -> bool:
     return bool(mine) and all(o.status in {"saved", "skipped"} for o in mine)
 
 
+def _data_dir(store: LocalArtifactStore) -> Path:
+    """Return the workspace ``.atlas/data`` directory: pulls persist across sessions."""
+    return project_data_dir(store.root)
+
+
 class _Stop(Exception):
     """Internal: ends the chunk loop with a reason for the result text."""
-
-
-def _budget_refusal(spent: int, cap_mb: float) -> str:
-    return (
-        f"refused: max_download_mb budget reached: {spent / MIB:.4g} MB fetched this session, "
-        f"cap {cap_mb:.4g} MB. Fix: raise max_download_mb in .atlas/agent.toml or ask the user"
-    )
 
 
 class GetDataTool(Tool):
     name = "get_satellite_data"
     description = (
-        "Search satellite catalogs for a place and dates; download=true cuts the chosen assets "
-        "to the area as chips. Search first and show the user the estimate. Without assets a "
-        "download is a preview, not for analysis."
+        "Search satellite catalogs for a place and dates. download=true cuts assets as chips "
+        "into .atlas/data (kept across sessions); analysis needs assets."
     )
     trust = "default"
     domain: ClassVar[str] = "satellite"
@@ -470,8 +450,8 @@ class GetDataTool(Tool):
     ) -> ToolResult:
         """Search, narrow, then report the estimate or download chips.
 
-        Clients are always closed. A download is bounded by max_download_mb, a window
-        limit and a wall clock; it is never approval-gated.
+        Clients are always closed. A download has no size limit; it is bounded by a
+        per-window memory guard and a wall clock, and is never approval-gated.
         """
         clients = sources(*names)
         try:
@@ -495,7 +475,7 @@ class GetDataTool(Tool):
         store: LocalArtifactStore,
         warnings: list[str],
     ) -> ToolResult:
-        estimate = estimate_pull(catalog, out_dir=store.resolve("data"), bbox=pull_request.bbox)
+        estimate = estimate_pull(catalog, out_dir=_data_dir(store), bbox=pull_request.bbox)
         # the per-source assets line below replaces the estimate's alias listing
         estimate = replace(
             estimate, sources=tuple(replace(s, assets_text="") for s in estimate.sources)
@@ -528,10 +508,7 @@ class GetDataTool(Tool):
         if not download:
             default = ["vv", "vh"] if request.data_type is SceneKind.sar else ["red", "nir"]
             assets = request.assets or default
-            return (
-                "next: show the estimate, then call again with download=true and "
-                f"assets={assets!r}".replace("'", '"')
-            )
+            return f"next: call again with download=true and assets={assets!r}".replace("'", '"')
         if request.assets:
             bands = list(request.assets)
             return f'next: prepare_stack scenes="last_pull" bands={bands!r}'.replace("'", '"')
@@ -546,9 +523,7 @@ class GetDataTool(Tool):
         store: LocalArtifactStore,
         warnings: list[str],
     ) -> ToolResult:
-        from atlas.agent.runtime import load_optional_limit
         from atlas.agent.tools import _geo
-        from atlas.geo import provenance
         from atlas.geo._lazy import check_cancel
         from atlas.geo.errors import GeoCancelled
 
@@ -568,22 +543,11 @@ class GetDataTool(Tool):
                 if refusal:
                     return ToolResult(text=refusal)
             plan.append((src, effective))
-        try:
-            cap_mb = float(load_optional_limit(store.root, "max_download_mb", kind=float) or 0)
-        except ValueError as exc:
-            return ToolResult(
-                text=f"refused: {exc}. Fix: set max_download_mb to a positive number in "
-                ".atlas/agent.toml"
-            )
-        cap_mb = cap_mb or DEFAULT_CAP_MB
         adir = _geo.analysis_dir(store)
-        spent = provenance.bytes_fetched_total(adir)
-        if spent >= cap_mb * MIB:
-            return ToolResult(text=_budget_refusal(spent, cap_mb))
 
         ring = [list(v) for v in pull_request.polygon.ring] if pull_request.polygon else None
         total_scenes = sum(len(src.scenes) for src, _ in plan)
-        out_dir = store.resolve("data")
+        out_dir = _data_dir(store)
         deadline = time.monotonic() + WALL_CLOCK_S
         outcomes: list[DownloadOutcome] = []
         pulled = 0
@@ -597,10 +561,6 @@ class GetDataTool(Tool):
                         break
                     for start in range(0, len(src.scenes), CHUNK_SCENES):
                         stop = self._stop_reason(check_cancel, GeoCancelled, deadline, done)
-                        if stop is None and spent + pulled >= cap_mb * MIB:
-                            stop = _budget_refusal(spent + pulled, cap_mb).replace(
-                                "refused", f"stopped after {done} of {total_scenes} scenes", 1
-                            )
                         if stop:
                             break
                         chunk = src.scenes[start : start + CHUNK_SCENES]
@@ -611,8 +571,6 @@ class GetDataTool(Tool):
                             clients=clients,
                             bbox=bbox,
                             asset_names=effective,
-                            whole_file="size_limited",
-                            allow_whole_file=request.allow_whole_file,
                             max_pixels=MAX_WINDOW_PIXELS,
                             deadline_seconds=max(1.0, deadline - time.monotonic()),
                             polygon=ring,
@@ -663,7 +621,7 @@ class GetDataTool(Tool):
         pulled: int,
         stop: str | None,
     ) -> str:
-        """Append the pull to the run ledger, which is also the download budget."""
+        """Append the pull to the run ledger."""
         from atlas.geo import provenance
 
         outputs: list[str] = []

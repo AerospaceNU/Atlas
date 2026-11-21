@@ -409,14 +409,14 @@ def test_download_saves_files_and_reports_each_source(
     # only scenes from the source whose search worked are downloaded, cut to the box
     call = downloaded[0]
     assert call["ids"] == ["a", "b"]
-    assert call["out"] == store.resolve("data")
+    assert call["out"] == tmp_path / ".atlas" / "data"
     assert call["bbox"].contains(-71.06, 42.36)
 
-    assert result.artifacts == ["data/sentinel2/a_visual.tif"]
+    assert result.artifacts == [".atlas/data/sentinel2/a_visual.tif"]
     assert "sentinel2: 1 of 2 scenes saved" in result.text
     assert "  b: no native-resolution asset" in result.text
     assert "landsat9: search failed: RuntimeError: catalog is down" in result.text
-    assert "saved: data/sentinel2/a_visual.tif" in result.text
+    assert "saved: .atlas/data/sentinel2/a_visual.tif" in result.text
     assert "run: r0001" in result.text
     assert good.closed and broken.closed
 
@@ -557,16 +557,14 @@ def test_search_only_sources_refuse_a_download(
         )
 
 
-def test_download_budget_refuses_after_the_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_downloads_are_not_budgeted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / ".atlas").mkdir()
     (tmp_path / ".atlas" / "agent.toml").write_text("max_download_mb = 1\n")
     _use_clients(monkeypatch, {"sentinel2": FakePullClient([_scene(id="a")])})
     calls: list[dict[str, Any]] = []
 
     async def fake_download(scenes: list[Scene], out: Path, **kwargs: Any) -> DownloadReport:
-        calls.append(kwargs)
+        calls.append({"out": out, **kwargs})
         path = out / "sentinel2" / "a_B04.tif"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"tif")
@@ -596,10 +594,12 @@ def test_download_budget_refuses_after_the_cap(
     first = GetDataTool().run(arguments, store)
     second = GetDataTool().run(arguments, store)
 
-    assert "run: r0001" in first.text
-    assert len(calls) == 1
+    assert "run: r0001" in first.text and "run: r0002" in second.text
+    assert not second.text.startswith("refused")
+    assert len(calls) == 2
     assert calls[0]["asset_names"] == ["red"]
     assert calls[0]["polygon"] is not None
-    assert "max_download_mb" in second.text and second.text.startswith("refused")
+    assert calls[0]["out"] == tmp_path / ".atlas" / "data"
+    assert "whole_file" not in calls[0] and "allow_whole_file" not in calls[0]
     runs = (tmp_path / "analysis" / "runs.jsonl").read_text().splitlines()
     assert json.loads(runs[0])["bytes_fetched"] == 2 * 1024 * 1024

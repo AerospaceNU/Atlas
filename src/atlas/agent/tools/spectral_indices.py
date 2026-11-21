@@ -9,7 +9,8 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.contracts import Tool, ToolDefinition, ToolResult
+from atlas.agent.tools._schema import slim_definition
 from atlas.data.indices import MAX_BAND_BYTES, compute_indices
 
 _LABELS = {
@@ -23,53 +24,25 @@ class SpectralIndicesInput(BaseModel):
     """Paths to surface-reflectance arrays and optional calibration."""
 
     red: str = Field(description="Workspace path of the red .npy array.")
-    nir: str = Field(description="Workspace path of the NIR .npy array.")
-    green: str | None = Field(
-        default=None,
-        description="Green .npy array. Required for McFeeters NDWI.",
-    )
-    swir22: str | None = Field(
-        default=None,
-        description="SWIR2.2 .npy array. Required for NBR.",
-    )
-    out: str = Field(
-        default="indices",
-        description="Workspace directory for the index .npy files.",
-    )
+    nir: str = Field(description="NIR .npy array.")
+    green: str | None = Field(default=None, description="Green .npy array; needed for NDWI.")
+    swir22: str | None = Field(default=None, description="SWIR2.2 .npy array; needed for NBR.")
+    out: str = Field(default="indices", description="Directory for the index .npy files.")
     nodata: float | dict[str, float] | None = Field(
-        default=None,
-        description="Fill value, or band name to fill value. Matches become NaN.",
+        default=None, description="Fill value (or {band: value}); matches become NaN."
     )
-    mask: str | None = Field(
-        default=None,
-        description="Boolean .npy mask. True marks nodata for every band.",
-    )
+    mask: str | None = Field(default=None, description="Boolean .npy mask; True = nodata.")
     scale: float | dict[str, float] | None = Field(
         default=None,
-        description=(
-            "Multiply stored digital numbers. Surface reflectance is "
-            "stored * scale + offset. Sentinel-2 L2A scale is 1e-4."
-        ),
+        description="Multiplier (or {band: value}): reflectance = stored*scale+offset.",
     )
     offset: float | dict[str, float] | None = Field(
-        default=None,
-        description=(
-            "Add after scale. Sentinel-2 L2A's published offset of -1000 is "
-            "passed as -0.1 with scale 1e-4. Landsat Collection 2 uses "
-            "scale 2.75e-5 and offset -0.2."
-        ),
+        default=None, description="Added after scale (or {band: value})."
     )
-    overwrite: bool = Field(
-        default=False,
-        description="Replace index .npy files that already exist. Refused otherwise.",
-    )
+    overwrite: bool = Field(default=False, description="Replace existing index files.")
     preset: Literal["s2-l2a", "landsat-c2"] | None = Field(
         default=None,
-        description=(
-            "Calibration preset. s2-l2a is scale 1e-4 and offset -0.1 "
-            "(published DN offset -1000). landsat-c2 is scale 2.75e-5 and "
-            "offset -0.2. Cannot be combined with scale or offset."
-        ),
+        description="Sets scale and offset: s2-l2a 1e-4/-0.1, landsat-c2 2.75e-5/-0.2. Not with scale/offset.",
     )
 
 
@@ -79,21 +52,19 @@ class SpectralIndicesTool(Tool):
     name = "spectral_indices"
     domain: ClassVar[str] = "satellite"
     description = (
-        "Legacy NDVI/NDWI/NBR on .npy arrays; for stacks use band_math (index=...). "
-        "Compute NDVI, McFeeters NDWI (ndwi_mcfeeters), and NBR from surface "
-        "reflectance .npy arrays once red and NIR are available. Optional scale "
-        "and offset convert digital numbers (reflectance = stored * scale + offset). "
-        "Sentinel-2 L2A: scale 1e-4 and offset -0.1 (published DN offset -1000). "
-        "Landsat Collection 2: scale 2.75e-5 and offset -0.2. Presets s2-l2a and "
-        "landsat-c2 set both. A nodata fill value "
-        "or a boolean mask (True = nodata) becomes NaN. Each input must be at most "
-        "16777216 elements and 64 MiB."
+        "Legacy NDVI, NDWI (ndwi_mcfeeters) and NBR from surface-reflectance .npy arrays; for "
+        "stacks use band_math (index=...). Needs red and NIR. Each input is at most 16777216 "
+        "elements and 64 MiB."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
 
     @property
     def input_model(self) -> type[BaseModel]:
         return SpectralIndicesInput
+
+    def definition(self) -> ToolDefinition:
+        """Return the advertised schema without null branches or the model docstring."""
+        return slim_definition(super().definition())
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request = SpectralIndicesInput.model_validate(arguments)

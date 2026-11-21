@@ -11,13 +11,14 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.contracts import Tool, ToolDefinition, ToolResult
 from atlas.agent.scope import cancel_requested
 from atlas.agent.tools._grep_scan import (
     WorkerConfig,
     run_worker,
     worker_available,
 )
+from atlas.agent.tools._schema import slim_definition
 from atlas.agent.tools._walk import iter_files, load_ignore_set, match_glob
 
 _GNU_ESCAPES = ("\\|", "\\(", "\\)")
@@ -41,12 +42,7 @@ MAX_MATCHES = 1000
 
 
 class GrepInput(BaseModel):
-    """Arguments for ``grep``.
-
-    ``pattern`` is a Python regular expression unless ``fixed_strings`` is set.
-    ``path`` and ``glob`` are workspace-relative; ``glob`` filters file names
-    such as ``*.py``.
-    """
+    """Arguments for ``grep``."""
 
     pattern: str = Field(description="Python regular expression (use | for alternation).")
     path: str = Field(default=".", description="File or directory to search.")
@@ -54,7 +50,7 @@ class GrepInput(BaseModel):
     max_matches: int = Field(
         default=200,
         ge=1,
-        description="Maximum matching lines to return (at least 1; values above 1000 are clamped to 1000).",
+        description="Max matching lines (clamped to 1000).",
     )
     case_sensitive: bool = Field(default=True, description="Match case sensitively.")
     fixed_strings: bool = Field(default=False, description="Treat the pattern as a literal.")
@@ -64,7 +60,7 @@ class GrepInput(BaseModel):
     context: int = Field(
         default=0,
         ge=0,
-        description="Lines shown before and after a match (values above 30 are clamped to 30).",
+        description="Lines before and after a match (clamped to 30).",
     )
     output_mode: Literal["content", "files_with_matches", "count"] = Field(
         default="content", description="content, files_with_matches (paths only) or count."
@@ -163,8 +159,8 @@ class GrepTool(Tool):
         "Search file contents with a Python regular expression (use | for alternation). "
         "Returns path:line:text. context=N adds surrounding lines, output_mode lists only "
         "file names or per-file counts, glob filters file names. Skips .git, virtualenvs and "
-        "caches unless include_ignored is true. Binary files and files over 1 MB are skipped (a file you name is searched up to 32 MB); "
-        "respects .gitignore."
+        "caches unless include_ignored is true. Binary files and files over 1 MB are skipped "
+        "(a file you name is searched up to 32 MB); respects .gitignore."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     max_file_bytes: ClassVar[int] = 1 << 20
@@ -176,6 +172,10 @@ class GrepTool(Tool):
     @property
     def input_model(self) -> type[BaseModel]:
         return GrepInput
+
+    def definition(self) -> ToolDefinition:
+        """Return the advertised schema without null branches or the model docstring."""
+        return slim_definition(super().definition())
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request, notes = _clamped(GrepInput.model_validate(arguments))
