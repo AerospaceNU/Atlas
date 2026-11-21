@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from os import PathLike
 from typing import IO
 
+from atlas.agent.scope import cancel_requested
+
 DEFAULT_MAX_CHARS = 200_000
 MAX_CAPTURE_BYTES = 64 * 1024 * 1024
 OUTPUT_LIMIT_NOTE = "note: output exceeded 64 MB and the command was stopped"
@@ -35,6 +37,7 @@ class Captured:
     stderr: str
     timed_out: bool
     output_limited: bool = False
+    cancelled: bool = False
 
 
 def run_captured(
@@ -51,8 +54,13 @@ def run_captured(
     descendant still holds the output files. On timeout the output written so
     far is returned with ``timed_out=True``. When either output file grows past
     :data:`MAX_CAPTURE_BYTES` the process group is killed and ``output_limited``
-    is set; the child itself is never given a resource limit.
+    is set; the child itself is never given a resource limit. When the current
+    :class:`~atlas.agent.scope.RunScope` is cancelled the group is killed, the
+    output so far is returned with ``cancelled=True`` and ``exit_code=None``; an
+    already-cancelled scope returns without spawning.
     """
+    if cancel_requested():
+        return Captured(None, "", "", False, cancelled=True)
     with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
         process = subprocess.Popen(
             list(argv),
@@ -67,41 +75,48 @@ def run_captured(
         pgid = process.pid
         timed_out = False
         output_limited = False
+        cancelled = False
         try:
-            timed_out, output_limited = _wait(process, out_file, err_file, timeout)
+            timed_out, output_limited, cancelled = _wait(process, out_file, err_file, timeout)
         finally:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(pgid, signal.SIGKILL)
             process.wait()
         return Captured(
-            exit_code=None if timed_out else process.returncode,
+            exit_code=None if (timed_out or cancelled) else process.returncode,
             stdout=_read_bounded(out_file, max_chars),
             stderr=_read_bounded(err_file, max_chars),
             timed_out=timed_out,
             output_limited=output_limited,
+            cancelled=cancelled,
         )
 
 
 def _wait(
     process: subprocess.Popen[bytes], out_file: IO[bytes], err_file: IO[bytes], timeout: float
-) -> tuple[bool, bool]:
-    """Wait for the direct child; return ``(timed_out, output_limited)``.
+) -> tuple[bool, bool, bool]:
+    """Wait for the direct child; return ``(timed_out, output_limited, cancelled)``.
 
     Waits in short slices so the size of both capture files can be checked
-    between them. Reaching the byte cap stops the wait; the caller kills the group.
+    between them. Reaching the byte cap stops the wait; the caller kills the group. A cancelled scope is polled each slice and also
+    stops the wait; a child that already exited is never reported as cancelled.
     """
     deadline = time.monotonic() + timeout
     while True:
+        if cancel_requested():
+            return False, False, True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return True, False
+            return True, False, False
         try:
             process.wait(timeout=min(_POLL_SECONDS, remaining))
         except subprocess.TimeoutExpired:
+            if cancel_requested():
+                return False, False, True
             if _over_cap(out_file) or _over_cap(err_file):
-                return False, True
+                return False, True, False
             continue
-        return False, False
+        return False, False, False
 
 
 def _over_cap(handle: IO[bytes]) -> bool:
