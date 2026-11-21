@@ -133,20 +133,14 @@ def _write_csv(points: list[Any], path: Any) -> None:
 
 
 def _chart(points: list[Any], path: Any, what: str, trend: Any) -> Any:
-    """Draw with S-06 charts.line_chart; fall back to the minimal Pillow chart."""
-    from atlas.geo import temporal
+    """Draw the series with `charts.line_chart`."""
+    from atlas.geo import charts, temporal
 
-    title = f"{what} by date"
-    try:
-        from atlas.geo import charts
-
-        xs = [temporal.decimal_year(p.date) for p in points]
-        linear = "linear" if trend is not None and trend.kind == "ols" else None
-        return charts.line_chart(
-            xs, {what: [p.value for p in points]}, title=title, path=path, trend=linear
-        )
-    except (ImportError, AttributeError, TypeError, ValueError):
-        return temporal.draw_series_png(points, path, title=title)
+    xs = [temporal.decimal_year(p.date) for p in points]
+    linear = "linear" if trend is not None and trend.kind == "ols" else None
+    return charts.line_chart(
+        xs, {what: [p.value for p in points]}, title=f"{what} by date", path=path, trend=linear
+    )
 
 
 def _sketch(points: list[Any]) -> list[dict[str, Any]]:

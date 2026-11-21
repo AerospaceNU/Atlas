@@ -41,7 +41,6 @@ __all__ = [
     "choose_trend",
     "date_valid",
     "decimal_year",
-    "draw_series_png",
     "fit_trend",
     "series_points",
     "zone_mask",
@@ -58,16 +57,6 @@ _MAX_VERTICES = 500
 _REFUSED_KINDS = frozenset({"categorical", "probability", "count"})
 _DATE_RE = re.compile(r"@(\d{8})$")
 _PCT_SAMPLE = 1_000_000
-_FALLBACK_INDICES: dict[str, tuple[str, tuple[str, ...]]] = {
-    "ndvi": ("(nir-red)/(nir+red)", ("nir", "red")),
-    "ndwi": ("(green-nir)/(green+nir)", ("green", "nir")),
-    "mndwi": ("(green-swir16)/(green+swir16)", ("green", "swir16")),
-    "nbr": ("(nir-swir22)/(nir+swir22)", ("nir", "swir22")),
-    "ndmi": ("(nir-swir16)/(nir+swir16)", ("nir", "swir16")),
-    "ndbi": ("(swir16-nir)/(swir16+nir)", ("swir16", "nir")),
-    "ndsi": ("(green-swir16)/(green+swir16)", ("green", "swir16")),
-    "vv_vh_ratio": ("vv-vh", ("vv", "vh")),
-}
 
 
 @dataclass(frozen=True)
@@ -625,18 +614,13 @@ def _summarise(
 
 
 def _index_spec(index: str) -> tuple[str, tuple[str, ...]]:
-    key = index.lower()
-    try:
-        from atlas.geo import indices
+    from atlas.geo.indices import INDEX_CATALOGUE
 
-        spec = indices.INDEX_CATALOGUE[key]
-        return str(spec["expr"]), tuple(spec["bands"])
-    except (ImportError, AttributeError, KeyError):
-        pass
-    if key in _FALLBACK_INDICES:
-        return _FALLBACK_INDICES[key]
-    names = ", ".join(sorted(_FALLBACK_INDICES))
-    raise GeoError(fix(f"unknown index {index!r}; known: {names}.", "time_series layer=<name>"))
+    spec = INDEX_CATALOGUE.get(index.lower())
+    if spec is None:
+        names = ", ".join(sorted(INDEX_CATALOGUE))
+        raise GeoError(fix(f"unknown index {index!r}; known: {names}.", "time_series layer=<name>"))
+    return str(spec["expr"]), tuple(spec["bands"])
 
 
 def _reduce_stat(values: NDArray[np.float32], stat: str) -> float:
@@ -799,46 +783,3 @@ def fit_trend(points: Sequence[SeriesPoint], kind: Literal["ols", "month_anomaly
     slope = float((t * v).sum() / denom)
     n = int(keep.sum())
     return TrendResult("month_anomaly", slope, n, _r2(v - slope * t, v), len(points) - n)
-
-
-def draw_series_png(
-    points: Sequence[SeriesPoint], path: Path, *, title: str, ylabel: str = ""
-) -> Path:
-    """Write a minimal Pillow line chart (fallback when atlas.geo.charts is absent)."""
-    from PIL import Image, ImageDraw
-
-    width, height, pad = 800, 450, 50
-    img = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(img)
-    xs = [decimal_year(p.date) for p in points]
-    ys = [p.value for p in points]
-    finite = [y for y in ys if math.isfinite(y)]
-    lo, hi = (min(finite), max(finite)) if finite else (0.0, 1.0)
-    hi = hi if hi > lo else lo + 1.0
-    x0 = min(xs)
-    x1 = max(xs) if len(xs) > 1 else x0 + 1.0
-
-    def at(x: float, y: float) -> tuple[float, float]:
-        return (
-            pad + (x - x0) / (x1 - x0) * (width - 2 * pad),
-            height - pad - (y - lo) / (hi - lo) * (height - 2 * pad),
-        )
-
-    draw.rectangle([pad, pad, width - pad, height - pad], outline="black")
-    draw.text((pad, 10), f"{title} {ylabel}".strip(), fill="black")
-    draw.text((pad, height - 30), f"{points[0].date} .. {points[-1].date}", fill="black")
-    draw.text((5, pad), f"{hi:.4g}", fill="black")
-    draw.text((5, height - pad - 10), f"{lo:.4g}", fill="black")
-    run: list[tuple[float, float]] = []
-    for x, y in zip(xs, ys, strict=True):
-        if math.isfinite(y):
-            px, py = at(x, y)
-            run.append((px, py))
-            draw.ellipse([px - 3, py - 3, px + 3, py + 3], fill="blue")
-            if len(run) > 1:
-                draw.line(run[-2:], fill="blue", width=2)
-        else:
-            run = []
-    path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(path, format="PNG")
-    return path
