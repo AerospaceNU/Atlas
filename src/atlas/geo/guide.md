@@ -4,7 +4,7 @@ Served by satellite_guide(topic) and `atlas geo guide TOPIC`. Topics: workflow, 
 
 ## topic: workflow
 Call order. Each step reads the previous result; do not skip prepare_stack.
-1. get_satellite_data(assets=[...], select=..., polygon=...) searches; add download=true to pull chips into data/<source>/.
+1. get_satellite_data(assets=[...], select=..., polygon=...) searches; add download=true to pull chips into .atlas/data/<source>/.
 2. prepare_stack(scenes="last_pull", name=...) builds ONE co-registered physical-unit stack.
 3. inspect_stack(stack=...) shows layers, valid %, QA fractions.
 4. band_math, classify, change_detect, area_table, time_series, composite, or a model tool. Each writes a NEW stack or table.
@@ -15,12 +15,12 @@ Report: units, valid fraction, hectares with aoi_px and valid_px denominators, m
 Topics: stack, masks, areas, models, render, recipes, scripts, limits.
 
 ## topic: stack
-A stack is a directory analysis/stacks/<id>/ with stack.json, data.npy (float32, layers x H x W), optional qa.npy and preview.png. Other analysis dirs: analysis/{figures,tables,exports,scripts} and analysis/runs.jsonl.
+A stack is a directory .atlas/analysis/stacks/<id>/ (workspace-relative) with stack.json, data.npy (float32, layers x H x W), optional qa.npy and preview.png. Other analysis dirs: .atlas/analysis/{figures,tables,exports,scripts} and .atlas/analysis/runs.jsonl. Run ids are unique per workspace.
 Layers: lowercase common names (red, nir, swir22, vv, scl, landcover). Several dates: red@YYYYMMDD. Units: reflectance 0-1, backscatter dB, metres, K, class codes. NaN means no data.
 Stacks are immutable. A tool that changes anything writes a new stack named <parent>-<op>-<hash>, or name=... if given. Same name with different parameters is refused unless overwrite=true (approval needed).
 Derived stacks hold only their own layers. To keep inputs, use keep_layers on a model tool. Combining stacks needs the same grid.
-Raw pulls stay in data/<source>/ with a .meta.json sidecar; prepare_stack finds chips by sidecar.
-Stacks do NOT survive a new session. List them: atlas geo stacks.
+Raw pulls stay in .atlas/data/<source>/ with a .meta.json sidecar; prepare_stack finds chips by sidecar.
+Stacks, figures, tables, exports and pulls persist across sessions: a new session opens a stack by id. List them: atlas geo stacks. Stacks from older sessions under <artifact_root>/analysis are still found by id, read-only.
 inspect_stack(stack="latest") opens the newest stack.
 
 ## topic: masks
@@ -45,15 +45,15 @@ classify(stack, layer, rules|thresholds+labels|preset|method="otsu") makes the c
 Model tools run only on prepared stacks, never on raw chips. Tool input: stack, name, keep_layers, params, mask_with. A model tool refuses a stack that does not fit its input contract and names the fix; follow it.
 Cite the model's tool name, version, run id and licence. Report its known limits. Heuristic RGB tools are previews, not models.
 {{MODELS}}
-Hidden models are not callable. You cannot pull weights; tell the user to run the pull command shown, then start a new session.
+Hidden models are not callable. You cannot pull weights; tell the user to run the pull command shown, then start a new session. cloud_mask is a local weight (no public URL): the user installs it with atlas models pull cloud_mask --from PATH --accept-license into ~/.atlas/weights, and it appears once the verified weight is present and onnxruntime imports.
 
 ## topic: render
-render_map(stack, layers=[one layer or three for RGB], composite, stretch, colormap, overlay, compare, date, attach) writes a PNG under analysis/figures/ plus a .json sidecar.
+render_map(stack, layers=[one layer or three for RGB], composite, stretch, colormap, overlay, compare, date, attach) writes a PNG under .atlas/analysis/figures/ plus a .json sidecar.
 Stretch is the 2-98 percentile of valid pixels; the result states the range. overlay=<class layer> outlines classes over a base. compare=<stack> draws two panels on the same grid.
 attach=true shows you the PNG. If you cannot see images, or attach=false, the result carries a 12x24 text grid and legend with hectares instead; read those.
 Legend areas, scale bar and north arrow are drawn by the tool. Images are 800 px on the longest side by default and under 250 KB.
 Use render_map to check that a product looks plausible; do not measure from it. Take numbers from area_table.
-export_geotiff(stack, layers, format=geotiff|geojson|csv) writes under analysis/exports/. An explicit path outside it needs approval.
+export_geotiff(stack, layers, format=geotiff|geojson|csv) writes under .atlas/analysis/exports/. An explicit path outside it needs approval.
 time_series and area_table can add a chart PNG with chart=true.
 
 ## topic: recipes
@@ -65,7 +65,7 @@ get_satellite_data(data_type="sar", assets=["vv"], orbit="8:ascending", select="
 get_satellite_data(assets=["red","nir","scl"], select="per_month", download=true); prepare_stack(scenes="last_pull", name="ts", qa="auto"); time_series(stack="ts", index="ndvi", trend="month_anomaly"). month_anomaly removes the seasonal cycle; plain ols does not. Report slope per year and n_dates.
 
 ## topic: scripts
-Typed tools first. If none fits, write a script with write_file to analysis/scripts/<name>.py, then run it with bash: "$ATLAS_PYTHON" analysis/scripts/<name>.py. Write only under analysis/. Print at most 40 lines. End with finish({...}), which records the script sha256 and prints run: rNNNN.
+Typed tools first. If none fits, write a script with write_file to .atlas/analysis/scripts/<name>.py (the same directory as $ATLAS_ANALYSIS_DIR/scripts), then run it with bash: "$ATLAS_PYTHON" .atlas/analysis/scripts/<name>.py. Write only under .atlas/analysis/. workspace() returns the .atlas root, so workspace() / "analysis" / "exports" is the exports directory. Print at most 40 lines. End with finish({...}), which records the script sha256 and prints run: rNNNN.
 Imports: from atlas.geo import open_stack, workspace, eval_expr, class_table, render_map, write_geotiff, finish
 1. Hectares of dNBR above 0.27 on stack fire:
 ```python
@@ -90,7 +90,7 @@ finish({"bytes": info["bytes"]}, outputs=[p])
 ```
 
 ## topic: limits
-Window cap: 36 MP per pulled window; larger AOIs are refused with advice to shrink the box. Stacks are capped at 200e6 cells. Long tools stop at 600 s and say so.
+Window cap: 36 MP per pulled window, a memory guard rather than a download limit; larger AOIs are refused with advice to shrink the box. Stacks are capped at 200e6 cells. Long tools stop at 600 s and say so.
 Per-pixel cloud masking only through QA planes or cloud_mask. Heuristic RGB tools (mask_clouds, burn_scar, flood_mask, segment_landcover, rgb_change) work on 8-bit PNG previews and are not trained models.
 nir is B8A (20 m) on Sentinel-2; nir_broad is B08 (10 m). Landsat nir is B5. The result names the real band.
 SAR: urban and vegetated areas give double-bounce returns that fool fixed-threshold flood rules. Use the same relative orbit and direction for a pair. Sentinel-1 is shown in dB.

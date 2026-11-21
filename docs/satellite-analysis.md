@@ -8,7 +8,11 @@ and learned models. Rule-based paths run without them.
 
 ## 1. Stack format
 
-A stack is a directory `analysis/stacks/<id>/` under the artifact root:
+A stack is a directory `.atlas/analysis/stacks/<id>/` under the workspace. It is
+persistent: a new session opens it by id, and removing a session does not remove
+it. Stacks from older sessions under `<artifact_root>/analysis/stacks` are still
+found by id (read-only fallback; nothing is migrated). Run ids are unique per
+workspace:
 
 - `stack.json` (schema `atlas.stack/1`, written last as the commit marker)
 - `data.npy`: float32, layers x H x W
@@ -36,7 +40,7 @@ transform, size, bounds, `pixel_area_m2`), `aoi`, `layers`, `qa`, `provenance`,
 
 | Tool | Does | Writes |
 |---|---|---|
-| `get_satellite_data` | search; `download=true` pulls chips to `data/<source>/` | chips |
+| `get_satellite_data` | search; `download=true` pulls chips to `.atlas/data/<source>/` (workspace, persistent) | chips |
 | `prepare_stack` | chips or rasters to one stack | stack |
 | `inspect_stack` | layers, valid %, QA fractions | none |
 | `band_math` | expression or `index=` | stack |
@@ -52,7 +56,9 @@ transform, size, bounds, `pixel_area_m2`), `aoi`, `layers`, `qa`, `provenance`,
 Results are at most 1,500 characters and end with `run: rNNNN`. Errors end in a
 `Fix:` line. Mutating cases are approval-gated: `overwrite=true`, and
 `render_map` or `export_geotiff` with an explicit `path`.
-`get_satellite_data` is not gated but is bounded by `max_download_mb`.
+`get_satellite_data` is not gated and has no size limit; windows over 36 MP are
+refused as a memory guard, and a call stops at 600 s. Every tool definition the
+model sees is at most 1,600 characters.
 `spectral_indices` is the legacy `.npy` tool; use `band_math` on stacks.
 
 ## 3. Models
@@ -64,31 +70,36 @@ from names the model supplies. Fields: `name`, `version`, `tier`
 sensors, bands, unit, resolution, pair rules), `runtime` (`rules` or `onnx`;
 `remote` and `torch` parse only), `output`, `params`.
 
-Weights live in the user weights directory or `ATLAS_WEIGHTS_DIR`.
-`atlas models pull NAME` installs and `atlas models verify` re-hashes them. A
-model whose weight is missing is hidden from the agent. Heuristic RGB tools join
+Weights live in the user weights directory (`~/.atlas/weights`) or
+`ATLAS_WEIGHTS_DIR`. `atlas models pull NAME` installs and `atlas models verify`
+re-hashes them. Weight status is `ready`, `missing`, `corrupt`, `local` (pinned,
+no public URL, install with `--from PATH`) or `unpublished` (no pin). A model
+whose weight is not installed is hidden from the agent. Heuristic RGB tools join
 only with `ATLAS_HEURISTIC_MODELS=1`.
 
 | Model | Tier | Notes and limits |
 |---|---|---|
-| `cloud_mask` | learned, onnx | OmniCloudMask, MIT. Weight pin is PROVISIONAL; unpublished, use `--from`. |
+| `cloud_mask` | learned, onnx | OmniCloudMask V4, MIT. Local weight (no public URL); install with `atlas models pull cloud_mask --from PATH --accept-license`. |
 | `burn_severity` | baseline, rules | dNBR classes from fixed thresholds; not calibrated per fire. |
 | `water_extent` | baseline, rules | Index thresholds; shadow and wet soil confuse it. |
 | `sar_flood` | baseline, rules | VV pair in dB, same relative orbit; urban and vegetated areas give false results. |
 
 ## 4. Script path
 
-If no typed tool fits, the agent writes `analysis/scripts/<name>.py` and runs it
-with bash as `"$ATLAS_PYTHON"`. There is no python-exec tool. The bash
-environment sets `ATLAS_PYTHON`, `ATLAS_WORKSPACE` and `ATLAS_ARTIFACT_ROOT`.
+If no typed tool fits, the agent writes `.atlas/analysis/scripts/<name>.py` and runs
+it with bash as `"$ATLAS_PYTHON"`. There is no python-exec tool. The bash
+environment sets `ATLAS_PYTHON`, `ATLAS_WORKSPACE`, `ATLAS_ANALYSIS_DIR` (the
+persistent analysis directory) and `ATLAS_ARTIFACT_ROOT` (the session artifact
+root; only a fallback for scripts run outside the agent).
 Scripts import from `atlas.geo` (`open_stack`, `workspace`, `eval_expr`,
 `class_table`, `render_map`, `write_geotiff`, `finish`). `finish({...})` records
-the script's sha256 in `analysis/runs.jsonl` and prints `run: rNNNN`.
+the script's sha256 in `.atlas/analysis/runs.jsonl` and prints `run: rNNNN`.
 
 ## 5. Limits
 
-- Stacks do not survive a new session; `atlas geo stacks` lists them.
-- A pulled window is at most 36 MP; larger AOIs are refused.
+- Stacks and pulls persist across sessions; `atlas geo stacks` lists them.
+- No download limit. A pulled window is at most 36 MP (a memory guard); larger
+  AOIs are refused.
 - A stack is at most 200e6 cells; one UTM zone per AOI.
 - Long tools stop at 600 s and say so.
 - Per-pixel cloud masking exists only through QA planes or `cloud_mask`.
@@ -97,5 +108,5 @@ the script's sha256 in `analysis/runs.jsonl` and prints `run: rNNNN`.
 
 Every typed result carries a run id. The agent cites the tool name, run id and
 artifact path for each number, and the model tool name, version and licence for
-model output. `analysis/runs.jsonl` has one line per run with parameters and
+model output. `.atlas/analysis/runs.jsonl` has one line per run with parameters and
 input hashes; each stack's `stack.json` carries layer sources and `sha256`.

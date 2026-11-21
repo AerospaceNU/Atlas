@@ -5,7 +5,9 @@ Project root (the workspace, the current directory):
 - ``sessions/<id>/`` — one directory per session. ``meta.json`` records the
   id and model. No keys.
 - ``artifacts/<id>/`` — files that belong to that session id
-- ``data/`` — pulls from the data CLI (existing ``.atlas/data``)
+- ``analysis/`` — stacks, figures, tables, exports, scripts and ``runs.jsonl`` from the
+  satellite tools. Persistent and shared across sessions; removing a session keeps them.
+- ``data/`` — pulls from the data CLI and from ``get_satellite_data`` (persistent)
 - ``skills/`` and ``skills-drafts/`` — vetted skills and drafts that are not
   loaded until a person enables them
 - ``agent.toml`` — workspace model and tool-call budget

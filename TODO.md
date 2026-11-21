@@ -11,7 +11,9 @@ Plugins follow the `model.toml` schema 2: tiers `baseline`, `learned`,
 
 Packs today:
 
-- `cloud_mask` (OmniCloudMask, ONNX; hidden until its weight is published)
+- `cloud_mask` (OmniCloudMask V4, ONNX; local weight in `~/.atlas/weights`, installed with
+  `atlas models pull cloud_mask --from PATH --accept-license`; registers when the verified weight
+  is present and `onnxruntime` imports)
 - `burn_severity` (rules)
 - `water_extent` (rules)
 - `sar_flood` (rules)

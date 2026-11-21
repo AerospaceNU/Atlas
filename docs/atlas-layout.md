@@ -24,12 +24,12 @@ searched.
 | `artifacts/<id>/` | Files for that session. Removing the session removes this directory. |
 | `artifacts/<id>/tool-output/` | Full text of any tool result over 20,000 characters, redacted. It is `.atlas/tool-output/` when the artifact root is the workspace. |
 | `artifacts/<id>/jobs/<jobid>.log` | Background bash jobs, capped at 64 MiB each. Removed with the session. |
-| `artifacts/<id>/analysis/{stacks,figures,tables,exports,scripts}/` and `analysis/runs.jsonl` | Satellite analysis outputs and the run record. Stacks do not survive a new session. |
+| `analysis/{stacks,figures,tables,exports,scripts}/` and `analysis/runs.jsonl` | Satellite analysis outputs and the run record. Persistent and shared across sessions; removing a session does not remove them. Old per-session `artifacts/<id>/analysis/` directories are read-only fallbacks. |
 | `artifacts/<id>/subagents/<child>/plan.json` | A sub-agent's private plan. |
 | `checkpoints/<session>/<n>/` | Pre-edit copies of files for `/undo`. Child agents share the parent's chain. Outside `artifacts/`, so removing a session keeps its undo history. |
 | `audit.log` | One JSON line per tool and model event. |
 | `plan.json` | The plan written by `update_plan` and read by `read_plan`. |
-| `data/` | Data CLI pulls. This is the existing `.atlas/data` default. `manifest.json` is the pull manifest, one row per source, each with its own request. |
+| `data/` | Pulls from the data CLI and from `get_satellite_data`. Persistent across sessions. `manifest.json` is the pull manifest, one row per source, each with its own request. |
 | `skills/` | Vetted skills. |
 | `skills-drafts/` | Draft skills. They are not loaded until a person enables one. |
 | `agent.toml` | Workspace model and tool-call budget. |

@@ -14,7 +14,7 @@ def add_geo_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     geo_sub = parser.add_subparsers(dest="geo_command")
     guide = geo_sub.add_parser("guide", help="Print one guide topic")
     guide.add_argument("topic", nargs="?", default=None, help="workflow, stack, masks, ...")
-    geo_sub.add_parser("stacks", help="List stacks under the artifact root")
+    geo_sub.add_parser("stacks", help="List stacks under the workspace .atlas/analysis")
 
 
 def run_geo(args: argparse.Namespace) -> int:
