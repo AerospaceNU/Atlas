@@ -15,6 +15,7 @@ roles for ``spawn_agent``. With no tree the package prompt stays in force.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import time
 from collections.abc import Callable, Sequence
@@ -244,8 +245,9 @@ def run_headless(
         approval: Approval mode (``allow`` for eval; ``ask``/``deny`` keep edits out).
         model: Injected model (tests). When set, ``model_id``/``api_key`` are ignored.
         deadline_seconds: Wall-clock allowance. Once it has passed the turn
-            stops at the next round with ``cancelled=True``. It does not
-            interrupt a tool call or a model request that is in flight.
+            stops with ``cancelled=True``. A running bash/run_tests call and an
+            in-flight model stream are interrupted; other tools stop at the
+            next round.
         on_step: Called after each tool action, so a caller can keep a
             partial record of a run that is later killed.
         tool_profile: ``full`` keeps every tool; ``coding`` drops the satellite and
@@ -320,9 +322,19 @@ def run_headless(
             wall_seconds=round(time.monotonic() - started, 1),
         )
     finally:
+        # stop_all is process-wide; headless runs one agent per process.
+        _stop_jobs("run ended")
         close = getattr(active_model, "close", None)
         if owns_model and callable(close):
             close()
+
+
+def _stop_jobs(reason: str) -> None:
+    """Stop background bash jobs this process started; never raises."""
+    with contextlib.suppress(Exception):
+        from atlas.agent.tools._jobs import stop_all
+
+        stop_all(reason)
 
 
 def _assistant_notes(messages: Sequence[ChatMessage]) -> dict[str, str]:
