@@ -107,9 +107,13 @@ from atlas.agent.runtime import (
     load_spend_limit,
 )
 from atlas.agent.sessions import (
+    call_summary,
     discard_unused_session,
     first_prompt,
+    list_sessions,
+    newest_session,
     repair_history,
+    replay_items,
     write_meta,
 )
 from atlas.agent.skill_author import normalize_skill_name
@@ -198,6 +202,10 @@ class AgentSession:
         # rounds and before a tool batch, so a turn can be stopped without
         # killing the process that holds the history.
         self.cancel_event = threading.Event()
+        # A ``quit`` read while turn N runs stops turn N only; later turns run.
+        self.quit_turn: int | None = None
+        self._turn_no = 0
+        self.loaded_at_launch = False
         # Set when this session has a directory under .atlas/sessions.
         self.session_id: str | None = None
         # Approval round-trip. The reader thread fills a slot when a
@@ -275,13 +283,14 @@ class AgentSession:
         (``agent.partial_run``) is accounted like a finished run and the same
         exception propagates.
         """
+        self._turn_no += 1
         try:
             run = self.agent.advance(
                 self.messages,
                 on_step=on_step,
                 on_phase=self._autosaving_phase(on_phase),
                 on_thought=on_thought,
-                should_cancel=self.cancel_event.is_set,
+                should_cancel=self._should_cancel,
             )
         except BaseException:
             partial = self.agent.partial_run
@@ -295,6 +304,14 @@ class AgentSession:
         self._note(run)
         self._capture_analysis(run)
         return run
+
+    def _should_cancel(self) -> bool:
+        quit_turn = self.quit_turn
+        return self.cancel_event.is_set() or (quit_turn is not None and quit_turn >= self._turn_no)
+
+    def has_conversation(self) -> bool:
+        """Return whether any real user message has been added."""
+        return any(m.role is Role.USER and not m.tool_observation for m in self.messages)
 
     def _autosaving_phase(
         self, on_phase: Callable[[str, str | None], None] | None
@@ -823,6 +840,7 @@ def step_event(step: AgentStep) -> dict[str, Any]:
         "error_kind": step.error_kind,
         "artifacts": result.artifacts if result is not None else [],
         "notes": step.notes,
+        "summary": _safe_summary(step),
     }
 
 
@@ -837,6 +855,13 @@ def session_bound(session: AgentSession) -> Iterator[None]:
     finally:
         unbind_session_credentials()
         unbind_session_secrets()
+
+
+def _safe_summary(step: AgentStep) -> str:
+    try:
+        return call_summary(step.call.name, step.call.arguments)
+    except Exception:
+        return ""
 
 
 def serve(
@@ -860,12 +885,19 @@ def serve(
     )
     with session_bound(session):
         _remember_resolved_credentials(session)
-        return _serve_bound(session, stdin, stdout)
+        code = _serve_bound(session, stdin, stdout)
+        if session.has_conversation():
+            with contextlib.suppress(Exception):
+                session.save_state(only_if_dir_exists=True)
+        return code
 
 
 def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
     """Read the protocol after the session credential map is bound."""
     _write_line(stdout, _ready_event(session), session.secrets)
+    if session.loaded_at_launch:
+        session.loaded_at_launch = False
+        _write_line(stdout, _session_loaded_event(session), session.secrets)
     lines: queue.Queue[str | None] = queue.Queue()
     reader = threading.Thread(
         target=_read_protocol, args=(stdin, lines, session, stdout), daemon=True
@@ -971,6 +1003,10 @@ def _read_protocol(
         if isinstance(message, dict) and message.get("type") == "cancel":
             session.cancel_event.set()
             continue
+        if isinstance(message, dict) and message.get("type") == "quit":
+            session.quit_turn = session._turn_no
+            lines.put(text)
+            return
         if isinstance(message, dict) and message.get("type") == "permission":
             request_id = message.get("id")
             if isinstance(request_id, str):
@@ -1093,8 +1129,16 @@ def _handle_load_session(session: AgentSession, stdout: IO[str], message: dict[s
             session.secrets,
         )
         return
+    wanted = session_id.strip()
+    previous = session.session_id
+    if wanted == "last" and session.workspace is not None:
+        newest = newest_session(session.workspace, exclude=previous)
+        if newest is None:
+            _write_line(stdout, {"type": "error", "message": "No saved session"}, session.secrets)
+            return
+        wanted = newest
     try:
-        loaded = session.load_state(session_id.strip())
+        loaded = session.load_state(wanted)
     except (OSError, ValueError, ValidationError) as exc:
         _write_line(
             stdout,
@@ -1105,21 +1149,33 @@ def _handle_load_session(session: AgentSession, stdout: IO[str], message: dict[s
     if not loaded:
         _write_line(
             stdout,
-            {"type": "error", "message": f"No saved session {session_id.strip()}"},
+            {"type": "error", "message": f"No saved session {wanted}"},
             session.secrets,
         )
         return
-    _write_line(
-        stdout,
-        {
-            "type": "session_loaded",
-            "id": session.session_id,
-            "goal": session.goal,
-            "messages": len(session.messages),
-            **_status_fields(session),
-        },
-        session.secrets,
-    )
+    if (
+        session.workspace is not None
+        and isinstance(previous, str)
+        and previous != session.session_id
+    ):
+        discard_unused_session(session.workspace, previous)
+    _write_line(stdout, _session_loaded_event(session), session.secrets)
+
+
+def _session_loaded_event(session: AgentSession) -> dict[str, Any]:
+    replay, omitted = replay_items(session.messages, limit=40, max_chars=1500)
+    return {
+        "type": "session_loaded",
+        "id": session.session_id,
+        "goal": session.goal,
+        "messages": len(session.messages),
+        "saved_model": session.model_id,
+        "stopped_for_limit": session.stopped_for_limit,
+        "interrupted": session.interrupted,
+        "replay": replay,
+        "omitted": omitted,
+        **_status_fields(session),
+    }
 
 
 def _handle_new(session: AgentSession, stdout: IO[str]) -> None:
@@ -1575,16 +1631,31 @@ def _handle_list(session: AgentSession, stdout: IO[str], message: dict[str, Any]
     except (AtlasPathError, TypeError) as exc:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
-    _write_line(
-        stdout,
-        {
-            "type": "listing",
-            "scope": message.get("scope"),
-            "kind": message.get("kind"),
-            "names": names,
-        },
-        session.secrets,
-    )
+    payload: dict[str, Any] = {
+        "type": "listing",
+        "scope": message.get("scope"),
+        "kind": message.get("kind"),
+        "names": names,
+    }
+    if message.get("kind") == "sessions" and message.get("scope") == "project":
+        payload["sessions"] = _session_rows(session)
+    _write_line(stdout, payload, session.secrets)
+
+
+def _session_rows(session: AgentSession) -> list[dict[str, Any]]:
+    if session.workspace is None:
+        return []
+    try:
+        found = list_sessions(session.workspace, limit=50)
+    except OSError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in found:
+        row = item.model_dump()
+        prompt = str(row.get("prompt", ""))
+        row["prompt"] = prompt if len(prompt) <= 120 else prompt[:117] + "..."
+        rows.append(row)
+    return rows
 
 
 def _handle_remove(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
@@ -2138,8 +2209,10 @@ def build_session(
         list_models = getattr(active, "list_models", None)
         if list_models is not None:
             session.fetch_models = list_models
-        if resume is not None and not session.load_state(resume):
-            raise SessionNotFound(f"no saved session {resume}")
+        if resume is not None:
+            if not session.load_state(resume):
+                raise SessionNotFound(f"no saved session {resume}")
+            session.loaded_at_launch = True
     except BaseException:
         if owned:
             close = getattr(active, "close", None)
