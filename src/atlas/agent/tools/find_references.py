@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import fnmatch
 import os
+import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -11,10 +13,20 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
-from atlas.agent.tools._walk import prune_dirs
+from atlas.agent.tools._walk import load_ignore_set, prune_dirs
 
 _EXTRA_SKIP_DIRS = frozenset({"build", "dist", "target", ".atlas"})
 _DEFINITION_KINDS = frozenset({"class", "def", "assign", "param"})
+_PYTHON_SUFFIXES = (".py", ".pyi")
+_EXT_GLOB = re.compile(r"\*\.(\w+)")
+
+
+@dataclass
+class _ScanStats:
+    """Counts of Python files that could not be searched."""
+
+    unparsed: int = 0
+    skipped: int = 0
 
 
 @dataclass
@@ -67,9 +79,10 @@ class FindReferencesTool(Tool):
 
     name = "find_references"
     description = (
-        "Find where a Python name is defined and used (AST-based, so comments and strings are "
-        "ignored). Returns path:line:column with the source line. A directory scan skips .git, "
-        "virtualenvs, caches, build output (build, dist, target) and .atlas."
+        "Python only (.py/.pyi): find where a name is defined and used (AST-based, so comments "
+        "and strings are ignored). Returns path:line:column with the source line. A directory "
+        "scan skips git-ignored paths, .git, virtualenvs, caches, build output (build, dist, "
+        "target) and .atlas. For other languages use grep."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     max_file_bytes: ClassVar[int] = 1_000_000
@@ -85,14 +98,20 @@ class FindReferencesTool(Tool):
         base = store.resolve_read(request.path)
         if not base.exists():
             raise FileNotFoundError(f"Path does not exist: {request.path}")
+        refusal = self._non_python_refusal(request, base, store)
+        if refusal is not None:
+            return ToolResult(text=refusal)
         found: list[_Match] = []
         overflow = 0
         scanned = 0
-        for path, text in self._iter_python(base, request.glob, store.root):
+        stats = _ScanStats()
+        stopped = False
+        for path, text in self._iter_python(base, request.glob, store.root, stats):
             scanned += len(text.encode("utf-8", errors="replace"))
             if scanned > self.max_scan_bytes:
+                stopped = True
                 break
-            matches = self._scan_file(path, text, request.name, store)
+            matches = self._scan_file(path, text, request.name, store, stats)
             for match in matches:
                 if not request.include_definition and match.kind in _DEFINITION_KINDS:
                     continue
@@ -100,8 +119,6 @@ class FindReferencesTool(Tool):
                     found.append(match)
                 else:
                     overflow += 1
-        if not found and not overflow:
-            return ToolResult(text=f"no references to {request.name}")
         found.sort(key=lambda match: (match.path, match.line, match.column))
         rows = [
             f"{match.path}:{match.line}:{match.column}: {match.kind}: {match.text}"
@@ -109,23 +126,54 @@ class FindReferencesTool(Tool):
         ]
         if overflow:
             rows.append(f"... [{overflow} more matches]")
+        if not found and not overflow:
+            rows = [f"no references to {request.name}"]
+        rows.extend(self._notes(stats, stopped))
         return ToolResult(text="\n".join(rows))
 
+    def _non_python_refusal(
+        self, request: FindReferencesInput, base: Path, store: LocalArtifactStore
+    ) -> str | None:
+        """Return a refusal text when the target is explicitly not Python."""
+        ext: str | None = None
+        if base.is_file() and base.suffix.lower() not in _PYTHON_SUFFIXES:
+            ext = base.suffix
+        elif request.glob is not None:
+            found = _EXT_GLOB.fullmatch(request.glob)
+            if found is not None and f".{found.group(1).lower()}" not in _PYTHON_SUFFIXES:
+                ext = found.group(1)
+        if ext is None:
+            return None
+        return (
+            f"find_references reads Python (.py/.pyi) only; {store.relative(base)} is not "
+            f"Python. Use grep -w {request.name} for other languages."
+        )
+
+    def _notes(self, stats: _ScanStats, stopped: bool) -> list[str]:
+        """Return note lines for files that were not searched."""
+        notes: list[str] = []
+        if stats.unparsed:
+            notes.append(
+                f"note: {stats.unparsed} Python file(s) could not be parsed (syntax error) "
+                "and were not searched"
+            )
+        if stats.skipped:
+            notes.append(
+                f"note: {stats.skipped} Python file(s) over 1 MB, binary or non-UTF-8 were skipped"
+            )
+        if stopped:
+            notes.append("note: scan stopped after 20 MB; narrow path")
+        return notes
+
     def _iter_python(
-        self, base: Path, pattern: str | None, store_root: Path
-    ) -> list[tuple[Path, str]]:
-        """Return readable Python files under ``base`` with their text."""
-        if base.is_file():
-            candidates = [base]
-        else:
-            candidates = []
-            for root, dir_names, file_names in os.walk(base, followlinks=False):
-                prune_dirs(Path(root), dir_names, root=store_root, extra_skip=_EXTRA_SKIP_DIRS)
-                for name in sorted(file_names):
-                    candidates.append(Path(root) / name)
-        files: list[tuple[Path, str]] = []
-        for path in candidates:
-            if not path.is_file():
+        self, base: Path, pattern: str | None, store_root: Path, stats: _ScanStats
+    ) -> Iterator[tuple[Path, str]]:
+        """Yield readable Python files under ``base`` with their text.
+
+        Only ``.py``/``.pyi`` files are candidates, so ``stats.skipped`` counts Python only.
+        """
+        for path in self._candidates(base, store_root):
+            if path.suffix.lower() not in _PYTHON_SUFFIXES:
                 continue
             if pattern is not None and not fnmatch.fnmatch(path.name, pattern):
                 continue
@@ -134,20 +182,39 @@ class FindReferencesTool(Tool):
             except OSError:
                 continue
             if len(data) > self.max_file_bytes or b"\x00" in data:
+                stats.skipped += 1
                 continue
             try:
-                files.append((path, data.decode("utf-8")))
+                yield path, data.decode("utf-8")
             except UnicodeDecodeError:
-                continue
-        return files
+                stats.skipped += 1
+
+    def _candidates(self, base: Path, store_root: Path) -> Iterator[Path]:
+        """Yield regular files under ``base`` in sorted order, honouring skips and gitignore."""
+        if base.is_file():
+            yield base
+            return
+        ignore = load_ignore_set(base, root=store_root)
+        for root, dir_names, file_names in os.walk(base, followlinks=False):
+            current = Path(root)
+            prune_dirs(
+                current, dir_names, root=store_root, extra_skip=_EXTRA_SKIP_DIRS, ignore=ignore
+            )
+            for name in sorted(file_names):
+                if ignore is not None and ignore.hides_file(current, name):
+                    continue
+                path = current / name
+                if path.is_file():
+                    yield path
 
     def _scan_file(
-        self, path: Path, text: str, name: str, store: LocalArtifactStore
+        self, path: Path, text: str, name: str, store: LocalArtifactStore, stats: _ScanStats
     ) -> list[_Match]:
         """Parse one file and return its definition and reference matches."""
         try:
             tree = ast.parse(text)
         except SyntaxError:
+            stats.unparsed += 1
             return []
         lines = text.splitlines()
         display = store.relative(path)

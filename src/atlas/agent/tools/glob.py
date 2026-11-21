@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import fnmatch
 import glob as glob_module
+import itertools
 import os
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -11,7 +11,14 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
-from atlas.agent.tools._walk import SKIP_DIR_NAMES, prune_dirs
+from atlas.agent.tools._walk import (
+    SKIP_DIR_NAMES,
+    IgnoreSet,
+    expand_braces,
+    load_ignore_set,
+    match_glob,
+    prune_dirs,
+)
 
 
 class GlobInput(BaseModel):
@@ -30,7 +37,8 @@ class GlobInput(BaseModel):
         default=500, ge=1, le=10_000, description="Maximum number of paths to return."
     )
     include_ignored: bool = Field(
-        default=False, description="Also match inside .git, virtualenvs and caches."
+        default=False,
+        description="Also match inside .git, virtualenvs, caches and git-ignored paths.",
     )
 
 
@@ -43,52 +51,23 @@ def _names_skipped_dir(pattern: str) -> bool:
     return len(parts) > 1 and parts[0] in SKIP_DIR_NAMES
 
 
-def _single_segment(pattern: str) -> str | None:
-    """Return the file-name pattern when it matches at any depth, else None."""
-    bare = pattern[3:] if pattern.startswith("**/") else pattern
-    if "/" in bare or "**" in bare:
-        return None
-    return bare
-
-
 def _walk_matches(
-    base: Path, name_pattern: str, *, root: Path, include_ignored: bool
+    base: Path,
+    pattern: str,
+    *,
+    root: Path,
+    include_ignored: bool,
+    ignore: IgnoreSet | None,
 ) -> Iterator[str]:
-    """Yield entries at any depth whose name matches, pruning skipped directories."""
+    """Yield entries below ``base`` matching ``pattern``, pruning during the walk."""
     for current_name, dir_names, file_names in os.walk(base, followlinks=False):
         current = Path(current_name)
-        prune_dirs(current, dir_names, root=root, include_ignored=include_ignored)
+        prune_dirs(current, dir_names, root=root, include_ignored=include_ignored, ignore=ignore)
         for name in (*dir_names, *file_names):
-            if fnmatch.fnmatchcase(name, name_pattern):
-                yield str(current / name)
-
-
-def _match_parts(pattern: list[str], parts: list[str]) -> bool:
-    """Match path segments against pattern segments; ``**`` spans zero or more segments."""
-    if not pattern:
-        return not parts
-    head, rest = pattern[0], pattern[1:]
-    if head == "**":
-        return any(_match_parts(rest, parts[skip:]) for skip in range(len(parts) + 1))
-    if not parts:
-        return False
-    return fnmatch.fnmatchcase(parts[0], head) and _match_parts(rest, parts[1:])
-
-
-def _walk_path_matches(
-    base: Path, pattern: str, *, root: Path, include_ignored: bool
-) -> Iterator[str]:
-    """Yield entries whose path below ``base`` matches at any depth, pruning during the walk.
-
-    Mirrors ``Path.rglob`` for multi-segment patterns without entering skipped directories.
-    """
-    pattern_parts = ["**", *[part for part in pattern.split("/") if part]]
-    for current_name, dir_names, file_names in os.walk(base, followlinks=False):
-        current = Path(current_name)
-        prune_dirs(current, dir_names, root=root, include_ignored=include_ignored)
-        for name in (*dir_names, *file_names):
+            if ignore is not None and name in file_names and ignore.hides_file(current, name):
+                continue
             entry = current / name
-            if _match_parts(pattern_parts, list(entry.relative_to(base).parts)):
+            if match_glob(pattern, entry.relative_to(base).as_posix()):
                 yield str(entry)
 
 
@@ -106,7 +85,8 @@ class GlobTool(Tool):
     description = (
         "List files and directories matching a shell-style pattern such as '**/*.py'. "
         "Relative patterns resolve against the workspace; absolute patterns are allowed. "
-        ".git, virtualenvs and caches are skipped unless include_ignored is true."
+        "Respects .gitignore in git repos plus .git, virtualenvs and caches; set include_ignored "
+        "to search them. Supports {a,b} braces."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
 
@@ -122,9 +102,12 @@ class GlobTool(Tool):
         if not base.exists():
             raise FileNotFoundError(f"Path does not exist: {request.path}")
 
-        candidate_paths = self._candidates(request, base, store)
+        ignore = self._ignore_set(request, base, store)
+        candidate_paths = self._candidates(request, base, store, ignore)
         matches = [store.relative(Path(name)) for name in candidate_paths if Path(name).exists()]
         matches.sort()
+        if not matches:
+            return ToolResult(text=self._no_matches(request, base, store, ignore))
 
         overflow = len(matches) - request.max_results
         if overflow > 0:
@@ -132,22 +115,62 @@ class GlobTool(Tool):
             matches.append(f"... [truncated {overflow} more results]")
         return ToolResult(text="\n".join(matches))
 
-    def _candidates(
+    def _ignore_set(
         self, request: GlobInput, base: Path, store: LocalArtifactStore
+    ) -> IgnoreSet | None:
+        """Return the git-ignore set for a relative pattern over a directory base."""
+        pattern = os.path.expanduser(request.pattern)
+        path_pattern = Path(pattern)
+        if path_pattern.is_absolute() or ".." in path_pattern.parts or not base.is_dir():
+            return None
+        if request.include_ignored or _names_skipped_dir(pattern):
+            return None
+        return load_ignore_set(base, root=store.root)
+
+    def _no_matches(
+        self,
+        request: GlobInput,
+        base: Path,
+        store: LocalArtifactStore,
+        ignore: IgnoreSet | None,
+    ) -> str:
+        """Return ``no matches``, noting git-ignored hits only when some really exist."""
+        if ignore is None:
+            return "no matches"
+        hidden = self._candidates(request, base, store, None)
+        hits = sorted(
+            store.relative(Path(name))
+            for name in itertools.islice(hidden, 3)
+            if Path(name).exists()
+        )
+        if not hits:
+            return "no matches"
+        return (
+            f"no matches outside git-ignored paths; {len(hits)}+ match(es) are git-ignored "
+            f"(e.g. {', '.join(hits)}); set include_ignored=true to search them"
+        )
+
+    def _candidates(
+        self,
+        request: GlobInput,
+        base: Path,
+        store: LocalArtifactStore,
+        ignore: IgnoreSet | None,
     ) -> Iterable[str]:
         """Return raw candidate paths for the pattern."""
         pattern = os.path.expanduser(request.pattern)
         path_pattern = Path(pattern)
         if path_pattern.is_absolute():
-            return glob_module.glob(pattern, recursive=True)
+            return itertools.chain.from_iterable(
+                glob_module.glob(alt, recursive=True) for alt in expand_braces(pattern)
+            )
         if ".." in path_pattern.parts:
-            return glob_module.glob(str(base / pattern), recursive=True)
+            return itertools.chain.from_iterable(
+                glob_module.glob(str(base / alt), recursive=True) for alt in expand_braces(pattern)
+            )
         if not base.is_dir():
             return (str(path) for path in base.rglob(pattern))
         include_ignored = request.include_ignored or _names_skipped_dir(pattern)
-        name_pattern = _single_segment(pattern)
-        if name_pattern is not None:
-            return _walk_matches(
-                base, name_pattern, root=store.root, include_ignored=include_ignored
-            )
-        return _walk_path_matches(base, pattern, root=store.root, include_ignored=include_ignored)
+        return _walk_matches(
+            base, pattern, root=store.root, include_ignored=include_ignored, ignore=ignore
+        )
