@@ -1,0 +1,141 @@
+schema = 2
+name = "burn_severity"
+description = "Burn severity classes from the differenced normalised burn ratio (dNBR = NBR pre-fire minus NBR post-fire) on a prepared pre/post stack. Fixed threshold set, fire- and sensor-specific, not calibrated. Baseline rule pack: verify against imagery."
+version = "0.1.0"
+tier = "baseline"
+status = "rule_based"
+task = "burn_severity"
+
+[license]
+spdx = "MIT"
+holder = "Atlas contributors"
+
+[citation]
+text = "Key, C.H. and Benson, N.C. (2006). Landscape Assessment: Ground measure of severity, the Composite Burn Index; and Remote sensing of severity, the Normalized Burn Ratio. In FIREMON: Fire Effects Monitoring and Inventory System, USDA Forest Service RMRS-GTR-164-CD."
+
+[input]
+mode = "pair"
+sensors = ["sentinel2", "landsat8", "landsat9", "hls_sentinel", "hls_landsat"]
+bands = ["nir", "swir22"]
+unit = "reflectance"
+resolution_m = [10, 60]
+min_size = 16
+max_nodata_fraction = 0.5
+
+[input.band_sources.sentinel2]
+nir = "B8A"
+swir22 = "B12"
+
+[input.band_sources.landsat8]
+nir = "SR_B5"
+swir22 = "SR_B7"
+
+[input.band_sources.landsat9]
+nir = "SR_B5"
+swir22 = "SR_B7"
+
+[input.band_sources.hls_sentinel]
+nir = "B8A"
+swir22 = "B12"
+
+[input.band_sources.hls_landsat]
+nir = "B05"
+swir22 = "B07"
+
+[input.pair]
+require_same_grid = true
+require_same_orbit = false
+
+[runtime]
+kind = "rules"
+
+[runtime.rules.define]
+nbr_pre = "(pre.nir - pre.swir22) / (pre.nir + pre.swir22)"
+nbr_post = "(post.nir - post.swir22) / (post.nir + post.swir22)"
+dnbr = "nbr_pre - nbr_post"
+
+[[runtime.rules.classes]]
+code = 1
+name = "regrowth"
+when = "dnbr < t_regrowth"
+
+[[runtime.rules.classes]]
+code = 2
+name = "unburned"
+when = "dnbr < t_unburned"
+
+[[runtime.rules.classes]]
+code = 3
+name = "low"
+when = "dnbr < t_low"
+
+[[runtime.rules.classes]]
+code = 4
+name = "moderate_low"
+when = "dnbr < t_mod_low"
+
+[[runtime.rules.classes]]
+code = 5
+name = "moderate_high"
+when = "dnbr < t_mod_high"
+
+[[runtime.rules.classes]]
+code = 6
+name = "high"
+when = "dnbr >= t_mod_high"
+
+[output]
+kind = "classes"
+layer = "burn_severity"
+
+[output.classes]
+1 = "regrowth"
+2 = "unburned"
+3 = "low"
+4 = "moderate_low"
+5 = "moderate_high"
+6 = "high"
+
+# Thresholds on dNBR must stay strictly increasing:
+# t_regrowth < t_unburned < t_low < t_mod_low < t_mod_high. Per-parameter min/max cannot
+# enforce the order; an unordered override collapses classes (first match wins).
+[parameters.t_regrowth]
+type = "float"
+default = -0.10
+min = -1.0
+max = 2.0
+
+[parameters.t_unburned]
+type = "float"
+default = 0.10
+min = -1.0
+max = 2.0
+
+[parameters.t_low]
+type = "float"
+default = 0.27
+min = -1.0
+max = 2.0
+
+[parameters.t_mod_low]
+type = "float"
+default = 0.44
+min = -1.0
+max = 2.0
+
+[parameters.t_mod_high]
+type = "float"
+default = 0.66
+min = -1.0
+max = 2.0
+
+[evidence]
+card = "README.md"
+known_limits = [
+  "Threshold set is fire- and sensor-specific, not calibrated; the defaults are the USGS/FIREMON dNBR table, originally derived from Landsat.",
+  "Pre and post scenes must be the same season and phenology; vegetation change unrelated to fire shows up as dNBR.",
+  "Cloud and shadow are masked only through the QA planes of the stack; unmasked haze or shadow biases dNBR.",
+  "Sentinel-2 NIR is B8A (20 m) rather than B08 (10 m); this shifts dNBR relative to Landsat-derived thresholds.",
+  "Dark soil, water and burned-then-flooded ground give spurious dNBR.",
+  "No field-validated Composite Burn Index (CBI) calibration; thresholds t_regrowth < t_unburned < t_low < t_mod_low < t_mod_high must stay strictly increasing.",
+]
