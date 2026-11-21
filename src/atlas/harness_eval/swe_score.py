@@ -225,9 +225,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log-dir", type=Path, default=None)
     parser.add_argument("--timeout", type=int, default=1800)
     args = parser.parse_args(argv)
+    if not args.patch.is_file():
+        print(
+            f"swe_score: patch file not found: {args.patch}. Collection failed or the "
+            "rollout did not finish; see collect.json beside it.",
+            file=sys.stderr,
+        )
+        return 1
     try:
         instance = load_instance(args.eval_jsonl, args.instance_id)
-        patch = args.patch.read_text(encoding="utf-8") if args.patch.is_file() else ""
+        patch = args.patch.read_text(encoding="utf-8")
         verdict = score(
             instance, patch, args.log_dir or args.out.parent / "eval", timeout=args.timeout
         )

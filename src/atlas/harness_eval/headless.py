@@ -36,6 +36,7 @@ from atlas.agent.skills import Skill, load_skills, register_skill_tool, render_s
 from atlas.agent.tools._list_tools import ListToolsTool
 from atlas.agent.tools._subagent import SubagentTool
 from atlas.agent.trace import write_trace
+from atlas.harness_eval.patch import build_patch
 from atlas.harness_eval.substrate import InstalledHarness, SubagentRole, install_harness
 
 TOOL_PROFILES = ("full", "coding", "minimal")
@@ -342,16 +343,34 @@ def _assistant_notes(messages: Sequence[ChatMessage]) -> dict[str, str]:
 
 
 def collect_patch(workspace: Path) -> str:
-    """Return ``git diff`` for a workspace, or empty when not a git tree."""
+    """Return the diff against HEAD (untracked files included) for a workspace.
+
+    Empty when the workspace is not a git tree or HEAD is unborn.
+
+    Raises:
+        RuntimeError: When the patch could not be computed; failure is never
+            reported as an empty patch.
+    """
     if not (workspace / ".git").exists():
         return ""
-    proc = subprocess.run(
-        ["git", "-C", str(workspace), "diff", "--no-color"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    return proc.stdout
+    head = ["git", "-C", str(workspace)]
+    try:
+        if (
+            subprocess.run(
+                [*head, "rev-parse", "--verify", "-q", "HEAD"], capture_output=True
+            ).returncode
+            != 0
+        ):
+            unborn = subprocess.run([*head, "symbolic-ref", "-q", "HEAD"], capture_output=True)
+            if unborn.returncode == 0:
+                return ""
+            raise RuntimeError("could not collect patch: not a usable git repository")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"could not collect patch: {exc}") from exc
+    res = build_patch(workspace, "HEAD")
+    if not res.ok:
+        raise RuntimeError(f"could not collect patch: {res.error}")
+    return res.patch
 
 
 def render_step(step: AgentStep, *, obs_trunc: int = 50_000) -> str:
