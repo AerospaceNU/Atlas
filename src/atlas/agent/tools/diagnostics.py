@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -11,12 +12,15 @@ from pydantic import BaseModel, Field
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
 from atlas.agent.tools._process import run_captured
+from atlas.agent.tools._project_env import project_bin
+from atlas.agent.tools._walk import SKIP_DIR_NAMES
 
 DiagnosticName = Literal["ruff", "mypy", "cargo"]
 _DIAGNOSTIC_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+):(?:(?P<column>\d+):)? (?P<message>.+)$")
 _MAX_DIAGNOSTICS = 100
 _MAX_OUTPUT_CHARS = 100_000
 _CRASH_TAIL_LINES = 20
+_PYTHON_SUFFIXES = {".py", ".pyi"}
 
 
 @dataclass
@@ -76,25 +80,34 @@ class DiagnosticsTool(Tool):
         target = store.resolve_read(request.path)
         if not target.exists():
             raise FileNotFoundError(f"Path does not exist: {request.path}")
-        checks, missing = self._resolve(request.tools, root, request.path)
+        wanted: list[DiagnosticName] = list(request.tools or ["ruff", "mypy", "cargo"])
+        skipped: list[str] = []
+        if target.is_file() and target.suffix not in _PYTHON_SUFFIXES:
+            skipped = [n for n in wanted if n in ("ruff", "mypy")]
+            wanted = [n for n in wanted if n not in ("ruff", "mypy")]
+        checks, missing = self._resolve(wanted, root, request.path) if wanted else ([], [])
         rows: list[str] = []
         if missing:
             rows.append("missing: " + ", ".join(missing))
+        if skipped:
+            rows.append(f"skipped {', '.join(skipped)}: {request.path} is not a Python file")
         if not checks:
             rows.append("no diagnostics tools available")
             return ToolResult(text="\n".join(rows))
         for check in checks:
             rows.append(self._run_check(check, request.timeout))
+        ran_python = any(check.name in ("ruff", "mypy") for check in checks)
+        if target.is_dir() and ran_python and not _has_python_files(target):
+            rows.append(f"note: no Python files under {request.path}")
         text = "\n".join(rows)
         if len(text) > _MAX_OUTPUT_CHARS:
             text = text[:_MAX_OUTPUT_CHARS] + "\n... [output truncated]"
         return ToolResult(text=text)
 
     def _resolve(
-        self, requested: list[DiagnosticName] | None, root: Path, path: str
+        self, wanted: list[DiagnosticName], root: Path, path: str
     ) -> tuple[list[_Check], list[str]]:
         """Return runnable checks and the names that are unavailable."""
-        wanted = requested or ["ruff", "mypy", "cargo"]
         checks: list[_Check] = []
         missing: list[str] = []
         for name in wanted:
@@ -175,11 +188,20 @@ class DiagnosticsTool(Tool):
 
 
 def _find_binary(root: Path, name: str) -> str | None:
-    """Return an installed tool binary from PATH or the project's venv."""
-    found = shutil.which(name)
-    if found is not None:
-        return found
-    for candidate in (root / ".venv" / "bin" / name, root / "venv" / "bin" / name):
-        if candidate.is_file():
-            return str(candidate)
-    return None
+    """Return an installed tool binary: the project venv first, then PATH."""
+    return project_bin(root, name) or shutil.which(name)
+
+
+def _has_python_files(path: Path, limit: int = 20_000) -> bool:
+    """True when a Python file exists under ``path``, or the tree is too big to say."""
+    seen = 0
+    for _, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIR_NAMES]
+        for name in files:
+            if name.endswith((".py", ".pyi")):
+                return True
+            seen += 1
+        seen += len(dirs)
+        if seen >= limit:
+            return True
+    return False
