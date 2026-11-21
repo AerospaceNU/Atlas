@@ -26,6 +26,7 @@ from atlas.agent.contracts import (
     ToolDefinition,
 )
 from atlas.agent.images import apply_image_budget
+from atlas.agent.scope import ModelCancelled, cancel_requested
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
@@ -37,7 +38,23 @@ _MAX_ATTEMPTS = 4
 _RETRY_BASE_DELAY = 0.5
 _RETRY_BACKOFF = 2.0
 _RETRY_AFTER_CAP = 30.0
-_sleep = time.sleep
+_CANCEL_SLICE = 0.1
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep up to seconds in short slices, returning early once the run is cancelled.
+
+    Returns silently on cancel; the caller raises. Cooperative: it never kills a thread.
+    """
+    deadline = time.monotonic() + seconds
+    while not cancel_requested():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(_CANCEL_SLICE, remaining))
+
+
+_sleep = _interruptible_sleep
 _OVERFLOW_STATUS = frozenset({400, 413, 422})
 _OVERFLOW_MARKERS = (
     "context_length_exceeded",
@@ -170,7 +187,11 @@ class OpenRouterModel:
 
         Older image attachments are removed until the newest ones fit in the
         request budget. Those bytes are not sent again on a later call.
+
+        Raises:
+            ModelCancelled: The run was cancelled before or during the request.
         """
+        _raise_if_cancelled()
         apply_image_budget(messages)
         payload: dict[str, Any] = {
             "model": self.config.model,
@@ -273,6 +294,7 @@ class OpenRouterModel:
         delay = _RETRY_BASE_DELAY
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             retry_after: float | None = None
+            _raise_if_cancelled()
             try:
                 return self._complete(payload)
             except OpenRouterHTTPError as exc:
@@ -474,6 +496,11 @@ def _stream_error(payload: dict[str, Any], resp: Any, started: float) -> OpenRou
     )
 
 
+def _raise_if_cancelled() -> None:
+    if cancel_requested():
+        raise ModelCancelled("model request cancelled")
+
+
 def _iter_events(resp: Any) -> Iterator[dict[str, Any]]:
     """Yield SSE payloads as each line arrives.
 
@@ -489,6 +516,7 @@ def _iter_events(resp: Any) -> Iterator[dict[str, Any]]:
         body = resp.json()
         raw_lines = (json.dumps(body), "[DONE]")
     for raw in raw_lines:
+        _raise_if_cancelled()
         text = raw.decode() if isinstance(raw, bytes) else raw
         if not isinstance(text, str):
             continue
