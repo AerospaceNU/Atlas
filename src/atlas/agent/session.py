@@ -7,6 +7,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
@@ -97,6 +98,12 @@ from atlas.agent.runtime import (
     load_reasoning_effort,
     load_spend_limit,
 )
+from atlas.agent.sessions import (
+    discard_unused_session,
+    first_prompt,
+    repair_history,
+    write_meta,
+)
 from atlas.agent.skill_author import normalize_skill_name
 from atlas.agent.skills import Skill, load_skills, register_skill_tool
 
@@ -137,10 +144,14 @@ class AgentSession:
     two user messages in a row. Those messages stay separate.
     """
 
+    AUTOSAVE_SECONDS: float = 5.0
+
     def __init__(self, agent: Agent) -> None:
         self.agent = agent
         self.messages: list[ChatMessage] = self.agent.opening_messages()
         self.stopped_for_limit = False
+        self.interrupted = False
+        self._last_autosave: float | None = None
         self.session_key: str | None = None
         self.credential_keys: dict[str, str] = {}
         self.home: Path | None = None
@@ -225,6 +236,8 @@ class AgentSession:
             message.images = ingest_images(self.agent.artifacts, list(images))
         self._begin_analysis(request)
         self.messages.append(message)
+        self.interrupted = True
+        self._autosave(force=True)
         return self._advance(on_step, on_phase, on_thought)
 
     def resume(
@@ -236,8 +249,10 @@ class AgentSession:
     ) -> AgentRun:
         """Continue a turn that stopped at the tool-call limit, with a fresh budget."""
         self._require_key()
-        if not self.stopped_for_limit:
+        if not (self.stopped_for_limit or self.interrupted):
             raise RuntimeError("Session is not stopped for the tool-call limit")
+        self.interrupted = True
+        self._autosave(force=True)
         return self._advance(on_step, on_phase, on_thought)
 
     def _advance(
@@ -256,7 +271,7 @@ class AgentSession:
             run = self.agent.advance(
                 self.messages,
                 on_step=on_step,
-                on_phase=on_phase,
+                on_phase=self._autosaving_phase(on_phase),
                 on_thought=on_thought,
                 should_cancel=self.cancel_event.is_set,
             )
@@ -268,9 +283,31 @@ class AgentSession:
                     self._note(partial)
             raise
         self.stopped_for_limit = run.stopped_for_limit
+        self.interrupted = False
         self._note(run)
         self._capture_analysis(run)
         return run
+
+    def _autosaving_phase(
+        self, on_phase: Callable[[str, str | None], None] | None
+    ) -> Callable[[str, str | None], None]:
+        def wrapped(phase: str, detail: str | None = None) -> None:
+            if phase in ("thinking", "working"):
+                self._autosave()
+            if on_phase is not None:
+                on_phase(phase, detail)
+
+        return wrapped
+
+    def _autosave(self, *, force: bool = False) -> None:
+        """Save at a round boundary, at most every AUTOSAVE_SECONDS; never raises."""
+        now = time.monotonic()
+        last = self._last_autosave
+        if not force and last is not None and now - last < self.AUTOSAVE_SECONDS:
+            return
+        self._last_autosave = now
+        with contextlib.suppress(Exception):
+            self.save_state(only_if_dir_exists=True)
 
     def compact(self) -> ContextCompaction:
         """Halve the estimated context when possible, keeping protected messages.
@@ -298,10 +335,13 @@ class AgentSession:
         workspace. Reads keep the previous read root, so this never widens
         write access to the workspace.
         """
+        old_id = self.session_id
         self.goal = ""
         self._goal_message = None
         self.active_skills = []
         self.stopped_for_limit = False
+        self.interrupted = False
+        self._last_autosave = None
         self.totals = SessionTotals(
             model=self.model_id or self.totals.model,
             context_limit=self.totals.context_limit,
@@ -312,6 +352,8 @@ class AgentSession:
             self.session_id = session_id
             artifact_root = project_artifact_dir(self.workspace, session_id)
             self.agent.artifacts = LocalArtifactStore(self.workspace, artifact_root=artifact_root)
+            if isinstance(old_id, str) and old_id != session_id:
+                discard_unused_session(self.workspace, old_id)
         self.messages = self.agent.opening_messages()
 
     def set_goal(self, text: str) -> None:
@@ -433,7 +475,7 @@ class AgentSession:
         self.active_skills.append(skill.name)
         return skill
 
-    def save_state(self) -> None:
+    def save_state(self, *, only_if_dir_exists: bool = False) -> None:
         """Write this conversation to ``.atlas/sessions/<id>/state.json``.
 
         The file holds the model id, the goal, the message history, and the
@@ -445,9 +487,12 @@ class AgentSession:
         if self.workspace is None or self.session_id is None:
             return
         directory = project_session_dir(self.workspace, self.session_id)
+        if only_if_dir_exists and not directory.is_dir():
+            return
         directory.mkdir(parents=True, exist_ok=True)
+        snapshot = list(self.messages)
         messages = []
-        for message in self.messages:
+        for message in snapshot:
             dumped = message.model_dump(mode="json")
             dumped["images"] = []
             messages.append(dumped)
@@ -458,6 +503,8 @@ class AgentSession:
             "messages": messages,
             "totals": self.totals.model_dump(mode="json"),
             "saved": datetime.now(UTC).isoformat(),
+            "interrupted": self.interrupted,
+            "stopped_for_limit": self.stopped_for_limit,
         }
         text = json.dumps(payload, indent=2)
         for secret in self.secrets:
@@ -467,12 +514,28 @@ class AgentSession:
         temporary = directory / ".state.json.tmp"
         temporary.write_text(text + "\n", encoding="utf-8")
         os.replace(temporary, target)
+        prompt = first_prompt(snapshot)
+        for secret in self.secrets:
+            if secret:
+                prompt = prompt.replace(secret, "[redacted]")
+        with contextlib.suppress(OSError):
+            write_meta(
+                directory,
+                session_id=self.session_id,
+                model=self.model_id,
+                messages=sum(1 for item in snapshot if item.role is not Role.SYSTEM),
+                saved=str(payload["saved"]),
+                interrupted=self.interrupted,
+                stopped_for_limit=self.stopped_for_limit,
+                prompt=prompt,
+            )
 
-    def load_state(self, session_id: str) -> bool:
+    def load_state(self, session_id: str, *, adopt_model: bool = True) -> bool:
         """Restore a saved conversation into this session.
 
         Args:
             session_id: Directory name under ``.atlas/sessions``.
+            adopt_model: Take the saved model id; False keeps the current one.
 
         Returns:
             True when a saved state was loaded. A missing file leaves the
@@ -492,6 +555,7 @@ class AgentSession:
         if not isinstance(payload, dict):
             raise ValueError("saved session must be a JSON object")
         messages = [ChatMessage.model_validate(item) for item in payload.get("messages", [])]
+        inserted = repair_history(messages)
         self.session_id = session_id
         self.messages = messages
         self.goal = str(payload.get("goal") or "")
@@ -499,11 +563,24 @@ class AgentSession:
         if isinstance(totals, dict):
             self.totals = SessionTotals.model_validate(totals)
         model = payload.get("model")
-        if isinstance(model, str) and model.strip():
+        if adopt_model and isinstance(model, str) and model.strip():
             self.model_id = model.strip()
             self.totals.model = self.model_id
         artifact_root = project_artifact_dir(self.workspace, session_id)
         self.agent.artifacts = LocalArtifactStore(self.workspace, artifact_root=artifact_root)
+        if messages and messages[0].role is Role.SYSTEM:
+            messages[0] = self.agent.opening_messages()[0]
+        goal_text = session_goal_text(self.goal) if self.goal else None
+        self._goal_message = next(
+            (m for m in messages if goal_text and m.role is Role.USER and m.content == goal_text),
+            None,
+        )
+        self.stopped_for_limit = bool(payload.get("stopped_for_limit"))
+        self.interrupted = bool(payload.get("interrupted")) or inserted > 0
+        last = messages[-1] if messages else None
+        if last is not None and last.role is Role.ASSISTANT and not last.tool_calls:
+            self.interrupted = False
+        self._last_autosave = None
         return True
 
     def ask_permission(self, request: Any, emit: Callable[[dict[str, Any]], None]) -> bool:
@@ -908,6 +985,9 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
     except MissingOpenRouterKey as exc:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
+    except KeyboardInterrupt:
+        _save_after_failure(session)
+        raise
     except OpenRouterHTTPError as exc:
         _save_after_failure(session)
         _write_http_error(session, stdout, exc)
@@ -956,6 +1036,9 @@ def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
     except MissingOpenRouterKey as exc:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
+    except KeyboardInterrupt:
+        _save_after_failure(session)
+        raise
     except OpenRouterHTTPError as exc:
         _save_after_failure(session)
         _write_http_error(session, stdout, exc)
@@ -1947,6 +2030,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             model=model_id, api_key=api_key, reasoning_effort=load_reasoning_effort(workspace)
         )
     )
+    active_id = session_id
     try:
         agent = Agent(
             model,
@@ -1981,8 +2065,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         registry.register(SubagentTool(build_child))
         session = AgentSession(agent)
         session.session_id = session_id
-        if args.resume:
-            session.load_state(args.resume)
+        launch_id = session_id
+        loaded = bool(args.resume) and session.load_state(args.resume)
+        if loaded and launch_id != session.session_id:
+            discard_unused_session(workspace, launch_id)
+            active_id = session.session_id or launch_id
         session.requires_api_key = True
         session.home = home
         session.workspace = workspace
@@ -1990,6 +2077,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session.fetch_models = model.list_models
         return serve(session, sys.stdin, sys.stdout, redact=api_key or None)
     finally:
+        discard_unused_session(workspace, active_id)
         model.close()
 
 
