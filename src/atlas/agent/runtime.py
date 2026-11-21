@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import datetime
 import difflib
+import hashlib
 import json
 import logging
+import platform
 import re
 import secrets
+import sys
 import time
 import tomllib
 from collections.abc import Callable, Sequence
@@ -22,16 +26,19 @@ from atlas.agent.contracts import (
     ChatMessage,
     ModelCall,
     ModelImage,
+    ModelResponse,
     Role,
     ToolCall,
     ToolCapableModel,
     ToolRegistry,
     ToolResult,
+    UnknownToolError,
 )
 from atlas.agent.images import ingest_image, ingest_images, is_model_image
 from atlas.agent.instructions import load_project_instructions
 from atlas.agent.layout import project_agent_config_path, project_atlas_root
 from atlas.agent.metrics import observe_model_call, output_tokens_per_second
+from atlas.agent.model import validate_reasoning_effort
 from atlas.agent.skills import (
     Skill,
     render_system_prompt,
@@ -62,7 +69,39 @@ _STOPPED_CONTEXT = (
 )
 _PREVIEW_LIMIT = 4000
 _DIGEST_HEADER = "Context digest (earlier turns)"
-_DIGEST_LIMIT_CHARS = 2000
+_DIGEST_LIMIT_CHARS = 3000
+
+_MAX_EMPTY_REPLY_NUDGES = 2
+_MAX_INTENT_NUDGES = 1
+_INTENT_MAX_CHARS = 400
+_INTENT_PREFIXES = (
+    "let me",
+    "let's",
+    "i'll",
+    "i will",
+    "i'm going to",
+    "i am going to",
+    "now i",
+    "next, i",
+    "next i",
+)
+_NUDGE_INTENT = (
+    "You described a next step but did not call a tool. If the work is not finished, make "
+    "that tool call now. If it is finished, give your final answer."
+)
+_MAX_OVERFLOW_RETRIES = 3
+_OVERFLOW_SHRINK = 0.5
+_NUDGE_LENGTH = (
+    "Your last reply was cut off at the output limit before it contained any text or tool "
+    "call. Continue the task in smaller steps: call a tool, or give your final answer."
+)
+_NUDGE_EMPTY = (
+    "Your last reply was empty: no text and no tool call. Continue the task: call a tool, "
+    "or give your final answer."
+)
+_DIGEST_EDIT_TOOLS = frozenset({"edit_file", "patch_file", "write_file", "apply_patch"})
+_NOTE_CHARS = 200
+_DIGEST_CAPS = {"edited": 24, "read": 24, "commands": 12, "errors": 12, "notes": 8, "plan": 12}
 
 # Tool calls in one assistant turn are independent, so they run concurrently.
 # The cap keeps a model that emits twenty calls from opening twenty shells.
@@ -70,7 +109,16 @@ _MAX_PARALLEL_TOOLS = 4
 
 # Tools that change the workspace. A read-only session refuses them, and each
 # one is checkpointed before it runs so /undo can put the file back.
-MUTATING_TOOLS = frozenset({"apply_patch", "bash_tool", "edit_file", "patch_file", "write_file"})
+MUTATING_TOOLS = frozenset(
+    {"apply_patch", "bash", "edit_file", "git_commit", "patch_file", "write_file"}
+)
+
+_MAX_VALIDATION_CHARS = 1500
+_REPEAT_NOTE_AT = 3
+_MIN_BUDGET_WARNING_CALLS = 20
+_TOOL_OUTPUT_DIR = "tool-output"
+_MAX_SPILL_ID_CHARS = 64
+_MAX_ENV_PATH_CHARS = 300
 
 ErrorKind = Literal[
     "validation",
@@ -90,6 +138,7 @@ class AgentStep(BaseModel):
     result: ToolResult | None = None
     error: str | None = None
     error_kind: ErrorKind | None = None
+    notes: list[str] = Field(default_factory=list)
 
 
 class PermissionRequest(BaseModel):
@@ -132,6 +181,17 @@ class AgentRun(BaseModel):
     cancelled: bool = False
     calls: list[ModelCall] = Field(default_factory=list)
     compaction: ContextCompaction = Field(default_factory=ContextCompaction)
+    empty_replies: int = 0
+    intent_nudges: int = 0
+    error: str | None = None
+
+
+def _announces_next_step(text: str) -> bool:
+    """Return whether a short text-only reply announces work instead of finishing it."""
+    stripped = text.strip()
+    if not stripped or len(stripped) > _INTENT_MAX_CHARS:
+        return False
+    return stripped.lower().startswith(_INTENT_PREFIXES)
 
 
 def _load_agent_config(root: Path) -> dict[str, object]:
@@ -226,6 +286,21 @@ def load_max_tool_calls(root: Path) -> int:
     return value
 
 
+def load_reasoning_effort(root: Path) -> str | None:
+    """Return ``reasoning_effort`` from ``.atlas/agent.toml``, or None when unset.
+
+    Raises:
+        ValueError: The key is present but not an OpenRouter effort level.
+    """
+    data = _load_agent_config(root)
+    if "reasoning_effort" not in data:
+        return None
+    value = data["reasoning_effort"]
+    if not isinstance(value, str):
+        raise ValueError("reasoning_effort must be a string")
+    return validate_reasoning_effort(value)
+
+
 def ensure_agent_config(root: Path) -> Path:
     """Create ``.atlas/agent.toml`` with defaults when the file is missing.
 
@@ -307,15 +382,40 @@ class Agent:
         self.on_permission = on_permission
         self.skills = list(skills or [])
         self.instruction_nonce = secrets.token_hex(8)
+        self.partial_run: AgentRun | None = None
+        # Applied to the saved copy of an oversized tool result (never to the visible head/tail).
+        self.redact_output: Callable[[str], str] | None = None
+        self._empty_replies = 0
+        self._intent_nudges = 0
 
     def system_prompt(self) -> str:
         """Return the package system prompt, plus the skill catalog when skills are loaded."""
         return render_system_prompt(load_system_prompt(), self.skills)
 
+    def environment_context(self) -> str:
+        """Return host facts the model cannot infer: directory, shell, platform, date.
+
+        Contains no file contents and no git data.
+        """
+        store = self.artifacts
+        root = _clean_path(store.root)
+        shell_root = _clean_path(store.read_root or store.root)
+        return "\n".join(
+            [
+                "Environment",
+                f"- Working directory: {root} (relative tool paths resolve here)",
+                f"- Shell: bash runs each command in a new shell starting in {shell_root}; "
+                "cd and exported variables do not carry over to the next call",
+                f"- Platform: {platform.system()} {platform.release()} ({sys.platform})",
+                f"- Date: {_today()}",
+            ]
+        )
+
     def opening_messages(self) -> list[ChatMessage]:
         """Return the trusted system prompt and any project instructions.
 
-        The first message is :meth:`system_prompt` and nothing else. When the
+        The first message is :meth:`system_prompt` followed by
+        :meth:`environment_context` and nothing else. When the
         project root has a readable instruction file, the next message is that
         file as delimited project guidance with role ``user``. The wrapper tags
         use :attr:`instruction_nonce`. A missing or unreadable file leaves the
@@ -325,7 +425,8 @@ class Agent:
         Returns:
             The messages that start a run or a session.
         """
-        messages = [ChatMessage(role=Role.SYSTEM, content=self.system_prompt())]
+        system = f"{self.system_prompt()}\n\n{self.environment_context()}"
+        messages = [ChatMessage(role=Role.SYSTEM, content=system)]
         instructions = load_project_instructions(self.artifacts, nonce=self.instruction_nonce)
         if instructions is not None:
             messages.append(ChatMessage(role=Role.USER, content=instructions))
@@ -368,10 +469,45 @@ class Agent:
 
         ``max_tokens`` and ``max_spend_usd`` stop the turn with
         :data:`_STOPPED_BUDGET` once the running total is at or past the limit.
+
+        An empty model reply (no text, no tool call) is answered with a short
+        nudge, at most :data:`_MAX_EMPTY_REPLY_NUDGES` times in a row (a reply with
+        tool calls resets the count), and never spends tool budget. A text-only
+        reply that announces a next step after at least one tool call is nudged
+        once per call (:func:`_announces_next_step`), also without spending budget. A model exception is re-raised unchanged after the
+        work so far is stored on :attr:`partial_run`. A provider refusal for
+        context length compacts the history and retries.
         """
+        self.partial_run = None
+        self._empty_replies = 0
+        self._intent_nudges = 0
+        run = self._advance_turn(
+            messages,
+            on_step=on_step,
+            on_phase=on_phase,
+            on_thought=on_thought,
+            should_cancel=should_cancel,
+        )
+        run.empty_replies = self._empty_replies
+        run.intent_nudges = self._intent_nudges
+        return run
+
+    def _advance_turn(
+        self,
+        messages: list[ChatMessage],
+        *,
+        on_step: Callable[[AgentStep], None] | None,
+        on_phase: Callable[[str, str | None], None] | None,
+        on_thought: Callable[[str, float | None], None] | None,
+        should_cancel: Callable[[], bool] | None,
+    ) -> AgentRun:
+        """Run the loop for :meth:`advance`."""
+        nudges = 0
         steps: list[AgentStep] = []
         calls: list[ModelCall] = []
         executed = 0
+        budget_warned = False
+        repeats: dict[tuple[str, str], tuple[int, str]] = {}
         compaction = ContextCompaction()
         current_user = _current_user_message(messages)
 
@@ -393,12 +529,7 @@ class Agent:
             emit("thinking" if reasoning else "working")
             if _estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
                 change = _compact(messages, protected_user=current_user, root=self.artifacts.root)
-                compaction.occurred |= change.occurred
-                compaction.tokens_reclaimed += change.tokens_reclaimed
-                compaction.tool_results_shortened += change.tool_results_shortened
-                compaction.messages_dropped += change.messages_dropped
-                compaction.digest_inserted |= change.digest_inserted
-                compaction.digest_chars = max(compaction.digest_chars, change.digest_chars)
+                _merge_compaction(compaction, change)
                 if _estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
                     return AgentRun(
                         response=_STOPPED_CONTEXT,
@@ -407,102 +538,135 @@ class Agent:
                         stopped_for_context=True,
                         compaction=compaction,
                     )
-            response = self.model.complete(messages, self.tools.definitions)
+            completed = self._complete(messages, current_user, steps, calls, compaction)
+            if isinstance(completed, AgentRun):
+                return completed
+            response = completed
             observed = observe_model_call(response)
             if observed is not None:
                 calls.append(observed)
-            messages.append(
-                ChatMessage(
-                    role=Role.ASSISTANT,
-                    content=response.content,
-                    tool_calls=response.tool_calls,
-                    reasoning=response.reasoning,
-                    reasoning_details=response.reasoning_details,
+            empty = not response.tool_calls and not (response.content or "").strip()
+            if empty:
+                self._empty_replies += 1
+            elif response.tool_calls:
+                nudges = 0  # the cap counts consecutive empty replies only
+            discard = empty and nudges < _MAX_EMPTY_REPLY_NUDGES
+            if not discard and not empty:
+                messages.append(
+                    ChatMessage(
+                        role=Role.ASSISTANT,
+                        content=response.content,
+                        tool_calls=response.tool_calls,
+                        reasoning=response.reasoning,
+                        reasoning_details=response.reasoning_details,
+                    )
                 )
-            )
-            if response.reasoning and on_thought is not None:
-                speed = output_tokens_per_second(
-                    response.usage.completion_tokens,
-                    response.timing,
-                )
-                on_thought(response.reasoning, speed)
-            if not response.tool_calls:
-                return AgentRun(
-                    response=response.content or "", steps=steps, calls=calls, compaction=compaction
-                )
-            if should_cancel is not None and should_cancel():
-                run = self._stop_cancelled(messages, steps, calls, response.tool_calls)
-                run.compaction = compaction
-                return run
-            if self._over_budget(calls):
-                self._answer_pending(
+            try:
+                if response.reasoning and on_thought is not None:
+                    speed = output_tokens_per_second(
+                        response.usage.completion_tokens,
+                        response.timing,
+                    )
+                    on_thought(response.reasoning, speed)
+                if discard:
+                    if self._over_budget(calls):
+                        return AgentRun(
+                            response=_STOPPED_BUDGET,
+                            steps=steps,
+                            stopped_for_budget=True,
+                            calls=calls,
+                            compaction=compaction,
+                        )
+                    nudges += 1
+                    nudge = _NUDGE_LENGTH if response.finish_reason == "length" else _NUDGE_EMPTY
+                    messages.append(
+                        ChatMessage(role=Role.USER, content=nudge, tool_observation=True)
+                    )
+                    continue
+                if (
+                    not response.tool_calls
+                    and executed >= 1
+                    and self._intent_nudges < _MAX_INTENT_NUDGES
+                    and _announces_next_step(response.content or "")
+                ):
+                    if self._over_budget(calls):
+                        return AgentRun(
+                            response=_STOPPED_BUDGET,
+                            steps=steps,
+                            stopped_for_budget=True,
+                            calls=calls,
+                            compaction=compaction,
+                        )
+                    self._intent_nudges += 1
+                    messages.append(
+                        ChatMessage(role=Role.USER, content=_NUDGE_INTENT, tool_observation=True)
+                    )
+                    continue
+                if not response.tool_calls:
+                    return AgentRun(
+                        response=response.content or "",
+                        steps=steps,
+                        calls=calls,
+                        compaction=compaction,
+                    )
+                if should_cancel is not None and should_cancel():
+                    run = self._stop_cancelled(messages, steps, calls, response.tool_calls)
+                    run.compaction = compaction
+                    return run
+                if self._over_budget(calls):
+                    self._answer_pending(
+                        messages,
+                        steps,
+                        response.tool_calls,
+                        error="token or spend budget reached",
+                        error_kind="budget",
+                    )
+                    return AgentRun(
+                        response=_STOPPED_BUDGET,
+                        steps=steps,
+                        stopped_for_budget=True,
+                        calls=calls,
+                        compaction=compaction,
+                    )
+
+                pending: list[ToolCall] = []
+                limited: list[ToolCall] = []
+                for call in response.tool_calls:
+                    if executed < self.max_tool_calls:
+                        pending.append(call)
+                        executed += 1
+                    else:
+                        limited.append(call)
+
+                warning: str | None = None
+                if (
+                    pending
+                    and not budget_warned
+                    and self.max_tool_calls >= _MIN_BUDGET_WARNING_CALLS
+                    and executed >= self.max_tool_calls - max(2, self.max_tool_calls // 10)
+                ):
+                    budget_warned = True
+                    warning = (
+                        f"tool budget: {executed} of {self.max_tool_calls} calls used this turn, "
+                        f"{self.max_tool_calls - executed} left. Finish the current change, verify "
+                        "it, and give your final answer before the budget runs out."
+                    )
+                self._tool_phase(
                     messages,
                     steps,
-                    response.tool_calls,
-                    error="token or spend budget reached",
-                    error_kind="budget",
+                    response,
+                    pending,
+                    limited,
+                    repeats=repeats,
+                    warning=warning,
+                    emit=emit,
+                    on_step=on_step,
                 )
-                return AgentRun(
-                    response=_STOPPED_BUDGET,
-                    steps=steps,
-                    stopped_for_budget=True,
-                    calls=calls,
-                    compaction=compaction,
+            except BaseException as exc:
+                self._close_interrupted_round(
+                    messages, steps, calls, compaction, response.tool_calls, exc
                 )
-
-            pending: list[ToolCall] = []
-            limited: list[ToolCall] = []
-            for call in response.tool_calls:
-                if executed < self.max_tool_calls:
-                    pending.append(call)
-                    executed += 1
-                else:
-                    limited.append(call)
-
-            for call in (*pending, *limited):
-                emit("tool_calling", call.name)
-            results = self._execute_all(pending, on_phase=emit) if pending else []
-
-            attached: list[ModelImage] = []
-            image_errors: list[str] = []
-            for call, step in zip(pending, results, strict=True):
-                images, errors = _ingest_tool_images(step, self.artifacts)
-                if errors and step.error is None:
-                    step.error = "\n".join(errors)
-                    step.error_kind = "tool_failure"
-                steps.append(step)
-                messages.append(
-                    ChatMessage(
-                        role=Role.TOOL,
-                        tool_call_id=call.id,
-                        content=_tool_message(step),
-                    )
-                )
-                attached.extend(images)
-                image_errors.extend(errors)
-                if on_step is not None:
-                    on_step(step)
-            for call in limited:
-                step = AgentStep(call=call, error="tool call limit reached", error_kind="limit")
-                steps.append(step)
-                messages.append(
-                    ChatMessage(
-                        role=Role.TOOL,
-                        tool_call_id=call.id,
-                        content=_tool_message(step),
-                    )
-                )
-                if on_step is not None:
-                    on_step(step)
-            if attached or image_errors:
-                messages.append(
-                    ChatMessage(
-                        role=Role.USER,
-                        content="\n".join(image_errors) if image_errors else None,
-                        images=attached,
-                        tool_observation=True,
-                    )
-                )
+                raise
             if executed >= self.max_tool_calls or limited:
                 return AgentRun(
                     response=_STOPPED_RESPONSE,
@@ -518,6 +682,151 @@ class Agent:
             calls=calls,
             compaction=compaction,
         )
+
+    def _tool_phase(
+        self,
+        messages: list[ChatMessage],
+        steps: list[AgentStep],
+        response: ModelResponse,
+        pending: Sequence[ToolCall],
+        limited: Sequence[ToolCall],
+        *,
+        repeats: dict[tuple[str, str], tuple[int, str]],
+        warning: str | None,
+        emit: Callable[[str, str | None], None],
+        on_step: Callable[[AgentStep], None] | None,
+    ) -> None:
+        """Run one round's tools and append a tool message for every call, in order."""
+        for call in (*pending, *limited):
+            emit("tool_calling", call.name)
+        argument_errors = response.argument_errors
+        results = self._run_round(pending, argument_errors, emit)
+        for call, step in zip(pending, results, strict=True):
+            if call.id not in argument_errors:
+                self._add_notes(step, repeats)
+        if warning is not None and results:
+            results[-1].notes.append(warning)
+        attached: list[ModelImage] = []
+        image_errors: list[str] = []
+        for call, step in zip(pending, results, strict=True):
+            images, errors = _ingest_tool_images(step, self.artifacts)
+            if errors and step.error is None:
+                step.error = "\n".join(errors)
+                step.error_kind = "tool_failure"
+            steps.append(step)
+            messages.append(self._tool_chat_message(call, step))
+            attached.extend(images)
+            image_errors.extend(errors)
+            if on_step is not None:
+                on_step(step)
+        for call in limited:
+            step = AgentStep(call=call, error="tool call limit reached", error_kind="limit")
+            steps.append(step)
+            messages.append(self._tool_chat_message(call, step))
+            if on_step is not None:
+                on_step(step)
+        if attached or image_errors:
+            messages.append(
+                ChatMessage(
+                    role=Role.USER,
+                    content="\n".join(image_errors) if image_errors else None,
+                    images=attached,
+                    tool_observation=True,
+                )
+            )
+
+    def _tool_chat_message(self, call: ToolCall, step: AgentStep) -> ChatMessage:
+        """Build the tool message for a step, with saved output redacted when configured."""
+        return ChatMessage(
+            role=Role.TOOL,
+            tool_call_id=call.id,
+            content=_tool_message(step, self.artifacts, self.redact_output),
+        )
+
+    def _close_interrupted_round(
+        self,
+        messages: list[ChatMessage],
+        steps: list[AgentStep],
+        calls: list[ModelCall],
+        compaction: ContextCompaction,
+        tool_calls: Sequence[ToolCall],
+        exc: BaseException,
+    ) -> None:
+        """Answer every tool call still unanswered after an exception; never swallows it.
+
+        The caller re-raises ``exc``. History stays a valid call/result sequence.
+        """
+        answered = {m.tool_call_id for m in messages if m.role is Role.TOOL}
+        missing = [call for call in tool_calls if call.id not in answered]
+        self._answer_pending(
+            messages,
+            steps,
+            missing,
+            error=f"interrupted: {type(exc).__name__}",
+            error_kind="cancelled",
+        )
+        if isinstance(exc, Exception):
+            self._store_partial(steps, calls, compaction, exc)
+
+    def _store_partial(
+        self,
+        steps: list[AgentStep],
+        calls: list[ModelCall],
+        compaction: ContextCompaction,
+        exc: BaseException,
+    ) -> None:
+        """Record the work done before ``exc`` on :attr:`partial_run`."""
+        self.partial_run = AgentRun(
+            response="",
+            steps=steps,
+            calls=calls,
+            compaction=compaction,
+            empty_replies=self._empty_replies,
+            intent_nudges=self._intent_nudges,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    def _complete(
+        self,
+        messages: list[ChatMessage],
+        current_user: ChatMessage | None,
+        steps: list[AgentStep],
+        calls: list[ModelCall],
+        compaction: ContextCompaction,
+    ) -> ModelResponse | AgentRun:
+        """Call the model once, compacting and retrying on a context-length refusal.
+
+        The shrink target is a fraction of the current estimate; no provider window is
+        read and ``MAX_CONTEXT_TOKENS`` is never changed. Any other exception is stored
+        as :attr:`partial_run` and re-raised unchanged (a ``BaseException`` too).
+        """
+        retries = 0
+        while True:
+            try:
+                return self.model.complete(messages, self.tools.definitions)
+            except BaseException as exc:
+                if not (isinstance(exc, Exception) and getattr(exc, "is_context_overflow", False)):
+                    self._store_partial(steps, calls, compaction, exc)
+                    raise
+                change = ContextCompaction()
+                if retries < _MAX_OVERFLOW_RETRIES:
+                    retries += 1
+                    limit = max(1, int(_estimate_tokens(messages) * _OVERFLOW_SHRINK))
+                    change = _compact(
+                        messages,
+                        protected_user=current_user,
+                        root=self.artifacts.root,
+                        limit=limit,
+                    )
+                    _merge_compaction(compaction, change)
+                if not change.occurred:
+                    return AgentRun(
+                        response=_STOPPED_CONTEXT,
+                        steps=steps,
+                        calls=calls,
+                        stopped_for_context=True,
+                        compaction=compaction,
+                    )
 
     def _over_budget(self, calls: Sequence[ModelCall]) -> bool:
         """Return true once the running usage reaches a configured budget."""
@@ -547,7 +856,7 @@ class Agent:
         file, or an edit beside a patch, must not interleave, and a checkpoint
         taken in parallel with the write it protects is not a checkpoint.
         """
-        serial = any(call.name in MUTATING_TOOLS for call in calls) or len(calls) <= 1
+        serial = any(_is_mutating(call) for call in calls) or len(calls) <= 1
         if on_phase is not None:
             for call in calls:
                 on_phase("tool_executing", call.name)
@@ -582,25 +891,121 @@ class Agent:
         for call in pending:
             step = AgentStep(call=call, error=error, error_kind=error_kind)
             steps.append(step)
-            messages.append(
-                ChatMessage(
-                    role=Role.TOOL,
-                    tool_call_id=call.id,
-                    content=_tool_message(step),
-                )
+            messages.append(self._tool_chat_message(call, step))
+
+    def _run_round(
+        self,
+        pending: Sequence[ToolCall],
+        argument_errors: dict[str, str],
+        emit: Callable[[str, str | None], None],
+    ) -> list[AgentStep]:
+        """Execute a round, recording unparseable calls as validation steps unexecuted."""
+        runnable = [call for call in pending if call.id not in argument_errors]
+        ran = iter(self._execute_all(runnable, on_phase=emit) if runnable else [])
+        steps: list[AgentStep] = []
+        for call in pending:
+            if call.id in argument_errors:
+                steps.append(_argument_error_step(call, argument_errors[call.id]))
+            else:
+                steps.append(next(ran))
+        return steps
+
+    def _add_notes(self, step: AgentStep, repeats: dict[tuple[str, str], tuple[int, str]]) -> None:
+        """Attach harness feedback to a step; never changes its result or raises."""
+        call = step.call
+        unknown = self._unknown_argument_note(call)
+        if unknown is not None:
+            step.notes.append(unknown)
+        try:
+            key = (call.name, json.dumps(call.arguments, sort_keys=True, default=str))
+            text = step.result.text if step.result is not None else (step.error or "")
+            digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+            previous = repeats.get(key)
+            count = previous[0] + 1 if previous is not None and previous[1] == digest else 1
+            repeats[key] = (count, digest)
+        except Exception:
+            return
+        if count >= _REPEAT_NOTE_AT:
+            step.notes.append(
+                f"this exact call has returned the same result {count} times; repeating it "
+                "will not help. Change the arguments or try a different approach."
             )
+
+    def _unknown_argument_note(self, call: ToolCall) -> str | None:
+        """Name arguments the tool's input model does not declare, or None."""
+        try:
+            tool = self.tools.get(call.name)
+            if tool is None:
+                return None
+            fields = tool.input_model.model_fields
+            accepted = set(fields)
+            for info in fields.values():
+                if info.alias:
+                    accepted.add(info.alias)
+                if isinstance(info.validation_alias, str):
+                    accepted.add(info.validation_alias)
+            unknown = sorted(str(name) for name in call.arguments if name not in accepted)
+            if not unknown:
+                return None
+            return (
+                f"ignored unknown argument(s): {', '.join(unknown)}; "
+                f"valid arguments: {', '.join(fields)}"
+            )
+        except Exception:
+            return None
+
+    def _validation_message(self, call: ToolCall, exc: ValidationError) -> str:
+        """Render a validation failure without pydantic URLs or echoed input."""
+        lines = [f"Invalid arguments for {call.name}:"]
+        for error in exc.errors(include_url=False, include_context=False, include_input=False):
+            location = ".".join(str(part) for part in error["loc"]) or "(arguments)"
+            lines.append(f"- {location}: {error['msg']}")
+        try:
+            tool = self.tools.get(call.name)
+            if tool is not None:
+                parts = []
+                for name, info in tool.input_model.model_fields.items():
+                    if info.is_required():
+                        parts.append(f"{name} (required)")
+                    else:
+                        default = info.get_default(call_default_factory=True)
+                        parts.append(f"{name} (default {default!r})")
+                lines.append("Expected arguments: " + ", ".join(parts))
+        except Exception:
+            pass
+        text = "\n".join(lines)
+        if len(text) > _MAX_VALIDATION_CHARS:
+            text = text[: _MAX_VALIDATION_CHARS - 3] + "..."
+        return text
 
     def _checkpoint(self, call: ToolCall) -> None:
         """Snapshot a file a mutating tool is about to change."""
-        if call.name not in MUTATING_TOOLS:
+        if not _is_mutating(call) or call.name in {"run_tests", "git_commit"}:
             return
-        path = call.arguments.get("path")
-        if not isinstance(path, str) or not path:
-            return
+        if call.name == "apply_patch":
+            paths = [] if self._patch_is_dry_run(call) else _patch_paths(call.arguments)
+        else:
+            path = call.arguments.get("path")
+            paths = [path] if isinstance(path, str) and path else []
+        for path in paths:
+            try:
+                snapshot(self.artifacts, path)
+            except Exception:
+                _LOGGER.exception("Could not checkpoint %s before %s", path, call.name)
+
+    def _patch_is_dry_run(self, call: ToolCall) -> bool:
+        """Return whether apply_patch will not write, using the tool's own coercion.
+
+        Validation failure also means nothing is written, so no snapshot is needed.
+        """
+        tool = self.tools.get("apply_patch")
+        if tool is None:
+            return True
         try:
-            snapshot(self.artifacts, path)
-        except Exception:
-            _LOGGER.exception("Could not checkpoint %s before %s", path, call.name)
+            request = tool.input_model.model_validate(call.arguments)
+        except ValidationError:
+            return True
+        return getattr(request, "dry_run", False) is True
 
     def _execute(self, call: ToolCall) -> AgentStep:
         decision = self._approve(call)
@@ -611,7 +1016,12 @@ class Agent:
         try:
             result = self.tools.execute(call.name, call.arguments, self.artifacts)
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, UnknownToolError):
+                error = self._unknown_tool_message(call.name)
+            elif isinstance(exc, ValidationError):
+                error = self._validation_message(call, exc)
+            else:
+                error = f"{type(exc).__name__}: {exc}"
             audit_event(
                 self.artifacts,
                 "tool",
@@ -630,6 +1040,15 @@ class Agent:
         )
         return AgentStep(call=call, result=result)
 
+    def _unknown_tool_message(self, name: str) -> str:
+        """Name the registered tools and the closest match; nothing is aliased."""
+        names = sorted(self.tools.names)
+        text = f"Unknown tool '{name}'."
+        close = difflib.get_close_matches(name, names, n=1, cutoff=0.6)
+        if close:
+            text += f" Did you mean '{close[0]}'?"
+        return f"{text} Available tools: {', '.join(names)}."
+
     def _approve(self, call: ToolCall) -> str | None:
         """Return a refusal message, or None when the call may run.
 
@@ -638,7 +1057,7 @@ class Agent:
         ``on_permission``. An ``ask`` session with no approver is treated as
         deny with an explicit message, never as allow.
         """
-        if call.name not in MUTATING_TOOLS:
+        if not _is_mutating(call):
             return None
         if self.read_only:
             return f"{call.name} is refused: this session is read-only"
@@ -661,9 +1080,13 @@ class Agent:
 
     def _preview(self, call: ToolCall) -> str:
         """Return a short, human-readable preview of what the call would change."""
-        if call.name == "bash_tool":
+        if call.name == "bash":
             command = call.arguments.get("command")
             return str(command or "")[:_PREVIEW_LIMIT]
+        if call.name == "run_tests":
+            return _argv_text(call.arguments)[:_PREVIEW_LIMIT]
+        if call.name == "git_commit":
+            return str(call.arguments.get("message") or "")[:_PREVIEW_LIMIT]
         patch = call.arguments.get("patch")
         if isinstance(patch, str):
             return patch[:_PREVIEW_LIMIT]
@@ -690,10 +1113,84 @@ class Agent:
 
 def _summary(call: ToolCall) -> str:
     """Return a one-line description of a mutating call for the approver."""
-    if call.name == "bash_tool":
+    if call.name == "bash":
         return f"run: {str(call.arguments.get('command') or '')[:200]}"
+    if call.name == "run_tests":
+        return f"run: {_argv_text(call.arguments)[:200]}"
+    if call.name == "git_commit":
+        return f"git commit: {str(call.arguments.get('message') or '')[:200]}"
     path = call.arguments.get("path")
     return f"{call.name} {path}" if path else call.name
+
+
+def _argv_text(arguments: dict[str, Any]) -> str:
+    """Return a run_tests argv as one display line."""
+    command = arguments.get("command")
+    if isinstance(command, list):
+        return " ".join(str(part) for part in command)
+    return str(command or "")
+
+
+def _is_mutating(call: ToolCall) -> bool:
+    """Return whether a call can change the workspace or repository.
+
+    ``run_tests`` is only mutating with an explicit ``command``, which runs any argv.
+    """
+    if call.name in MUTATING_TOOLS:
+        return True
+    return call.name == "run_tests" and bool(call.arguments.get("command"))
+
+
+def _patch_paths(arguments: dict[str, Any]) -> list[str]:
+    """Return the files named by the ``---``/``+++`` headers of an apply_patch call."""
+    patch = arguments.get("patch")
+    if not isinstance(patch, str):
+        return []
+    paths: list[str] = []
+    for line in patch.splitlines():
+        candidate = _patch_line_path(line)
+        if candidate and candidate != "/dev/null" and candidate not in paths:
+            paths.append(candidate)
+    return paths
+
+
+def _patch_line_path(line: str) -> str:
+    """Return the path a patch header or envelope line names, or an empty string."""
+    for prefix in _PATCH_ENVELOPE_PREFIXES:
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip()
+    if not line.startswith(("+++ ", "--- ")):
+        return ""
+    candidate = line[4:].split("\t", 1)[0].strip().strip('"')
+    if candidate.startswith(("a/", "b/")):
+        candidate = candidate[2:]
+    return candidate
+
+
+_PATCH_ENVELOPE_PREFIXES = ("*** Update File:", "*** Add File:")
+
+
+def _argument_error_step(call: ToolCall, reason: str) -> AgentStep:
+    """Record a call whose arguments could not be parsed; it is never executed."""
+    return AgentStep(
+        call=call,
+        error=(
+            f"Invalid arguments for {call.name}: {reason} Resend the call with complete, valid "
+            "JSON arguments; split a large write into several smaller calls."
+        ),
+        error_kind="validation",
+    )
+
+
+def _today() -> str:
+    """Return the local date as YYYY-MM-DD; tests monkeypatch this."""
+    return datetime.date.today().isoformat()
+
+
+def _clean_path(path: Path) -> str:
+    """Return a path safe to place in a prompt: no control characters, capped length."""
+    text = "".join("?" if ord(ch) < 32 or ord(ch) == 127 else ch for ch in str(path))
+    return text[:_MAX_ENV_PATH_CHARS]
 
 
 def _preview_text(old: str, arguments: dict[str, Any]) -> str | None:
@@ -720,7 +1217,7 @@ def _preview_text(old: str, arguments: dict[str, Any]) -> str | None:
 
 
 def _kind(exc: Exception) -> ErrorKind:
-    if isinstance(exc, KeyError):
+    if isinstance(exc, UnknownToolError):
         return "unknown_tool"
     if isinstance(exc, ValidationError):
         return "validation"
@@ -732,10 +1229,32 @@ class _Digest:
     """What the model still needs from tool exchanges that left the context."""
 
     dropped: int = 0
-    files: list[str] = field(default_factory=list)
+    edited: list[str] = field(default_factory=list)
+    read: list[str] = field(default_factory=list)
     commands: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     plan: list[str] = field(default_factory=list)
+
+
+_DIGEST_SECTIONS = (
+    ("edited", "Edited:"),
+    ("read", "Read:"),
+    ("commands", "Commands:"),
+    ("errors", "Errors:"),
+    ("notes", "Notes:"),
+    ("plan", "Plan:"),
+)
+
+
+def _merge_compaction(total: ContextCompaction, change: ContextCompaction) -> None:
+    """Fold one compaction pass into the running totals for a turn."""
+    total.occurred |= change.occurred
+    total.tokens_reclaimed += change.tokens_reclaimed
+    total.tool_results_shortened += change.tool_results_shortened
+    total.messages_dropped += change.messages_dropped
+    total.digest_inserted |= change.digest_inserted
+    total.digest_chars = max(total.digest_chars, change.digest_chars)
 
 
 def _is_digest(message: ChatMessage) -> bool:
@@ -748,20 +1267,25 @@ def _compact(
     *,
     protected_user: ChatMessage | None = None,
     root: Path | None = None,
+    limit: int | None = None,
 ) -> ContextCompaction:
     """Shorten observations, then replace dropped tool exchanges with a digest.
 
     Keep the opening instructions, every system message, the current user
     request, and the last six messages. A tool-call batch intersecting those
     messages is kept whole. Dropped exchanges are folded into one protected
-    system digest so later turns keep the files, commands, errors, and plan.
-    Work toward 80% of the trigger to leave headroom.
+    system digest so later turns keep edited and read files, commands, errors,
+    assistant notes, and the plan. Every user request that is not a tool
+    observation is protected. ``limit`` is the token trigger; None reads the
+    module constant ``MAX_CONTEXT_TOKENS`` at call time. Work toward 80% of it.
     """
+    if limit is None:
+        limit = MAX_CONTEXT_TOKENS
     sizes = [_message_chars(message) for message in messages]
     total = sum(sizes)
     before = total // CHARS_PER_TOKEN
     result = ContextCompaction()
-    if before <= MAX_CONTEXT_TOKENS:
+    if before <= limit:
         return result
 
     if protected_user is None:
@@ -783,13 +1307,14 @@ def _compact(
             or index >= recent_start
             or messages[index].role is Role.SYSTEM
             or messages[index] is protected_user
+            or (messages[index].role is Role.USER and not messages[index].tool_observation)
             for index in group
         )
         for index in group
     }
     if digest_index is not None:
         protected.add(digest_index)
-    target = int(MAX_CONTEXT_TOKENS * _COMPACT_TARGET_FRACTION) * CHARS_PER_TOKEN
+    target = int(limit * _COMPACT_TARGET_FRACTION) * CHARS_PER_TOKEN
 
     for index, message in enumerate(messages):
         if total <= target:
@@ -841,14 +1366,24 @@ def _collect_digest(
 ) -> _Digest:
     """Summarise the dropped messages without re-reading their full text."""
     calls = {call.id: call for message in messages for call in message.tool_calls}
+    failed_calls = _failed_call_ids(messages)
     digest = _Digest(dropped=len(indexes))
-    files: list[str] = []
+    edited: list[str] = []
+    read: list[str] = []
     commands: list[str] = []
     errors: list[str] = []
+    notes: list[str] = []
     for index in indexes:
         message = messages[index]
         for tool_call in message.tool_calls:
-            _add_argument_paths(tool_call.arguments, files)
+            if tool_call.name not in _DIGEST_EDIT_TOOLS:
+                _add_argument_paths(tool_call.arguments, read)
+            elif tool_call.id not in failed_calls:
+                _add_argument_paths(tool_call.arguments, edited)
+        if message.role is Role.ASSISTANT:
+            note = _note_line(message.content)
+            if note:
+                notes.append(note)
         if message.role is not Role.TOOL:
             continue
         current_call = calls.get(message.tool_call_id or "")
@@ -861,18 +1396,59 @@ def _collect_digest(
             if error is not None:
                 kind, detail = error
                 errors.append(f"{kind}: {detail}")
+                read.extend(_saved_paths(_error_text(content)))
             continue
-        for artifact in result.artifacts:
-            files.append(artifact)
+        read.extend(result.artifacts)
+        read.extend(_saved_paths(result.text))
         command = _command_summary(current_call, result.text, name)
         if command:
             commands.append(command)
     if root is not None:
-        digest.plan = _plan_lines(root)
-    digest.files = _unique(files)[:24]
-    digest.commands = _unique(commands)[-12:]
-    digest.errors = _unique(errors)[-12:]
+        digest.plan = [_one_line(line) for line in _plan_lines(root)[-_DIGEST_CAPS["plan"] :]]
+    edited, read, commands, errors, notes = (
+        [_one_line(value) for value in values] for values in (edited, read, commands, errors, notes)
+    )
+    digest.edited = _unique(edited)[-_DIGEST_CAPS["edited"] :]
+    digest.read = [path for path in _unique(read) if path not in digest.edited]
+    digest.read = digest.read[-_DIGEST_CAPS["read"] :]
+    digest.commands = _unique(commands)[-_DIGEST_CAPS["commands"] :]
+    digest.errors = _unique(errors)[-_DIGEST_CAPS["errors"] :]
+    digest.notes = _unique(notes)[-_DIGEST_CAPS["notes"] :]
     return digest
+
+
+def _saved_paths(text: str) -> list[str]:
+    """Return the paths of saved full-output copies a tool message points to."""
+    return [match.group(1).strip() for match in _SAVED_PATH_RE.finditer(text)]
+
+
+def _error_text(content: str) -> str:
+    """Return the full error string of a JSON error payload, or an empty string."""
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return ""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return error if isinstance(error, str) else ""
+
+
+def _failed_call_ids(messages: Sequence[ChatMessage]) -> set[str]:
+    """Return ids of tool calls whose matching tool message is an error payload."""
+    return {
+        message.tool_call_id
+        for message in messages
+        if message.role is Role.TOOL
+        and message.tool_call_id
+        and _json_error(message.content or "") is not None
+    }
+
+
+def _note_line(content: str | None) -> str:
+    """Return the first non-empty line of assistant text, capped, or an empty string."""
+    for line in (content or "").splitlines():
+        if line.strip():
+            return line.strip()[:_NOTE_CHARS]
+    return ""
 
 
 def _add_argument_paths(arguments: dict[str, Any], files: list[str]) -> None:
@@ -880,16 +1456,7 @@ def _add_argument_paths(arguments: dict[str, Any], files: list[str]) -> None:
     path = arguments.get("path")
     if isinstance(path, str) and path.strip():
         files.append(path.strip())
-    patch = arguments.get("patch")
-    if isinstance(patch, str):
-        for line in patch.splitlines():
-            if not line.startswith("+++ "):
-                continue
-            candidate = line[4:].split("\t", 1)[0].strip().strip('"')
-            if candidate.startswith(("a/", "b/")):
-                candidate = candidate[2:]
-            if candidate and candidate != "/dev/null":
-                files.append(candidate)
+    files.extend(_patch_paths(arguments))
     targets = arguments.get("files")
     if isinstance(targets, list):
         for target in targets:
@@ -955,72 +1522,82 @@ def _plan_lines(root: Path) -> list[str]:
 
 
 def _unique(values: Sequence[str]) -> list[str]:
-    """Return values in first-seen order without duplicates."""
-    seen: list[str] = []
-    for value in values:
+    """Return values without duplicates, each at the position of its last occurrence."""
+    seen: set[str] = set()
+    kept: list[str] = []
+    for value in reversed(values):
         if value not in seen:
-            seen.append(value)
-    return seen
+            seen.add(value)
+            kept.append(value)
+    kept.reverse()
+    return kept
+
+
+def _one_line(value: str) -> str:
+    """Replace every line break (as ``str.splitlines`` sees them) with a space."""
+    return " ".join(value.splitlines()) if value else value
 
 
 def _merge_digest(existing: _Digest, new: _Digest) -> _Digest:
-    """Roll a new digest into the one already in the history."""
+    """Roll a new digest into the existing one; newest entries win the cap.
+
+    The plan is a snapshot: the new plan replaces the old one when it has any.
+    """
     merged = _Digest(dropped=existing.dropped + new.dropped)
-    limits = {"files": 24, "commands": 12, "errors": 12, "plan": 12}
-    for name, limit in limits.items():
+    for name, limit in _DIGEST_CAPS.items():
+        if name == "plan":
+            merged.plan = list(new.plan or existing.plan)
+            continue
         combined = _unique([*getattr(existing, name), *getattr(new, name)])
         setattr(merged, name, combined[-limit:])
+    merged.read = [path for path in merged.read if path not in merged.edited]
     return merged
 
 
 def _render_digest(digest: _Digest) -> str:
-    """Render the digest as a compact system message."""
+    """Render the digest as one compact system message, one entry per line."""
     lines = [f"{_DIGEST_HEADER}: {digest.dropped} messages compacted"]
-    if digest.files:
-        lines.append("Files: " + ", ".join(digest.files))
-    if digest.commands:
-        lines.append("Commands:")
-        lines.extend(f"  {command}" for command in digest.commands)
-    if digest.errors:
-        lines.append("Errors:")
-        lines.extend(f"  {error}" for error in digest.errors)
-    if digest.plan:
-        lines.append("Plan:")
-        lines.extend(f"  {item}" for item in digest.plan)
+    for name, title in _DIGEST_SECTIONS:
+        entries: list[str] = getattr(digest, name)
+        if entries:
+            lines.append(title)
+            lines.extend(f"  {entry}" for entry in entries)
     return "\n".join(lines)
 
 
 def _trim_digest(digest: _Digest) -> None:
-    """Drop digest entries until the rendered message fits its hard cap."""
+    """Drop the oldest entry of the largest section until the message fits its cap."""
     while len(_render_digest(digest)) > _DIGEST_LIMIT_CHARS:
-        groups = [digest.files, digest.commands, digest.errors, digest.plan]
+        groups: list[list[str]] = [getattr(digest, name) for name, _ in _DIGEST_SECTIONS]
         largest = max(groups, key=len)
         if not largest:
             return
-        largest.pop()
+        largest.pop(0)
 
 
 def _parse_digest(text: str) -> _Digest:
-    """Read a digest already in the history so it can be rolled forward."""
+    """Read a digest already in the history so it can be rolled forward.
+
+    The legacy single line ``Files: a, b`` is read as the Read section.
+    """
     digest = _Digest()
+    titles = {title: name for name, title in _DIGEST_SECTIONS}
     section: list[str] | None = None
     for line in text.splitlines():
         if line.startswith(_DIGEST_HEADER):
             match = re.search(r"(\d+) messages compacted", line)
             if match is not None:
                 digest.dropped = int(match.group(1))
+            section = None
         elif line.startswith("Files: "):
-            digest.files = [
+            digest.read = [
                 part.strip() for part in line[len("Files: ") :].split(",") if part.strip()
             ]
-        elif line == "Commands:":
-            section = digest.commands
-        elif line == "Errors:":
-            section = digest.errors
-        elif line == "Plan:":
-            section = digest.plan
+            section = None
+        elif line in titles:
+            section = getattr(digest, titles[line])
         elif section is not None and line.startswith("  "):
-            section.append(line.strip())
+            section.append(line[2:])
     return digest
 
 
@@ -1067,7 +1644,10 @@ def _compact_tool_content(content: str) -> str:
     return result.model_copy(update={"text": _compact_text(result.text)}).model_dump_json()
 
 
-_COMPACT_MARKER_RE = re.compile(r"\n\.\.\.\[\d+ characters compacted\]\.\.\.\n")
+# The marker runs to the end of its line, so a saved path containing "]" still matches.
+_COMPACT_MARKER_RE = re.compile(r"\n\.\.\.\[\d+ characters compacted[^\n]*\]\.\.\.\n")
+_SAVED_POINTER_RE = re.compile(r"full output saved to (.+?): read it with read_file")
+_SAVED_PATH_RE = re.compile(r"full output saved to (.+?)(?:: read it with read_file|\]\.\.\.)")
 
 
 def _compact_text(text: str) -> str:
@@ -1081,7 +1661,9 @@ def _compact_text(text: str) -> str:
     head = COMPACT_PREVIEW_CHARS // 2
     tail = COMPACT_PREVIEW_CHARS - head
     removed = len(text) - head - tail
-    return f"{text[:head]}\n...[{removed} characters compacted]...\n{text[-tail:]}"
+    saved = _SAVED_POINTER_RE.search(text)
+    pointer = f"; full output saved to {saved.group(1)}" if saved is not None else ""
+    return f"{text[:head]}\n...[{removed} characters compacted{pointer}]...\n{text[-tail:]}"
 
 
 def _message_chars(message: ChatMessage) -> int:
@@ -1092,17 +1674,104 @@ def _estimate_tokens(messages: list[ChatMessage]) -> int:
     return sum(_message_chars(message) for message in messages) // CHARS_PER_TOKEN
 
 
-def _tool_message(step: AgentStep) -> str:
+_SERIALISE_FAILURE = json.dumps(
+    {"error": "tool result could not be serialised", "error_kind": "tool_failure"}
+)
+
+
+def _scrub(text: str) -> str:
+    """Replace code points that cannot be encoded as UTF-8 (lone surrogates)."""
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
+def _tool_message(
+    step: AgentStep,
+    store: LocalArtifactStore | None = None,
+    redact: Callable[[str], str] | None = None,
+) -> str:
+    """Render a step for the model: bounded text, then harness notes. Never raises.
+
+    The stored step is never changed. Oversized text or error keeps its head and tail
+    and, given a ``store``, a full copy on disk (passed through ``redact`` first).
+    Model-visible text is scrubbed of unencodable code points. Notes come last so
+    truncation cannot cut them.
+    """
+    try:
+        return _render_tool_message(step, store, redact)
+    except Exception:
+        return _SERIALISE_FAILURE
+
+
+def _render_tool_message(
+    step: AgentStep, store: LocalArtifactStore | None, redact: Callable[[str], str] | None
+) -> str:
+    suffix = "".join(f"\n[note: {_scrub(note)}]" for note in step.notes)
+    if suffix:
+        suffix = "\n" + suffix
     if step.result is not None:
-        result = step.result
-        if len(result.text) > MAX_TOOL_RESULT_CHARS:
-            cut = len(result.text) - MAX_TOOL_RESULT_CHARS
-            marker = f"...[truncated {cut} characters]"
-            result = result.model_copy(
-                update={"text": result.text[:MAX_TOOL_RESULT_CHARS] + marker}
-            )
-        return result.model_dump_json()
-    return json.dumps({"error": step.error, "error_kind": step.error_kind})
+        text = _bounded_text(_scrub(step.result.text), step.call.id, store, redact) + suffix
+        artifacts = [_scrub(path) for path in step.result.artifacts]
+        update = {"text": text, "artifacts": artifacts}
+        return step.result.model_copy(update=update).model_dump_json()
+    error = step.error
+    if error is not None:
+        error = _bounded_text(_scrub(error), step.call.id, store, redact) + suffix
+    return json.dumps({"error": error, "error_kind": step.error_kind})
+
+
+def _bounded_text(
+    text: str,
+    call_id: str,
+    store: LocalArtifactStore | None,
+    redact: Callable[[str], str] | None = None,
+) -> str:
+    """Keep the head and tail of text over :data:`MAX_TOOL_RESULT_CHARS`."""
+    if len(text) <= MAX_TOOL_RESULT_CHARS:
+        return text
+    head = MAX_TOOL_RESULT_CHARS // 2
+    tail = MAX_TOOL_RESULT_CHARS - head
+    cut = len(text) - MAX_TOOL_RESULT_CHARS
+    saved = _spill_output(store, call_id, text, redact) if store is not None else None
+    if saved is None:
+        marker = f"...[truncated {cut} characters]..."
+    else:
+        marker = (
+            f"...[truncated {cut} characters; full output saved to {saved}: "
+            "read it with read_file (offset/limit) or search it with grep]..."
+        )
+    return f"{text[:head]}\n{marker}\n{text[-tail:]}"
+
+
+def _spill_output(
+    store: LocalArtifactStore,
+    call_id: str,
+    text: str,
+    redact: Callable[[str], str] | None = None,
+) -> str | None:
+    """Save the full text of an oversized result; None when the save fails.
+
+    ``redact`` runs over the text before it is written. A failed save never fails the turn.
+    """
+    if redact is not None:
+        try:
+            text = redact(text)
+        except Exception:
+            # Text that could not be redacted is never written.
+            return None
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
+    stem = re.sub(r"[^A-Za-z0-9_-]", "", call_id)[:_MAX_SPILL_ID_CHARS]
+    name = f"{stem}-{digest}" if stem else digest
+    if store.artifact_root != store.root:
+        directory = store.artifact_root / _TOOL_OUTPUT_DIR
+    else:
+        directory = store.root / ".atlas" / _TOOL_OUTPUT_DIR
+    path = directory / f"{name}.txt"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(text.encode("utf-8", errors="replace"))
+    except OSError:
+        return None
+    return store.relative(path)
 
 
 def _ingest_tool_images(

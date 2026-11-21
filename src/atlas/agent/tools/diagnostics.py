@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -11,11 +10,13 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.tools._process import run_captured
 
 DiagnosticName = Literal["ruff", "mypy", "cargo"]
 _DIAGNOSTIC_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+):(?:(?P<column>\d+):)? (?P<message>.+)$")
 _MAX_DIAGNOSTICS = 100
 _MAX_OUTPUT_CHARS = 100_000
+_CRASH_TAIL_LINES = 20
 
 
 @dataclass
@@ -144,26 +145,26 @@ class DiagnosticsTool(Tool):
     def _run_check(self, check: _Check, timeout: int) -> str:
         """Run one check and return its report section."""
         try:
-            result = subprocess.run(
-                check.argv,
-                cwd=check.cwd,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return f"== {check.name}\n[timed out after {timeout}s]"
+            result = run_captured(check.argv, cwd=check.cwd, timeout=timeout)
         except OSError as exc:
             return f"== {check.name}\n[error: {type(exc).__name__}: {exc}]"
+        if result.timed_out:
+            return f"== {check.name}\n[timed out after {timeout}s]"
         output = f"{result.stdout}\n{result.stderr}".strip()
         diagnostics = [
             line
             for line in output.splitlines()
             if _DIAGNOSTIC_RE.match(line) or line.startswith("error")
         ]
-        rows = [f"== {check.name} (exit {result.returncode}, {len(diagnostics)} diagnostics)"]
+        rows = [f"== {check.name} (exit {result.exit_code}, {len(diagnostics)} diagnostics)"]
+        if not diagnostics and result.exit_code not in (0, None):
+            return "\n".join(
+                [
+                    f"== {check.name} (exit {result.exit_code}, 0 diagnostics)",
+                    f"[{check.name} failed: exit {result.exit_code}]",
+                    *output.splitlines()[-_CRASH_TAIL_LINES:],
+                ]
+            )
         if not diagnostics:
             rows.append("no diagnostics")
         else:

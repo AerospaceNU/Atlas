@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from typing import Any, ClassVar, Literal
@@ -33,6 +34,9 @@ def _run(store: LocalArtifactStore, arguments: list[str]) -> subprocess.Complete
             cwd=store.resolve("."),
             capture_output=True,
             text=True,
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat"},
             timeout=_TIMEOUT_SECONDS,
             check=False,
         )

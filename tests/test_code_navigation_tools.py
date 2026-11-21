@@ -146,3 +146,19 @@ def test_find_references_reports_no_matches(tmp_path: Path) -> None:
     result = FindReferencesTool().run({"name": "absent"}, store)
 
     assert result.text == "no references to absent"
+
+
+def test_directory_scans_skip_the_whole_atlas_directory(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    for sub in ("data", "artifacts", "scratch"):
+        target = tmp_path / ".atlas" / sub
+        target.mkdir(parents=True)
+        (target / "hidden.py").write_text("def hidden_symbol():\n    pass\n", encoding="utf-8")
+    (tmp_path / "real.py").write_text("def hidden_symbol():\n    pass\n", encoding="utf-8")
+
+    outline = OutlineTool().run({"path": "."}, store).text
+    refs = FindReferencesTool().run({"name": "hidden_symbol"}, store).text
+
+    assert ".atlas" not in outline
+    assert ".atlas" not in refs
+    assert "real.py" in outline and "real.py" in refs

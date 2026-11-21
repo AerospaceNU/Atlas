@@ -16,6 +16,17 @@ def _clear_openrouter_catalog_cache() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_provider_backoff(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep default tests from really waiting out provider retry backoff.
+
+    A test that needs to observe the waits patches ``atlas.agent.model._sleep`` itself.
+    """
+    if request.node.get_closest_marker("evals") is not None:
+        return
+    monkeypatch.setattr("atlas.agent.model._sleep", lambda _delay: None)
+
+
+@pytest.fixture(autouse=True)
 def _clear_atlas_home(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep a developer ``ATLAS_HOME`` from redirecting tests that pass a home."""
     monkeypatch.delenv("ATLAS_HOME", raising=False)

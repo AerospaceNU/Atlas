@@ -34,9 +34,10 @@ def _populated_run() -> AgentRun:
                 result=ToolResult(text="hello\nworld", artifacts=["a.txt", "b.json"]),
             ),
             AgentStep(
-                call=ToolCall(id="call-2", name="bash_tool", arguments={"command": "ls"}),
+                call=ToolCall(id="call-2", name="bash", arguments={"command": "ls"}),
                 error="command not found",
                 error_kind="tool_failure",
+                notes=["this exact call has returned the same result 3 times"],
             ),
         ],
         stopped_for_limit=True,
@@ -58,6 +59,7 @@ def _populated_run() -> AgentRun:
                     elapsed_seconds=1.5,
                     time_to_first_token_seconds=0.25,
                 ),
+                finish_reason="length",
             ),
             ModelCall(usage=TokenUsage(prompt_tokens=1, completion_tokens=2, total_tokens=3)),
         ],
@@ -67,6 +69,9 @@ def _populated_run() -> AgentRun:
             tool_results_shortened=3,
             messages_dropped=4,
         ),
+        empty_replies=2,
+        intent_nudges=1,
+        error="RuntimeError: provider went away",
     )
 
 
@@ -76,6 +81,7 @@ def test_a_fully_populated_run_survives_a_round_trip() -> None:
     assert restored.run == run
     assert restored.run.steps[1].error_kind == "tool_failure"
     assert restored.run.calls[0].timing == run.calls[0].timing
+    assert restored.run.calls[0].finish_reason == "length"
     assert restored.run.compaction.messages_dropped == 4
 
 

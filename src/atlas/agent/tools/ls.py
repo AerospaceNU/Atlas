@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.tools._walk import prune_dirs
 
 
 class LsInput(BaseModel):
@@ -22,6 +23,9 @@ class LsInput(BaseModel):
     max_entries: int = Field(
         default=500, ge=1, le=10_000, description="Maximum number of entries to return."
     )
+    include_ignored: bool = Field(
+        default=False, description="Also list inside .git, virtualenvs and caches."
+    )
 
 
 def _display_path(store: LocalArtifactStore, path: Path) -> str:
@@ -29,7 +33,9 @@ def _display_path(store: LocalArtifactStore, path: Path) -> str:
     return store.relative(path)
 
 
-def _entries(store: LocalArtifactStore, base: Path, *, recursive: bool) -> list[str]:
+def _entries(
+    store: LocalArtifactStore, base: Path, *, recursive: bool, include_ignored: bool = False
+) -> list[str]:
     """Collect entries under ``base`` with directories suffixed by ``/``."""
     entries: list[str] = []
     if not recursive:
@@ -39,7 +45,7 @@ def _entries(store: LocalArtifactStore, base: Path, *, recursive: bool) -> list[
         return sorted(entries)
     for root, dir_names, file_names in os.walk(base, followlinks=False):
         current = Path(root)
-        dir_names[:] = sorted(dir_names)
+        prune_dirs(current, dir_names, root=store.root, include_ignored=include_ignored)
         for name in dir_names:
             entries.append(f"{_display_path(store, current / name)}/")
         for name in sorted(file_names):
@@ -59,7 +65,8 @@ class LsTool(Tool):
     name = "ls"
     description = (
         "List files and directories in a local artifact workspace directory, one "
-        "workspace-relative entry per line with directories suffixed by '/'."
+        "workspace-relative entry per line with directories suffixed by '/'. Recursive "
+        "listings skip .git, virtualenvs and caches unless include_ignored is true."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
 
@@ -75,7 +82,9 @@ class LsTool(Tool):
         if not base.is_dir():
             raise ValueError(f"Path is not a directory: {request.path}")
 
-        entries = _entries(store, base, recursive=request.recursive)
+        entries = _entries(
+            store, base, recursive=request.recursive, include_ignored=request.include_ignored
+        )
         overflow = len(entries) - request.max_entries
         if overflow > 0:
             entries = entries[: request.max_entries]

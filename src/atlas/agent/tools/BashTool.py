@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import contextlib
-import os
 import re
 import shutil
-import signal
-import subprocess
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -13,6 +9,9 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.tools._process import OUTPUT_LIMIT_NOTE, run_captured
+
+MAX_TIMEOUT = 900
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
@@ -22,8 +21,10 @@ class BashInputModel(BaseModel):
     timeout: int = Field(
         default=30,
         ge=1,
-        le=300,
-        description="Seconds (1-300) to allow the command to run before it's killed",
+        description=(
+            "Seconds (1-900) to allow the command to run before it's killed; "
+            "larger values are clamped to 900"
+        ),
     )
     working_directory: str = Field(
         default=".",
@@ -47,11 +48,13 @@ class BashTool(Tool):
     when it returns. A child that calls ``setsid()`` leaves that group.
     """
 
-    name = "bash_tool"
+    name = "bash"
     description = (
-        "Run a shell command. The working directory defaults to the workspace; "
-        "relative paths resolve there and absolute paths are allowed. "
-        "stdout and stderr are captured, and a non-zero exit is a result rather than an exception."
+        "Run a shell command with bash. Each call is a new shell that starts in the workspace "
+        "root (or working_directory); cd and exported variables do not carry over to the next "
+        "call. stdout and stderr are captured and a non-zero exit is a result, not an error. "
+        "timeout is in seconds (default 30, max 900). Prefer run_tests for test suites and "
+        "grep, glob and read_file for searching and reading files."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     input_model = BashInputModel
@@ -65,36 +68,30 @@ class BashTool(Tool):
         if not cwd.is_dir():
             return ToolResult(text=f"Working directory not found: {request.working_directory}")
 
-        process = subprocess.Popen(
+        timeout = min(request.timeout, MAX_TIMEOUT)
+        captured = run_captured(
             _shell_argv(request.command),
             cwd=cwd,
-            # The session's own stdin carries the user's protocol messages.
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            start_new_session=True,
+            timeout=timeout,
+            max_chars=self.max_output_chars,
         )
-        # start_new_session=True makes the shell the leader of a new process
-        # group whose id is its pid. Captured now because communicate() reaps
-        # the shell, and on macOS os.getpgid() fails once the leader has exited.
-        pgid = process.pid
-        try:
-            stdout, stderr = process.communicate(timeout=request.timeout)
-        except subprocess.TimeoutExpired:
-            return ToolResult(text=f"Command timed out after {request.timeout}s: {request.command}")
-        finally:
-            # A background child that redirects its stdio lets communicate()
-            # return normally, so the group is killed on every exit path.
-            self._kill_process_group(process, pgid)
-
-        output = (
-            f"exit_code: {process.returncode}\n"
-            f"stdout:\n{self._sanitize(stdout)}\n"
-            f"stderr:\n{self._sanitize(stderr)}"
+        stdout = self._sanitize(captured.stdout)
+        stderr = self._sanitize(captured.stderr)
+        note = f"note: timeout clamped to {MAX_TIMEOUT}s\n" if request.timeout > MAX_TIMEOUT else ""
+        if captured.output_limited:
+            note += f"{OUTPUT_LIMIT_NOTE}\n"
+        if captured.timed_out:
+            return ToolResult(
+                text=(
+                    f"{note}Command timed out after {timeout}s: {request.command}\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}\n"
+                    f"hint: rerun with a larger timeout (max {MAX_TIMEOUT}) "
+                    "or narrow the command"
+                )
+            )
+        return ToolResult(
+            text=f"{note}exit_code: {captured.exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         )
-        return ToolResult(text=output)
 
     def _resolve_cwd(self, working_directory: str, store: LocalArtifactStore) -> Path:
         """Return the directory for the command.
@@ -107,17 +104,8 @@ class BashTool(Tool):
             return store.read_root or store.root
         return store.resolve_read(working_directory)
 
-    def _kill_process_group(self, process: subprocess.Popen[str], pgid: int) -> None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(pgid, signal.SIGKILL)
-        process.wait()
-
     def _sanitize(self, text: str) -> str:
-        cleaned = _ANSI_ESCAPE_RE.sub("", text)
-        if len(cleaned) > self.max_output_chars:
-            omitted = len(cleaned) - self.max_output_chars
-            cleaned = cleaned[: self.max_output_chars] + f"\n... [truncated {omitted} characters]"
-        return cleaned
+        return _ANSI_ESCAPE_RE.sub("", text)
 
 
 def _shell_argv(command: str) -> list[str]:

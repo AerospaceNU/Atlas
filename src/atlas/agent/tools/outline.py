@@ -12,25 +12,9 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.tools._walk import prune_dirs
 
-_SKIP_DIRS = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        ".atlas",
-        ".venv",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-        "target",
-        "venv",
-    }
-)
+_EXTRA_SKIP_DIRS = frozenset({"build", "dist", "target", ".atlas"})
 _SOURCE_SUFFIXES = frozenset(
     {
         ".c",
@@ -118,8 +102,10 @@ class OutlineTool(Tool):
 
     name = "outline"
     description = (
-        "List the classes, functions, methods, and module constants of source files with "
-        "line ranges. Python uses an AST parse; other languages use a line-based scan."
+        "Map a file or directory before reading it: lists classes, functions and methods with "
+        "their line ranges so you can read just the part you need (Python via ast, other "
+        "languages by a keyword scan). A directory scan skips .git, virtualenvs, caches, "
+        "build output (build, dist, target) and .atlas."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     max_file_bytes: ClassVar[int] = 1_000_000
@@ -138,7 +124,7 @@ class OutlineTool(Tool):
         if base.is_file():
             files = [base]
         else:
-            files = list(self._iter_files(base, request.glob, request.max_files))
+            files = list(self._iter_files(base, request.glob, request.max_files, store.root))
         if not files:
             return ToolResult(text="no source files found")
 
@@ -153,11 +139,13 @@ class OutlineTool(Tool):
             used += len(section)
         return ToolResult(text="\n\n".join(sections))
 
-    def _iter_files(self, base: Path, pattern: str | None, limit: int) -> list[Path]:
+    def _iter_files(
+        self, base: Path, pattern: str | None, limit: int, store_root: Path
+    ) -> list[Path]:
         """Return up to ``limit`` source files under ``base`` in sorted order."""
         found: list[Path] = []
         for root, dir_names, file_names in os.walk(base, followlinks=False):
-            dir_names[:] = sorted(name for name in dir_names if name not in _SKIP_DIRS)
+            prune_dirs(Path(root), dir_names, root=store_root, extra_skip=_EXTRA_SKIP_DIRS)
             for name in sorted(file_names):
                 candidate = Path(root) / name
                 if not candidate.is_file():

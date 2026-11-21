@@ -72,7 +72,12 @@ pub enum ServerMessage {
         response: String,
         stopped_for_limit: bool,
         stopped_for_budget: bool,
+        stopped_for_context: bool,
         cancelled: bool,
+        compaction: Compaction,
+        status: StatusSnapshot,
+    },
+    Compacted {
         compaction: Compaction,
         status: StatusSnapshot,
     },
@@ -282,7 +287,16 @@ enum RawMessage {
         #[serde(default)]
         stopped_for_budget: bool,
         #[serde(default)]
+        stopped_for_context: bool,
+        #[serde(default)]
         cancelled: bool,
+        #[serde(default)]
+        compaction: Compaction,
+        #[serde(flatten)]
+        status: StatusSnapshot,
+    },
+    #[serde(rename = "compacted")]
+    Compacted {
         #[serde(default)]
         compaction: Compaction,
         #[serde(flatten)]
@@ -497,6 +511,7 @@ impl From<RawMessage> for ServerMessage {
                 response,
                 stopped_for_limit,
                 stopped_for_budget,
+                stopped_for_context,
                 cancelled,
                 compaction,
                 status,
@@ -504,10 +519,14 @@ impl From<RawMessage> for ServerMessage {
                 response,
                 stopped_for_limit,
                 stopped_for_budget,
+                stopped_for_context,
                 cancelled,
                 compaction,
                 status,
             },
+            RawMessage::Compacted { compaction, status } => {
+                ServerMessage::Compacted { compaction, status }
+            }
             RawMessage::PermissionRequest {
                 id,
                 tool,
@@ -795,6 +814,37 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_done_stopped_for_context() {
+        let line = r#"{"type":"done","response":"","stopped_for_context":true}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::Done {
+                stopped_for_context,
+                ..
+            }) => assert!(stopped_for_context),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_compacted() {
+        let line = r#"{"type":"compacted","compaction":{"occurred":true,"tokens_reclaimed":50,"tool_results_shortened":1,"messages_dropped":2,"digest_inserted":true,"digest_chars":10},"context_used":7,"context_limit":1000}"#;
+        match parse_line(line).unwrap() {
+            Some(ServerMessage::Compacted { compaction, status }) => {
+                assert!(compaction.occurred);
+                assert_eq!(compaction.tokens_reclaimed, 50);
+                assert_eq!(compaction.messages_dropped, 2);
+                assert_eq!(status.context_used, 7);
+                assert_eq!(status.context_limit, Some(1000));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            parse_line(r#"{"type":"compacted"}"#).unwrap(),
+            Some(ServerMessage::Compacted { .. })
+        ));
     }
 
     #[test]

@@ -34,7 +34,8 @@ class UpdatePlanInput(BaseModel):
     """Arguments for ``update_plan``.
 
     The list replaces the previous plan in full, has between 1 and 50 items,
-    and exactly one item must be ``in_progress``.
+    and at most one item may be ``in_progress``. Zero is valid: a finished plan
+    has every item completed, and a new plan may not be started yet.
     """
 
     items: list[PlanItem] = Field(
@@ -44,8 +45,8 @@ class UpdatePlanInput(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _exactly_one_in_progress(self) -> Self:
-        _require_one_in_progress(self.items)
+    def _at_most_one_in_progress(self) -> Self:
+        _require_at_most_one_in_progress(self.items)
         return self
 
 
@@ -53,11 +54,11 @@ class ReadPlanInput(BaseModel):
     """Arguments for ``read_plan`` (none)."""
 
 
-def _require_one_in_progress(items: Sequence[PlanItem]) -> None:
-    """Refuse a plan with zero or several in-progress tasks."""
+def _require_at_most_one_in_progress(items: Sequence[PlanItem]) -> None:
+    """Refuse a plan with several in-progress tasks; zero is valid."""
     in_progress = sum(item.status == "in_progress" for item in items)
-    if in_progress != 1:
-        raise ValueError(f"Plan must have exactly one in_progress item, got {in_progress}")
+    if in_progress > 1:
+        raise ValueError(f"Plan may have at most one in_progress item, got {in_progress}")
 
 
 def _render(items: Sequence[PlanItem]) -> str:
@@ -112,7 +113,7 @@ class UpdatePlanTool(Tool):
     description = (
         "Keep a short ordered task list for the current session. The list is shown to the user "
         "as a checklist. Each call replaces the whole list; use it to mark progress, with "
-        "exactly one item in_progress."
+        "at most one item in_progress."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
 

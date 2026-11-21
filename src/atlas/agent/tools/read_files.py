@@ -6,6 +6,12 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.tools._edits import split_lines
+
+_FOOTER_RESERVE = 70
+_RESPONSE_RESERVE = 100
+_MIN_FILE_BUDGET = 300
+MAX_LIMIT = 5000
 
 
 class ReadTarget(BaseModel):
@@ -15,13 +21,14 @@ class ReadTarget(BaseModel):
     ``limit`` caps how many lines are returned for this file.
     """
 
-    path: str = Field(description="Path relative to the local artifact workspace.")
+    path: str = Field(description="Path relative to the workspace, or absolute.")
     offset: int = Field(default=1, ge=1, description="First line to return (1-based).")
     limit: int = Field(
         default=2000,
         ge=1,
-        le=5000,
-        description="Maximum number of lines to return for this file (1-5000).",
+        description=(
+            "Maximum number of lines to return for this file (values above 5000 are clamped to 5000)."
+        ),
     )
 
 
@@ -42,9 +49,11 @@ class ReadFilesTool(Tool):
     """Read several UTF-8 text files in one call.
 
     Every path is resolved through
-    :class:`~atlas.agent.artifacts.LocalArtifactStore`. A missing, binary, or
-    oversized file becomes an error section instead of failing the batch. Each
-    section is capped and the whole response stops at a fixed character budget.
+    :class:`~atlas.agent.artifacts.LocalArtifactStore` (relative to the workspace;
+    absolute paths and ``..`` are accepted). A missing, binary, or oversized file
+    becomes an error section instead of failing the batch. The whole response stays
+    under ``max_output_chars``: each file gets an equal share of what is left, is cut
+    at a line boundary, and its header states the lines actually returned.
     """
 
     name = "read_files"
@@ -54,7 +63,7 @@ class ReadFilesTool(Tool):
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     max_file_bytes: ClassVar[int] = 1_000_000
-    max_output_chars: ClassVar[int] = 400_000
+    max_output_chars: ClassVar[int] = 18_000
     max_line_chars: ClassVar[int] = 2000
 
     @property
@@ -64,24 +73,23 @@ class ReadFilesTool(Tool):
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request = ReadFilesInput.model_validate(arguments)
         sections: list[str] = []
-        used = 0
+        left = self.max_output_chars - _RESPONSE_RESERVE
+        total = len(request.files)
         skipped = 0
         for index, target in enumerate(request.files):
-            section = self._read_one(target, store)
-            if used + len(section) > self.max_output_chars:
-                room = self.max_output_chars - used
-                if room > 0:
-                    sections.append(section[:room] + "\n... [output limit reached]")
-                skipped = len(request.files) - index
+            share = left // (total - index)
+            if share < _MIN_FILE_BUDGET:
+                skipped = total - index
                 break
+            section = self._read_one(target, store, share)
             sections.append(section)
-            used += len(section)
+            left -= len(section) + 2
         if skipped:
             sections.append(f"... [{skipped} more files not read: output limit]")
         return ToolResult(text="\n\n".join(sections))
 
-    def _read_one(self, target: ReadTarget, store: LocalArtifactStore) -> str:
-        """Return one labelled file section, or an error section."""
+    def _read_one(self, target: ReadTarget, store: LocalArtifactStore, budget: int) -> str:
+        """Return one labelled file section of at most about ``budget`` characters."""
         header = f"== {target.path}"
         try:
             data = store.read_bytes(target.path, max_bytes=self.max_file_bytes)
@@ -97,19 +105,34 @@ class ReadFilesTool(Tool):
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             return f"{header}\n[skipped: not valid UTF-8]"
-        lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+        lines = split_lines(text.replace("\r\n", "\n").replace("\r", "\n"))
         if not lines:
             return f"{header}\n(empty file)"
         start = target.offset - 1
         if start >= len(lines):
             return f"{header}\n[offset {target.offset} is past the end ({len(lines)} lines)]"
-        selected = lines[start : start + target.limit]
-        end = start + len(selected)
-        body = "\n".join(
-            f"{number:>6}| {line[: self.max_line_chars]}"
-            for number, line in enumerate(selected, start + 1)
-        )
-        section = f"{header} (lines {start + 1}-{end} of {len(lines)})\n{body}"
+        selected = lines[start : start + min(target.limit, MAX_LIMIT)]
+        fitted = self._fit(selected, start + 1, budget - len(header) - _FOOTER_RESERVE - 40)
+        end = start + len(fitted)
+        section = f"{header} (lines {start + 1}-{end} of {len(lines)})\n" + "\n".join(fitted)
         if end < len(lines):
-            section += f"\n... [{len(lines) - end} more lines]"
+            more = len(lines) - end
+            if len(fitted) < len(selected):
+                section += f"\n... [{more} more lines; continue with offset={end + 1}]"
+            else:
+                section += f"\n... [{more} more lines]"
         return section
+
+    def _fit(self, selected: list[str], first: int, room: int) -> list[str]:
+        """Return gutter-formatted lines that fit ``room`` characters, at least one."""
+        fitted: list[str] = []
+        used = 0
+        for number, line in enumerate(selected, first):
+            rendered = f"{number:>6}| {line[: self.max_line_chars]}"
+            if fitted and used + len(rendered) + 1 > room:
+                break
+            if not fitted and len(rendered) > room:
+                rendered = rendered[: max(room, 80)]
+            fitted.append(rendered)
+            used += len(rendered) + 1
+        return fitted

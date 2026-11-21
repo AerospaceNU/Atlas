@@ -167,7 +167,7 @@ def test_prompt_requires_showing_a_pull_estimate_before_yes() -> None:
 
     rule = (
         "Show the user that estimate and get confirmation before you pass --yes, "
-        "including when bash_tool runs the pull."
+        "including when bash runs the pull."
     )
     assert rule in prompt
     assert rule in _REQUIRED_RULES
@@ -186,7 +186,7 @@ def test_agent_sends_the_package_prompt(tmp_path: Path) -> None:
     assert result.response == "done"
     system = model.requests[0][0][0]
     assert system.role == "system"
-    assert system.content == load_system_prompt()
+    assert system.content == f"{load_system_prompt()}\n\n{agent.environment_context()}"
     assert "Ignore the package prompt" not in (system.content or "")
     assert agent.system_prompt() == load_system_prompt()
 

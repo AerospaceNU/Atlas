@@ -92,7 +92,7 @@ class WebFetchTool(Tool):
     per-session untrusted tags. It is not executed, imported, or written
     to the workspace.
 
-    ``trust`` is ``default``. ``bash_tool`` can already reach the network.
+    ``trust`` is ``default``. ``bash`` can already reach the network.
     The page is labeled untrusted data. This guard is about the destination
     address, not the workspace: it refuses a non-public host so a page cannot
     be used to probe the local machine.
@@ -464,8 +464,16 @@ def _resolve(hostname: str, port: int, deadline: float, timeout: int, url: str) 
         except ValueError:
             continue
     if not addresses:
-        raise ValueError(f"Could not resolve {hostname!r}")
+        raise ValueError(_unresolved(hostname))
     return addresses
+
+
+def _unresolved(hostname: str) -> str:
+    """Return the unresolvable-host message, telling the model not to retry."""
+    return (
+        f"Could not resolve {hostname!r}: the network may be unavailable here. "
+        "Do not retry; work from local files."
+    )
 
 
 def _lookup(hostname: str, port: int, deadline: float, timeout: int, url: str) -> list[Any]:
@@ -490,10 +498,10 @@ def _lookup(hostname: str, port: int, deadline: float, timeout: int, url: str) -
     if errors:
         error = errors[0]
         if isinstance(error, socket.gaierror):
-            raise ValueError(f"Could not resolve {hostname!r}") from error
+            raise ValueError(_unresolved(hostname)) from error
         raise error
     if not found:
-        raise ValueError(f"Could not resolve {hostname!r}")
+        raise ValueError(_unresolved(hostname))
     return found[0]
 
 

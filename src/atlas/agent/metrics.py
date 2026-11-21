@@ -59,7 +59,7 @@ def observe_model_call(response: ModelResponse) -> ModelCall | None:
     )
     if response.timing is None and not has_usage:
         return None
-    return ModelCall(usage=usage, timing=response.timing)
+    return ModelCall(usage=usage, timing=response.timing, finish_reason=response.finish_reason)
 
 
 def tokens_per_second(completion_tokens: int, generation_seconds: float) -> float | None:

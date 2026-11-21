@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import queue
@@ -83,6 +84,9 @@ from atlas.agent.runtime import (
     Agent,
     AgentRun,
     AgentStep,
+    ContextCompaction,
+    _compact,
+    _estimate_tokens,
     ensure_agent_config,
     load_approval,
     load_home_skills_enabled,
@@ -90,6 +94,7 @@ from atlas.agent.runtime import (
     load_model,
     load_optional_tokens,
     load_read_only,
+    load_reasoning_effort,
     load_spend_limit,
 )
 from atlas.agent.skill_author import normalize_skill_name
@@ -161,6 +166,8 @@ class AgentSession:
             self.active_key = key or None
             if key:
                 self.secrets.append(key)
+        # Bound to the live list, so a key added later through set_key is covered too.
+        self.agent.redact_output = lambda text: _redact_value(text, self.secrets)
         self.skill_catalog_note = ""
         self._skill_previews: dict[tuple[str, str], str] = {}
         self._analysis_turns: list[AnalysisTurn] = []
@@ -218,17 +225,7 @@ class AgentSession:
             message.images = ingest_images(self.agent.artifacts, list(images))
         self._begin_analysis(request)
         self.messages.append(message)
-        run = self.agent.advance(
-            self.messages,
-            on_step=on_step,
-            on_phase=on_phase,
-            on_thought=on_thought,
-            should_cancel=self.cancel_event.is_set,
-        )
-        self.stopped_for_limit = run.stopped_for_limit
-        self._note(run)
-        self._capture_analysis(run)
-        return run
+        return self._advance(on_step, on_phase, on_thought)
 
     def resume(
         self,
@@ -241,17 +238,52 @@ class AgentSession:
         self._require_key()
         if not self.stopped_for_limit:
             raise RuntimeError("Session is not stopped for the tool-call limit")
-        run = self.agent.advance(
-            self.messages,
-            on_step=on_step,
-            on_phase=on_phase,
-            on_thought=on_thought,
-            should_cancel=self.cancel_event.is_set,
-        )
+        return self._advance(on_step, on_phase, on_thought)
+
+    def _advance(
+        self,
+        on_step: Callable[[AgentStep], None] | None,
+        on_phase: Callable[[str, str | None], None] | None,
+        on_thought: Callable[[str, float | None], None] | None,
+    ) -> AgentRun:
+        """Advance the history one turn; usage of a failed turn is still counted.
+
+        When the model raises, the work collected before the failure
+        (``agent.partial_run``) is accounted like a finished run and the same
+        exception propagates.
+        """
+        try:
+            run = self.agent.advance(
+                self.messages,
+                on_step=on_step,
+                on_phase=on_phase,
+                on_thought=on_thought,
+                should_cancel=self.cancel_event.is_set,
+            )
+        except BaseException:
+            partial = self.agent.partial_run
+            if partial is not None:
+                # Accounting must never replace the failure being reported.
+                with contextlib.suppress(Exception):
+                    self._note(partial)
+            raise
         self.stopped_for_limit = run.stopped_for_limit
         self._note(run)
         self._capture_analysis(run)
         return run
+
+    def compact(self) -> ContextCompaction:
+        """Halve the estimated context when possible, keeping protected messages.
+
+        The trigger is half the current estimate, passed as an explicit limit;
+        ``MAX_CONTEXT_TOKENS`` is never changed. The system prompt, project
+        instructions, the goal message and every real user message stay.
+        """
+        limit = max(1, _estimate_tokens(self.messages) // 2)
+        change = _compact(self.messages, root=self.agent.artifacts.root, limit=limit)
+        if change.occurred:
+            self.totals.context_used = _estimate_tokens(self.messages)
+        return change
 
     def start_fresh(self) -> None:
         """Start a new conversation without reopening the process.
@@ -705,6 +737,7 @@ def _step_event(step: AgentStep) -> dict[str, Any]:
         "error": step.error,
         "error_kind": step.error_kind,
         "artifacts": result.artifacts if result is not None else [],
+        "notes": step.notes,
     }
 
 
@@ -772,6 +805,9 @@ def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
             continue
         if kind == "resume":
             _handle_resume(session, stdout)
+            continue
+        if kind == "compact":
+            _handle_compact(session, stdout)
             continue
         if kind == "undo":
             _handle_undo(session, stdout)
@@ -873,9 +909,11 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
     except OpenRouterHTTPError as exc:
+        _save_after_failure(session)
         _write_http_error(session, stdout, exc)
         return
     except Exception as exc:
+        _save_after_failure(session)
         _write_line(
             stdout,
             {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
@@ -884,6 +922,29 @@ def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]
         return
     session.save_state()
     _write_line(stdout, _done_event(session, run), session.secrets)
+
+
+def _save_after_failure(session: AgentSession) -> None:
+    """Persist history appended before a failed turn; a save error never masks the cause."""
+    with contextlib.suppress(Exception):
+        session.save_state()
+
+
+def _handle_compact(session: AgentSession, stdout: IO[str]) -> None:
+    """Compact the history on request and report the result."""
+    try:
+        compaction = session.compact()
+        session.save_state()
+    except Exception as exc:
+        _write_line(
+            stdout,
+            {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
+            session.secrets,
+        )
+        return
+    payload: dict[str, Any] = {"type": "compacted", "compaction": compaction.model_dump()}
+    payload.update(_status_fields(session))
+    _write_line(stdout, payload, session.secrets)
 
 
 def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
@@ -896,9 +957,11 @@ def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
         _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
         return
     except OpenRouterHTTPError as exc:
+        _save_after_failure(session)
         _write_http_error(session, stdout, exc)
         return
     except Exception as exc:
+        _save_after_failure(session)
         _write_line(
             stdout,
             {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
@@ -1780,6 +1843,8 @@ def _done_event(session: AgentSession, run: AgentRun) -> dict[str, Any]:
         "stopped_for_context": run.stopped_for_context,
         "cancelled": run.cancelled,
         "compaction": run.compaction.model_dump(),
+        "empty_replies": run.empty_replies,
+        "intent_nudges": run.intent_nudges,
     }
     payload.update(_status_fields(session))
     return payload
@@ -1877,7 +1942,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     skills = load_skills(store, home=skill_home)
     registry = default_registry()
     register_skill_tool(registry, skills)
-    model = OpenRouterModel(ModelConfig(model=model_id, api_key=api_key))
+    model = OpenRouterModel(
+        ModelConfig(
+            model=model_id, api_key=api_key, reasoning_effort=load_reasoning_effort(workspace)
+        )
+    )
     try:
         agent = Agent(
             model,
@@ -1903,7 +1972,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_tool_calls=budget,
                 max_tokens=agent.max_tokens,
                 max_spend_usd=None,
-                read_only=not allow_writes,
+                read_only=agent.read_only or not allow_writes,
                 approval=agent.approval,
                 on_permission=agent.on_permission,
                 skills=skills,

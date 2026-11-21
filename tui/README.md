@@ -50,7 +50,8 @@ through draft lines, then recall sent prompts at the boundaries. `PageUp` /
 `Esc` keeps an unfinished ordinary draft; during a running turn it stops the
 turn and keeps the draft. `Ctrl+R` resumes a turn stopped at the tool-call limit,
 and `Ctrl+C` copies selected text or quits when nothing is selected. `/new`
-starts a fresh conversation and clears the transcript. `/skill <name>` applies
+starts a fresh conversation and clears the transcript. `/compact` shrinks the
+model context on demand. `/skill <name>` applies
 a workspace skill for the rest of this conversation. The `.atlas` copy wins
 over `.agents` when both exist.
 

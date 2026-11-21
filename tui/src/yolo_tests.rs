@@ -97,7 +97,7 @@ fn yolo_can_be_typed_at_a_pending_prompt_and_during_a_turn() {
     app.input = "keep my draft".to_string();
     app.apply(ServerMessage::PermissionRequest {
         id: "pending".to_string(),
-        tool: "bash_tool".to_string(),
+        tool: "bash".to_string(),
         summary: "run a command".to_string(),
         preview: "pwd".to_string(),
     });

@@ -421,9 +421,10 @@ def test_tool_failures_get_error_kinds(tmp_path: Path) -> None:
     kinds = [step.error_kind for step in result.steps]
     assert kinds == ["validation", "tool_failure", "unknown_tool", None]
     assert result.steps[0].error is not None
-    assert result.steps[0].error.startswith("ValidationError")
+    assert result.steps[0].error.startswith("Invalid arguments for echo:")
     assert result.steps[1].error == "RuntimeError: tool exploded"
-    assert result.steps[2].error == "KeyError: 'Unknown tool: missing_tool'"
+    assert result.steps[2].error is not None
+    assert result.steps[2].error.startswith("Unknown tool 'missing_tool'.")
     assert result.steps[3].result is not None
     assert result.steps[3].result.text == "echo:7"
 
@@ -796,7 +797,7 @@ def test_degenerate_window_on_a_fresh_session_stays_unavailable(tmp_path: Path) 
 def test_http_error_keeps_status_and_short_body(tmp_path: Path) -> None:
     # A rate limit is retried, so the queue holds one response per attempt.
     client = _QueueClient(
-        [{"error": {"message": "slow down"}}] * 3,
+        [{"error": {"message": "slow down"}}] * 4,
         status_code=429,
         elapsed_seconds=0.25,
     )

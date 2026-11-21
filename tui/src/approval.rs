@@ -43,7 +43,7 @@ impl PermissionPrompt {
     pub fn body(&self) -> String {
         if self.preview.is_empty() {
             self.summary.clone()
-        } else if self.tool == "bash_tool" || self.summary.is_empty() {
+        } else if self.tool == "bash" || self.summary.is_empty() {
             self.preview.clone()
         } else {
             format!("{}\n\n{}", self.summary, self.preview)

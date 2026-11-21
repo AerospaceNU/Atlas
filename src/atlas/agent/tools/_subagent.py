@@ -32,7 +32,7 @@ class SubagentInput(BaseModel):
     )
     allow_writes: bool = Field(
         default=False,
-        description="Let the child use write_file, edit_file, patch_file, and bash.",
+        description="Let the child use write_file, edit_file, patch_file, apply_patch and bash.",
     )
     max_tool_calls: int = Field(
         default=40,
@@ -50,7 +50,8 @@ class SubagentTool(Tool):
         "Delegate one self-contained task to a child agent with a fresh context. "
         "The child sees only the task text and the workspace, not this conversation. "
         "It returns a short report. Use it for independent exploration or a scoped edit; "
-        "writes are refused unless allow_writes is true."
+        "writes are refused unless allow_writes is true. "
+        "Children do bounded work in this workspace, not recall of external code."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     max_report_chars: ClassVar[int] = 8000
@@ -83,7 +84,23 @@ class SubagentTool(Tool):
         report = run.response.strip() or "(no answer)"
         if len(report) > self.max_report_chars:
             report = report[: self.max_report_chars] + "\n... [truncated]"
-        return ToolResult(
-            text=f"subagent {child_id} ({steps} tool calls, writes="
-            f"{'allowed' if request.allow_writes else 'refused'}):\n{report}",
+        header = (
+            f"subagent {child_id} ({steps} tool calls, writes="
+            f"{'allowed' if request.allow_writes else 'refused'}{_stop_note(run)}):"
         )
+        return ToolResult(text=f"{header}\n{report}")
+
+
+_STOP_NOTES: tuple[tuple[str, str], ...] = (
+    ("stopped_for_limit", "tool-call budget reached"),
+    ("stopped_for_budget", "token or spend budget reached"),
+    ("stopped_for_context", "context limit"),
+)
+
+
+def _stop_note(run: Any) -> str:
+    """Return ``; stopped: <reason>`` for each early stop flag set on ``run``, else empty.
+
+    The factory may return any object, so a missing flag counts as not set.
+    """
+    return "".join(f"; stopped: {text}" for flag, text in _STOP_NOTES if getattr(run, flag, False))

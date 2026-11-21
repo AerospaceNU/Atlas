@@ -138,7 +138,7 @@ fn command_preview_selection_preserves_approval_button_clicks() {
     let mut app = App::new();
     app.apply(ServerMessage::PermissionRequest {
         id: "pending".to_string(),
-        tool: "bash_tool".to_string(),
+        tool: "bash".to_string(),
         summary: "run: pwd".to_string(),
         preview: "pwd".to_string(),
     });

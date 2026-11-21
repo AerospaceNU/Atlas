@@ -75,7 +75,7 @@ def test_author_skill_writes_optional_frontmatter_in_stable_order(tmp_path: Path
         license="Apache-2.0",
         compatibility="Requires Python 3.12.",
         metadata={"version": "1.0", "author": "atlas"},
-        allowed_tools="read_file bash_tool",
+        allowed_tools="read_file bash",
     )
 
     text = render_skill_md(draft)
@@ -90,7 +90,7 @@ def test_author_skill_writes_optional_frontmatter_in_stable_order(tmp_path: Path
         "metadata:\n"
         '  author: "atlas"\n'
         '  version: "1.0"\n'
-        'allowed-tools: "read_file bash_tool"\n'
+        'allowed-tools: "read_file bash"\n'
         "---\n"
         "\n"
         "Do the thing.\n"
@@ -583,7 +583,7 @@ def test_loader_parses_quoted_and_folded_frontmatter() -> None:
         license="Apache-2.0",
         compatibility="Requires Python 3.12.",
         metadata={"version": "1.0", "author": "atlas"},
-        allowed_tools="read_file bash_tool",
+        allowed_tools="read_file bash",
     )
 
     fields, body = _parse_like_skills_loader(render_skill_md(draft))
@@ -593,7 +593,7 @@ def test_loader_parses_quoted_and_folded_frontmatter() -> None:
     assert fields["license"] == "Apache-2.0"
     assert fields["compatibility"] == "Requires Python 3.12."
     assert fields["metadata"] == {"author": "atlas", "version": "1.0"}
-    assert fields["allowed-tools"] == "read_file bash_tool"
+    assert fields["allowed-tools"] == "read_file bash"
     assert body == "Do the thing."
 
 
@@ -709,7 +709,7 @@ def test_author_skill_tool_does_not_change_the_default_registry() -> None:
     names = [tool.name for tool in default_registry().definitions]
 
     core = {
-        "bash_tool",
+        "bash",
         "edit_file",
         "glob",
         "grep",

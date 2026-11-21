@@ -11,7 +11,7 @@ fn approval_app() -> App {
     let mut app = App::new();
     app.apply(ServerMessage::PermissionRequest {
         id: CALL_ID.to_string(),
-        tool: "bash_tool".to_string(),
+        tool: "bash".to_string(),
         summary: format!("run: {COMMAND}"),
         preview: COMMAND.to_string(),
     });
@@ -46,7 +46,7 @@ fn approval_panel_shows_the_request_and_safe_choices() {
     let visible_lower = visible.to_lowercase();
 
     assert!(visible.contains("Approval required"), "{painted}");
-    assert!(visible.contains("bash_tool"), "{painted}");
+    assert!(visible.contains("bash"), "{painted}");
     assert!(visible.contains(COMMAND), "{painted}");
     assert_eq!(visible.matches(COMMAND).count(), 1, "{painted}");
     assert!(visible.contains("Allow once"), "{painted}");
@@ -69,7 +69,7 @@ fn short_approval_stays_visible_at_supported_terminal_sizes() {
             visible.contains("Approval required"),
             "{width}x{height}: {painted}"
         );
-        assert!(visible.contains("bash_tool"), "{width}x{height}: {painted}");
+        assert!(visible.contains("bash"), "{width}x{height}: {painted}");
         assert!(visible.contains(COMMAND), "{width}x{height}: {painted}");
         assert!(
             visible.contains("Allow once"),
@@ -83,7 +83,7 @@ fn short_approval_stays_visible_at_supported_terminal_sizes() {
 fn waiting_for_approval_has_no_activity_spinner() {
     let mut app = approval_app();
     app.status = Status::Waiting;
-    app.activity = Some(Activity::ToolExecuting("bash_tool".to_string()));
+    app.activity = Some(Activity::ToolExecuting("bash".to_string()));
 
     let painted = screen(&mut app, 100, 28);
     let visible_lower = normalized(&painted).to_lowercase();
@@ -190,6 +190,7 @@ fn completed_or_failed_turns_remove_stale_approval_prompts() {
             response: String::new(),
             stopped_for_limit: false,
             stopped_for_budget: false,
+            stopped_for_context: false,
             cancelled: true,
             compaction: Default::default(),
             status: StatusSnapshot::default(),
@@ -202,7 +203,7 @@ fn completed_or_failed_turns_remove_stale_approval_prompts() {
             status_line: String::new(),
         },
         ServerMessage::Step {
-            name: "bash_tool".to_string(),
+            name: "bash".to_string(),
             call_id: CALL_ID.to_string(),
             ok: false,
             arguments: serde_json::json!({}),

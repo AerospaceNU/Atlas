@@ -80,3 +80,10 @@ def test_read_files_is_registered_by_default() -> None:
         "run_tests",
         "diagnostics",
     } <= names
+
+
+def test_per_file_limit_above_the_maximum_is_clamped(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+    store = LocalArtifactStore(tmp_path)
+    result = ReadFilesTool().run({"files": [{"path": "a.txt", "limit": 10**6}]}, store)
+    assert "alpha" in result.text and "beta" in result.text

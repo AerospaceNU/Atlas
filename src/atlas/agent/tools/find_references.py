@@ -11,25 +11,9 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import Tool, ToolResult
+from atlas.agent.tools._walk import prune_dirs
 
-_SKIP_DIRS = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        ".atlas",
-        ".venv",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-        "target",
-        "venv",
-    }
-)
+_EXTRA_SKIP_DIRS = frozenset({"build", "dist", "target", ".atlas"})
 _DEFINITION_KINDS = frozenset({"class", "def", "assign", "param"})
 
 
@@ -83,8 +67,9 @@ class FindReferencesTool(Tool):
 
     name = "find_references"
     description = (
-        "Find definitions and uses of a Python identifier across the workspace using an AST "
-        "scan. Comments and string literals are excluded; every hit is path:line:column."
+        "Find where a Python name is defined and used (AST-based, so comments and strings are "
+        "ignored). Returns path:line:column with the source line. A directory scan skips .git, "
+        "virtualenvs, caches, build output (build, dist, target) and .atlas."
     )
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
     max_file_bytes: ClassVar[int] = 1_000_000
@@ -103,7 +88,7 @@ class FindReferencesTool(Tool):
         found: list[_Match] = []
         overflow = 0
         scanned = 0
-        for path, text in self._iter_python(base, request.glob):
+        for path, text in self._iter_python(base, request.glob, store.root):
             scanned += len(text.encode("utf-8", errors="replace"))
             if scanned > self.max_scan_bytes:
                 break
@@ -126,14 +111,16 @@ class FindReferencesTool(Tool):
             rows.append(f"... [{overflow} more matches]")
         return ToolResult(text="\n".join(rows))
 
-    def _iter_python(self, base: Path, pattern: str | None) -> list[tuple[Path, str]]:
+    def _iter_python(
+        self, base: Path, pattern: str | None, store_root: Path
+    ) -> list[tuple[Path, str]]:
         """Return readable Python files under ``base`` with their text."""
         if base.is_file():
             candidates = [base]
         else:
             candidates = []
             for root, dir_names, file_names in os.walk(base, followlinks=False):
-                dir_names[:] = sorted(name for name in dir_names if name not in _SKIP_DIRS)
+                prune_dirs(Path(root), dir_names, root=store_root, extra_skip=_EXTRA_SKIP_DIRS)
                 for name in sorted(file_names):
                     candidates.append(Path(root) / name)
         files: list[tuple[Path, str]] = []

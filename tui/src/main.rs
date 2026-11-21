@@ -537,6 +537,7 @@ impl App {
                 response,
                 stopped_for_limit,
                 stopped_for_budget,
+                stopped_for_context,
                 cancelled,
                 compaction,
                 status,
@@ -561,6 +562,9 @@ impl App {
                         "stopped at the token or spend budget in .atlas/agent.toml",
                     ));
                 }
+                if stopped_for_context {
+                    self.transcript.push(tool_note(CONTEXT_STOP_NOTE));
+                }
                 if let Some(notice) = compaction.notice() {
                     self.transcript.push(tool_note(notice));
                 }
@@ -569,6 +573,14 @@ impl App {
                 } else {
                     Status::Ready
                 };
+            }
+            ServerMessage::Compacted { compaction, status } => {
+                self.status_notice = None;
+                self.adopt_status(&status);
+                let note = compaction
+                    .notice()
+                    .unwrap_or_else(|| "nothing to compact".to_string());
+                self.transcript.push(tool_note(note));
             }
             ServerMessage::PermissionRequest {
                 id,
@@ -1966,6 +1978,16 @@ fn slash_outcome(app: &mut App, text: &str) -> Option<serde_json::Value> {
                 }
             }
         }
+        "/compact" => {
+            if parts.next().is_some() {
+                app.transcript.push(tool_note("usage: /compact"));
+                None
+            } else {
+                app.transcript
+                    .push(tool_note("compacting the conversation context"));
+                Some(serde_json::json!({"type": "compact"}))
+            }
+        }
         "/undo" => {
             if parts.next().is_some() {
                 app.transcript.push(tool_note("usage: /undo"));
@@ -2164,7 +2186,11 @@ fn key_command(
 
 const PICKER_PAGE: usize = 8;
 /// Slash commands stay on one page so a new command is not clipped off `/`.
-const MENU_PAGE: usize = 14;
+const MENU_PAGE: usize = 15;
+
+/// Transcript note for a turn that stopped because the request cannot fit.
+const CONTEXT_STOP_NOTE: &str =
+    "stopped: the conversation no longer fits the model context; run /compact or start /new";
 
 /// Slice of the filtered catalog that stays on screen around `index`.
 fn picker_window(len: usize, index: usize, page: usize) -> std::ops::Range<usize> {
@@ -2186,10 +2212,14 @@ struct MenuItem {
 }
 
 /// Slash commands offered in the menu and the help panel.
-const COMMANDS: [MenuItem; 14] = [
+const COMMANDS: [MenuItem; 15] = [
     MenuItem {
         token: "/new",
         description: "Start a fresh conversation",
+    },
+    MenuItem {
+        token: "/compact",
+        description: "Compact the conversation context",
     },
     MenuItem {
         token: "/help",
@@ -2442,7 +2472,7 @@ fn is_finished_command(text: &str) -> bool {
     let trimmed = text.trim_end();
     if matches!(
         trimmed,
-        "/new" | "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy" | "/yolo"
+        "/new" | "/compact" | "/sessions" | "/artifacts" | "/quit" | "/exit" | "/copy" | "/yolo"
     ) {
         return true;
     }
@@ -3157,7 +3187,7 @@ fn is_diff_tool(name: &str) -> bool {
 
 /// Tools whose result reports an explicit exit code.
 fn is_exit_tool(name: &str) -> bool {
-    matches!(name, "bash_tool" | "run_tests")
+    matches!(name, "bash" | "run_tests")
 }
 
 /// Return whether an ``exit_code:`` line reports success.
@@ -4192,6 +4222,7 @@ mod tests {
             tokens,
             vec![
                 "/new",
+                "/compact",
                 "/help",
                 "/goal",
                 "/yolo",
@@ -4379,6 +4410,7 @@ mod tests {
         let painted = screen(&mut app, 80, 40);
         for name in [
             "/new",
+            "/compact",
             "/help",
             "/goal",
             "/model",
@@ -4527,6 +4559,7 @@ mod tests {
             response: "alpha beta gamma".to_string(),
             stopped_for_limit: false,
             stopped_for_budget: false,
+            stopped_for_context: false,
             cancelled: false,
             compaction: Default::default(),
             status: StatusSnapshot {
@@ -5060,12 +5093,60 @@ mod tests {
     }
 
     #[test]
+    fn compact_command_sends_the_compact_request() {
+        let mut app = App::new();
+        let payload = slash_outcome(&mut app, "/compact").expect("compact request");
+        assert_eq!(payload, serde_json::json!({"type": "compact"}));
+        assert!(is_finished_command("/compact"));
+        assert!(!is_finished_command("/compact now"));
+        assert!(slash_outcome(&mut app, "/compact now").is_none());
+    }
+
+    #[test]
+    fn compacted_event_adds_a_note() {
+        let mut app = App::new();
+        app.apply(ServerMessage::Compacted {
+            compaction: crate::protocol::Compaction {
+                occurred: true,
+                tokens_reclaimed: 900,
+                ..Default::default()
+            },
+            status: StatusSnapshot::default(),
+        });
+        assert!(tool_text(&app).contains("900 tokens reclaimed"));
+        let mut idle = App::new();
+        idle.apply(ServerMessage::Compacted {
+            compaction: Default::default(),
+            status: StatusSnapshot::default(),
+        });
+        assert!(tool_text(&idle).contains("nothing to compact"));
+    }
+
+    #[test]
+    fn context_stop_adds_a_note_and_stays_ready() {
+        let mut app = App::new();
+        app.apply(ServerMessage::Done {
+            response: String::new(),
+            stopped_for_limit: false,
+            stopped_for_budget: false,
+            stopped_for_context: true,
+            cancelled: false,
+            compaction: Default::default(),
+            status: StatusSnapshot::default(),
+        });
+        assert!(tool_text(&app).contains("no longer fits the model context"));
+        assert!(tool_text(&app).contains("/compact"));
+        assert!(matches!(app.status, Status::Ready));
+    }
+
+    #[test]
     fn compaction_notice_reports_what_changed() {
         let mut app = App::new();
         app.apply(ServerMessage::Done {
             response: String::new(),
             stopped_for_limit: false,
             stopped_for_budget: false,
+            stopped_for_context: false,
             cancelled: false,
             compaction: crate::protocol::Compaction {
                 occurred: true,
@@ -5101,7 +5182,7 @@ mod tests {
             RowKind::ToolHunk
         ));
         assert!(matches!(
-            tool_body_kind("bash_tool", false, "  exit_code: 0", false),
+            tool_body_kind("bash", false, "  exit_code: 0", false),
             RowKind::ToolExitOk
         ));
         assert!(matches!(
