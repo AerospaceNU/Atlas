@@ -360,6 +360,7 @@ class AgentSession:
         workspace. Reads keep the previous read root, so this never widens
         write access to the workspace.
         """
+        _stop_jobs("new conversation")
         old_id = self.session_id
         self.goal = ""
         self._goal_message = None
@@ -864,6 +865,14 @@ def _safe_summary(step: AgentStep) -> str:
         return ""
 
 
+def _stop_jobs(reason: str) -> None:
+    """Stop background bash jobs this process started; never raises."""
+    with contextlib.suppress(Exception):
+        from atlas.agent.tools._jobs import stop_all
+
+        stop_all(reason)
+
+
 def serve(
     session: AgentSession,
     stdin: IO[str],
@@ -885,7 +894,10 @@ def serve(
     )
     with session_bound(session):
         _remember_resolved_credentials(session)
-        code = _serve_bound(session, stdin, stdout)
+        try:
+            code = _serve_bound(session, stdin, stdout)
+        finally:
+            _stop_jobs("session ended")
         if session.has_conversation():
             with contextlib.suppress(Exception):
                 session.save_state(only_if_dir_exists=True)
