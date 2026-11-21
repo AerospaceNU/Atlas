@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -69,9 +71,16 @@ class BashTool(Tool):
             return ToolResult(text=f"Working directory not found: {request.working_directory}")
 
         timeout = min(request.timeout, MAX_TIMEOUT)
+        env = {
+            **os.environ,
+            "ATLAS_PYTHON": sys.executable,
+            "ATLAS_WORKSPACE": str(store.read_root or store.root),
+            "ATLAS_ARTIFACT_ROOT": str(store.artifact_root),
+        }
         captured = run_captured(
             _shell_argv(request.command),
             cwd=cwd,
+            env=env,
             timeout=timeout,
             max_chars=self.max_output_chars,
         )

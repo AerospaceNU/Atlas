@@ -6,13 +6,17 @@ from collections.abc import Sequence
 
 from atlas.cli.catalog import is_known_target
 from atlas.cli.data import add_data_parser, run_data
+from atlas.cli.geo import add_geo_parser, run_geo
 from atlas.cli.indices import add_indices_parser, run_indices
+from atlas.cli.models import add_models_parser, run_models
 
-_ROOT = frozenset({"data", "indices", "-h", "--help"})
+_ROOT = frozenset({"data", "indices", "models", "geo", "-h", "--help"})
 _TUI_FLAGS = frozenset({"--workspace", "--repo"})
 _HELP = """examples:
   atlas                          open the agent TUI
   atlas data                     list satellites
+  atlas models list              list model plugins
+  atlas geo guide workflow       satellite analysis guide
   atlas sentinel2 optical ...    search one collection
   atlas indices --red red.npy --nir nir.npy --out indices
 """
@@ -46,11 +50,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="group")
     add_data_parser(sub)
     add_indices_parser(sub)
+    add_models_parser(sub)
+    add_geo_parser(sub)
     args = parser.parse_args(tokens)
     if getattr(args, "_atlas_cmd", None) == "data":
         return run_data(args)
     if getattr(args, "_atlas_cmd", None) == "indices":
         return run_indices(args)
+    if getattr(args, "_atlas_cmd", None) == "models":
+        return run_models(args)
+    if getattr(args, "_atlas_cmd", None) == "geo":
+        return run_geo(args)
     parser.print_help()
     return 0
 

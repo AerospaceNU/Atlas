@@ -172,6 +172,8 @@ class Tool(ABC):
     name: str
     description: str
     trust: ClassVar[Literal["default", "opt_in"]] = "default"
+    # Capability family used by tool profiles; "satellite" marks remote-sensing tools.
+    domain: ClassVar[str] = ""
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

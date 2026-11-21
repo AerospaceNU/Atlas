@@ -123,7 +123,8 @@ def profile_registry(tool_profile: str = "full") -> ToolRegistry:
     """Return the registry for a headless tool profile.
 
     "full" is :func:`default_registry`. "coding" is the same registry minus
-    :data:`NON_CODING_TOOLS`. "minimal" keeps only :data:`MINIMAL_TOOLS`. Only registered tools ever run; this narrows the
+    :data:`NON_CODING_TOOLS` and any tool whose ``domain`` is "satellite". "minimal" keeps only
+    :data:`MINIMAL_TOOLS` (also minus satellite-domain tools). Only registered tools ever run; this narrows the
     allow-list and never aliases a name.
 
     Raises:
@@ -142,6 +143,8 @@ def profile_registry(tool_profile: str = "full") -> ToolRegistry:
         if tool_profile == "minimal" and name not in MINIMAL_TOOLS:
             continue
         if tool_profile == "coding" and name in NON_CODING_TOOLS:
+            continue
+        if tool_profile in {"coding", "minimal"} and getattr(tool, "domain", "") == "satellite":
             continue
         registry.register(tool)
     if tool_profile == "minimal":

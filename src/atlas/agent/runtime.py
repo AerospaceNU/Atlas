@@ -113,6 +113,22 @@ MUTATING_TOOLS = frozenset(
     {"apply_patch", "bash", "edit_file", "git_commit", "patch_file", "write_file"}
 )
 
+# Satellite tools that become mutating only for specific arguments. Approval-gated, not
+# undoable (regenerable analysis/ data).
+_PATH_WRITING_TOOLS = frozenset({"render_map", "export_geotiff"})
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return value is True or (type(value) is int and value == 1)
+
+
+def _writes_to_path(call: ToolCall) -> bool:
+    path = call.arguments.get("path")
+    return call.name in _PATH_WRITING_TOOLS and isinstance(path, str) and bool(path.strip())
+
+
 _MAX_VALIDATION_CHARS = 1500
 _REPEAT_NOTE_AT = 3
 _MIN_BUDGET_WARNING_CALLS = 20
@@ -980,7 +996,9 @@ class Agent:
 
     def _checkpoint(self, call: ToolCall) -> None:
         """Snapshot a file a mutating tool is about to change."""
-        if not _is_mutating(call) or call.name in {"run_tests", "git_commit"}:
+        # Satellite overwrite/path writes are directories or rasters, regenerable, so they
+        # are skipped explicitly rather than snapshotted and logged.
+        if call.name not in MUTATING_TOOLS or call.name in {"run_tests", "git_commit"}:
             return
         if call.name == "apply_patch":
             paths = [] if self._patch_is_dry_run(call) else _patch_paths(call.arguments)
@@ -1087,6 +1105,12 @@ class Agent:
             return _argv_text(call.arguments)[:_PREVIEW_LIMIT]
         if call.name == "git_commit":
             return str(call.arguments.get("message") or "")[:_PREVIEW_LIMIT]
+        if call.name not in MUTATING_TOOLS:
+            if _truthy(call.arguments.get("overwrite")):
+                target = call.arguments.get("name") or call.arguments.get("path") or "?"
+                return f"replaces existing output: {target}"
+            if _writes_to_path(call):
+                return f"writes outside analysis/: {call.arguments.get('path')}"
         patch = call.arguments.get("patch")
         if isinstance(patch, str):
             return patch[:_PREVIEW_LIMIT]
@@ -1120,6 +1144,12 @@ def _summary(call: ToolCall) -> str:
     if call.name == "git_commit":
         return f"git commit: {str(call.arguments.get('message') or '')[:200]}"
     path = call.arguments.get("path")
+    if call.name not in MUTATING_TOOLS:
+        if _truthy(call.arguments.get("overwrite")):
+            name = call.arguments.get("name")
+            return f"{call.name} overwrite=true {name or path or '?'}"[:200]
+        if _writes_to_path(call):
+            return f"{call.name} write {path}"
     return f"{call.name} {path}" if path else call.name
 
 
@@ -1134,9 +1164,15 @@ def _argv_text(arguments: dict[str, Any]) -> str:
 def _is_mutating(call: ToolCall) -> bool:
     """Return whether a call can change the workspace or repository.
 
-    ``run_tests`` is only mutating with an explicit ``command``, which runs any argv.
+    ``run_tests`` is only mutating with an explicit ``command``, which runs any argv. Any call
+    with a truthy ``overwrite``, and ``render_map``/``export_geotiff`` with a non-empty
+    ``path``, also count; ``get_satellite_data`` downloads stay ungated.
     """
     if call.name in MUTATING_TOOLS:
+        return True
+    if _truthy(call.arguments.get("overwrite")):
+        return True
+    if _writes_to_path(call):
         return True
     return call.name == "run_tests" and bool(call.arguments.get("command"))
 
