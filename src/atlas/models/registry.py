@@ -155,6 +155,8 @@ def manifest_hidden_reason(manifest: ModelManifest) -> str | None:
     if not _extra_available(manifest.extra):
         return f"needs the {manifest.extra} extra: uv sync --extra {manifest.extra}"
     state = weights_state(manifest)
+    if state == "local":
+        return f"local weight not installed: atlas models pull {manifest.name} --from PATH"
     if state != "ready":
         return f"weights {state}: atlas models pull {manifest.name}"
     return None

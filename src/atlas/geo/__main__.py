@@ -68,7 +68,7 @@ def _model_lines() -> list[str]:
             pulls.append(f"uv sync --extra {extra}")
         if state != "ready":
             reasons.append(f"weights {state}")
-            if state == "unpublished":
+            if state in ("local", "unpublished"):
                 pulls.append(f"atlas models pull {manifest.name} --from PATH")
             else:
                 pulls.append(f"atlas models pull {manifest.name}")

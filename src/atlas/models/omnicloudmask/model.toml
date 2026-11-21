@@ -18,9 +18,10 @@ text = "Wright, N., Duncan, J.M.A., Callow, J.N., Thompson, S.E., George, R.J. (
 doi = "10.1016/j.rse.2025.114694"
 url = "https://github.com/DPIRD-DMA/OmniCloudMask"
 
-# PROVISIONAL pin: sha256 of the maintainer conversion (tools/models/convert_omnicloudmask.py).
-# It becomes the hash of the file the owner publishes; url stays empty until then, so the
-# weight reports "unpublished" and users run: atlas models pull cloud_mask --from PATH
+# Local weight: sha256 of the maintainer conversion (tools/models/convert_omnicloudmask.py),
+# hosted on this machine in the user weight store. There is no public URL (url is empty), so
+# the weight reports "local" until installed with: atlas models pull cloud_mask --from PATH
+# It registers whenever the verified file is present and onnxruntime imports.
 [weights]
 file = "omnicloudmask_v4.onnx"
 url = ""

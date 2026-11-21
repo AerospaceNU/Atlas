@@ -24,9 +24,11 @@ them in. See `NOTICE` for the MIT, RegNetY and EdgeNeXt notices.
 
 ## Weights
 
-Not published yet: `url` in `model.toml` is empty and the status is `unpublished`. The
-sha256 pin is provisional (it is the hash of the maintainer conversion) and becomes the hash
-of the file the owner publishes. Until then:
+Local weight, hosted on the machine that uses it: `url` in `model.toml` is empty (there is
+no public URL) and the status is `local` until installed. The sha256 pin is the hash of the
+maintainer conversion and is always checked. The file lands in the user weight store
+(`~/.atlas/weights`, or `ATLAS_WEIGHTS_DIR`). The tool registers whenever that verified file is
+present and onnxruntime imports. To install:
 
     uv run python tools/models/convert_omnicloudmask.py WEIGHTS_DIR omnicloudmask_v4.onnx
     atlas models pull cloud_mask --from omnicloudmask_v4.onnx
