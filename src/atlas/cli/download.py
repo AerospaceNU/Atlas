@@ -10,9 +10,10 @@ import os
 import re
 import time
 from collections import defaultdict
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -36,6 +37,18 @@ from atlas.data.cog import (
     model_bounds,
     open_cog,
 )
+from atlas.data.profiles import AssetNotFound, calibration_for, epsg_hint, resolve_asset
+from atlas.geo.chipmeta import (
+    BandInfo,
+    Calibration,
+    ChipMeta,
+    FileInfo,
+    RasterInfo,
+    read_chip_meta,
+    sidecar_path,
+    write_chip_meta,
+)
+from atlas.geo.errors import GeoError
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
 _BROWSE_KEYS = frozenset({"rendered_preview", "thumbnail", "preview", "quicklook", "browse"})
@@ -119,6 +132,15 @@ SIGN_WAIT_CAP_SECONDS = 16.0
 # success, so a killed run never leaves a truncated file at the final name.
 PARTIAL_PREFIX = "."
 PARTIAL_SUFFIX = ".part"
+# Agent-facing limits: one window per asset is capped at 36 megapixels, a whole
+# file larger than 200 MB needs an explicit opt-in, and a whole-file fallback for
+# a window that failed transiently is abandoned after 64 MiB.
+WINDOW_MAX_PIXELS = 36_000_000
+WHOLE_FILE_CAP_BYTES = 200_000_000
+WINDOW_INTENDED_ABORT_BYTES = 64 * 1024 * 1024
+_CHIP_TILE = 512
+_SIDECAR_PROPERTIES = ("eo:cloud_cover", "s2:processing_baseline", "earthsearch:boa_offset_applied")
+_SIDECAR_PROPERTY_PREFIXES = ("sat:", "sar:")
 _REDACTED = "***"
 _URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
 # FIRMS puts MAP_KEY in the path: /api/area/csv/<key>/<source>/<area>/...
@@ -139,6 +161,22 @@ class BrowseAssetError(ValueError):
 
 class DownloadStallError(OSError):
     """Raised when a whole-file GET stops making progress."""
+
+
+class _WholeFileAbort(OSError):
+    """A whole-file fallback for an intended window passed the abort size."""
+
+
+class _WholeFileRefused(Exception):
+    """A whole-file fetch was refused for size; carries the final error text."""
+
+
+class _Stop(Exception):
+    """Cancellation or the wall-clock cap tripped; ``status`` is the outcome status."""
+
+    def __init__(self, status: str) -> None:
+        super().__init__(status)
+        self.status = status
 
 
 def redact_url(url: str) -> str:
@@ -190,11 +228,14 @@ def describe_error(exc: BaseException) -> str:
 
 @dataclass
 class DownloadOutcome:
-    """One scene's download attempt.
+    """One (scene, asset) download attempt.
 
-    ``error`` is passed through ``redact_secrets`` on construction, so a
-    signed href or key in an exception message never reaches the CLI table
-    or ``manifest.json``.
+    ``error`` and ``note`` are passed through ``redact_secrets`` on construction,
+    so a signed href or key in an exception message never reaches the CLI table
+    or ``manifest.json``. ``status`` is one of saved, skipped, failed, no_asset,
+    cancelled, timeout (the last two only when a cancel or deadline is used).
+    ``windowed`` is True for a chip, False for a whole file, None when no window
+    was intended. ``bytes_fetched`` counts bytes over the network for this outcome.
     """
 
     source: str
@@ -206,10 +247,17 @@ class DownloadOutcome:
     granule_size: int | None = None
     preview: Path | None = None
     preview_error: str | None = None
+    asset_key: str | None = None
+    alias: str | None = None
+    windowed: bool | None = None
+    note: str | None = None
+    bytes_fetched: int = 0
 
     def __post_init__(self) -> None:
         if self.error is not None:
             self.error = redact_secrets(self.error)
+        if self.note is not None:
+            self.note = redact_secrets(self.note)
 
 
 @dataclass
@@ -274,6 +322,10 @@ def pick_asset(scene: Scene, name: str | None = None) -> tuple[str, Asset] | Non
         # `nir` is ~865 nm everywhere. Earth Search keys B08 (0.842) as `nir`.
         key = scene.band_aliases.get(name.strip().lower(), name)
         asset = scene.assets.get(key)
+        if asset is None:
+            folded = key.strip().casefold()
+            key = next((k for k in sorted(scene.assets) if k.casefold() == folded), key)
+            asset = scene.assets.get(key)
         if asset is None:
             return None
         if is_browse_asset(key, asset):
@@ -515,6 +567,13 @@ async def download_assets(
     stall_min_bytes: int = STALL_MIN_BYTES,
     attempts: int = GET_ATTEMPTS,
     retry_backoff: float = RETRY_BACKOFF_SECONDS,
+    asset_names: Sequence[str] | None = None,
+    whole_file: Literal["allow", "size_limited"] = "allow",
+    allow_whole_file: bool = False,
+    max_pixels: int | None = None,
+    deadline_seconds: float | None = None,
+    polygon: Sequence[Sequence[float]] | None = None,
+    write_sidecar: bool | None = None,
 ) -> DownloadReport:
     """GET one native-resolution asset per scene, streamed to disk.
 
@@ -555,12 +614,60 @@ async def download_assets(
     with URL queries and credentials masked (see ``redact_secrets``).
     An unexpected exception fails that scene only and does not abort the
     other downloads.
+
+    ``asset_names`` fetches several assets per scene (alias or key, any case, via
+    ``atlas.data.profiles.resolve_asset``); one outcome is recorded per (scene,
+    asset). Combined with ``asset_name`` it raises ``ValueError``. Each chip is
+    written as tiled, deflate-compressed GeoTIFF; with ``write_sidecar`` (default:
+    on when ``asset_names`` is given) a ``<chip>.meta.json`` records provenance,
+    calibration, and the AOI ``polygon``. A chip is reused only when its AOI marker
+    and sidecar polygon match the request.
+
+    ``whole_file="allow"`` keeps the CLI behaviour. ``"size_limited"`` refuses a
+    whole-file GET for an asset that cannot be windowed when its size is known to
+    exceed ``WHOLE_FILE_CAP_BYTES`` (or turns out to, from Content-Length) unless
+    ``allow_whole_file``, and abandons the whole-file fallback for a transient
+    window failure after ``WINDOW_INTENDED_ABORT_BYTES``. ``max_pixels`` caps one
+    window. ``deadline_seconds`` is a wall-clock cap; user cancellation
+    (``atlas.geo._lazy.check_cancel``) and the cap record ``cancelled`` or ``timeout``
+    for work not finished, delete partial files, and keep finished outputs. The
+    caller must run this coroutine in the thread that holds the cancel scope.
     """
-    if asset_name and is_forbidden_asset_name(asset_name):
-        raise BrowseAssetError(f"{asset_name!r} is a preview/thumbnail and cannot be downloaded")
+    from atlas.geo._lazy import check_cancel
+    from atlas.geo.errors import GeoCancelled
+
+    if asset_name and asset_names is not None:
+        raise ValueError("pass asset_name or asset_names, not both")
+    names = _unique_names(asset_names)
+    for requested in names or ([asset_name] if asset_name else []):
+        if is_forbidden_asset_name(requested):
+            raise BrowseAssetError(f"{requested!r} is a preview/thumbnail and cannot be downloaded")
+    pairs: list[tuple[Scene, str | None]] = (
+        [(scene, name) for scene in scenes for name in names]
+        if asset_names is not None
+        else [(scene, asset_name) for scene in scenes]
+    )
+    sidecars = asset_names is not None if write_sidecar is None else write_sidecar
+    ring = _ring(polygon)
+    deadline = None if deadline_seconds is None else time.monotonic() + deadline_seconds
+
+    def tripped() -> str | None:
+        """Return the stop status when the cap passed or the user cancelled."""
+        if deadline is not None and time.monotonic() >= deadline:
+            return "timeout"
+        try:
+            check_cancel()
+        except GeoCancelled:
+            return "cancelled"
+        return None
+
+    def checkpoint() -> None:
+        stop = tripped()
+        if stop is not None:
+            raise _Stop(stop)
 
     totals: dict[str, int] = {}
-    for scene in scenes:
+    for scene, _name in pairs:
         totals[scene.source] = totals.get(scene.source, 0) + 1
     done_counts: dict[str, int] = dict.fromkeys(totals, 0)
     report = DownloadReport()
@@ -578,35 +685,52 @@ async def download_assets(
                     totals.get(outcome.source, done_counts[outcome.source]),
                 )
 
-    async def one(scene: Scene) -> None:
+    async def one(scene: Scene, name: str | None) -> None:
         path: Path | None = None
         partial: Path | None = None
         stale: Path | None = None
         bytes_read: int | None = None
         granule_size: int | None = None
+        bytes_fetched = 0
         chip: CogRead | None = None
+        key: str | None = None
+        alias: str | None = None
+        windowed_flag: bool | None = None
+        notes: list[str] = []
+
+        def make(status: str, **fields: Any) -> DownloadOutcome:
+            return DownloadOutcome(
+                source=scene.source,
+                scene_id=scene.id,
+                status=status,
+                asset_key=key,
+                alias=alias,
+                **fields,
+            )
+
         try:
-            picked = pick_asset(scene, asset_name)
-            if picked is None:
-                await record(
-                    DownloadOutcome(
-                        source=scene.source,
-                        scene_id=scene.id,
-                        status="no_asset",
-                        error="no native-resolution asset",
+            if asset_names is not None:
+                try:
+                    resolved = resolve_asset(scene, name or "")
+                except AssetNotFound as exc:
+                    await record(make("no_asset", error=str(exc)))
+                    return
+                key, asset, alias = resolved.key, resolved.asset, resolved.alias
+                if is_browse_asset(key, asset):
+                    raise BrowseAssetError(
+                        f"{key!r} is a preview/thumbnail and cannot be downloaded"
                     )
-                )
-                return
-            key, asset = picked
+            else:
+                picked = pick_asset(scene, asset_name)
+                if picked is None:
+                    await record(make("no_asset", error="no native-resolution asset"))
+                    return
+                key, asset = picked
+                alias = _alias_of(scene, key)
             dest_dir = output_source_dir(out, scene.source)
             if dest_dir is None:
                 await record(
-                    DownloadOutcome(
-                        source=scene.source,
-                        scene_id=scene.id,
-                        status="failed",
-                        error="source name is not a directory inside the output",
-                    )
+                    make("failed", error="source name is not a directory inside the output")
                 )
                 return
             dest_dir.mkdir(parents=True, exist_ok=True)
@@ -618,18 +742,22 @@ async def download_assets(
             window = bbox is not None and _is_geotiff_asset(asset)
             present = existing_product(dest_dir, scene.id, key, planned_suffix)
             if present is not None:
-                if not window or (bbox is not None and same_aoi(present, bbox)):
+                if not window or (
+                    bbox is not None
+                    and same_aoi(present, bbox)
+                    and (not sidecars or _sidecar_matches(present, ring))
+                ):
                     # A whole-file download is AOI-independent. A chip is only
-                    # reusable when its marker records this same AOI.
+                    # reusable when its marker records this same AOI (and, with a
+                    # sidecar, this same polygon).
                     preview, preview_error = await _missing_preview(present)
                     await record(
-                        DownloadOutcome(
-                            source=scene.source,
-                            scene_id=scene.id,
-                            status="skipped",
+                        make(
+                            "skipped",
                             path=present,
                             preview=preview,
                             preview_error=preview_error,
+                            windowed=True if window else None,
                         )
                     )
                     return
@@ -639,19 +767,40 @@ async def download_assets(
             elif window and planned.is_symlink():
                 stale = planned
             async with sem:
+                checkpoint()
                 client = clients.get(scene.source)
                 href = await _signed_href(client, asset.href)
+                checkpoint()
                 headers = await client.download_headers(href) if client is not None else {}
-                windowed = await _windowed_cog(http, href, asset, bbox, headers)
+                why: list[str] = []
+                windowed = await _windowed_cog(
+                    http,
+                    href,
+                    asset,
+                    bbox,
+                    headers,
+                    epsg_hint=epsg_hint(scene),
+                    max_pixels=max_pixels,
+                    why=why,
+                )
+                checkpoint()
                 if isinstance(windowed, tuple):
                     payload, chip = windowed
                     bytes_read, granule_size = chip.bytes_fetched, chip.granule_size
+                    bytes_fetched = chip.bytes_fetched
+                    windowed_flag = True
                     final = dest_dir / scene_filename(scene.id, key, ".tif")
                     partial = partial_path(final)
                     _unlink_symlink(partial)
                     partial.write_bytes(payload)
                     path = _commit_partial(partial, final)
                     partial = None
+                    if sidecars:
+                        failure = _write_sidecar(
+                            path, scene, key, alias, chip, len(payload), bbox, ring
+                        )
+                        if failure is not None:
+                            notes.append(failure)
                     if bbox is not None:
                         write_aoi(final, bbox)
                     _retire_previous(out, stale, path)
@@ -669,18 +818,17 @@ async def download_assets(
                     # the granule again.
                     preview, preview_error = await _missing_preview(stale)
                     await record(
-                        DownloadOutcome(
-                            source=scene.source,
-                            scene_id=scene.id,
-                            status="skipped",
-                            path=stale,
-                            preview=preview,
-                            preview_error=preview_error,
-                        )
+                        make("skipped", path=stale, preview=preview, preview_error=preview_error)
                     )
                     return
                 else:
+                    reason = "; ".join(why) or "window not read"
+                    limit_check = _WholeFilePolicy.for_download(
+                        whole_file, allow_whole_file, window, windowed is UNWINDOWABLE, asset
+                    )
+                    limit_check.pre_check(key, reason)
                     total_attempts = max(1, attempts)
+                    written = 0
                     for attempt in range(1, total_attempts + 1):
                         if attempt > 1 and client is not None:
                             # A Retry-After wait can outlast a short-lived token.
@@ -694,33 +842,45 @@ async def download_assets(
                                 await asyncio.sleep(delay)
                                 continue
                             response.raise_for_status()
+                            limit_check.check_headers(response, key, reason)
                             suffix = asset_suffix(asset, response.headers.get("content-type"))
                             final = dest_dir / scene_filename(scene.id, key, suffix)
                             partial = partial_path(final)
                             _unlink_symlink(partial)
+                            written = 0
                             with partial.open("wb") as handle:
                                 async for chunk in _guarded_chunks(
                                     response, stall_seconds, stall_min_bytes
                                 ):
+                                    checkpoint()
+                                    written += len(chunk)
+                                    limit_check.check_written(written, key, reason)
                                     handle.write(chunk)
                             path = _commit_partial(partial, final)
                             clear_aoi(path)
+                            # A new whole file must not keep a sidecar that
+                            # describes the chip it replaced.
+                            _unlink_file(sidecar_path(path))
                             partial = None
                         break
+                    bytes_fetched = written
+                    if window:
+                        windowed_flag = False
+                        notes.append(f"whole file ({reason})")
+                        if sidecars:
+                            notes.append("no sidecar: whole file")
                     _retire_previous(out, stale, path)
                     stale = None
+        except _Stop as stop:
+            _unlink_partial(path, stale)
+            _unlink_file(partial)
+            await record(make(stop.status, bytes_fetched=bytes_fetched))
+            return
         except CogMissError as exc:
             _retire_previous(out, stale, None)
             _unlink_partial(path, stale)
             _unlink_file(partial)
-            await record(
-                DownloadOutcome(
-                    source=scene.source,
-                    scene_id=scene.id,
-                    status="failed",
-                    error=str(exc) or describe_error(exc),
-                )
-            )
+            await record(make("failed", error=str(exc) or describe_error(exc)))
             return
         except (CogRangeError, CogLimitError) as exc:
             # A refused range and a window over the read limit are not an
@@ -728,65 +888,43 @@ async def download_assets(
             # attempt is removed.
             _unlink_partial(path, stale)
             _unlink_file(partial)
-            await record(
-                DownloadOutcome(
-                    source=scene.source,
-                    scene_id=scene.id,
-                    status="failed",
-                    error=str(exc) or describe_error(exc),
-                )
-            )
+            await record(make("failed", error=_limit_error(exc, max_pixels)))
+            return
+        except (_WholeFileRefused, _WholeFileAbort) as exc:
+            _unlink_partial(path, stale)
+            _unlink_file(partial)
+            await record(make("failed", error=str(exc), windowed=False))
             return
         except BrowseAssetError as exc:
             _unlink_file(partial)
-            await record(
-                DownloadOutcome(
-                    source=scene.source,
-                    scene_id=scene.id,
-                    status="failed",
-                    error=str(exc) or describe_error(exc),
-                )
-            )
+            await record(make("failed", error=str(exc) or describe_error(exc)))
             return
         except Exception as exc:
             # Transport, HTTP status, stall, disk, signing, and any unexpected
             # client error fail this scene only. The partial file is removed.
             _unlink_partial(path, stale)
             _unlink_file(partial)
-            await record(
-                DownloadOutcome(
-                    source=scene.source,
-                    scene_id=scene.id,
-                    status="failed",
-                    error=describe_error(exc),
-                )
-            )
+            await record(make("failed", error=describe_error(exc)))
             return
         if path is None:
-            await record(
-                DownloadOutcome(
-                    source=scene.source,
-                    scene_id=scene.id,
-                    status="failed",
-                    error="download produced no file",
-                )
-            )
+            await record(make("failed", error="download produced no file"))
             return
         preview, preview_error = await _saved_preview(path, chip)
         await record(
-            DownloadOutcome(
-                source=scene.source,
-                scene_id=scene.id,
-                status="saved",
+            make(
+                "saved",
                 path=path,
                 bytes_read=bytes_read,
                 granule_size=granule_size,
                 preview=preview,
                 preview_error=preview_error,
+                windowed=windowed_flag,
+                note="; ".join(notes) or None,
+                bytes_fetched=bytes_fetched,
             )
         )
 
-    await asyncio.gather(*(one(scene) for scene in scenes))
+    await asyncio.gather(*(one(scene, name) for scene, name in pairs))
     return report
 
 
@@ -961,12 +1099,13 @@ def retire_product(path: Path) -> None:
 
     A regular file is moved to ``<name>.stale`` beside itself. A symlink is
     unlinked and not followed. Directories are left alone. A GeoTIFF's
-    ``<stem>.preview.png`` and AOI marker are retired with it, so neither
+    ``<stem>.preview.png``, AOI marker, and metadata sidecar are retired with it, so neither
     outlives its data.
     """
     if _is_tiff_path(path) and not path.name.endswith(".stale"):
         _retire_one(preview_path(path))
         _retire_one(aoi_path(path))
+        _retire_one(sidecar_path(path))
     _retire_one(path)
 
 
@@ -1007,12 +1146,236 @@ def _is_geotiff_asset(asset: Asset) -> bool:
     return Path(urlsplit(asset.href).path).suffix.lower() in {".tif", ".tiff"}
 
 
+def _unique_names(names: Sequence[str] | None) -> list[str]:
+    """Return the requested asset names without case-insensitive duplicates."""
+    if names is None:
+        return []
+    unique: dict[str, str] = {}
+    for name in names:
+        cleaned = name.strip()
+        if cleaned:
+            unique.setdefault(cleaned.casefold(), cleaned)
+    if not unique:
+        raise ValueError("asset_names is empty")
+    return list(unique.values())
+
+
+def _ring(polygon: Sequence[Sequence[float]] | None) -> list[list[float]] | None:
+    """Return a lon/lat ring as plain float lists, or None."""
+    if not polygon:
+        return None
+    return [[float(value) for value in point] for point in polygon]
+
+
+def _alias_of(scene: Scene, key: str) -> str | None:
+    """Return the profile alias of asset ``key``, or None."""
+    try:
+        return resolve_asset(scene, key).alias
+    except AssetNotFound:
+        return None
+
+
+def _sidecar_matches(chip: Path, ring: list[list[float]] | None) -> bool:
+    """True when the chip's sidecar exists and records the requested polygon."""
+    try:
+        meta = read_chip_meta(chip)
+    except GeoError:
+        return False
+    if meta is None or not meta.file.windowed:
+        return False
+    stored = meta.aoi.get("polygon") if isinstance(meta.aoi, dict) else None
+    return _ring(stored) == ring
+
+
+def _float_or_none(text: str | None) -> float | None:
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _scene_properties(scene: Scene) -> dict[str, Any]:
+    return {
+        name: value
+        for name, value in scene.properties.items()
+        if name in _SIDECAR_PROPERTIES or name.startswith(_SIDECAR_PROPERTY_PREFIXES)
+    }
+
+
+def _chip_meta(
+    scene: Scene,
+    key: str,
+    alias: str | None,
+    read: CogRead,
+    size: int,
+    bbox: BBox | None,
+    ring: list[list[float]] | None,
+) -> ChipMeta:
+    """Build the sidecar for one windowed chip from catalog facts and the read."""
+    asset = scene.assets[key]
+    try:
+        resolved = resolve_asset(scene, key)
+        band = resolved.band
+    except AssetNotFound:
+        band = None
+    rule = calibration_for(scene, key)
+    dtype = str(read.array.dtype)
+    calibration = Calibration()
+    if rule is not None:
+        calibration = Calibration(
+            scale=rule.scale,
+            offset=rule.offset,
+            offset_applied=rule.offset_applied,
+            nodata_in=rule.nodata_in,
+            dtype_in=rule.dtype_in or dtype,
+            valid_range=list(rule.valid_range) if rule.valid_range else None,
+            source=rule.source,
+        )
+    aoi = None
+    if bbox is not None:
+        aoi = {"bbox": [bbox.west, bbox.south, bbox.east, bbox.north], "polygon": ring}
+    return ChipMeta(
+        scene_id=scene.id,
+        source=scene.source,
+        collection=scene.collection,
+        platform=scene.platform,
+        datetime=scene.datetime.isoformat(),
+        asset_key=key,
+        alias=alias,
+        band=BandInfo(
+            common_name=asset.common_name or (band.common_name if band else None),
+            wavelength_um=asset.center_wavelength or (band.wavelength_um if band else None),
+            gsd_m=asset.spatial_resolution or (band.gsd_m if band else None),
+            source_band=key,
+        ),
+        file=FileInfo(
+            bytes=size,
+            windowed=True,
+            granule_bytes=read.granule_size,
+            bytes_fetched=read.bytes_fetched,
+        ),
+        raster=RasterInfo(
+            dtype=dtype,
+            height=int(read.array.shape[-2]),
+            width=int(read.array.shape[-1]),
+            epsg=read.epsg,
+            transform=[
+                read.pixel_size_x,
+                0.0,
+                read.origin_x,
+                0.0,
+                -read.pixel_size_y,
+                read.origin_y,
+            ],
+            nodata=_float_or_none(read.nodata),
+            registration="area",
+        ),
+        calibration=calibration,
+        qa_preset=band.qa_preset if band else None,
+        aoi=aoi,
+        scene_properties=_scene_properties(scene),
+    )
+
+
+def _write_sidecar(
+    chip: Path,
+    scene: Scene,
+    key: str,
+    alias: str | None,
+    read: CogRead,
+    size: int,
+    bbox: BBox | None,
+    ring: list[list[float]] | None,
+) -> str | None:
+    """Write the chip's sidecar; return a note on failure, never raise.
+
+    Any older sidecar is removed first, so a chip never carries the sidecar of a
+    different window. A failed write leaves none, and the chip is re-read next run.
+    """
+    _unlink_file(sidecar_path(chip))
+    try:
+        write_chip_meta(chip, _chip_meta(scene, key, alias, read, size, bbox, ring))
+    except Exception as exc:
+        return f"sidecar not written: {describe_error(exc)}"
+    return None
+
+
+def _limit_error(exc: BaseException, max_pixels: int | None) -> str:
+    """Error text for a refused range or oversized window."""
+    text = str(exc) or describe_error(exc)
+    if max_pixels is None or "Fix:" in text or not isinstance(exc, CogLimitError):
+        return text
+    return f"{text}. Fix: shrink the AOI (limit {max_pixels / 1e6:g} megapixels per asset)"
+
+
+@dataclass(frozen=True)
+class _WholeFilePolicy:
+    """Size rules for a whole-file GET when a window was intended."""
+
+    known_size: int | None = None
+    refuse_over: int | None = None
+    abort_over: int | None = None
+
+    @classmethod
+    def for_download(
+        cls,
+        mode: str,
+        allow: bool,
+        window: bool,
+        unwindowable: bool,
+        asset: Asset,
+    ) -> _WholeFilePolicy:
+        if mode != "size_limited" or not window:
+            return cls()
+        if not unwindowable:
+            return cls(abort_over=WINDOW_INTENDED_ABORT_BYTES)
+        if allow:
+            return cls()
+        size = asset.size_bytes
+        if size is None:
+            return cls(refuse_over=WHOLE_FILE_CAP_BYTES)
+        return cls(known_size=size if size > WHOLE_FILE_CAP_BYTES else None)
+
+    def pre_check(self, key: str, reason: str) -> None:
+        if self.known_size is not None:
+            raise _WholeFileRefused(_refusal(key, reason, f"{self.known_size / 1e6:.0f} MB"))
+
+    def check_headers(self, response: httpx.Response, key: str, reason: str) -> None:
+        if self.refuse_over is None:
+            return
+        header = response.headers.get("content-length", "")
+        if header.isdigit() and int(header) > self.refuse_over:
+            raise _WholeFileRefused(_refusal(key, reason, f"{int(header) / 1e6:.0f} MB"))
+
+    def check_written(self, written: int, key: str, reason: str) -> None:
+        if self.refuse_over is not None and written > self.refuse_over:
+            raise _WholeFileRefused(_refusal(key, reason, f"over {self.refuse_over / 1e6:.0f} MB"))
+        if self.abort_over is not None and written > self.abort_over:
+            raise _WholeFileAbort(
+                f"window read failed ({reason}); whole-file fetch aborted at "
+                f"{self.abort_over // (1024 * 1024)} MiB"
+            )
+
+
+def _refusal(key: str, reason: str, size: str) -> str:
+    return (
+        f"{key} cannot be windowed ({reason}) and is {size}; whole-file fetch skipped. "
+        "Fix: allow_whole_file=true, or choose another asset"
+    )
+
+
 async def _windowed_cog(
     http: httpx.AsyncClient,
     href: str,
     asset: Asset,
     bbox: BBox | None,
     headers: Mapping[str, str] | None = None,
+    *,
+    epsg_hint: int | None = None,
+    max_pixels: int | None = None,
+    why: list[str] | None = None,
 ) -> tuple[bytes, CogRead] | _Unwindowable | None:
     """Return the AOI GeoTIFF bytes and the window they encode.
 
@@ -1022,21 +1385,32 @@ async def _windowed_cog(
     undecodable tile) and the whole asset should be fetched. A miss is not a fallback:
     the AOI is outside the raster, and downloading the granule would not
     contain it. The read carries bytes fetched, the object size from
-    Content-Range, and the pixels used for the preview.
+    Content-Range, and the pixels used for the preview. The chip is encoded as
+    tiled, deflate-compressed GeoTIFF.
+
+    ``epsg_hint`` resolves a user-defined projection, ``max_pixels`` caps the window,
+    and each reason a window was not produced is appended to ``why``.
 
     A box that crosses the antimeridian is read one side at a time. A scene on
     one side is windowed normally; a global raster whose two edges both meet
     the AOI cannot be one rectangular chip, so that case stays whole-file.
     """
-    if bbox is None or not _is_geotiff_asset(asset):
+    reasons: list[str] = why if why is not None else []
+    if bbox is None:
+        reasons.append("no AOI")
+        return UNWINDOWABLE
+    if not _is_geotiff_asset(asset):
+        reasons.append("not a GeoTIFF")
         return UNWINDOWABLE
     try:
-        cog = await open_cog(http, href, headers=headers)
+        cog = await open_cog(http, href, headers=headers, epsg_hint=epsg_hint)
         if cog.epsg is None:
+            reasons.append("raster CRS unknown and no proj:epsg hint")
             return UNWINDOWABLE
         try:
             parts = bbox.antimeridian_parts()
         except ValueError:
+            reasons.append("AOI crosses the antimeridian")
             return UNWINDOWABLE
         reads: list[CogRead] = []
         unsupported = False
@@ -1053,23 +1427,31 @@ async def _windowed_cog(
                 continue
             west, south, east, north = bounds
             try:
-                reads.append(await cog.read_window(west=west, south=south, east=east, north=north))
+                reads.append(
+                    await cog.read_window(
+                        west=west, south=south, east=east, north=north, max_pixels=max_pixels
+                    )
+                )
             except CogMissError:
                 continue
         if not reads and unsupported:
+            reasons.append(f"unsupported projection EPSG:{cog.epsg}")
             return UNWINDOWABLE
         if not reads:
             raise CogMissError("AOI does not overlap the COG")
         if len(reads) > 1:
+            reasons.append("AOI crosses the antimeridian and both edges meet the raster")
             return UNWINDOWABLE
         read = reads[0]
     except (CogMissError, CogRangeError, CogLimitError):
         raise
-    except CogUnsupportedError:
+    except CogUnsupportedError as exc:
+        reasons.append(exc.reason or str(exc) or "unsupported GeoTIFF layout")
         return UNWINDOWABLE
-    except (CogError, httpx.HTTPError):
+    except (CogError, httpx.HTTPError) as exc:
+        reasons.append(type(exc).__name__)
         return None
-    return encode_cog(read), read
+    return encode_cog(read, tile=_CHIP_TILE, compress="deflate"), read
 
 
 async def _signed_href(
