@@ -35,10 +35,12 @@ from atlas.harness_eval.headless import (
     render_trajectory,
     run_headless,
 )
+from atlas.harness_eval.patch import build_patch
 from atlas.harness_eval.substrate import exclude_from_git
 
 BASE_REF_FILE = "base_ref"
 META_FILE = "meta.json"
+COLLECT_FILE = "collect.json"
 _GIT_EXCLUDES = ("__pycache__/", "*.pyc")
 
 
@@ -83,15 +85,31 @@ def prepare(workspace: Path, out: Path) -> int:
 
 
 def collect(workspace: Path, out: Path) -> int:
-    """Write every change since the base commit to ``patch.diff``."""
+    """Write every change since the base commit to ``patch.diff``.
+
+    ``collect.json`` records ``ok`` with the byte count, or ``error`` with the reason.
+    On failure ``patch.diff`` is removed, so a missing patch never reads as an
+    empty one, and the return code is 1.
+    """
+    out.mkdir(parents=True, exist_ok=True)
     base_file = out / BASE_REF_FILE
     base = base_file.read_text(encoding="utf-8").strip() if base_file.is_file() else "HEAD"
-    _git(workspace, "add", "-A")
-    diff = _git(workspace, "diff", "--cached", "--no-color", base)
-    if diff.returncode != 0:
-        print(f"git diff failed: {diff.stderr.strip()}", file=sys.stderr)
+    res = build_patch(workspace, base)
+    patch_path = out / "patch.diff"
+    if not res.ok:
+        patch_path.unlink(missing_ok=True)
+        (out / COLLECT_FILE).write_text(
+            json.dumps({"status": "error", "error": res.error}) + "\n", encoding="utf-8"
+        )
+        print(f"collect failed: {res.error}", file=sys.stderr)
         return 1
-    (out / "patch.diff").write_text(diff.stdout, encoding="utf-8")
+    tmp = out / "patch.diff.tmp"
+    tmp.write_text(res.patch, encoding="utf-8")
+    os.replace(tmp, patch_path)
+    size = len(res.patch.encode("utf-8"))
+    (out / COLLECT_FILE).write_text(
+        json.dumps({"status": "ok", "bytes": size}) + "\n", encoding="utf-8"
+    )
     return 0
 
 

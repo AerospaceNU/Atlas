@@ -324,6 +324,19 @@ def _exec(
     return proc
 
 
+def _collect_error(run_dir: Path, col: subprocess.CompletedProcess[str] | None) -> str | None:
+    """Return why patch collection failed, or None when ``collect.json`` says ok."""
+    path = run_dir / "collect.json"
+    rc = "timed out" if col is None else f"rc {col.returncode}"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return f"collect did not run or wrote no collect.json ({rc})"
+    if isinstance(data, dict) and data.get("status") == "error":
+        return str(data.get("error") or "unknown error")
+    return None
+
+
 def run_rollout(spec: RolloutSpec) -> dict[str, object]:
     """Run one rollout in its task container and return ``meta.json``.
 
@@ -392,7 +405,12 @@ def run_rollout(spec: RolloutSpec) -> dict[str, object]:
         except subprocess.TimeoutExpired:
             timed_out = True
             _exec(name, ["pkill", "-f", "atlas.harness_eval.rollout"], timeout=60, check=False)
-        _exec(name, [*_ROLLOUT, "collect", *step], timeout=600, check=False)
+        try:
+            col: subprocess.CompletedProcess[str] | None = _exec(
+                name, [*_ROLLOUT, "collect", *step], timeout=600, check=False
+            )
+        except subprocess.TimeoutExpired:
+            col = None
     finally:
         docker("rm", "-f", name, check=False, timeout=600)
     meta_path = run_dir / "meta.json"
@@ -403,7 +421,16 @@ def run_rollout(spec: RolloutSpec) -> dict[str, object]:
             if timed_out
             else "rollout exited without writing meta.json; see rollout.log",
         }
+    else:
+        loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta = loaded if isinstance(loaded, dict) else {"status": "error", "error": "bad meta.json"}
+    collect_error = _collect_error(run_dir, col)
+    if collect_error is not None:
+        if timed_out:
+            meta["collect_error"] = collect_error
+        else:
+            meta["status"] = "error"
+            meta["error"] = f"patch collection failed: {collect_error}"
+    if timed_out or not meta_path.is_file() or collect_error is not None:
         meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-        return meta
-    loaded = json.loads(meta_path.read_text(encoding="utf-8"))
-    return loaded if isinstance(loaded, dict) else {"status": "error", "error": "bad meta.json"}
+    return meta

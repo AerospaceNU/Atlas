@@ -43,6 +43,7 @@ _RUN_FILES = (
     "trace.json",
     "trajectory.md",
     "patch.diff",
+    "collect.json",
     "rollout.log",
     "base_ref",
     "score.json",
