@@ -3,8 +3,11 @@ from __future__ import annotations
 import importlib
 import inspect
 import pkgutil
+import threading
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from typing import Any, ClassVar, Literal, Protocol
 
@@ -13,9 +16,66 @@ from pydantic import BaseModel, Field
 from atlas.agent.artifacts import LocalArtifactStore
 
 _TRUST_VALUES = frozenset({"default", "opt_in"})
+_SCHEMA_MAPS = frozenset({"properties", "$defs", "definitions", "patternProperties"})
+_SCHEMA_VALUES = frozenset({"default", "const", "enum", "examples"})
+
+_cancel_event_var: ContextVar[threading.Event | None] = ContextVar(
+    "atlas_cancel_event", default=None
+)
+_output_sink_var: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "atlas_output_sink", default=None
+)
+_child_calls_var: ContextVar[list[ModelCall] | None] = ContextVar("atlas_child_calls", default=None)
+_shared_budget_var: ContextVar[Any] = ContextVar("atlas_shared_budget", default=None)
 
 
-class Role(str, Enum):  # noqa: UP042 - str mixin keeps the lowercase wire values
+def current_cancel_event() -> threading.Event | None:
+    """Return the active turn's cancellation event, if executing inside an agent turn."""
+    return _cancel_event_var.get()
+
+
+def emit_tool_output(chunk: str) -> None:
+    """Stream an incremental tool output chunk to the active RPC sink, if any."""
+    if not chunk:
+        return
+    sink = _output_sink_var.get()
+    if sink is not None:
+        sink(chunk)
+
+
+def current_child_calls() -> list[ModelCall] | None:
+    """Return the parent turn's call collector when executing inside a subagent."""
+    return _child_calls_var.get()
+
+
+def current_shared_budget() -> Any:
+    """Return the shared parent budget state when executing inside a subagent."""
+    return _shared_budget_var.get()
+
+
+@contextmanager
+def tool_execution_scope(
+    *,
+    cancel_event: threading.Event | None = None,
+    output_sink: Callable[[str], None] | None = None,
+    child_calls: list[ModelCall] | None = None,
+    shared_budget: Any = None,
+) -> Iterator[None]:
+    """Bind per-call cancellation, output streaming, and subagent accounting contextvars."""
+    t_cancel = _cancel_event_var.set(cancel_event)
+    t_sink = _output_sink_var.set(output_sink)
+    t_calls = _child_calls_var.set(child_calls)
+    t_budget = _shared_budget_var.set(shared_budget)
+    try:
+        yield
+    finally:
+        _cancel_event_var.reset(t_cancel)
+        _output_sink_var.reset(t_sink)
+        _child_calls_var.reset(t_calls)
+        _shared_budget_var.reset(t_budget)
+
+
+class Role(str, Enum):  # noqa: UP042 - str mixin keeps lowercase wire values
     """Chat role. A str enum so the wire format stays lowercase."""
 
     SYSTEM = "system"
@@ -38,14 +98,11 @@ class ToolCall(BaseModel):
     id: str
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    arguments_error: str | None = None
 
 
 class ModelImage(BaseModel):
-    """One local image artifact encoded for a vision model.
-
-    ``data`` is standard base64 of the file bytes. ``path`` is the
-    workspace-relative artifact path those bytes were read from.
-    """
+    """One local image artifact encoded for a vision model."""
 
     path: str
     media_type: str
@@ -53,12 +110,7 @@ class ModelImage(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    """A portable chat-completions message.
-
-    ``reasoning`` and ``reasoning_details`` are echoed on the next request when
-    the provider returned them. They are not part of ``content``. ``images``
-    are local artifact bytes sent alongside ``content`` as vision input.
-    """
+    """A portable chat-completions message."""
 
     role: Role
     content: str | None = None
@@ -72,13 +124,7 @@ class ChatMessage(BaseModel):
 
 
 class TokenUsage(BaseModel):
-    """Provider token counts and optional spend for one completion.
-
-    ``cached_tokens`` is the portion of the prompt served from cache.
-    ``reasoning_tokens`` is the portion of the completion spent on reasoning.
-    Both stay zero when the provider omits them. They are not added on top of
-    ``prompt_tokens`` or ``completion_tokens``.
-    """
+    """Provider token counts and optional spend for one completion."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -89,11 +135,7 @@ class TokenUsage(BaseModel):
 
 
 class CallTiming(BaseModel):
-    """HTTP status and measured duration for one model call.
-
-    ``time_to_first_token_seconds`` is set only when the transport reports it.
-    A non-streaming body leaves it empty.
-    """
+    """HTTP status and measured duration for one model call."""
 
     http_status: int
     elapsed_seconds: float
@@ -110,13 +152,7 @@ class ModelCall(BaseModel):
 
 
 class CatalogModel(BaseModel):
-    """One row from the OpenRouter models catalog.
-
-    ``name`` and ``description`` are display text with control characters,
-    ANSI sequences, and bidi overrides removed. An id that contains those
-    characters is not stored. ``supports_tools`` is true when the provider
-    lists ``tools`` in ``supported_parameters``.
-    """
+    """One row from the OpenRouter models catalog."""
 
     id: str
     name: str | None = None
@@ -124,19 +160,12 @@ class CatalogModel(BaseModel):
     context_length: int | None = None
     prompt_price: str | None = None
     completion_price: str | None = None
-    # OpenRouter ``pricing.input_cache_read``, dollars per cached token.
-    # Unset when the row has no cache-read rate. Estimates then price cached
-    # tokens at ``prompt_price``, because prompt tokens already include them.
     cache_read_price: str | None = None
     supports_tools: bool = False
 
 
 class ModelResponse(BaseModel):
-    """The subset of a model response needed by the runtime.
-
-    ``reasoning`` is display text for the turn. ``reasoning_details`` is the
-    provider payload to send back unchanged on the next request.
-    """
+    """The subset of a model response needed by the runtime."""
 
     content: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
@@ -164,6 +193,50 @@ class ToolResult(BaseModel):
 
     text: str
     artifacts: list[str] = Field(default_factory=list)
+    diff: str | None = None
+    summary: str | None = None
+
+
+def _clean_schema(node: Any, *, drop_description: bool = True) -> Any:
+    """Strip Pydantic JSON-schema noise (titles, null anyOf unions, model docstrings)."""
+    if isinstance(node, list):
+        return [_clean_schema(item, drop_description=False) for item in node]
+    if not isinstance(node, dict):
+        return node
+
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "title" and isinstance(value, str):
+            continue
+        if key == "description" and drop_description and isinstance(value, str):
+            continue
+        if key == "default" and value is None:
+            continue
+        if key in _SCHEMA_VALUES:
+            out[key] = value
+        elif key in _SCHEMA_MAPS and isinstance(value, dict):
+            sub_drop = key in {"$defs", "definitions"}
+            cleaned_map = {
+                name: _clean_schema(schema, drop_description=sub_drop)
+                for name, schema in value.items()
+            }
+            if cleaned_map or key == "properties":
+                out[key] = cleaned_map
+        elif key == "anyOf" and isinstance(value, list):
+            non_null = [item for item in value if item != {"type": "null"}]
+            if len(non_null) == 1 and len(non_null) < len(value):
+                merged = _clean_schema(non_null[0], drop_description=False)
+                if isinstance(merged, dict):
+                    for mk, mv in merged.items():
+                        out.setdefault(mk, mv)
+                    continue
+            out[key] = [_clean_schema(item, drop_description=False) for item in value]
+        else:
+            out[key] = _clean_schema(value, drop_description=False)
+    return out
+
+
+_without_titles = _clean_schema
 
 
 class Tool(ABC):
@@ -188,11 +261,11 @@ class Tool(ABC):
         raise NotImplementedError
 
     def definition(self) -> ToolDefinition:
-        """Return the schema advertised to the model, without Pydantic titles."""
+        """Return the schema advertised to the model, without Pydantic noise."""
         return ToolDefinition(
             name=self.name,
             description=self.description,
-            parameters=_without_titles(self.input_model.model_json_schema()),
+            parameters=_clean_schema(self.input_model.model_json_schema()),
         )
 
     @abstractmethod
@@ -201,45 +274,8 @@ class Tool(ABC):
         raise NotImplementedError
 
 
-_SCHEMA_MAPS = frozenset({"properties", "$defs", "definitions", "patternProperties"})
-_SCHEMA_VALUES = frozenset({"default", "const", "enum", "examples"})
-
-
-def _without_titles(schema: Any) -> Any:
-    """Return a JSON schema without generated ``title`` annotations.
-
-    Pydantic adds a title to every model and field. They repeat the property
-    names and are sent with every request, so they are dropped. A property
-    that is itself named ``title`` is kept, and literal values are untouched.
-    """
-    if isinstance(schema, list):
-        return [_without_titles(item) for item in schema]
-    if not isinstance(schema, dict):
-        return schema
-    cleaned: dict[str, Any] = {}
-    for key, value in schema.items():
-        if key == "title" and isinstance(value, str):
-            continue
-        if key in _SCHEMA_MAPS and isinstance(value, dict):
-            cleaned[key] = {name: _without_titles(item) for name, item in value.items()}
-        elif key in _SCHEMA_VALUES:
-            cleaned[key] = value
-        else:
-            cleaned[key] = _without_titles(value)
-    return cleaned
-
-
 class UnknownToolError(KeyError):
-    """A requested tool name that is not on the registry.
-
-    It stays a ``KeyError`` so callers that catch that keep working. Nothing is
-    executed for an unknown name: the registry is the only source of
-    capabilities.
-
-    Attributes:
-        name: The name the caller asked for.
-        available: The registered names, in registration order.
-    """
+    """A requested tool name that is not on the registry."""
 
     def __init__(self, name: str, available: Sequence[str] = ()) -> None:
         super().__init__(f"Unknown tool: {name}")
@@ -252,20 +288,24 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        self._definitions_cache: list[ToolDefinition] | None = None
 
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
             raise ValueError(f"Tool already registered: {tool.name}")
         self._tools[tool.name] = tool
+        self._definitions_cache = None
 
-    # ATLAS-90. register() still refuses a duplicate. This only swaps one name.
     def replace(self, tool: Tool) -> None:
         """Register ``tool``, replacing any tool already stored under its name."""
         self._tools[tool.name] = tool
+        self._definitions_cache = None
 
     @property
     def definitions(self) -> list[ToolDefinition]:
-        return [tool.definition() for tool in self._tools.values()]
+        if self._definitions_cache is None:
+            self._definitions_cache = [tool.definition() for tool in self._tools.values()]
+        return list(self._definitions_cache)
 
     @property
     def names(self) -> list[str]:
@@ -286,15 +326,7 @@ class ToolRegistry:
 
 
 def discover_tool_classes(packages: Sequence[str]) -> list[type[Tool]]:
-    """Import every module directly inside ``packages`` and collect concrete tools.
-
-    A tool counts only when its class statement is in that module. Imported
-    tool classes are ignored, so a re-export cannot grant a capability.
-    Subpackages and private modules are skipped. Import errors propagate.
-
-    A concrete tool with no string ``name`` raises ``ValueError``. Two classes
-    that share a name raise ``ValueError`` naming both sources.
-    """
+    """Import every module directly inside ``packages`` and collect concrete tools."""
     found: dict[type[Tool], str] = {}
     for package in packages:
         module = importlib.import_module(package)

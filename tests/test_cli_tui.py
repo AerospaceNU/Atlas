@@ -4,6 +4,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -425,7 +426,7 @@ def test_launch_replaces_the_process(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     launch_tui(["--repo", "/tmp/atlas"])
 
     assert recorded["path"] == str(binary)
-    assert recorded["argv"] == [str(binary), "--repo", "/tmp/atlas"]
+    assert recorded["argv"] == [str(binary), "--python", sys.executable, "--repo", "/tmp/atlas"]
 
 
 def test_explicit_binary_is_used_without_building(
@@ -469,6 +470,34 @@ def test_stale_binary_is_rebuilt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     assert ensure_tui_binary() == repo / "tui" / "target" / "release" / "atlas-tui"
 
 
+def test_tui_test_files_do_not_trigger_rebuild(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _fake_repo(tmp_path)
+    release = repo / "tui" / "target" / "release" / "atlas-tui"
+    release.parent.mkdir(parents=True)
+    release.write_text("bin", encoding="utf-8")
+    tests_rs = repo / "tui" / "src" / "tests.rs"
+    tests_rs.write_text("// test\n", encoding="utf-8")
+    unit_tests_rs = repo / "tui" / "src" / "extra_tests.rs"
+    unit_tests_rs.write_text("// test\n", encoding="utf-8")
+    os.utime(repo / "tui" / "Cargo.toml", (1, 1))
+    os.utime(repo / "tui" / "src" / "main.rs", (1, 1))
+    os.utime(release, (5, 5))
+    os.utime(tests_rs, (20, 20))
+    os.utime(unit_tests_rs, (20, 20))
+    monkeypatch.delenv("ATLAS_TUI", raising=False)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "atlas.cli.tui.__file__", str(tmp_path / "site" / "atlas" / "cli" / "tui.py")
+    )
+    monkeypatch.setattr(
+        "atlas.cli.tui._build", lambda *_: (_ for _ in ()).throw(AssertionError("rebuilt"))
+    )
+
+    assert ensure_tui_binary() == release
+
+
 def test_missing_cargo_reports_a_clear_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -497,22 +526,27 @@ def test_goal_slash_results_are_session_text(tmp_path: Path) -> None:
     root = session.agent.artifacts.root
     read_root = session.agent.artifacts.read_root
 
-    assert _goal_events(session, ['{"type":"goal"}'])[-1]["message"] == "none is set"
+    initial = _goal_events(session, ['{"type":"goal"}'])[-1]
+    assert initial["text"] == ""
+    assert initial["cleared"] is False
 
     set_goal = _goal_events(session, ['{"type":"goal","text":"map  the flood"}'])[-1]
-    assert set_goal["message"] == "map  the flood"
     assert set_goal["text"] == "map  the flood"
+    assert set_goal["cleared"] is False
+    assert set_goal["status"]["goal"] == "map  the flood"
     assert session.messages[1].content == session_goal_text("map  the flood")
 
     shown = _goal_events(session, ['{"type":"goal"}'])[-1]
-    assert shown["message"] == "map  the flood"
+    assert shown["text"] == "map  the flood"
 
     rejected = _goal_events(session, ['{"type":"goal","clear":true,"text":"other"}'])[-1]
     assert rejected == {"type": "error", "message": "usage: /goal [text] | /goal clear"}
     assert session.goal == "map  the flood"
 
-    cleared = _goal_events(session, ['{"type":"goal","clear":true}'])[-1]
-    assert cleared["message"] == "goal cleared"
+    cleared = _goal_events(session, ['{"type":"goal","text":""}'])[-1]
+    assert cleared["cleared"] is True
+    assert cleared["text"] == ""
+    assert cleared["status"]["goal"] is None
     assert session.goal == ""
     assert [tool.name for tool in session.agent.tools.definitions] == names
     assert "goal" not in names

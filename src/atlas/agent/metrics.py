@@ -10,18 +10,12 @@ from pydantic import BaseModel, Field
 from atlas.agent.contracts import CallTiming, ModelCall, ModelResponse, TokenUsage
 
 _RECENT_LIMIT = 8
-# A single late chunk timestamps the first token and the end of the stream
-# on top of each other. A few milliseconds is that sliver, not a generation
-# interval, and dividing the completion by it publishes a six-digit spike.
 _MIN_GENERATION_SECONDS = 0.05
+_PRICE_RE = re.compile(r"\+?(?:\d+\.?\d*|\.\d+)")
 
 
 class SessionTotals(BaseModel):
-    """Running totals the TUI status line renders.
-
-    ``context_limit`` stays unset until a catalog row supplies it. Nothing in
-    this module substitutes a hardcoded window.
-    """
+    """Running totals tracked across a session."""
 
     model: str = ""
     prompt_tokens: int = 0
@@ -30,12 +24,7 @@ class SessionTotals(BaseModel):
     cached_tokens: int = 0
     reasoning_tokens: int = 0
     cost: Decimal | None = None
-    # False once any call used tokens but had neither a provider cost nor
-    # catalog prices. The status line then says ``spend unknown``. A session
-    # with no token-using calls stays known and renders ``$0``.
     spend_known: bool = True
-    # True when any of the running total came from catalog prices rather
-    # than a provider-reported cost. The status line then prefixes ``~``.
     estimated: bool = False
     context_used: int = 0
     context_limit: int | None = None
@@ -48,47 +37,36 @@ class SessionTotals(BaseModel):
 
 def observe_model_call(response: ModelResponse) -> ModelCall | None:
     """Return a call record when the response carried usage or timing."""
-    usage = response.usage
-    has_usage = (
-        usage.prompt_tokens != 0
-        or usage.completion_tokens != 0
-        or usage.total_tokens != 0
-        or usage.cached_tokens != 0
-        or usage.reasoning_tokens != 0
-        or usage.cost is not None
+    u = response.usage
+    has_usage = any(
+        (
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.total_tokens,
+            u.cached_tokens,
+            u.reasoning_tokens,
+            u.cost is not None,
+        )
     )
     if response.timing is None and not has_usage:
         return None
-    return ModelCall(usage=usage, timing=response.timing, finish_reason=response.finish_reason)
+    return ModelCall(usage=u, timing=response.timing, finish_reason=response.finish_reason)
 
 
 def tokens_per_second(completion_tokens: int, generation_seconds: float) -> float | None:
-    """Output tokens divided by time after the first token.
-
-    ``generation_seconds`` excludes time to first token and any tool
-    execution between calls. A call with no output tokens does not produce
-    a rate. A window that is ``<= 0``, or only a few milliseconds (the first
-    measured chunk and the end of the stream landing together), does not
-    either: that quotient is not the speed of the call.
-    """
+    """Output tokens divided by generation time after first token."""
     if completion_tokens <= 0 or generation_seconds <= _MIN_GENERATION_SECONDS:
         return None
     return completion_tokens / generation_seconds
 
 
 def output_tokens_per_second(completion_tokens: int, timing: CallTiming | None) -> float | None:
-    """Latest-call output speed, measured from the first token.
-
-    The denominator is ``elapsed_seconds - time_to_first_token_seconds``.
-    When the transport did not record that instant, or the gap is too small
-    to be a generation interval, the rate is left unset so the whole HTTP
-    wait and a collapsed window are not reported as generation speed.
-    ``None`` means a previously measured rate should stay on the status line.
-    """
+    """Latest-call output speed measured after TTFT."""
     if timing is None or timing.time_to_first_token_seconds is None:
         return None
-    window = timing.elapsed_seconds - timing.time_to_first_token_seconds
-    return tokens_per_second(completion_tokens, window)
+    return tokens_per_second(
+        completion_tokens, timing.elapsed_seconds - timing.time_to_first_token_seconds
+    )
 
 
 def catalog_spend(
@@ -100,47 +78,25 @@ def catalog_spend(
     cached_tokens: int = 0,
     cache_read_price: str | None = None,
 ) -> Decimal | None:
-    """Price one call from catalog per-token rates.
-
-    ``prompt_price`` and ``completion_price`` are dollars per token. The
-    product is :class:`~decimal.Decimal` times the token counts. A missing,
-    negative, or non-decimal prompt or completion rate leaves the call
-    unpriced.
-
-    Cached tokens use ``cache_read_price`` when the catalog row has one
-    (OpenRouter ``pricing.input_cache_read``). The remainder of
-    ``prompt_tokens`` stays at the prompt rate. When the catalog has no
-    cache-read price, cached tokens are priced at the prompt rate, because
-    ``prompt_tokens`` already includes them.
-    """
+    """Price one call from catalog per-token rates."""
     prompt = _price_decimal(prompt_price)
     completion = _price_decimal(completion_price)
     if prompt is None or completion is None:
         return None
     cache = _price_decimal(cache_read_price)
     if cache is None:
-        # No cache-read price on this catalog row. Cached tokens are priced
-        # at the prompt rate.
         return (prompt * prompt_tokens) + (completion * completion_tokens)
-    cached = cached_tokens if cached_tokens > 0 else 0
-    uncached = prompt_tokens - cached
-    if uncached < 0:
-        uncached = 0
+    cached = max(0, cached_tokens)
+    uncached = max(0, prompt_tokens - cached)
     return (prompt * uncached) + (cache * cached) + (completion * completion_tokens)
 
 
 def reported_spend(totals: SessionTotals) -> float | None:
-    """Dollars to publish, or None when the session total is incomplete.
-
-    A fresh session with no token-using calls reports ``0``. That is a known
-    zero, not an unknown provider cost.
-    """
+    """Dollars to publish, or None when any token-using call was unpriced."""
     if not totals.spend_known:
         return None
     amount = _decimal_cost(totals.cost)
-    if amount is None:
-        return 0.0
-    return float(amount)
+    return 0.0 if amount is None else float(amount)
 
 
 def apply_call(
@@ -151,17 +107,7 @@ def apply_call(
     completion_price: str | None = None,
     cache_read_price: str | None = None,
 ) -> SessionTotals:
-    """Fold one completion into ``totals`` and return the same object.
-
-    A provider ``cost`` is added as reported. When that field is missing and
-    the call used tokens, the catalog per-token prices are applied and
-    ``estimated`` is set so the status line can prefix ``~``. If those rates
-    are missing too, the session spend becomes unknown. A session that has
-    not used tokens stays at ``$0``. Output speed is the latest call whose
-    generation window, after time to first token, is long enough to be a
-    rate. A later call with no time to first token, or a window of only a
-    few milliseconds, does not replace it.
-    """
+    """Fold one completion into ``totals`` and return the same object."""
     usage = call.usage
     totals.prompt_tokens += usage.prompt_tokens
     totals.completion_tokens += usage.completion_tokens
@@ -176,7 +122,7 @@ def apply_call(
         totals.last_http_status = timing.http_status
         totals.last_elapsed_seconds = timing.elapsed_seconds
         totals.last_ttft_seconds = timing.time_to_first_token_seconds
-        totals.recent.append(_recent_label(timing))
+        totals.recent.append(f"{timing.http_status} {timing.elapsed_seconds:.2f}s")
         del totals.recent[:-_RECENT_LIMIT]
         speed = output_tokens_per_second(usage.completion_tokens, timing)
         if speed is not None:
@@ -201,79 +147,56 @@ def apply_http_error(
 
 
 def format_token_count(value: int) -> str:
-    """Three significant figures, in K, M, or B once the count reaches that unit.
-
-    ``355`` stays ``355``, ``128000`` is ``128K``, ``1048576`` is ``1.05M``,
-    and ``1500000000`` is ``1.50B``.
-    """
+    """Format a token count to three significant figures with K/M/B suffix."""
     if value <= 0:
         return "0"
-    rounded = _round_sig3(value)
-    if rounded >= 1_000_000_000:
-        return f"{_sig_coeff(rounded, 1_000_000_000)}B"
-    if rounded >= 1_000_000:
-        return f"{_sig_coeff(rounded, 1_000_000)}M"
-    if rounded >= 1_000:
-        return f"{_sig_coeff(rounded, 1_000)}K"
+    digits = len(str(value))
+    if digits <= 3:
+        rounded = value
+    else:
+        factor = 10 ** (digits - 3)
+        head, rem = divmod(value, factor)
+        rounded = head + int(rem * 2 >= factor)
+        if rounded >= 1000:
+            rounded //= 10
+            factor *= 10
+        rounded *= factor
+    for unit, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if rounded >= unit:
+            whole, frac = divmod(rounded, unit)
+            if whole >= 100:
+                return f"{whole}{suffix}"
+            if whole >= 10:
+                return f"{whole}.{frac // (unit // 10)}{suffix}"
+            return f"{whole}.{frac // (unit // 100):02d}{suffix}"
     return str(rounded)
 
 
 def format_tui_status(totals: SessionTotals) -> str:
-    """One status line: model, context window, spend, and output speed.
-
-    A session with no token-using calls shows ``spend $0``. An unpriced call
-    shows ``spend unknown``. A catalog estimate shows ``spend ~$...`` so it is
-    not mistaken for a provider cost. The speed is the latest call, labeled
-    ``last``, and is ``n/a`` until one is measured from the first token.
-
-    Token counts are deliberately absent: they accumulate without bound and
-    crowded the bar on a narrow terminal. ``SessionTotals`` still carries them
-    for the cost math and the protocol, and the context window is what the bar
-    reports.
-    """
+    """Format one compact status summary line for diagnostics and tests."""
     limit = "unknown" if totals.context_limit is None else format_token_count(totals.context_limit)
     model = totals.model or "unset"
+    if not totals.spend_known:
+        spend = "unknown"
+    else:
+        amount = _decimal_cost(totals.cost)
+        if amount is None:
+            spend = "$0"
+        else:
+            raw = format(amount, "f")
+            if "." in raw:
+                raw = raw.rstrip("0").rstrip(".")
+            raw = "0" if raw in {"", "-0"} else raw
+            spend = f"~${raw}" if totals.estimated else f"${raw}"
+    speed = (
+        "last n/a tok/s"
+        if totals.tokens_per_second is None
+        else f"last {totals.tokens_per_second:.1f} tok/s"
+    )
     return (
         f"model {model}  context {format_token_count(totals.context_used)}/{limit}  "
-        f"spend {_spend_label(totals)}  {_speed_label(totals.tokens_per_second)}"
+        f"spend {spend}  {speed}"
     )
-
-
-def _round_sig3(value: int) -> int:
-    digits = _decimal_digits(value)
-    if digits <= 3:
-        return value
-    factor = _pow10(digits - 3)
-    head, rem = divmod(value, factor)
-    rounded = head + int(rem * 2 >= factor)
-    if rounded >= 1000:
-        rounded //= 10
-        factor *= 10
-    return rounded * factor
-
-
-def _pow10(exponent: int) -> int:
-    result = 1
-    for _ in range(exponent):
-        result *= 10
-    return result
-
-
-def _decimal_digits(value: int) -> int:
-    digits = 1
-    while value >= 10:
-        value //= 10
-        digits += 1
-    return digits
-
-
-def _sig_coeff(rounded: int, unit: int) -> str:
-    whole, frac = divmod(rounded, unit)
-    if whole >= 100:
-        return str(whole)
-    if whole >= 10:
-        return f"{whole}.{frac // (unit // 10)}"
-    return f"{whole}.{frac // (unit // 100):02d}"
 
 
 def _note_spend(
@@ -284,10 +207,11 @@ def _note_spend(
     cache_read_price: str | None,
 ) -> None:
     if usage.cost is not None:
-        _add_spend(totals, Decimal(str(usage.cost)))
+        current = _decimal_cost(totals.cost)
+        amount = Decimal(str(usage.cost))
+        totals.cost = amount if current is None else current + amount
         return
-    used_tokens = usage.prompt_tokens > 0 or usage.completion_tokens > 0 or usage.total_tokens > 0
-    if not used_tokens:
+    if not (usage.prompt_tokens > 0 or usage.completion_tokens > 0 or usage.total_tokens > 0):
         return
     estimate = catalog_spend(
         usage.prompt_tokens,
@@ -297,26 +221,20 @@ def _note_spend(
         cached_tokens=usage.cached_tokens,
         cache_read_price=cache_read_price,
     )
-    # A total with no prompt or completion split cannot be priced from the
-    # two catalog rates, so a zero product would still be a guess.
     if estimate is None or (usage.prompt_tokens == 0 and usage.completion_tokens == 0):
         totals.spend_known = False
         return
     totals.estimated = True
-    _add_spend(totals, estimate)
-
-
-def _add_spend(totals: SessionTotals, amount: Decimal) -> None:
     current = _decimal_cost(totals.cost)
-    totals.cost = amount if current is None else current + amount
+    totals.cost = estimate if current is None else current + estimate
 
 
 def _decimal_cost(value: object) -> Decimal | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, Decimal):
         return value
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+    if not isinstance(value, int | float | str):
         return None
     try:
         return Decimal(str(value))
@@ -328,43 +246,10 @@ def _price_decimal(value: str | None) -> Decimal | None:
     if not isinstance(value, str):
         return None
     text = value.strip()
-    if not re.fullmatch(r"\+?(?:\d+\.?\d*|\.\d+)", text):
+    if not _PRICE_RE.fullmatch(text):
         return None
     try:
         number = Decimal(text)
     except InvalidOperation:
         return None
-    if not number.is_finite() or number < 0:
-        return None
-    return number
-
-
-def _spend_label(totals: SessionTotals) -> str:
-    if not totals.spend_known:
-        return "unknown"
-    amount = _decimal_cost(totals.cost)
-    if amount is None:
-        return "$0"
-    text = _format_spend(amount)
-    if totals.estimated:
-        return f"~{text}"
-    return text
-
-
-def _speed_label(speed: float | None) -> str:
-    if speed is None:
-        return "last n/a tok/s"
-    return f"last {speed:.1f} tok/s"
-
-
-def _format_spend(cost: Decimal) -> str:
-    text = format(cost, "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    if text in {"", "-0"}:
-        text = "0"
-    return f"${text}"
-
-
-def _recent_label(timing: CallTiming) -> str:
-    return f"{timing.http_status} {timing.elapsed_seconds:.2f}s"
+    return number if number.is_finite() and number >= 0 else None

@@ -1,6 +1,6 @@
 [project]
 name = "atlas"
-version = "0.17.0"
+version = "0.17.1"
 description = "Automated satellite data analysis framework"
 readme = "README.md"
 authors = [
@@ -16,14 +16,17 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "anthropic>=0.104.1",
+    "html2text>=2024.2.26",
     "httpx>=0.28.1",
+    "httpx-sse>=0.4",
     "numpy>=2.2.0",
     "pillow>=11.0.0",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
+    "pyyaml>=6.0",
     "rich>=13.9.0",
     "scipy>=1.14.0",
+    "tenacity>=9.0",
 ]
 
 [project.optional-dependencies]
@@ -41,7 +44,7 @@ onnx = [
 atlas = "atlas:main"
 
 [build-system]
-requires = ["uv_build>=0.11.7,<0.12.0"]
+requires = ["uv_build>=0.11.7,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
@@ -53,6 +56,7 @@ dev = [
     "pytest-recording>=0.13.4",
     "ruff>=0.15.14",
     "lightgbm>=4.6.0",
+    "types-pyyaml>=6.0",
 ]
 
 [tool.ruff]

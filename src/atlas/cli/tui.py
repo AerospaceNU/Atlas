@@ -11,30 +11,9 @@ class TuiLaunchError(Exception):
     """The Rust TUI binary could not be found or built."""
 
 
-def launch_tui(argv: list[str]) -> int:
-    """Replace this process with the Rust TUI, passing ``argv`` through.
-
-    ``os.execv`` does not return on success. The terminal stays attached to
-    the TUI, which is what raw mode needs.
-    """
-    if sys.platform == "win32" and os.environ.get("ATLAS_ALLOW_NATIVE_WINDOWS") != "1":
-        print(f"atlas: {native_windows_message()}", file=sys.stderr)
-        return 1
-    try:
-        binary = ensure_tui_binary()
-    except TuiLaunchError as exc:
-        print(f"atlas: {exc}", file=sys.stderr)
-        return 1
-    args = list(argv)
-    has_repo = any(arg == "--repo" or arg.startswith("--repo=") for arg in args)
-    if not has_repo and (root := _repo_root()) is not None:
-        args += ["--repo", str(root)]
-    os.environ.setdefault("ATLAS_PYTHON", sys.executable)
-    try:
-        os.execv(str(binary), [str(binary), *args])
-    except OSError as exc:
-        print(f"atlas: could not start {binary}: {exc}", file=sys.stderr)
-        return 1
+def _has_flag(argv: list[str], flag: str) -> bool:
+    prefix = f"{flag}="
+    return any(tok == flag or tok.startswith(prefix) for tok in argv)
 
 
 def native_windows_message() -> str:
@@ -47,14 +26,36 @@ def native_windows_message() -> str:
     )
 
 
-def ensure_tui_binary() -> Path:
-    """Return the ``atlas-tui`` binary, building a release one when sources changed.
+def launch_tui(argv: list[str]) -> int:
+    """Replace this process with ``atlas-tui``, forwarding repo root and Python executable."""
+    if sys.platform == "win32" and os.environ.get("ATLAS_ALLOW_NATIVE_WINDOWS") != "1":
+        print(f"atlas: {native_windows_message()}", file=sys.stderr)
+        return 1
+    try:
+        binary = ensure_tui_binary()
+    except TuiLaunchError as exc:
+        print(f"atlas: {exc}", file=sys.stderr)
+        return 1
 
-    ``ATLAS_TUI`` wins and is not rebuilt. Otherwise a fresh binary already
-    under ``tui/target`` is used. A missing or stale binary is built with
-    ``cargo`` from ``PATH`` or ``~/.cargo/bin``, so the caller does not need
-    Rust on ``PATH``.
-    """
+    forwarded = list(argv)
+    if not _has_flag(forwarded, "--repo"):
+        repo = _repo_root()
+        if repo is not None:
+            forwarded = ["--repo", str(repo), *forwarded]
+    if not _has_flag(forwarded, "--python"):
+        python_exe = os.environ.get("ATLAS_PYTHON") or sys.executable
+        forwarded = ["--python", python_exe, *forwarded]
+    os.environ.setdefault("ATLAS_PYTHON", sys.executable)
+
+    try:
+        os.execv(str(binary), [str(binary), *forwarded])
+    except OSError as exc:
+        print(f"atlas: could not start {binary}: {exc}", file=sys.stderr)
+        return 1
+
+
+def ensure_tui_binary() -> Path:
+    """Return the ``atlas-tui`` binary, building a release binary when non-test sources changed."""
     explicit = os.environ.get("ATLAS_TUI")
     if explicit:
         path = Path(explicit).expanduser()
@@ -63,8 +64,8 @@ def ensure_tui_binary() -> Path:
         return path
 
     repo = _repo_root()
-    release = _target_binary(repo, "release")
-    debug = _target_binary(repo, "debug")
+    release = (repo / "tui" / "target" / "release" / "atlas-tui") if repo is not None else None
+    debug = (repo / "tui" / "target" / "debug" / "atlas-tui") if repo is not None else None
     on_path = _which("atlas-tui")
     source_mtime = _source_mtime(repo) if repo is not None else None
 
@@ -86,41 +87,28 @@ def ensure_tui_binary() -> Path:
     )
 
 
-def _target_binary(repo: Path | None, profile: str) -> Path | None:
-    if repo is None:
-        return None
-    return repo / "tui" / "target" / profile / "atlas-tui"
-
-
 def _which(name: str) -> Path | None:
     found = shutil.which(name)
-    if found is None:
-        return None
-    return Path(found)
+    return Path(found) if found is not None else None
 
 
 def _is_fresh(binary: Path, source_mtime: float | None) -> bool:
     if not binary.is_file():
         return False
-    if source_mtime is None:
-        return True
-    return binary.stat().st_mtime >= source_mtime
+    return True if source_mtime is None else binary.stat().st_mtime >= source_mtime
 
 
 def _repo_root() -> Path | None:
-    starts = [Path(__file__).resolve(), Path.cwd()]
     seen: set[Path] = set()
-    for start in starts:
+    for start in (Path(__file__).resolve(), Path.cwd()):
         for candidate in (start, *start.parents):
             if candidate in seen:
                 continue
             seen.add(candidate)
             pyproject = candidate / "pyproject.toml"
-            cargo = candidate / "tui" / "Cargo.toml"
-            if not pyproject.is_file() or not cargo.is_file():
+            if not pyproject.is_file() or not (candidate / "tui" / "Cargo.toml").is_file():
                 continue
-            text = pyproject.read_text(encoding="utf-8")
-            if 'name = "atlas"' in text:
+            if 'name = "atlas"' in pyproject.read_text(encoding="utf-8"):
                 return candidate
     return None
 
@@ -129,11 +117,18 @@ def _source_mtime(repo: Path) -> float | None:
     paths = [repo / "tui" / "Cargo.toml", repo / "tui" / "Cargo.lock"]
     src = repo / "tui" / "src"
     if src.is_dir():
-        paths.extend(path for path in src.rglob("*") if path.is_file())
+        for path in src.rglob("*"):
+            if not path.is_file():
+                continue
+            if (
+                path.name == "tests.rs"
+                or path.name.endswith("_tests.rs")
+                or "tests" in path.relative_to(src).parts
+            ):
+                continue
+            paths.append(path)
     mtimes = [path.stat().st_mtime for path in paths if path.is_file()]
-    if not mtimes:
-        return None
-    return max(mtimes)
+    return max(mtimes) if mtimes else None
 
 
 def _cargo_path() -> Path | None:
@@ -145,9 +140,7 @@ def _cargo_path() -> Path | None:
     if found is not None:
         return Path(found)
     home = Path.home() / ".cargo" / "bin" / "cargo"
-    if home.is_file():
-        return home
-    return None
+    return home if home.is_file() else None
 
 
 def _build(repo: Path, cargo: Path) -> Path:

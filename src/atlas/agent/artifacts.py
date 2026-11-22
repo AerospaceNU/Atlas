@@ -4,7 +4,6 @@ import os
 import stat
 from pathlib import Path
 
-from PIL import Image
 from pydantic import BaseModel
 
 _IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"})
@@ -51,15 +50,8 @@ class ImageInfo(BaseModel):
 class LocalArtifactStore:
     """An agent's working tree and its tool-output directory.
 
-    ``root`` is the working tree, usually the directory the person pointed the
-    session at. A relative tool path resolves against it. An absolute path is
-    used as given, ``~`` is expanded, and ``..`` is allowed.
-
-    ``artifact_root`` is where tool-produced outputs are written. It defaults
-    to ``root`` so removing a session removes its artifacts.
-
-    ``read_root`` is an optional second tree that reads may fall back to. It
-    lets a caller keep artifacts outside the working tree.
+    Relative tool paths resolve against ``root``. Absolute paths, ``~``, and
+    ``..`` are accepted without sandboxing.
     """
 
     def __init__(
@@ -76,7 +68,6 @@ class LocalArtifactStore:
         self.read_root = read_root.resolve() if read_root is not None else None
 
     def _path(self, base: Path, path: str) -> Path:
-        """Resolve ``path`` against ``base``, honoring an absolute path or ``~``."""
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
             candidate = base / candidate
@@ -91,12 +82,7 @@ class LocalArtifactStore:
         return self._path(self.artifact_root, path)
 
     def resolve_read(self, path: str) -> Path:
-        """Resolve a path for reading.
-
-        A path that exists in the working tree wins, then the artifact root,
-        then ``read_root`` when one is mounted. A path that exists in none of
-        them returns its ``root``-relative form.
-        """
+        """Resolve a path for reading across root, artifact_root, and read_root."""
         primary = self._path(self.root, path)
         if primary.exists():
             return primary
@@ -110,35 +96,12 @@ class LocalArtifactStore:
         return fallback if fallback.exists() else primary
 
     def read_project_bytes(self, path: str, *, max_bytes: int | None = None) -> bytes:
-        """Read one file from the project workspace.
-
-        The project root is ``read_root`` when this store has one, and ``root``
-        otherwise. Any path the host can read is accepted, including an
-        absolute path and ``..``.
-
-        Args:
-            path: Path relative to the project root, or an absolute path.
-            max_bytes: When set, a longer file is refused instead of truncated.
-
-        Returns:
-            The file bytes, at most ``max_bytes`` when that limit is set.
-
-        Raises:
-            ArtifactError: The path is not a regular file, or exceeds
-                ``max_bytes``.
-            FileNotFoundError: The file is missing.
-            OSError: The file could not be read.
-        """
+        """Read one regular file from the project root (``read_root`` or ``root``)."""
         base = self.read_root if self.read_root is not None else self.root
-        resolved = self._path(base, path)
-        return _read_regular_file(resolved, max_bytes=max_bytes, display_path=path)
+        return _read_regular_file(self._path(base, path), max_bytes=max_bytes, display_path=path)
 
     def read_bytes(self, path: str, *, max_bytes: int | None = None) -> bytes:
-        """Read a regular file using the working/artifact/read-root fallback order.
-
-        When ``max_bytes`` is set, the open stream is read at most one byte
-        beyond that limit and oversized content is refused rather than truncated.
-        """
+        """Read one regular file using the working/artifact/read-root fallback order."""
         return _read_regular_file(self.resolve_read(path), max_bytes=max_bytes, display_path=path)
 
     def relative(self, path: Path) -> str:
@@ -163,6 +126,8 @@ class LocalArtifactStore:
 
     def inspect(self, path: str) -> ImageInfo:
         """Read image dimensions for ``path``."""
+        from PIL import Image
+
         resolved = self.resolve(path)
         if not resolved.is_file():
             raise FileNotFoundError(f"Image does not exist: {path}")

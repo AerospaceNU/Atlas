@@ -156,17 +156,16 @@ def test_start_fresh_keeps_model_and_zeroes_totals(tmp_path: Path) -> None:
 
     ready = events[-1]
     assert ready["type"] == "ready"
-    assert ready["total_tokens"] == 0
-    assert ready["prompt_tokens"] == 0
-    assert ready["completion_tokens"] == 0
-    assert ready["spend"] == 0
-    assert ready["estimated"] is False
-    assert "spend $0" in ready["status_line"]
-    assert "spend unknown" not in ready["status_line"]
-    assert ready["tokens_per_second"] is None
-    assert ready["recent"] == []
+    status = ready["status"]
+    assert status["total_tokens"] == 0
+    assert status["prompt_tokens"] == 0
+    assert status["completion_tokens"] == 0
+    assert status["spend"] == 0
+    assert status["estimated"] is False
+    assert status["tokens_per_second"] is None
     assert ready["model"] == "keep/model"
-    assert ready["context_limit"] == 111
+    assert status["model"] == "keep/model"
+    assert status["context_limit"] == 111
     assert session.model_id == "keep/model"
 
 
@@ -486,7 +485,7 @@ def test_protocol_ready_step_done_and_second_turn(tmp_path: Path) -> None:
     )
 
     assert events[0]["type"] == "ready"
-    assert any(tool["name"] == "echo" for tool in events[0]["tools"])
+    assert "echo" in events[0]["tools"]
     steps = [event for event in events if event["type"] == "step"]
     dones = [event for event in events if event["type"] == "done"]
     phases = [event["phase"] for event in events if event["type"] == "phase"]
@@ -496,7 +495,7 @@ def test_protocol_ready_step_done_and_second_turn(tmp_path: Path) -> None:
     assert dones[0]["response"] == "first done"
     assert dones[1]["response"] == "second done"
     assert phases[:4] == ["thinking", "tool_calling", "tool_executing", "thinking"]
-    assert events[events.index(steps[0]) - 1]["phase"] == "tool_executing"
+    assert events[events.index(steps[0]) - 1]["type"] == "tool_start"
 
 
 def test_protocol_emits_thoughts_before_steps_and_the_answer(tmp_path: Path) -> None:
@@ -520,16 +519,16 @@ def test_protocol_emits_thoughts_before_steps_and_the_answer(tmp_path: Path) -> 
 
     events = _run_protocol(['{"type":"user","text":"one"}'], session)
 
-    thoughts = [event for event in events if event["type"] == "thought"]
+    thoughts = [event for event in events if event["type"] == "thought_delta"]
     steps = [event for event in events if event["type"] == "step"]
     dones = [event for event in events if event["type"] == "done"]
     assert [event["text"] for event in thoughts] == ["check the file", "that was enough"]
-    assert thoughts[0]["tokens_per_second"] == 20.0
-    assert "tokens_per_second" not in thoughts[1]
     assert events.index(thoughts[0]) < events.index(steps[0])
     assert events.index(steps[0]) < events.index(thoughts[1])
     assert events.index(thoughts[1]) < events.index(dones[0])
     assert dones[0]["response"] == "done"
+    assert dones[0]["thoughts"] == "check the file\n\nthat was enough"
+    assert dones[0]["status"]["tokens_per_second"] == 20.0
     assistant = next(message for message in model.requests[1][0] if message.role == "assistant")
     assert assistant.reasoning == "check the file"
 
@@ -579,7 +578,7 @@ def test_protocol_redacts_api_key(tmp_path: Path) -> None:
 
     assert api_key not in json.dumps(events)
     done = next(event for event in events if event["type"] == "done")
-    assert "***" in done["response"]
+    assert "[redacted]" in done["response"]
 
 
 def test_main_without_key_prompts_instead_of_a_stack_trace(
@@ -608,7 +607,8 @@ def test_main_without_key_prompts_instead_of_a_stack_trace(
     events = [json.loads(line) for line in captured.out.splitlines()]
     assert events[0]["type"] == "ready"
     assert events[0]["key_set"] is False
-    assert "context 0/unknown" in events[0]["status_line"]
+    assert events[0]["status"]["context_used"] == 0
+    assert events[0]["status"]["context_limit"] is None
     assert events[1]["type"] == "error"
     assert events[1]["message"] == MISSING_KEY_MESSAGE
 
@@ -691,40 +691,22 @@ def test_turn_accumulates_usage_cost_status_and_speed(tmp_path: Path) -> None:
     )
 
     done = [event for event in events if event["type"] == "done"]
-    assert done[0]["prompt_tokens"] == 10
-    assert done[0]["completion_tokens"] == 2
-    assert done[0]["total_tokens"] == 12
-    assert done[0]["spend"] == 0.01
-    assert done[0]["cached_tokens"] == 0
-    assert done[0]["reasoning_tokens"] == 0
-    assert done[0]["tokens_per_second"] == 5.0
-    assert "last 5.0 tok/s" in done[0]["status_line"]
-    assert done[0]["http_status"] == 200
-    assert done[0]["elapsed_seconds"] == 0.5
-    assert done[0]["time_to_first_token_seconds"] == 0.1
-    assert done[0]["recent"] == ["200 0.50s"]
-    assert "http" not in done[0]["status_line"]
-    assert "latency" not in done[0]["status_line"]
-    assert "ttft" not in done[0]["status_line"]
-    assert "recent" not in done[0]["status_line"]
-    assert done[0]["context_used"] == 10
-    assert done[0]["context_limit"] is None
-    assert "context 10/unknown" in done[0]["status_line"]
-    assert done[1]["prompt_tokens"] == 30
-    assert done[1]["completion_tokens"] == 8
-    assert done[1]["total_tokens"] == 38
-    assert done[1]["spend"] == pytest.approx(0.04)
-    assert done[1]["context_used"] == 20
-    assert done[1]["tokens_per_second"] == 15.0
-    line = done[1]["status_line"]
-    assert "context 20/unknown" in line
-    assert "tokens" not in line
-    assert "last 15.0 tok/s" in line
-    assert "http" not in line
-    assert "latency" not in line
-    assert done[1]["recent"] == ["200 0.50s", "200 0.50s"]
-    assert "ttft" not in line
-    assert "recent" not in line
+    s0, s1 = done[0]["status"], done[1]["status"]
+    assert s0["prompt_tokens"] == 10
+    assert s0["completion_tokens"] == 2
+    assert s0["total_tokens"] == 12
+    assert s0["spend"] == 0.01
+    assert s0["cached_tokens"] == 0
+    assert s0["reasoning_tokens"] == 0
+    assert s0["tokens_per_second"] == 5.0
+    assert s0["context_used"] == 10
+    assert s0["context_limit"] is None
+    assert s1["prompt_tokens"] == 30
+    assert s1["completion_tokens"] == 8
+    assert s1["total_tokens"] == 38
+    assert s1["spend"] == pytest.approx(0.04)
+    assert s1["context_used"] == 20
+    assert s1["tokens_per_second"] == 15.0
     assert "test-key" not in json.dumps(events)
 
 
@@ -760,14 +742,10 @@ def test_degenerate_window_does_not_replace_the_session_rate(tmp_path: Path) -> 
     )
 
     done = [event for event in events if event["type"] == "done"]
-    thoughts = [event for event in events if event["type"] == "thought"]
-    assert done[0]["tokens_per_second"] == 10.0
-    assert "last 10.0 tok/s" in done[0]["status_line"]
+    thoughts = [event for event in events if event["type"] == "thought_delta"]
+    assert done[0]["status"]["tokens_per_second"] == 10.0
     assert [event["text"] for event in thoughts] == ["bundled"]
-    assert "tokens_per_second" not in thoughts[0]
-    assert done[1]["tokens_per_second"] == 10.0
-    assert "last 10.0 tok/s" in done[1]["status_line"]
-    assert "250000.0" not in done[1]["status_line"]
+    assert done[1]["status"]["tokens_per_second"] == 10.0
 
 
 def test_degenerate_window_on_a_fresh_session_stays_unavailable(tmp_path: Path) -> None:
@@ -789,9 +767,7 @@ def test_degenerate_window_on_a_fresh_session_stays_unavailable(tmp_path: Path) 
     events = _run_protocol(['{"type":"user","text":"hi"}'], session)
 
     done = next(event for event in events if event["type"] == "done")
-    assert done["tokens_per_second"] is None
-    assert "last n/a tok/s" in done["status_line"]
-    assert "250000.0" not in done["status_line"]
+    assert done["status"]["tokens_per_second"] is None
 
 
 def test_http_error_keeps_status_and_short_body(tmp_path: Path) -> None:
@@ -810,8 +786,7 @@ def test_http_error_keeps_status_and_short_body(tmp_path: Path) -> None:
     assert error["http_status"] == 429
     assert error["elapsed_seconds"] == 0.25
     assert error["error_body"] == "slow down"
-    assert "http" not in error["status_line"]
-    assert "latency" not in error["status_line"]
+    assert error["status"]["model"] == "example/model"
     assert any(event.get("phase") == "thinking" for event in events)
     dumped = json.dumps(events)
     assert "Traceback" not in dumped
@@ -832,8 +807,7 @@ def test_model_fetch_failure_keeps_the_selected_model(tmp_path: Path) -> None:
 
     assert session.model_id == "keep-me"
     assert session.totals.context_limit == 111
-    assert events[1]["type"] == "models"
-    assert events[1]["ok"] is False
+    assert events[1]["type"] == "error"
     assert "500" in events[1]["message"]
     assert "down" in events[1]["message"]
 
@@ -859,20 +833,22 @@ def test_select_model_updates_context_limit_and_rejects_unknown(tmp_path: Path) 
     session.totals.context_limit = 111
     session.totals.context_used = 10
 
-    missing = _run_protocol(['{"type":"select_model","id":"missing"}'], session)
+    missing = _run_protocol(['{"type":"select_model","model":"missing"}'], session)
     assert session.model_id == "a"
     assert session.totals.context_limit == 111
     assert model.config.model == "a"
     assert missing[1]["type"] == "error"
 
-    selected = _run_protocol(['{"type":"select_model","id":"b"}'], session)
+    selected = _run_protocol(['{"type":"select_model","model":"b"}'], session)
     assert session.model_id == "b"
     assert model.config.model == "b"
     assert session.totals.context_limit == 222
     assert session.totals.context_used == 10
-    assert selected[1]["type"] == "model"
+    assert selected[1]["type"] == "model_selected"
+    assert selected[1]["model"] == "b"
     assert selected[1]["context_length"] == 222
-    assert "context 10/222" in selected[1]["status_line"]
+    assert selected[1]["status"]["context_used"] == 10
+    assert selected[1]["status"]["context_limit"] == 222
 
 
 def test_catalog_fills_the_active_model_context_on_the_dashboard(tmp_path: Path) -> None:
@@ -891,9 +867,9 @@ def test_catalog_fills_the_active_model_context_on_the_dashboard(tmp_path: Path)
     events = _run_protocol(['{"type":"models"}'], session)
 
     assert session.totals.context_limit == 1_048_576
-    line = events[1]["status_line"]
-    assert "context 355/1.05M" in line
-    assert "tokens" not in line
+    assert session.agent.context_limit == 1_048_576
+    assert events[1]["type"] == "models"
+    assert events[1]["selected"] == "google/gemini-3.8-flash"
 
 
 def test_session_key_overrides_the_user_key_and_is_not_stored_in_the_project(
@@ -937,9 +913,11 @@ def test_session_key_overrides_the_user_key_and_is_not_stored_in_the_project(
     dumped = json.dumps(events)
     assert "user-key" not in dumped
     assert "session-key" not in dumped
-    assert events[1]["type"] == "key"
-    assert events[1]["scope"] == "user"
-    assert events[2]["scope"] == "session"
+    assert events[1]["type"] == "key_set"
+    assert events[1]["provider"] == "openrouter"
+    assert events[1]["key_set"] is True
+    assert events[2]["type"] == "key_set"
+    assert events[2]["key_set"] is True
     for path in (project / ".atlas").rglob("*"):
         if path.is_file():
             assert "user-key" not in path.read_text(encoding="utf-8")
@@ -1030,8 +1008,7 @@ def test_catalog_fetch_failure_uses_openrouter_and_keeps_the_model(tmp_path: Pat
     assert session.model_id == "keep-me"
     assert model.config.model == "keep-me"
     assert session.totals.context_limit == 111
-    assert events[1]["type"] == "models"
-    assert events[1]["ok"] is False
+    assert events[1]["type"] == "error"
     assert "500" in events[1]["message"]
     assert "down" in events[1]["message"]
     assert client.gets[0]["url"] == OPENROUTER_MODELS_URL
@@ -1074,26 +1051,22 @@ def test_models_command_returns_the_live_catalog_without_changing_the_model(
     assert client.posts == []
     catalog = events[1]
     assert catalog["type"] == "models"
-    assert catalog["ok"] is True
+    assert catalog["selected"] == "keep-me"
     assert catalog["models"] == [
         {
             "id": "google/gemini-3.8-flash",
             "name": None,
-            "description": None,
             "context_length": 128000,
             "prompt_price": "0.1",
             "completion_price": "0.4",
-            "cache_read_price": None,
             "supports_tools": True,
         },
         {
             "id": "keep-me",
             "name": None,
-            "description": None,
             "context_length": None,
             "prompt_price": None,
             "completion_price": None,
-            "cache_read_price": None,
             "supports_tools": True,
         },
     ]
@@ -1151,11 +1124,12 @@ def test_later_page_failure_keeps_rows_in_the_session(tmp_path: Path) -> None:
     assert [item.id for item in session.catalog] == ["alpha/one", "keep-me"]
     assert session.catalog[0].name == "Alpha!"
     catalog = events[1]
-    assert catalog["ok"] is False
-    assert "500" in catalog["message"]
+    assert catalog["type"] == "models"
     assert catalog["models"][0]["id"] == "alpha/one"
     assert catalog["models"][0]["name"] == "Alpha!"
     assert catalog["models"][1]["id"] == "keep-me"
+    assert events[2]["type"] == "error"
+    assert "500" in events[2]["message"]
     assert "catalog-key" not in json.dumps(events)
 
 
@@ -1234,10 +1208,12 @@ def test_catalog_publish_waits_for_the_catalog_lock(tmp_path: Path) -> None:
     session._catalog_lock = _HeldCatalogLock(inner, waiting)
     stdout = io.StringIO()
 
+    from atlas.agent import rpc as rpc_module
+
     def publish() -> None:
-        session_module._publish_catalog(
+        rpc_module._publish_catalog(
             session,
-            stdout,
+            lambda ev: rpc_module._write_line(stdout, ev, session.secrets),
             session_module.CatalogFetch(
                 models=[CatalogModel(id="plain/text", supports_tools=False)]
             ),
@@ -1284,16 +1260,16 @@ def test_catalog_paging_does_not_block_the_next_session_message(
         assert release.wait(timeout=2)
         return [CatalogModel(id="vendor/model", supports_tools=True)]
 
-    original = session_module._handle_new
+    session = _session(ScriptedModel([]), tmp_path=tmp_path)
+    original_fresh = session.start_fresh
 
-    def wrapped(active: AgentSession, stdout: Any) -> None:
+    def wrapped() -> None:
         assert started.is_set()
         saw_new.set()
         release.set()
-        original(active, stdout)
+        original_fresh()
 
-    monkeypatch.setattr(session_module, "_handle_new", wrapped)
-    session = _session(ScriptedModel([]), tmp_path=tmp_path)
+    monkeypatch.setattr(session, "start_fresh", wrapped)
     session.fetch_models = fetch
     stdout = io.StringIO()
     code = serve(session, PausingStdin(), stdout)
@@ -1302,7 +1278,6 @@ def test_catalog_paging_does_not_block_the_next_session_message(
     events = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert any(event["type"] == "ready" for event in events)
     models = [event for event in events if event["type"] == "models"]
-    assert models[0]["ok"] is True
     assert models[0]["models"][0]["id"] == "vendor/model"
 
 
@@ -1331,8 +1306,7 @@ def test_session_key_is_what_the_next_completion_sends(tmp_path: Path) -> None:
     assert model.config.api_key == "session-key"
     assert session.session_key == "session-key"
     done = [event for event in events if event["type"] == "done"]
-    assert done[0]["tokens_per_second"] == 5.0
-    assert "last 5.0 tok/s" in done[0]["status_line"]
+    assert done[0]["status"]["tokens_per_second"] == 5.0
     dumped = json.dumps(events)
     assert "user-key" not in dumped
     assert "session-key" not in dumped
@@ -1348,67 +1322,14 @@ def test_session_key_is_what_the_next_completion_sends(tmp_path: Path) -> None:
             assert "later-user-key" not in text
 
 
-def test_protocol_remove_confirms_and_stays_inside_the_root(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    ensure_project_layout(project)
-    ensure_user_layout(home)
-    session_dir = project / ".atlas" / "sessions" / "s1"
-    artifact = project / ".atlas" / "artifacts" / "s1"
-    session_dir.mkdir()
-    artifact.mkdir()
-    (artifact / "chip.txt").write_text("chip", encoding="utf-8")
-    outside = tmp_path / "secret.txt"
-    outside.write_text("nope", encoding="utf-8")
-    key = write_user_key("user-key", home)
-    weight = home / ".atlas" / "weights" / "model.json"
-    weight.write_text("{}", encoding="utf-8")
-    data = project / ".atlas" / "data" / "keep.txt"
-    data.write_text("table", encoding="utf-8")
-
-    session = _session(ScriptedModel([]), tmp_path=project)
-    session.home = home
-    session.workspace = project
-
-    denied = _run_protocol(
-        [
-            '{"type":"remove","scope":"project","kind":"sessions","name":"s1"}',
-        ],
+def test_protocol_rejects_removed_remove_message(tmp_path: Path) -> None:
+    session = _session(ScriptedModel([]), tmp_path=tmp_path)
+    events = _run_protocol(
+        ['{"type":"remove","scope":"project","kind":"sessions","name":"s1","confirm":true}'],
         session,
     )
-    assert denied[1]["type"] == "error"
-    assert "confirmation required" in denied[1]["message"]
-    assert session_dir.is_dir()
-    assert artifact.is_dir()
-
-    escaped = _run_protocol(
-        [
-            '{"type":"remove","scope":"project","kind":"sessions",'
-            '"name":"../secret.txt","confirm":true}',
-        ],
-        session,
-    )
-    assert escaped[1]["type"] == "error"
-    assert "escapes" in escaped[1]["message"]
-    assert outside.is_file()
-    assert key.is_file()
-    assert weight.is_file()
-
-    removed = _run_protocol(
-        [
-            '{"type":"remove","scope":"project","kind":"sessions","name":"s1","confirm":true}',
-        ],
-        session,
-    )
-    assert removed[1]["type"] == "removed"
-    assert removed[1]["scope"] == "project"
-    assert removed[1]["name"] == "s1"
-    assert not session_dir.exists()
-    assert not artifact.exists()
-    assert data.is_file()
-    assert key.read_text(encoding="utf-8").strip() == "user-key"
-    assert weight.is_file()
-    assert "user-key" not in json.dumps(removed)
+    assert events[1]["type"] == "error"
+    assert "Unknown message type" in events[1]["message"]
 
 
 def test_omitted_provider_cost_stays_unset(tmp_path: Path) -> None:
@@ -1428,18 +1349,12 @@ def test_omitted_provider_cost_stays_unset(tmp_path: Path) -> None:
     events = _run_protocol(['{"type":"user","text":"hi"}'], session, redact="test-key")
 
     done = next(event for event in events if event["type"] == "done")
-    assert done["spend"] is None
-    assert done["prompt_tokens"] == 3
-    assert done["completion_tokens"] == 1
-    assert done["total_tokens"] == 4
-    assert done["tokens_per_second"] == 5.0
-    assert done["time_to_first_token_seconds"] == 0.05
-    assert done["recent"] == ["200 0.25s"]
-    assert "spend unknown" in done["status_line"]
-    assert "spend $0" not in done["status_line"]
-    assert "last 5.0 tok/s" in done["status_line"]
-    assert "ttft" not in done["status_line"]
-    assert "recent" not in done["status_line"]
+    status = done["status"]
+    assert status["spend"] is None
+    assert status["prompt_tokens"] == 3
+    assert status["completion_tokens"] == 1
+    assert status["total_tokens"] == 4
+    assert status["tokens_per_second"] == 5.0
     assert "test-key" not in json.dumps(events)
 
 
@@ -1473,17 +1388,12 @@ def test_omitted_cost_uses_catalog_prices_and_token_details(tmp_path: Path) -> N
     events = _run_protocol(['{"type":"user","text":"hi"}'], session, redact="test-key")
 
     done = next(event for event in events if event["type"] == "done")
-    assert done["cached_tokens"] == 800
-    assert done["reasoning_tokens"] == 40
-    assert done["spend"] == pytest.approx(0.003)
-    assert done["estimated"] is True
-    assert "spend ~$0.003" in done["status_line"]
-    assert "spend $0.003" not in done["status_line"]
-    assert "spend unknown" not in done["status_line"]
-    assert "cached" not in done["status_line"]
-    assert "reasoning" not in done["status_line"]
-    assert done["tokens_per_second"] == 250.0
-    assert "last 250.0 tok/s" in done["status_line"]
+    status = done["status"]
+    assert status["cached_tokens"] == 800
+    assert status["reasoning_tokens"] == 40
+    assert status["spend"] == pytest.approx(0.003)
+    assert status["estimated"] is True
+    assert status["tokens_per_second"] == 250.0
     assert "test-key" not in json.dumps(events)
 
 
@@ -1505,28 +1415,26 @@ def test_turn_after_select_uses_the_catalog_context_limit(tmp_path: Path) -> Non
     model = OpenRouterModel(ModelConfig(model="a", api_key="test-key"), client)
     session = AgentSession(Agent(model, ToolRegistry(), LocalArtifactStore(tmp_path)))
     session.catalog = [
-        CatalogModel(id="a", context_length=111, prompt_price="0.1", completion_price="0.2"),
-        CatalogModel(id="b", context_length=222, prompt_price="0.3", completion_price="0.4"),
+        CatalogModel(id="a", context_length=11_111, prompt_price="0.1", completion_price="0.2"),
+        CatalogModel(id="b", context_length=22_222, prompt_price="0.3", completion_price="0.4"),
     ]
     session.model_id = "a"
     session.totals.model = "a"
-    session.totals.context_limit = 111
+    session.totals.context_limit = 11_111
 
     events = _run_protocol(
-        ['{"type":"select_model","id":"b"}', '{"type":"user","text":"look"}'],
+        ['{"type":"select_model","model":"b"}', '{"type":"user","text":"look"}'],
         session,
         redact="test-key",
     )
 
-    selected = next(event for event in events if event["type"] == "model")
+    selected = next(event for event in events if event["type"] == "model_selected")
     done = next(event for event in events if event["type"] == "done")
-    assert selected["id"] == "b"
-    assert selected["context_length"] == 222
+    assert selected["model"] == "b"
+    assert selected["context_length"] == 22_222
     assert model.config.model == "b"
-    assert done["context_used"] == 9
-    assert done["context_limit"] == 222
-    assert "context 9/222" in done["status_line"]
-    assert "128000" not in done["status_line"]
+    assert done["status"]["context_used"] == 9
+    assert done["status"]["context_limit"] == 22_222
     assert "test-key" not in json.dumps(events)
 
 
@@ -1548,18 +1456,18 @@ def test_main_accepts_the_environment_key_without_printing_it(
     events = [json.loads(line) for line in captured.out.splitlines()]
     assert events[0]["type"] == "ready"
     assert events[0]["key_set"] is True
-    assert "context 0/unknown" in events[0]["status_line"]
+    assert events[0]["status"]["context_used"] == 0
+    assert events[0]["status"]["context_limit"] is None
     assert "env-session-key" not in captured.out
     assert "env-session-key" not in captured.err
     assert not (home / ".atlas" / "keys" / "openrouter_api_key").exists()
     assert (home / ".atlas" / "weights").is_dir()
-    assert (home / ".atlas" / "defaults").is_dir()
     for path in (workspace / ".atlas").rglob("*"):
         if path.is_file():
             assert "env-session-key" not in path.read_text(encoding="utf-8")
 
 
-def test_protocol_lists_the_chosen_root_and_names_a_weight(tmp_path: Path) -> None:
+def test_protocol_lists_the_chosen_root_and_runtime_kinds(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
     ensure_project_layout(project)
@@ -1567,10 +1475,9 @@ def test_protocol_lists_the_chosen_root_and_names_a_weight(tmp_path: Path) -> No
     (project / ".atlas" / "sessions" / "s1").mkdir()
     (project / ".atlas" / "artifacts" / "s1").mkdir()
     (home / ".atlas" / "sessions" / "user-only").mkdir(parents=True)
-    weight = home / ".atlas" / "weights" / "model.json"
-    weight.write_text("{}", encoding="utf-8")
     key = write_user_key("user-key", home)
     session = _session(ScriptedModel([]), tmp_path=project)
+    session.agent.tools.register(EchoTool())
     session.home = home
     session.workspace = project
 
@@ -1579,30 +1486,26 @@ def test_protocol_lists_the_chosen_root_and_names_a_weight(tmp_path: Path) -> No
             '{"type":"list","scope":"project","kind":"sessions"}',
             '{"type":"list","scope":"project","kind":"artifacts"}',
             '{"type":"list","scope":"user","kind":"sessions"}',
+            '{"type":"list","kind":"tools"}',
+            '{"type":"list","kind":"skills"}',
             '{"type":"list","scope":"project","kind":"keys"}',
         ],
         session,
     )
 
-    assert listed[1]["type"] == "listing"
-    assert listed[1]["names"] == ["s1"]
-    assert listed[2]["names"] == ["s1"]
-    assert listed[3]["scope"] == "user"
-    assert listed[3]["names"] == ["user-only"]
-    assert listed[4]["type"] == "error"
-    assert "sessions" in listed[4]["message"]
-
-    removed = _run_protocol(
-        ['{"type":"remove","scope":"user","kind":"weights","name":"model.json","confirm":true}'],
-        session,
-    )
-    assert removed[1]["type"] == "removed"
-    assert removed[1]["scope"] == "user"
-    assert not weight.exists()
+    assert listed[1]["type"] == "list"
+    assert listed[1]["kind"] == "sessions"
+    assert listed[1]["items"] == ["s1"]
+    assert listed[2]["items"] == ["s1"]
+    assert listed[3]["items"] == ["user-only"]
+    assert listed[4]["kind"] == "tools"
+    assert listed[4]["items"] == ["echo"]
+    assert listed[5]["kind"] == "skills"
+    assert listed[5]["items"] == []
+    assert listed[6]["type"] == "error"
+    assert "sessions" in listed[6]["message"]
     assert key.is_file()
-    assert (project / ".atlas" / "sessions" / "s1").is_dir()
-    assert (project / ".atlas" / "data").is_dir()
-    assert "user-key" not in json.dumps(listed + removed)
+    assert "user-key" not in json.dumps(listed)
 
 
 class _ProtocolIn:
@@ -1750,26 +1653,13 @@ def test_main_writes_tools_into_the_session_artifact_dir(
         produced.write_text("{}", encoding="utf-8")
 
         protocol.push('{"type":"user","text":"save a note"}')
-        _wait_until(lambda: note.is_file(), f"tool did not write {note}: {stdout.text()}")
+        _wait_until(
+            lambda: '"type": "done"' in stdout.text() or '"type":"done"' in stdout.text(),
+            f"turn did not finish: {stdout.text()}",
+        )
+        assert note.is_file()
         assert note.read_text(encoding="utf-8") == "from-main"
         assert str(note.resolve()) not in stdout.text()
-
-        protocol.push(
-            json.dumps(
-                {
-                    "type": "remove",
-                    "scope": "project",
-                    "kind": "sessions",
-                    "name": session_id,
-                    "confirm": True,
-                }
-            )
-        )
-        session_dir = sessions / session_id
-        _wait_until(
-            lambda: not artifact_dir.exists() and not session_dir.exists(),
-            f"session remove left files behind: {stdout.text()}",
-        )
         assert other_note.read_text(encoding="utf-8") == "keep"
         assert other_session.is_dir()
         assert data.is_file()
@@ -1787,7 +1677,8 @@ def test_main_writes_tools_into_the_session_artifact_dir(
     events = [json.loads(line) for line in stdout.text().splitlines()]
     steps = [event for event in events if event["type"] == "step"]
     assert steps[0]["name"] == "write_file"
-    assert steps[0]["artifacts"] == ["note.txt"]
+    assert steps[0]["ok"] is True
+    assert "note.txt" in steps[0]["summary"]
 
 
 class _TwoCallClient:
@@ -1899,9 +1790,9 @@ def test_main_uses_the_workspace_tool_budget(
     done = [event for event in events if event["type"] == "done"]
     assert [step["name"] for step in steps] == ["write_file", "write_file"]
     assert steps[0]["ok"] is True
-    assert steps[0]["error_kind"] is None
+    assert steps[0].get("error") is None
     assert steps[1]["ok"] is False
-    assert steps[1]["error_kind"] == "limit"
+    assert "limit" in (steps[1].get("error") or "").lower()
     assert done[0]["stopped_for_limit"] is True
     assert "env-session-key" not in stdout.text()
 
@@ -2009,8 +1900,8 @@ def test_new_clears_the_goal_with_the_conversation(tmp_path: Path) -> None:
     shown = events[-1]
     assert shown["type"] == "goal"
     assert shown["text"] == ""
-    assert shown["message"] == "none is set"
     assert shown["cleared"] is False
+    assert shown["status"]["goal"] is None
     session.turn("after")
     assert all("map the flood" not in (message.content or "") for message in model.requests[-1][0])
 
@@ -2020,30 +1911,25 @@ def test_goal_protocol_sets_shows_and_clears(tmp_path: Path) -> None:
     session = _session(model, tmp_path=tmp_path)
 
     empty = _run_protocol(['{"type":"goal"}'], session)
-    assert empty[-1] == {
-        "type": "goal",
-        "text": "",
-        "cleared": False,
-        "message": "none is set",
-    }
+    assert empty[-1]["type"] == "goal"
+    assert empty[-1]["text"] == ""
+    assert empty[-1]["cleared"] is False
+    assert empty[-1]["status"]["goal"] is None
 
     set_goal = _run_protocol(['{"type":"goal","text":"map  the flood"}'], session)
     assert set_goal[-1]["type"] == "goal"
     assert set_goal[-1]["text"] == "map  the flood"
-    assert set_goal[-1]["message"] == "map  the flood"
     assert set_goal[-1]["cleared"] is False
+    assert set_goal[-1]["status"]["goal"] == "map  the flood"
 
     shown = _run_protocol(['{"type":"goal"}'], session)
     assert shown[-1]["text"] == "map  the flood"
-    assert shown[-1]["message"] == "map  the flood"
 
     cleared = _run_protocol(['{"type":"goal","clear":true}'], session)
-    assert cleared[-1] == {
-        "type": "goal",
-        "text": "",
-        "cleared": True,
-        "message": "goal cleared",
-    }
+    assert cleared[-1]["type"] == "goal"
+    assert cleared[-1]["text"] == ""
+    assert cleared[-1]["cleared"] is True
+    assert cleared[-1]["status"]["goal"] is None
     assert session.goal == ""
 
 

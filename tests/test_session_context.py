@@ -127,7 +127,7 @@ def test_compact_message_reports_and_saves(tmp_path: Path) -> None:
 
     compacted = next(event for event in events if event["type"] == "compacted")
     assert compacted["compaction"]["occurred"] is True
-    assert "status_line" in compacted and "context_used" in compacted
+    assert "context_used" in compacted["status"]
     state = project_session_dir(tmp_path, "abc123") / "state.json"
     assert state.is_file()
 

@@ -32,8 +32,12 @@ repos:
       - id: mypy
         additional_dependencies:
           - pydantic
-          - anthropic
           - httpx
+          - httpx-sse
+          - tenacity
+          - pyyaml
+          - types-PyYAML
+          - html2text
           - pillow
           - numpy
         args: [--config-file=pyproject.toml]

@@ -233,3 +233,23 @@ def test_run_tests_huge_timeout_is_clamped_with_a_note(tmp_path: Path) -> None:
     lines = result.text.splitlines()
     assert lines[0].startswith("command: ")
     assert lines[1] == "note: timeout clamped to 900s"
+
+
+def test_diagnostics_respects_request_path_for_cargo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tui = tmp_path / "tui"
+    tui.mkdir()
+    (tui / "Cargo.toml").write_text(
+        "[package]\nname = 'tui'\nversion = '0.1.0'\n", encoding="utf-8"
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _script(bin_dir / "cargo", "pwd\necho 'src/main.rs:5:1: warning: unused'\nexit 0\n")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    store = LocalArtifactStore(tmp_path)
+
+    cargo_res = DiagnosticsTool().run({"path": "tui", "tools": ["cargo"]}, store)
+
+    assert "== cargo (exit 0, 1 diagnostics)" in cargo_res.text
+    assert "src/main.rs:5:1: warning: unused" in cargo_res.text

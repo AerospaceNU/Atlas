@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
-import errno
 import os
-import re
-import shutil
 import stat
-import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-import atlas.agent.skill_author as skill_author
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.contracts import build_registry, default_registry
 from atlas.agent.skill_author import (
@@ -23,11 +16,9 @@ from atlas.agent.skill_author import (
     MAX_SKILL_NAME_LENGTH,
     SkillAuthorError,
     SkillDraft,
-    _exchange_directories,
     _write_text,
     author_skill,
     is_within,
-    normalize_name,
     normalize_skill_name,
     project_skill_drafts_root,
     project_skills_root,
@@ -35,6 +26,7 @@ from atlas.agent.skill_author import (
     user_skills_root,
     validate_skill,
 )
+from atlas.agent.skills import parse_skill_document
 from atlas.agent.tools.author_skill import AuthorSkillInput, AuthorSkillTool
 
 
@@ -127,10 +119,8 @@ def test_normalize_skill_name_is_the_public_nfkc_check() -> None:
     composed = "caf\u00e9-scan"
     normalized, errors = normalize_skill_name("  cafe\u0301-scan  ")
 
-    assert normalize_name is normalize_skill_name
     assert normalized == composed
     assert errors == []
-    assert normalize_name("  cafe\u0301-scan  ") == (composed, [])
     upper, upper_errors = normalize_skill_name("NDVI")
     assert upper == "NDVI"
     assert any("lowercase" in error for error in upper_errors)
@@ -432,10 +422,6 @@ def test_failed_publish_leaves_the_existing_skill(
     def fail_rename(*_args: object, **_kwargs: object) -> None:
         raise OSError(1, "nope")
 
-    def refuse_exchange(*_args: object, **_kwargs: object) -> bool:
-        return False
-
-    monkeypatch.setattr("atlas.agent.skill_author._exchange_directories", refuse_exchange)
     monkeypatch.setattr(os, "rename", fail_rename)
 
     with pytest.raises(SkillAuthorError, match="Could not write skill"):
@@ -443,110 +429,32 @@ def test_failed_publish_leaves_the_existing_skill(
 
     assert (path / "SKILL.md").read_text(encoding="utf-8") == original
     assert (path / "scripts" / "extract.py").read_text(encoding="utf-8") == "print(1)\n"
-    assert not (tmp_path / ".ndvi-change.authoring").exists()
-    assert not (tmp_path / ".ndvi-change.replacing").exists()
+    assert [p.name for p in tmp_path.iterdir()] == ["ndvi-change"]
 
 
-def test_refusing_a_write_leaves_a_replacing_backup_untouched(tmp_path: Path) -> None:
-    path = author_skill(tmp_path, _draft())
-    original = (path / "SKILL.md").read_text(encoding="utf-8")
-    backup = tmp_path / ".ndvi-change.replacing"
-    os.rename(path, backup)
-
-    with pytest.raises(SkillAuthorError, match=r"stored as \.ndvi-change\.replacing") as caught:
-        author_skill(tmp_path, _draft(body="changed"), overwrite=False)
-
-    assert "already exists" not in str(caught.value)
-    assert not path.exists()
-    assert (backup / "SKILL.md").read_text(encoding="utf-8") == original
-
-
-def test_overwrite_recovers_a_replacing_backup_before_it_publishes(tmp_path: Path) -> None:
-    path = author_skill(tmp_path, _draft())
-    backup = tmp_path / ".ndvi-change.replacing"
-    os.rename(path, backup)
-
-    author_skill(tmp_path, _draft(body="changed"), overwrite=True)
-
-    assert "changed" in (path / "SKILL.md").read_text(encoding="utf-8")
-    assert not backup.exists()
-    assert not (tmp_path / ".ndvi-change.authoring").exists()
-
-
-def test_failed_validation_does_not_touch_a_replacing_backup(tmp_path: Path) -> None:
-    path = author_skill(tmp_path, _draft())
-    backup = tmp_path / ".ndvi-change.replacing"
-    shutil.copytree(path, backup)
-    (path / "SKILL.md").write_text("live-marker\n", encoding="utf-8")
-    backup_text = (backup / "SKILL.md").read_text(encoding="utf-8")
-
-    with pytest.raises(SkillAuthorError, match="already exists"):
-        author_skill(tmp_path, _draft(body="changed"), overwrite=False)
-    with pytest.raises(SkillAuthorError, match="body"):
-        author_skill(tmp_path, _draft(body=""))
-
-    assert (path / "SKILL.md").read_text(encoding="utf-8") == "live-marker\n"
-    assert (backup / "SKILL.md").read_text(encoding="utf-8") == backup_text
-
-
-def test_exchange_falls_back_on_any_errno_except_enoent(
+def test_mid_publish_failure_restores_existing_skill(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = author_skill(tmp_path, _draft(), files={"scripts/extract.py": "print(1)\n"})
     original = (path / "SKILL.md").read_text(encoding="utf-8")
+    real_rename = os.rename
+    calls = 0
 
-    def fail_with(code: int) -> Any:
-        def fail(*_args: object) -> int:
-            ctypes.set_errno(code)
-            return -1
+    def fail_second(src: object, dst: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(1, "swap failed")
+        real_rename(src, dst)  # type: ignore[arg-type]
 
-        return fail
+    monkeypatch.setattr(os, "rename", fail_second)
 
-    monkeypatch.setattr(skill_author, "_renameat2_loaded", True)
-    monkeypatch.setattr(skill_author, "_renameat2", fail_with(errno.EXDEV))
+    with pytest.raises(SkillAuthorError, match="Could not write skill"):
+        author_skill(tmp_path, _draft(body="changed"), overwrite=True)
 
-    author_skill(tmp_path, _draft(body="changed"), overwrite=True)
-
-    assert "changed" in (path / "SKILL.md").read_text(encoding="utf-8")
-    assert not (tmp_path / ".ndvi-change.replacing").exists()
-
-    monkeypatch.setattr(skill_author, "_renameat2", fail_with(errno.EBUSY))
-    author_skill(tmp_path, _draft(body="busy"), overwrite=True)
-    assert "busy" in (path / "SKILL.md").read_text(encoding="utf-8")
-
-    monkeypatch.setattr(skill_author, "_renameat2", fail_with(errno.ENOENT))
-    with pytest.raises(SkillAuthorError, match="No such file"):
-        author_skill(tmp_path, _draft(body="missing"), overwrite=True)
-
-    assert "missing" not in (path / "SKILL.md").read_text(encoding="utf-8")
-    assert "busy" in (path / "SKILL.md").read_text(encoding="utf-8")
-    assert original != (path / "SKILL.md").read_text(encoding="utf-8")
-    assert not (tmp_path / ".ndvi-change.authoring").exists()
-    assert not (tmp_path / ".ndvi-change.replacing").exists()
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="renameat2 is a Linux syscall")
-def test_renameat2_lookup_is_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    source = tmp_path / "source"
-    target = tmp_path / "target"
-    source.mkdir()
-    target.mkdir()
-    calls: list[str] = []
-    real = ctypes.util.find_library
-
-    def counted(name: str) -> str | None:
-        calls.append(name)
-        return real(name)
-
-    monkeypatch.setattr(skill_author, "_renameat2_loaded", False)
-    monkeypatch.setattr(skill_author, "_renameat2", None)
-    monkeypatch.setattr(skill_author, "_libc", None)
-    monkeypatch.setattr(ctypes.util, "find_library", counted)
-
-    assert _exchange_directories(source, target) is True
-    assert _exchange_directories(source, target) is True
-
-    assert calls == ["c"]
+    assert (path / "SKILL.md").read_text(encoding="utf-8") == original
+    assert (path / "scripts" / "extract.py").read_text(encoding="utf-8") == "print(1)\n"
+    assert [p.name for p in tmp_path.iterdir()] == ["ndvi-change"]
 
 
 def test_overwrite_copies_preserved_bytes_and_permissions(tmp_path: Path) -> None:
@@ -678,14 +586,20 @@ def test_author_skill_tool_refuses_an_atlas_symlink_outside_the_workspace(tmp_pa
     assert not any(outside.rglob("SKILL.md"))
 
 
-def test_author_skill_tool_requires_a_workspace_read_root(tmp_path: Path) -> None:
-    store = LocalArtifactStore(tmp_path / "artifacts")
+def test_author_skill_tool_uses_store_root_when_read_root_is_none(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    artifact_root = workspace / ".atlas" / "artifacts" / "session"
+    store = LocalArtifactStore(workspace, artifact_root=artifact_root)
+    assert store.read_root is None
 
-    with pytest.raises(ValueError, match="read root"):
-        AuthorSkillTool().run(_tool_arguments(), store)
+    result = AuthorSkillTool().run(_tool_arguments(), store)
 
-    assert not (tmp_path / "artifacts" / "skills-drafts").exists()
-    assert not (tmp_path / "artifacts" / "skills").exists()
+    draft = workspace / ".atlas" / "skills-drafts" / "ndvi-change" / "SKILL.md"
+    assert draft.is_file()
+    assert not (artifact_root / "skills-drafts").exists()
+    assert not (workspace / ".atlas" / "skills").exists()
+    assert result.artifacts == [".atlas/skills-drafts/ndvi-change/SKILL.md"]
 
 
 def _project_store(tmp_path: Path) -> tuple[LocalArtifactStore, Path]:
@@ -750,104 +664,5 @@ def test_project_and_user_skills_roots(tmp_path: Path) -> None:
     assert not project_skill_drafts_root(tmp_path).exists()
 
 
-# Mirrors ``_split_frontmatter`` / ``_parse_frontmatter`` on richardtang/skills-loading
-# (atlas.agent.skills). Authoring has to stay readable by that loader.
-_FRONTMATTER_KEY = re.compile(r"^([A-Za-z0-9_-]+):\s*(.*)$")
-
-
 def _parse_like_skills_loader(text: str) -> tuple[dict[str, Any], str]:
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        raise AssertionError("missing frontmatter")
-    frontmatter = ""
-    body = ""
-    closed = False
-    for index, line in enumerate(lines[1:], start=1):
-        if line.strip() == "---":
-            frontmatter = "\n".join(lines[1:index])
-            body = "\n".join(lines[index + 1 :]).strip()
-            closed = True
-            break
-    if not closed:
-        raise AssertionError("frontmatter is not closed")
-    return _parse_frontmatter(frontmatter), body
-
-
-def _parse_frontmatter(text: str) -> dict[str, Any]:
-    fields: dict[str, Any] = {}
-    lines = text.splitlines()
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if not line.strip() or line.lstrip().startswith("#"):
-            index += 1
-            continue
-        if line[0] in {" ", "\t"}:
-            raise AssertionError("frontmatter is not a mapping")
-        match = _FRONTMATTER_KEY.match(line)
-        if match is None:
-            raise AssertionError(f"frontmatter is not a mapping: {line!r}")
-        key, raw = match.group(1), match.group(2).strip()
-        if raw.startswith(">") or raw.startswith("|"):
-            index += 1
-            block: list[str] = []
-            while index < len(lines) and (
-                not lines[index].strip() or lines[index][0] in {" ", "\t"}
-            ):
-                block.append(lines[index])
-                index += 1
-            fields[key] = _block_scalar(raw, block)
-            continue
-        if raw == "":
-            index += 1
-            nested, index = _parse_nested(lines, index)
-            fields[key] = nested
-            continue
-        fields[key] = _unquote(raw)
-        index += 1
-    return fields
-
-
-def _parse_nested(lines: list[str], index: int) -> tuple[dict[str, str], int]:
-    nested: dict[str, str] = {}
-    while index < len(lines) and lines[index][:1] in {" ", "\t"}:
-        stripped = lines[index].strip()
-        index += 1
-        if not stripped or stripped.startswith("#"):
-            continue
-        match = _FRONTMATTER_KEY.match(stripped)
-        if match is None or not match.group(2).strip():
-            raise AssertionError("frontmatter is not a mapping")
-        nested[match.group(1)] = _unquote(match.group(2).strip())
-    return nested, index
-
-
-def _block_scalar(style: str, lines: list[str]) -> str:
-    content = [line.strip() for line in lines]
-    while content and content[0] == "":
-        content.pop(0)
-    while content and content[-1] == "":
-        content.pop()
-    if style.startswith(">"):
-        paragraphs: list[str] = []
-        current: list[str] = []
-        for line in content:
-            if line == "":
-                if current:
-                    paragraphs.append(" ".join(current))
-                    current = []
-                continue
-            current.append(line)
-        if current:
-            paragraphs.append(" ".join(current))
-        return "\n".join(paragraphs)
-    return "\n".join(content)
-
-
-def _unquote(value: str) -> str:
-    if len(value) < 2 or value[0] not in {'"', "'"} or value[-1] != value[0]:
-        return value
-    inner = value[1:-1]
-    if value[0] == "'":
-        return inner.replace("''", "'")
-    return inner.replace(r"\n", "\n").replace(r"\"", '"').replace(r"\\", "\\")
+    return parse_skill_document(text)

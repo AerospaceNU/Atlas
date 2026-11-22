@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from atlas.agent.artifacts import LocalArtifactStore
-from atlas.agent.contracts import default_registry
+from atlas.agent.contracts import build_registry
 from atlas.agent.tools.spectral_indices import SpectralIndicesTool
 from atlas.data.indices import compute_indices
 
@@ -21,7 +21,10 @@ def test_tool_is_registered_and_calls_compute_indices(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert "spectral_indices" in {tool.name for tool in default_registry().definitions}
+    assert SpectralIndicesTool.domain == "satellite"
+    assert "spectral_indices" in {
+        tool.name for tool in build_registry(("atlas.agent.tools",)).definitions
+    }
     _save(tmp_path, "red.npy", [0.1, 65535.0])
     _save(tmp_path, "nir.npy", [0.5, 0.4])
     _save(tmp_path, "green.npy", [0.4, 0.2])
@@ -184,3 +187,16 @@ def test_tool_reads_a_path_outside_the_workspace(tmp_path: Path) -> None:
     )
 
     assert result.artifacts
+
+
+def test_empty_and_root_out_paths_do_not_write_to_filesystem_root(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    _save(tmp_path, "red.npy", [0.1])
+    _save(tmp_path, "nir.npy", [0.5])
+
+    empty_out = SpectralIndicesTool().run({"red": "red.npy", "nir": "nir.npy", "out": ""}, store)
+    assert empty_out.artifacts == ["ndvi.npy"]
+    assert (tmp_path / "ndvi.npy").is_file()
+
+    with pytest.raises(ValueError, match="filesystem root"):
+        SpectralIndicesTool().run({"red": "red.npy", "nir": "nir.npy", "out": "/"}, store)

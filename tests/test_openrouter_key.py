@@ -129,7 +129,12 @@ def test_session_key_is_sent_on_the_next_completion_and_is_not_stored(tmp_path: 
     assert _bearer(client) == ["Bearer sk-or-session-key", "Bearer sk-or-session-key"]
     assert session.session_key == "sk-or-session-key"
     assert "sk-or-session-key" in session.secrets
-    assert events[1] == {"type": "key", "scope": "session", "saved": True}
+    assert events[1] == {
+        "type": "key_set",
+        "provider": "openrouter",
+        "key_set": True,
+        "note": None,
+    }
     ready = next(event for event in events if event["type"] == "ready" and event is not events[0])
     assert ready["key_set"] is True
     assert "sk-or-session-key" not in json.dumps(events)
@@ -149,7 +154,12 @@ def test_user_key_is_saved_for_later_and_used_when_no_session_key_is_set(tmp_pat
     )
 
     assert _bearer(client) == ["Bearer sk-or-user-key"]
-    assert events[1] == {"type": "key", "scope": "user", "saved": True}
+    assert events[1] == {
+        "type": "key_set",
+        "provider": "openrouter",
+        "key_set": True,
+        "note": None,
+    }
     path = home / _USER_FILE
     assert path.read_text(encoding="utf-8") == "sk-or-user-key\n"
     assert path.stat().st_mode & 0o777 == 0o600
@@ -202,7 +212,7 @@ def test_a_blank_or_unknown_scope_is_rejected_without_echoing_the_key(tmp_path: 
     assert secret not in json.dumps(events)
     errors = [event for event in events if event["type"] == "error"]
     assert len(errors) == 5
-    assert errors[0]["message"] == "set_key needs scope session or user and a key"
+    assert errors[0]["message"] == "OPENROUTER_API_KEY needs scope session or user and a key"
     assert errors[-1]["message"] == MISSING_KEY_MESSAGE
     assert "rejected-key" not in _project_text(project)
 
@@ -248,7 +258,7 @@ def test_set_key_refuses_a_symlinked_user_file_without_installing_it(tmp_path: P
     assert outside.read_text(encoding="utf-8") == "original"
     assert client.posts == []
     assert events[1]["type"] == "error"
-    assert events[1]["message"] == "Could not save the key: AtlasPathError"
+    assert events[1]["message"] == "Could not save OPENROUTER_API_KEY: AtlasPathError"
     assert "planted-key" not in json.dumps(events)
     assert session.agent.model.config.api_key == ""
 
@@ -511,8 +521,8 @@ def test_a_newline_is_rejected_and_a_missing_prefix_is_warned(tmp_path: Path) ->
     events = _run(session, [_set_key("user", secret), _set_key("session", "plain-session-key")])
     assert secret not in json.dumps(events)
     assert events[1]["type"] == "error"
-    assert events[1]["message"] == "set_key rejected a key that contains a newline"
-    assert events[2]["warning"] == "OpenRouter key does not start with sk-or-"
+    assert events[1]["message"] == "key is empty or contains a newline"
+    assert events[2]["note"] == "OpenRouter key does not start with sk-or-"
     assert "plain-session-key" in session.secrets
     assert "plain-session-key" not in json.dumps(events)
     assert (session_home / _USER_FILE).read_text(encoding="utf-8") == "plain-user-key\n"
@@ -546,15 +556,19 @@ def test_delete_key_removes_the_file_and_keeps_redacting_it(tmp_path: Path) -> N
     assert session.session_key is None
     assert session.active_key is None
     assert echo.config.api_key == ""
-    deleted = next(event for event in events if event.get("scope") == "deleted")
+    deleted = next(
+        event
+        for event in events
+        if event.get("type") == "key_set" and event.get("key_set") is False
+    )
     assert deleted == {
-        "type": "key",
-        "scope": "deleted",
-        "saved": False,
-        "warning": ("OPENROUTER_API_KEY in the environment will still be used on the next launch"),
+        "type": "key_set",
+        "provider": "openrouter",
+        "key_set": False,
+        "note": ("OPENROUTER_API_KEY in the environment will still be used on the next launch"),
     }
     assert "sk-or-delete-me" not in json.dumps(events)
-    assert "***" in json.dumps(events)
+    assert "[redacted]" in json.dumps(events)
     assert client.posts == []
     missing = [event for event in events if event["type"] == "error"]
     assert missing[0]["message"] == MISSING_KEY_MESSAGE
@@ -579,4 +593,4 @@ def test_a_key_present_at_startup_is_redacted_without_a_separate_redact_argument
     assert "sk-or-startup-key" in session.secrets
     events = _run(session, ['{"type":"user","text":"hi"}'])
     assert "sk-or-startup-key" not in json.dumps(events)
-    assert "***" in json.dumps(events)
+    assert "[redacted]" in json.dumps(events)

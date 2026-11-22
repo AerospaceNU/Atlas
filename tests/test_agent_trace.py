@@ -32,6 +32,7 @@ def _populated_run() -> AgentRun:
             AgentStep(
                 call=ToolCall(id="call-1", name="read_file", arguments={"path": "a.txt"}),
                 result=ToolResult(text="hello\nworld", artifacts=["a.txt", "b.json"]),
+                duration_ms=12,
             ),
             AgentStep(
                 call=ToolCall(id="call-2", name="bash", arguments={"command": "ls"}),

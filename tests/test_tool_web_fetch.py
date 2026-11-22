@@ -6,20 +6,16 @@ import socket
 from pathlib import Path
 from typing import Any
 
-import httpcore
 import httpx
 import pytest
 from pydantic import ValidationError
 
 from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
-from atlas.agent.contracts import default_registry
+from atlas.agent.contracts import build_registry
 from atlas.agent.tools.web_fetch import (
     WebFetchTool,
-    _DeadlineBackend,
     _embedded_ipv4,
     _is_blocked,
-    _now,
-    _open_client,
 )
 
 _PUBLIC = "93.184.216.34"
@@ -53,6 +49,10 @@ def _html(body: str, status: int = 200) -> httpx.Response:
     return httpx.Response(status, headers={"content-type": "text/html; charset=utf-8"}, text=body)
 
 
+def _plain(body: str, status: int = 200) -> httpx.Response:
+    return httpx.Response(status, headers={"content-type": "text/plain; charset=utf-8"}, text=body)
+
+
 def _answers(ips: list[str]):
     def fake(host: str, port: int, *_args: Any, **_kwargs: Any) -> list[Any]:
         fake.hosts.append(host)  # type: ignore[attr-defined]
@@ -66,19 +66,26 @@ def _answers(ips: list[str]):
 
 
 def test_web_fetch_tool_is_registered_by_default() -> None:
-    names = [definition.name for definition in default_registry().definitions]
+    names = [definition.name for definition in build_registry(("atlas.agent.tools",)).definitions]
 
     assert WebFetchTool.trust == "default"
     assert "web_fetch" in names
 
 
-def test_returns_the_body_as_text(tmp_path: Path) -> None:
+def test_converts_html_to_readable_markdown(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
-    result = _tool(_handler(_html("<p>hello</p>"))).run({"url": "https://example.com/page"}, store)
+    page = (
+        "<html><head><style>body{color:red}</style><script>alert(1)</script></head>"
+        "<body><h1>Docs</h1><p>hello <b>world</b></p></body></html>"
+    )
+    result = _tool(_handler(_html(page))).run({"url": "https://example.com/page"}, store)
 
     assert "HTTP 200" in result.text
     assert "text/html" in result.text
-    assert "<p>hello</p>" in result.text
+    assert "# Docs" in result.text
+    assert "hello **world**" in result.text
+    assert "body{color:red}" not in result.text
+    assert "alert(1)" not in result.text
     assert "untrusted data" in result.text
     assert re.search(r"untrusted_web_content_[0-9a-f]{16}", result.text)
     assert result.artifacts == []
@@ -153,7 +160,7 @@ def test_refuses_a_non_text_response(tmp_path: Path) -> None:
 def test_truncates_a_large_body(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     oversized = "x" * (WebFetchTool.max_bytes + 5_000)
-    result = _tool(_handler(_html(oversized))).run({"url": "https://example.com/big"}, store)
+    result = _tool(_handler(_plain(oversized))).run({"url": "https://example.com/big"}, store)
 
     assert f"truncated at {WebFetchTool.max_bytes} bytes" in result.text
     assert "x" * WebFetchTool.max_bytes in result.text
@@ -345,7 +352,7 @@ def test_strips_escapes_c0_and_bidi_controls(tmp_path: Path) -> None:
         "\x00\x07a\rb\n"
         "\u202eright\u2066left\tstay"
     )
-    result = _tool(_handler(_html(body))).run({"url": "https://example.com/page"}, store)
+    result = _tool(_handler(_plain(body))).run({"url": "https://example.com/page"}, store)
 
     assert "keep" in result.text
     assert "red" in result.text
@@ -382,7 +389,7 @@ def test_body_cannot_close_the_untrusted_wrapper(tmp_path: Path) -> None:
     )
     store = LocalArtifactStore(tmp_path)
     tool = WebFetchTool(
-        httpx.Client(transport=httpx.MockTransport(_handler(_html(body)))),
+        httpx.Client(transport=httpx.MockTransport(_handler(_plain(body)))),
         nonce=nonce,
     )
 
@@ -449,9 +456,6 @@ def test_ignores_proxy_env_and_netrc(tmp_path: Path, monkeypatch: pytest.MonkeyP
         seen["trust_env"] = kwargs.get("trust_env", "missing")
         seen["follow_redirects"] = kwargs.get("follow_redirects", "missing")
         seen["proxy"] = kwargs.get("proxy")
-        transport = kwargs.get("transport")
-        pool = getattr(transport, "_pool", None)
-        seen["backend"] = type(getattr(pool, "_network_backend", None)).__name__
         kwargs["transport"] = httpx.MockTransport(handle)
         return real_client(*args, **kwargs)
 
@@ -462,7 +466,6 @@ def test_ignores_proxy_env_and_netrc(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert seen["trust_env"] is False
     assert seen["follow_redirects"] is False
     assert seen["proxy"] is None
-    assert seen["backend"] == "_DeadlineBackend"
     assert seen["authorization"] is None
     assert "proxy.invalid" not in seen["url"]
     assert "s3cret" not in seen["url"]
@@ -530,68 +533,6 @@ def test_deadline_covers_connect_and_the_full_read(
     assert "https://example.com/slow" in str(exc.value)
 
 
-def test_socket_operations_share_one_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = {"t": 0.0}
-    monkeypatch.setattr("atlas.agent.tools.web_fetch._now", lambda: clock["t"])
-    recorded: list[tuple[str, float | None]] = []
-
-    class InnerStream(httpcore.NetworkStream):
-        def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-            recorded.append(("read", timeout))
-            clock["t"] += float(timeout or 0)
-            return b"x"
-
-        def write(self, buffer: bytes, timeout: float | None = None) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
-
-        def start_tls(
-            self,
-            ssl_context: Any,
-            server_hostname: str | None = None,
-            timeout: float | None = None,
-        ) -> httpcore.NetworkStream:
-            return self
-
-        def get_extra_info(self, info: str) -> Any:
-            return None
-
-    class Inner(httpcore.NetworkBackend):
-        def connect_tcp(
-            self,
-            host: str,
-            port: int,
-            timeout: float | None = None,
-            local_address: str | None = None,
-            socket_options: Any = None,
-        ) -> httpcore.NetworkStream:
-            recorded.append(("connect", timeout))
-            clock["t"] += 0.25
-            return InnerStream()
-
-        def connect_unix_socket(
-            self,
-            path: str,
-            timeout: float | None = None,
-            socket_options: Any = None,
-        ) -> httpcore.NetworkStream:
-            raise AssertionError("unix socket")
-
-        def sleep(self, seconds: float) -> None:
-            clock["t"] += seconds
-
-    stream = _DeadlineBackend(Inner(), 1.0).connect_tcp("93.184.216.34", 443, timeout=30)
-    stream.read(16, timeout=30)
-    with pytest.raises(httpcore.ReadTimeout):
-        stream.read(16, timeout=30)
-
-    assert recorded[0] == ("connect", pytest.approx(1.0))
-    assert recorded[1] == ("read", pytest.approx(0.75))
-    assert len(recorded) == 2
-
-
 @pytest.mark.parametrize("timeout", [0, 300])
 def test_bounds_the_timeout(tmp_path: Path, timeout: int) -> None:
     store = LocalArtifactStore(tmp_path)
@@ -608,12 +549,6 @@ def test_reads_a_body_without_a_content_type(tmp_path: Path) -> None:
 
     assert "unspecified content type" in result.text
     assert "plain bytes, no declared type" in result.text
-
-
-def _nonce_of(text: str) -> str:
-    match = re.search(r"untrusted_web_content_([0-9a-f]{16})", text)
-    assert match is not None
-    return match.group(1)
 
 
 def test_transition_addresses_are_judged_by_the_embedded_ipv4() -> None:
@@ -640,97 +575,10 @@ def test_transition_addresses_are_judged_by_the_embedded_ipv4() -> None:
     assert not _is_blocked(ipaddress.IPv4Address("100.128.0.1"))
 
 
-def test_open_client_patches_the_pool_network_backend() -> None:
-    client = _open_client(_now() + 5)
-    try:
-        transport = client._transport
-        pool = getattr(transport, "_pool", None)
-        assert isinstance(pool, httpcore.ConnectionPool)
-        assert isinstance(pool._network_backend, _DeadlineBackend)
-    finally:
-        client.close()
+def test_web_fetch_definition_fits_schema_limit() -> None:
+    from atlas.agent.tools._schema import MAX_DEFINITION_CHARS, definition_chars
 
-
-def test_sni_hostname_reaches_start_tls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store = LocalArtifactStore(tmp_path)
-    seen: dict[str, Any] = {}
-
-    class RecordingStream(httpcore.NetworkStream):
-        def __init__(self) -> None:
-            self._response = (
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: text/plain\r\n"
-                b"Content-Length: 2\r\n"
-                b"Connection: close\r\n"
-                b"\r\n"
-                b"ok"
-            )
-            self._offset = 0
-
-        def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-            chunk = self._response[self._offset : self._offset + max_bytes]
-            self._offset += len(chunk)
-            return chunk
-
-        def write(self, buffer: bytes, timeout: float | None = None) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
-
-        def start_tls(
-            self,
-            ssl_context: Any,
-            server_hostname: str | None = None,
-            timeout: float | None = None,
-        ) -> httpcore.NetworkStream:
-            seen["sni"] = server_hostname
-            return self
-
-        def get_extra_info(self, info: str) -> Any:
-            return None
-
-    class RecordingBackend(httpcore.NetworkBackend):
-        def connect_tcp(
-            self,
-            host: str,
-            port: int,
-            timeout: float | None = None,
-            local_address: str | None = None,
-            socket_options: Any = None,
-        ) -> httpcore.NetworkStream:
-            seen["connect_host"] = host
-            seen["connect_port"] = port
-            return RecordingStream()
-
-        def connect_unix_socket(
-            self,
-            path: str,
-            timeout: float | None = None,
-            socket_options: Any = None,
-        ) -> httpcore.NetworkStream:
-            raise AssertionError("unix socket")
-
-        def sleep(self, seconds: float) -> None:
-            return None
-
-    def open_and_record(deadline: float) -> httpx.Client:
-        client = _open_client(deadline)
-        pool = client._transport._pool
-        backend = pool._network_backend
-        assert isinstance(backend, _DeadlineBackend)
-        seen["deadline_backend"] = True
-        backend._inner = RecordingBackend()
-        return client
-
-    monkeypatch.setattr("atlas.agent.tools.web_fetch._open_client", open_and_record)
-    result = WebFetchTool().run({"url": "https://example.com/page"}, store)
-
-    assert seen["deadline_backend"] is True
-    assert seen["connect_host"] == _PUBLIC
-    assert seen["connect_port"] == 443
-    assert seen["sni"] == "example.com"
-    assert "ok" in result.text
+    assert definition_chars(WebFetchTool().definition()) <= MAX_DEFINITION_CHARS
 
 
 def test_unresolved_name_says_not_to_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

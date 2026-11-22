@@ -25,7 +25,7 @@ The first launch builds `tui/target/release/atlas-tui` when `cargo` is on
 `atlas tui --workspace PATH` forwards the extra arguments. `ATLAS_TUI` can
 point at a binary you built yourself.
 
-Usage: `atlas-tui [--workspace PATH] [--repo PATH] [--python PATH] [--resume ID]`
+Usage: `atlas-tui [--workspace PATH] [--repo PATH] [--python PATH] [--model ID] [--resume ID] [--approval MODE]`
 
 Options:
 
@@ -35,9 +35,11 @@ Options:
   `ATLAS_PYTHON`). The `atlas` launcher sets it.
 - `--repo PATH` — optional Atlas checkout used as the child's working
   directory and `.env` source (default: walk the current directory's parents for
-  a `pyproject.toml` whose text contains `name = "atlas"`). With neither
-  `--python` nor a found repo the error names both options.
+  a `pyproject.toml` whose text contains `name = "atlas"`).
+- `--model ID` — override the model id for this session.
 - `--resume ID` — resume a saved session; `last` is the newest.
+- `--approval MODE` — approval mode handed to the agent (default: `ask`;
+  `allow`, `ask`, or `deny`).
 
 `OPENROUTER_API_KEY` is read from the environment, or from `<repo>/.env` when
 the repo root is found. The first session writes `<workspace>/.atlas/agent.toml`
@@ -72,28 +74,32 @@ a workspace skill for the rest of this conversation. The `.atlas` copy wins
 over `.agents` when both exist.
 
 Drag across visible text to select it. Releasing the mouse copies the selection
-to the clipboard; `Ctrl+C` copies it again. The agent keeps running while the
-selected view stays still. Press `Esc` to clear the selection and show the latest
-output. Paste into the composer with your terminal's paste shortcut (`Cmd+V` on
-macOS), `Ctrl+V`, or `Shift+Insert`. Multiline text stays in the composer until
-you press `Enter`. `/copy` copies the last assistant reply.
+to the clipboard; `Ctrl+C` copies it again. Incoming updates continue rendering
+while text is selected; press `Esc` to clear the selection. Paste into the
+composer with your terminal's paste shortcut (`Cmd+V` on macOS), `Ctrl+V`, or
+`Shift+Insert`. Multiline text stays in the composer until you press `Enter`.
+`/copy` copies the last assistant reply.
 
 When a tool needs approval, an **Approval required** panel shows the command
-or file preview. Use the arrow keys or `Tab` to choose **Allow once** or **Deny**,
-then press `Enter`. You can also click a choice. **Deny** is selected initially,
-and `Esc` denies the call. Use `PageUp`, `PageDown`, or the mouse wheel to scroll
-a long preview. The panel keeps any message you were composing.
+or colored diff preview. Press `y` (**Allow once**), `a` (**Allow for session**),
+`n` / `Esc` (**Deny**), `d` (**Deny with reason**), or `Ctrl+Y` to toggle YOLO,
+or use the arrow keys / `Tab` + `Enter` or click a choice. **Deny** is selected
+initially so bare `Enter` never approves accidentally. Use `PageUp`, `PageDown`,
+or the mouse wheel to scroll a long preview. The panel keeps any message you
+were composing.
 
-Use `/yolo` to toggle automatic approval for this Atlas TUI process. YOLO
-starts off; while it is on, tool calls proceed without per-tool prompts, and
-`/yolo` turns prompting back on. The status row shows `YOLO on` while enabled.
-You can enter `/yolo` at the approval prompt as well.
+Use `/yolo` (or `Ctrl+Y` in the approval modal) to toggle automatic approval for
+this Atlas TUI process. YOLO starts off; while it is on, tool calls proceed
+without per-tool prompts, and `/yolo` turns prompting back on. The status row
+shows `YOLO on` while enabled.
 
 ## Tool rows
 
-A tool row reads `<tool> - <summary>` (summary clipped to 60 characters). An
-expanded row adds a `notes` section with harness feedback (a repeated call, the
-budget note); raw results stay hidden. A tool that has run for 5 seconds or more
+A tool row reads `◆ <tool> <summary> (<duration>)` (summary clipped to 60
+characters) and streams live output while running. Clicking a row (or pressing
+`Ctrl+O` / `Right` / `Enter` on an empty composer) expands arguments, colored
+diffs, output, `notes` (harness feedback such as repeated-call or budget notes),
+and `artifacts`. An active phase or tool that has run for 5 seconds or more
 shows its elapsed time, for example `1m12s`.
 
 ## Sessions

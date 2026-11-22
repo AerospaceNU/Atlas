@@ -347,23 +347,32 @@ def test_protocol_use_skill_reports_active_names(tmp_path: Path) -> None:
     )
 
     skill_events = [event for event in events if event["type"] == "skill"]
-    assert skill_events == [
+    assert [
+        {
+            "type": event["type"],
+            "name": event["name"],
+            "active": event["active"],
+            "note": event["note"],
+            "active_skills": event["status"]["active_skills"],
+        }
+        for event in skill_events
+    ] == [
         {
             "type": "skill",
             "name": "flood-check",
-            "description": "Check water.",
-            "location": ".atlas/skills/flood-check",
-            "active": ["flood-check"],
+            "active": True,
+            "note": "Check water.",
+            "active_skills": ["flood-check"],
         },
         {
             "type": "skill",
             "name": "tide",
-            "description": "Read the tide.",
-            "location": ".atlas/skills/tide",
-            "active": ["flood-check", "tide"],
+            "active": True,
+            "note": "Read the tide.",
+            "active_skills": ["flood-check", "tide"],
         },
     ]
-    assert str(session.workspace) not in json.dumps(skill_events)
+    assert all(str(session.workspace) not in (event["note"] or "") for event in skill_events)
     system = model.requests[0][0][0].content or ""
     applied = model.requests[0][0][1].content or ""
     assert "Label water." not in system
@@ -395,7 +404,7 @@ def test_protocol_bad_skill_does_not_end_the_session(tmp_path: Path) -> None:
         "Skill name '../secrets' contains invalid characters. "
         "Only letters, digits, and hyphens are allowed."
     )
-    assert str(session.workspace) not in json.dumps(events)
+    assert str(session.workspace) not in json.dumps(events[1:])
     assert events[3]["message"] == "skill name must be a non-empty string"
 
 
@@ -430,4 +439,4 @@ def test_protocol_reports_a_changed_skill_without_a_path(tmp_path: Path) -> None
     assert events[1]["message"] == (
         "Skill flood-check changed since it was loaded. Restart the session to reload it."
     )
-    assert str(session.workspace) not in json.dumps(events)
+    assert str(session.workspace) not in json.dumps(events[1:])

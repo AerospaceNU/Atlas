@@ -1,143 +1,132 @@
-use std::collections::VecDeque;
+//! Prompt history with JSON-lines persistence across TUI sessions.
 
-const MAX_PROMPTS: usize = 100;
+use std::collections::VecDeque;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const MAX_PROMPTS: usize = 200;
 
 #[derive(Default)]
-pub(super) struct PromptHistory {
+pub struct PromptHistory {
     entries: VecDeque<String>,
-    browsing: Option<BrowseState>,
-}
-
-struct BrowseState {
-    index: usize,
-    draft: String,
+    browsing: Option<(usize, String)>,
+    path: Option<PathBuf>,
 }
 
 impl PromptHistory {
-    pub(super) fn record(&mut self, text: &str) {
+    pub fn load_default() -> Self {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|h| Self::load_from(PathBuf::from(h).join(".atlas/tui_history")))
+            .unwrap_or_default()
+    }
+
+    pub fn load_from(path: PathBuf) -> Self {
+        let mut entries: VecDeque<String> = fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<String>(l).ok())
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        while entries.len() > MAX_PROMPTS {
+            entries.pop_front();
+        }
+        Self {
+            entries,
+            browsing: None,
+            path: Some(path),
+        }
+    }
+
+    pub fn record(&mut self, text: &str) {
         if text.trim().is_empty() {
             return;
         }
         self.browsing = None;
-        if self.entries.back().is_some_and(|previous| previous == text) {
+        if self.entries.back().is_some_and(|p| p == text) {
             return;
         }
-
         self.entries.push_back(text.to_string());
         if self.entries.len() > MAX_PROMPTS {
             self.entries.pop_front();
         }
+        if let Some(path) = &self.path {
+            let _ = save(path, &self.entries);
+        }
     }
 
-    pub(super) fn older(&mut self, current: &str) -> Option<String> {
+    pub fn older(&mut self, current: &str) -> Option<String> {
         if self.entries.is_empty() {
             return None;
         }
-
-        let index = match &mut self.browsing {
-            Some(state) => {
-                state.index = state.index.saturating_sub(1);
-                state.index
+        let idx = match &mut self.browsing {
+            Some((i, _)) => {
+                *i = i.saturating_sub(1);
+                *i
             }
             None => {
-                let index = self.entries.len() - 1;
-                self.browsing = Some(BrowseState {
-                    index,
-                    draft: current.to_string(),
-                });
-                index
+                let i = self.entries.len() - 1;
+                self.browsing = Some((i, current.to_string()));
+                i
             }
         };
-        self.entries.get(index).cloned()
+        self.entries.get(idx).cloned()
     }
 
-    pub(super) fn newer(&mut self) -> Option<String> {
-        let state = self.browsing.as_mut()?;
-        if state.index + 1 < self.entries.len() {
-            state.index += 1;
-            return self.entries.get(state.index).cloned();
+    pub fn newer(&mut self) -> Option<String> {
+        let (idx, _) = self.browsing.as_mut()?;
+        if *idx + 1 < self.entries.len() {
+            *idx += 1;
+            return self.entries.get(*idx).cloned();
         }
-
-        self.browsing.take().map(|state| state.draft)
+        self.browsing.take().map(|(_, draft)| draft)
     }
 
-    pub(super) fn is_browsing(&self) -> bool {
+    pub fn is_browsing(&self) -> bool {
         self.browsing.is_some()
     }
-
-    pub(super) fn edited(&mut self) {
+    pub fn edited(&mut self) {
         self.browsing = None;
     }
 }
 
+fn save(path: &Path, entries: &VecDeque<String>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let out: String = entries
+        .iter()
+        .filter_map(|e| serde_json::to_string(e).ok())
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, out)?;
+    fs::rename(&tmp, path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PromptHistory, MAX_PROMPTS};
+    use super::*;
 
     #[test]
-    fn navigation_orders_prompts_and_restores_the_original_draft() {
-        let mut history = PromptHistory::default();
-        history.record("first prompt");
-        history.record("second prompt");
+    fn navigates_dedups_and_persists_multiline_history() {
+        let dir = std::env::temp_dir().join(format!("atlas-hist-{}", std::process::id()));
+        let path = dir.join("tui_history");
+        let _ = fs::remove_dir_all(&dir);
 
-        assert_eq!(history.older("unsent draft"), Some("second prompt".into()));
-        assert!(history.is_browsing());
-        assert_eq!(
-            history.older("ignored while browsing"),
-            Some("first prompt".into())
-        );
-        assert_eq!(
-            history.older("ignored while browsing"),
-            Some("first prompt".into())
-        );
-        assert_eq!(history.newer(), Some("second prompt".into()));
-        assert_eq!(history.newer(), Some("unsent draft".into()));
-        assert!(!history.is_browsing());
-        assert_eq!(history.newer(), None);
-    }
+        let mut h = PromptHistory::load_from(path.clone());
+        h.record("  ");
+        h.record("line1\nline2");
+        h.record("line1\nline2");
+        h.record("second");
+        assert_eq!(h.older("draft"), Some("second".into()));
+        assert_eq!(h.older("ignored"), Some("line1\nline2".into()));
+        assert_eq!(h.newer(), Some("second".into()));
+        assert_eq!(h.newer(), Some("draft".into()));
 
-    #[test]
-    fn blank_and_consecutive_duplicate_prompts_are_skipped() {
-        let mut history = PromptHistory::default();
-        history.record(" \n\t ");
-        assert_eq!(history.older("draft"), None);
-
-        history.record("repeat");
-        history.record("repeat");
-        history.record("different");
-        history.record("repeat");
-
-        assert_eq!(history.older("draft"), Some("repeat".into()));
-        assert_eq!(history.older("draft"), Some("different".into()));
-        assert_eq!(history.older("draft"), Some("repeat".into()));
-    }
-
-    #[test]
-    fn edited_prompt_starts_a_fresh_browsing_draft() {
-        let mut history = PromptHistory::default();
-        history.record("sent prompt");
-        assert_eq!(history.older("original draft"), Some("sent prompt".into()));
-
-        history.edited();
-        assert!(!history.is_browsing());
-        assert_eq!(history.older("edited prompt"), Some("sent prompt".into()));
-        assert_eq!(history.newer(), Some("edited prompt".into()));
-    }
-
-    #[test]
-    fn capacity_retains_only_the_latest_prompts() {
-        let mut history = PromptHistory::default();
-        for number in 0..=MAX_PROMPTS {
-            history.record(&format!("prompt {number}"));
-        }
-
-        assert_eq!(
-            history.older("draft"),
-            Some(format!("prompt {MAX_PROMPTS}"))
-        );
-        for number in (1..MAX_PROMPTS).rev() {
-            assert_eq!(history.older("draft"), Some(format!("prompt {number}")));
-        }
-        assert_eq!(history.older("draft"), Some("prompt 1".into()));
+        let mut reloaded = PromptHistory::load_from(path);
+        assert_eq!(reloaded.older(""), Some("second".into()));
+        assert_eq!(reloaded.older(""), Some("line1\nline2".into()));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

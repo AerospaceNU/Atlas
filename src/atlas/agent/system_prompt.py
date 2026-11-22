@@ -1,20 +1,10 @@
-"""Load the Atlas system prompt from package data.
-
-The text lives in ``system_prompt.md`` beside this module. The agent reads
-that package resource once and reuses it for the life of the process.
-Editing the file during development does not take effect until Atlas is
-restarted. A copy planted in the project workspace or the session artifact
-directory cannot replace it. The text must be UTF-8 and must include every
-required rule.
-"""
+"""Load the Atlas system prompt from package data."""
 
 from __future__ import annotations
 
 from functools import cache
 from importlib.resources import files
 
-_PACKAGE = "atlas.agent"
-_PROMPT_FILENAME = "system_prompt.md"
 _REQUIRED_RULES = (
     "You are Atlas, a local workspace assistant.",
     "Only use tools on the supplied registry.",
@@ -38,19 +28,9 @@ class SystemPromptError(ValueError):
 
 @cache
 def load_system_prompt() -> str:
-    """Return the system prompt shipped with this package.
-
-    The file is read once through :mod:`importlib.resources` and cached for
-    the life of the process. Editing ``system_prompt.md`` during development
-    does not take effect until Atlas is restarted. Installed copies may be
-    hard-linked, which is how ``uv`` lays a wheel into ``site-packages``.
-
-    Raises:
-        SystemPromptError: The package file is missing or not a safe prompt.
-    """
-    resource = files(_PACKAGE).joinpath(_PROMPT_FILENAME)
+    """Return the cached system prompt shipped inside ``atlas.agent``."""
     try:
-        data = resource.read_bytes()
+        data = files("atlas.agent").joinpath("system_prompt.md").read_bytes()
     except FileNotFoundError as exc:
         raise SystemPromptError("system prompt file is missing") from exc
     except OSError as exc:

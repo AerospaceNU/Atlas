@@ -162,3 +162,32 @@ def test_directory_scans_skip_the_whole_atlas_directory(tmp_path: Path) -> None:
     assert ".atlas" not in outline
     assert ".atlas" not in refs
     assert "real.py" in outline and "real.py" in refs
+
+
+def test_find_references_visits_imports_kwargs_except_global_nonlocal_match(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    (tmp_path / "mod.py").write_text(
+        "import pkg.sym\n"
+        "from other import foo as sym\n"
+        "def outer():\n"
+        "    global sym\n"
+        "    def inner():\n"
+        "        nonlocal sym\n"
+        "        call(sym=1)\n"
+        "        try:\n"
+        "            match x:\n"
+        "                case sym:\n"
+        "                    pass\n"
+        "        except Exception as sym:\n"
+        "            pass\n",
+        encoding="utf-8",
+    )
+
+    result = FindReferencesTool().run({"name": "sym"}, store).text
+
+    assert ": import:" in result
+    assert ": global:" in result
+    assert ": nonlocal:" in result
+    assert ": keyword:" in result
+    assert ": except:" in result
+    assert ": assign:" in result

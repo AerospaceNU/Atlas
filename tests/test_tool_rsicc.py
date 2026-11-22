@@ -16,7 +16,7 @@ from PIL import Image
 from pydantic import ValidationError
 
 from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
-from atlas.agent.contracts import build_registry, default_registry
+from atlas.agent.contracts import build_registry
 from atlas.agent.tools.rsicc_tool import (
     ChangeReport,
     GeoCheckFailed,
@@ -68,10 +68,12 @@ class _FakeGemini:
 
     def __init__(self, reply: str | None) -> None:
         self.api_keys: list[str | None] = []
+        self.http_options: list[Any] = []
         self.models = _FakeModels(reply)
 
-    def __call__(self, *, api_key: str | None = None) -> _FakeGemini:
+    def __call__(self, *, api_key: str | None = None, http_options: Any = None) -> _FakeGemini:
         self.api_keys.append(api_key)
+        self.http_options.append(http_options)
         return self
 
 
@@ -160,13 +162,14 @@ def _decode(part: Any) -> Image.Image:
 
 
 def test_rsicc_tool_is_opt_in() -> None:
-    names = [definition.name for definition in default_registry().definitions]
+    names = [definition.name for definition in build_registry(("atlas.agent.tools",)).definitions]
     opted_in = [
         definition.name
         for definition in build_registry(("atlas.agent.tools",), include_opt_in=True).definitions
     ]
 
     assert RSICCTool.trust == "opt_in"
+    assert RSICCTool.domain == "satellite"
     assert "rsicc_tool" not in names
     assert "rsicc_tool" in opted_in
 
@@ -754,11 +757,31 @@ def test_tiff_without_rasterio_explains_the_extra(
         ({"CLOUD_COVER": "150"}, None),
         ({"CLOUD_COVER": "-3"}, None),
         ({"CLOUD_COVER": "cloudy"}, None),
+        ({"CLOUD_COVER": "cloudy", "CLOUDY_PIXEL_PERCENTAGE": "18.5"}, 18.5),
+        ({"CLOUD_COVER": "250", "cloudcover": "22%"}, 22.0),
         ({}, None),
     ],
 )
 def test_cloud_cover_tags_are_validated(tags: dict[str, str], expected: float | None) -> None:
     assert _cloud_cover_from_tags(tags) == expected
+
+
+def test_reads_from_read_root_passes_timeout_and_honors_instance_max_bytes(
+    tmp_path: Path, gemini: _FakeGemini
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    before = _save(_rgb(8, 8), workspace / "before.png")
+    after = _save(_rgb(8, 8), workspace / "after.png")
+    store = LocalArtifactStore(tmp_path / "artifact", read_root=workspace)
+
+    RSICCTool().run({"image1": before, "image2": after}, store)
+    assert gemini.http_options and gemini.http_options[0]["timeout"] > 0
+
+    small_tool = RSICCTool()
+    small_tool.max_bytes = 5  # type: ignore[misc]
+    with pytest.raises(ArtifactError, match="exceeds the 5 byte"):
+        small_tool.run({"image1": before, "image2": after}, store)
 
 
 @pytest.mark.evals
@@ -780,3 +803,40 @@ def test_live_gemini_describes_an_obvious_change(tmp_path: Path) -> None:
 
     description = json.loads(result.text)["report"]["description"].lower()
     assert "red" in description or "square" in description
+
+
+def test_geotiff_zero_area_and_zero_gsd_raise_geo_check_failed(
+    tmp_path: Path, gemini: _FakeGemini, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    for name in ("before.tif", "after.tif"):
+        (tmp_path / name).write_bytes(b"II*\x00" + b"\x00" * 16)
+
+    def fake_open_factory(bounds: Any, res: tuple[float, float]) -> Any:
+        class _FakeDS:
+            driver = "GTiff"
+            crs = SimpleNamespace(linear_units="metre", __str__=lambda self: "EPSG:32633")
+            count = 1
+            colorinterp = ()
+
+            def __init__(self) -> None:
+                self.bounds = bounds
+                self.res = res
+
+            def tags(self) -> dict[str, str]:
+                return {}
+
+            def __enter__(self) -> _FakeDS:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        return SimpleNamespace(open=lambda _path: _FakeDS())
+
+    store = LocalArtifactStore(tmp_path)
+    zero_gsd = fake_open_factory(SimpleNamespace(left=0, bottom=0, right=10, top=10), (0.0, 0.0))
+    monkeypatch.setattr("atlas.agent.tools.rsicc_tool._load_rasterio", lambda: zero_gsd)
+    with pytest.raises(GeoCheckFailed, match="zero pixel resolution"):
+        RSICCTool().run({"image1": "before.tif", "image2": "after.tif"}, store)

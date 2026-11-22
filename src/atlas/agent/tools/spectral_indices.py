@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import numpy as np
@@ -68,6 +69,10 @@ class SpectralIndicesTool(Tool):
 
     def run(self, arguments: dict[str, Any], store: LocalArtifactStore) -> ToolResult:
         request = SpectralIndicesInput.model_validate(arguments)
+        out_raw = request.out.strip()
+        if out_raw == "/":
+            raise ValueError("Output directory cannot be filesystem root '/'")
+        out_dir = store.resolve(out_raw or ".")
         bands: dict[str, NDArray[np.generic]] = {
             "red": _load(store, request.red, "red"),
             "nir": _load(store, request.nir, "nir"),
@@ -87,20 +92,16 @@ class SpectralIndicesTool(Tool):
         )
         if not result:
             raise ValueError("red and NIR are required before an index can be computed")
-        planned: list[tuple[str, str]] = []
-        for name in result:
-            relative = f"{request.out.rstrip('/')}/{name}.npy"
-            path = store.resolve(relative)
+        planned: list[tuple[str, Path]] = [(name, out_dir / f"{name}.npy") for name in result]
+        for _, path in planned:
             if path.exists() and not request.overwrite:
                 raise FileExistsError(
-                    f"refusing to overwrite {relative}; pass overwrite to replace it"
+                    f"refusing to overwrite {store.relative(path)}; pass overwrite to replace it"
                 )
-            planned.append((name, relative))
         artifacts: list[str] = []
         lines: list[str] = []
-        for name, relative in planned:
+        for name, path in planned:
             array = result[name]
-            path = store.resolve(relative)
             path.parent.mkdir(parents=True, exist_ok=True)
             np.save(path, array)
             stored = store.relative(path)

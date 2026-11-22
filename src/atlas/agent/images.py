@@ -5,35 +5,28 @@ from __future__ import annotations
 import base64
 import io
 from pathlib import Path
-
-from PIL import Image, UnidentifiedImageError
+from typing import TYPE_CHECKING
 
 from atlas.agent.artifacts import ArtifactError, LocalArtifactStore
 from atlas.agent.contracts import ChatMessage, ModelImage, Role
 
-# Pillow format names the vision model can accept. The suffix is not consulted.
+if TYPE_CHECKING:
+    from PIL.Image import Image as PilImage
+
 _FORMAT_MEDIA_TYPES = {
     "GIF": "image/gif",
     "JPEG": "image/jpeg",
     "PNG": "image/png",
     "WEBP": "image/webp",
 }
-
-# Tool results with these suffixes are image artifacts. The media type still
-# comes from Pillow, so a mislabeled file is not sent as the wrong type.
 _IMAGE_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
-
-# Caps are the base64 payload length, not the raw file size. Each image stays
-# at or under this size. Larger images are downscaled.
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-
-# Newest images are sent until this base64 budget is full. Older images are
-# replaced with a placeholder and are not attached again on the next request.
 MAX_REQUEST_IMAGE_BYTES = 15 * 1024 * 1024
-
-# Files above this are refused before they are read. Images between
-# ``MAX_IMAGE_BYTES`` and this limit are opened and downscaled.
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
+
+
+def _b64_size(n: int) -> int:
+    return ((n + 2) // 3) * 4
 
 
 def is_model_image(relative_path: str) -> bool:
@@ -42,32 +35,14 @@ def is_model_image(relative_path: str) -> bool:
 
 
 def ingest_image(store: LocalArtifactStore, relative_path: str) -> ModelImage:
-    """Read one image into a model content part.
+    """Read and downscale one image into a base64 ``ModelImage`` under ``MAX_IMAGE_BYTES``."""
+    from PIL import Image, UnidentifiedImageError
 
-    The path is resolved with :meth:`~atlas.agent.artifacts.LocalArtifactStore.resolve_read`,
-    so a file in the working tree wins and a file in the project workspace is
-    still visible. The stored path is relative to the working tree when the
-    file sits inside it, and absolute otherwise.
-
-    Args:
-        store: Store that owns the artifact root and the optional read root.
-        relative_path: Image path relative to a root, or an absolute path.
-
-    Returns:
-        Base64 image bytes whose encoded length is at most ``MAX_IMAGE_BYTES``,
-        with a portable path.
-
-    Raises:
-        ValueError: Pillow cannot read the file, its format is unsupported, or
-            Pillow rejects it as a decompression bomb.
-        FileNotFoundError: The path is not a file.
-        ArtifactError: The file exceeds ``MAX_SOURCE_BYTES`` or cannot be
-            downscaled under ``MAX_IMAGE_BYTES``.
-    """
     path = store.resolve_read(relative_path)
     if not path.is_file():
         raise FileNotFoundError(f"Image does not exist: {relative_path}")
-    if path.stat().st_size > MAX_SOURCE_BYTES:
+    size = path.stat().st_size
+    if size > MAX_SOURCE_BYTES:
         raise ArtifactError(f"Image {relative_path} exceeds the {MAX_SOURCE_BYTES} byte read limit")
     try:
         with Image.open(path) as image:
@@ -75,8 +50,19 @@ def ingest_image(store: LocalArtifactStore, relative_path: str) -> ModelImage:
                 image.load()
             except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
                 raise ValueError(f"Image {relative_path} is not a readable image") from exc
-            media_type = _media_type(image.format, relative_path)
-            encoded = _within_cap(path, image, image.format or "", relative_path)
+            fmt = image.format or ""
+            media_type = _FORMAT_MEDIA_TYPES.get(fmt)
+            if media_type is None:
+                supported = ", ".join(sorted(set(_FORMAT_MEDIA_TYPES.values())))
+                raise ValueError(
+                    f"Unsupported image format {fmt or 'unknown'} for {relative_path}. "
+                    f"Supported formats: {supported}"
+                )
+            encoded = (
+                path.read_bytes()
+                if _b64_size(size) <= MAX_IMAGE_BYTES
+                else _shrink(image, fmt, relative_path)
+            )
     except Image.DecompressionBombError as exc:
         raise ValueError(f"Image {relative_path} was rejected as a decompression bomb") from exc
     except (UnidentifiedImageError, OSError, SyntaxError) as exc:
@@ -96,14 +82,7 @@ def ingest_images(
 
 
 def apply_image_budget(messages: list[ChatMessage]) -> None:
-    """Drop older images until the newest ones fit in one request.
-
-    Sizes are the base64 payload length. Images are considered from the newest
-    message backward. An image that does not fit, and every older image, is
-    removed. Each removed image leaves ``[image <path> omitted]`` on that
-    message. Tool messages never carry image parts. The messages are updated
-    in place so a later request does not send the evicted bytes again.
-    """
+    """Drop older images in place until the newest ones fit in ``MAX_REQUEST_IMAGE_BYTES``."""
     remaining = MAX_REQUEST_IMAGE_BYTES
     chosen: dict[int, list[ModelImage]] = {}
     stop = False
@@ -135,40 +114,25 @@ def apply_image_budget(messages: list[ChatMessage]) -> None:
             kept_ids = {id(image) for image in kept}
             omitted = [image for image in message.images if id(image) not in kept_ids]
         if omitted:
-            _mark_omitted(message, omitted)
+            note = "\n".join(f"[image {image.path} omitted]" for image in omitted)
+            message.content = f"{message.content}\n{note}" if message.content else note
         message.images = kept
 
 
-def _media_type(fmt: str | None, relative_path: str) -> str:
-    media_type = _FORMAT_MEDIA_TYPES.get(fmt or "")
-    if media_type is not None:
-        return media_type
-    supported = ", ".join(sorted(set(_FORMAT_MEDIA_TYPES.values())))
-    label = fmt or "unknown"
-    raise ValueError(
-        f"Unsupported image format {label} for {relative_path}. Supported formats: {supported}"
-    )
+def _shrink(image: PilImage, fmt: str, relative_path: str) -> bytes:
+    from PIL import Image
 
-
-def _base64_len(raw: bytes) -> int:
-    """Return the base64 payload length of ``raw``, without newlines."""
-    return len(base64.b64encode(raw))
-
-
-def _within_cap(path: Path, image: Image.Image, fmt: str, relative_path: str) -> bytes:
-    """Return the original bytes when their base64 form fits, else a smaller encoding."""
-    if path.stat().st_size <= MAX_IMAGE_BYTES:
-        data = path.read_bytes()
-        if _base64_len(data) <= MAX_IMAGE_BYTES:
-            return data
-    return _shrink(image, fmt, relative_path)
-
-
-def _shrink(image: Image.Image, fmt: str, relative_path: str) -> bytes:
     current = image
     while True:
-        encoded = _save_bytes(current, fmt)
-        if _base64_len(encoded) <= MAX_IMAGE_BYTES:
+        saving = (
+            current.convert("RGB")
+            if fmt == "JPEG" and current.mode not in ("L", "RGB")
+            else current
+        )
+        buf = io.BytesIO()
+        saving.save(buf, format=fmt)
+        encoded = buf.getvalue()
+        if _b64_size(len(encoded)) <= MAX_IMAGE_BYTES:
             return encoded
         width, height = current.size
         if width <= 1 or height <= 1:
@@ -179,25 +143,7 @@ def _shrink(image: Image.Image, fmt: str, relative_path: str) -> bytes:
         current = current.resize(resized, Image.Resampling.LANCZOS)
 
 
-def _save_bytes(image: Image.Image, fmt: str) -> bytes:
-    saving = image
-    if fmt == "JPEG" and image.mode not in ("L", "RGB"):
-        saving = image.convert("RGB")
-    buffer = io.BytesIO()
-    saving.save(buffer, format=fmt)
-    return buffer.getvalue()
-
-
-def _mark_omitted(message: ChatMessage, omitted: list[ModelImage]) -> None:
-    note = "\n".join(f"[image {image.path} omitted]" for image in omitted)
-    if message.content:
-        message.content = f"{message.content}\n{note}"
-    else:
-        message.content = note
-
-
 def _portable_path(store: LocalArtifactStore, resolved: Path) -> str:
-    """Return a root-relative path when the file sits inside one, else absolute."""
     candidate = resolved.resolve()
     for base in (store.root, store.read_root):
         if base is None:

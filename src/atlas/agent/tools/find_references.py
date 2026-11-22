@@ -220,9 +220,12 @@ class FindReferencesTool(Tool):
         display = store.relative(path)
         found: dict[tuple[int, int], _Match] = {}
 
-        def add(node: ast.AST, kind: str) -> None:
-            line = getattr(node, "lineno", 0)
-            column = getattr(node, "col_offset", 0) + 1
+        def add(node: ast.AST, kind: str, fallback: ast.AST | None = None) -> None:
+            line = getattr(node, "lineno", 0) or (getattr(fallback, "lineno", 0) if fallback else 0)
+            col_raw = getattr(node, "col_offset", None)
+            if col_raw is None and fallback is not None:
+                col_raw = getattr(fallback, "col_offset", 0)
+            column = (col_raw or 0) + 1
             key = (line, column)
             existing = found.get(key)
             if existing is not None and existing.kind not in ("reference", "attribute"):
@@ -247,8 +250,28 @@ class FindReferencesTool(Tool):
                 add(node, "attribute")
             elif isinstance(node, ast.arg) and node.arg == name:
                 add(node, "param")
+            elif isinstance(node, ast.keyword) and node.arg == name:
+                add(node, "keyword")
+            elif isinstance(node, ast.ExceptHandler) and node.name == name:
+                add(node, "except")
             elif isinstance(node, (ast.Assign, ast.AnnAssign)) and name in _assigned_names(node):
                 add(node, "assign")
+            elif isinstance(node, ast.Global) and name in node.names:
+                add(node, "global")
+            elif isinstance(node, ast.Nonlocal) and name in node.names:
+                add(node, "nonlocal")
+            elif isinstance(node, ast.MatchAs) and node.name == name:
+                add(node, "assign")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname == name or alias.name == name or name in alias.name.split("."):
+                        add(alias, "import", node)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and name in node.module.split("."):
+                    add(node, "import")
+                for alias in node.names:
+                    if alias.name == name or alias.asname == name:
+                        add(alias, "import", node)
         return sorted(found.values(), key=lambda match: (match.line, match.column))
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import difflib
 import hashlib
+import inspect
 import json
 import logging
 import platform
@@ -34,6 +35,8 @@ from atlas.agent.contracts import (
     ToolRegistry,
     ToolResult,
     UnknownToolError,
+    current_cancel_event,
+    tool_execution_scope,
 )
 from atlas.agent.images import ingest_image, ingest_images, is_model_image
 from atlas.agent.instructions import load_project_instructions
@@ -60,6 +63,7 @@ MAX_CONTEXT_TOKENS = 1_000_000
 COMPACT_PREVIEW_CHARS = 500
 KEEP_RECENT_MESSAGES = 6
 _COMPACT_TARGET_FRACTION = 0.8
+_COMPACT_TRIGGER_FRACTION = 0.85
 
 
 _STOPPED_RESPONSE = "Stopped after reaching the configured tool-use limit."
@@ -190,6 +194,14 @@ class AgentStep(BaseModel):
     error: str | None = None
     error_kind: ErrorKind | None = None
     notes: list[str] = Field(default_factory=list)
+    duration_ms: int = 0
+
+
+class PermissionDecision(BaseModel):
+    """Structured response to a :class:`PermissionRequest`."""
+
+    decision: Literal["allow", "allow_session", "deny"]
+    reason: str | None = None
 
 
 class PermissionRequest(BaseModel):
@@ -201,6 +213,7 @@ class PermissionRequest(BaseModel):
         summary: One line a person can decide on.
         arguments: The model's arguments, for display only.
         preview: Unified diff or command text, truncated for the transcript.
+        preview_kind: Display hint for the preview (``diff``, ``command``, ``text``).
     """
 
     id: str
@@ -208,6 +221,7 @@ class PermissionRequest(BaseModel):
     summary: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     preview: str = ""
+    preview_kind: Literal["diff", "command", "text"] = "text"
 
 
 class ContextCompaction(BaseModel):
@@ -412,8 +426,9 @@ class Agent:
         max_spend_usd: float | None = None,
         read_only: bool = False,
         approval: Literal["allow", "ask", "deny"] = "allow",
-        on_permission: Callable[[PermissionRequest], bool] | None = None,
+        on_permission: Callable[[PermissionRequest], bool | PermissionDecision] | None = None,
         skills: Sequence[Skill] | None = None,
+        context_limit: int | None = None,
     ) -> None:
         if max_tool_calls is None:
             max_tool_calls = load_max_tool_calls(artifacts.root)
@@ -433,6 +448,9 @@ class Agent:
         self.approval = approval
         self.on_permission = on_permission
         self.skills = list(skills or [])
+        self.context_limit = context_limit
+        self.session_allowed_tools: set[str] = set()
+        self._complete_params: frozenset[str] | None = None
         self.instruction_nonce = secrets.token_hex(8)
         self.partial_run: AgentRun | None = None
         # Applied to the saved copy of an oversized tool result (never to the visible head/tail).
@@ -506,7 +524,13 @@ class Agent:
         on_step: Callable[[AgentStep], None] | None = None,
         on_phase: Callable[[str, str | None], None] | None = None,
         on_thought: Callable[[str, float | None], None] | None = None,
+        on_content_delta: Callable[[str], None] | None = None,
+        on_thought_delta: Callable[[str], None] | None = None,
+        on_tool_start: Callable[[str, str, str], None] | None = None,
+        on_tool_output: Callable[[str, str], None] | None = None,
+        on_model_call: Callable[[ModelCall], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AgentRun:
         """Continue ``messages`` in place while the tool-call budget lasts.
 
@@ -535,8 +559,17 @@ class Agent:
         self._empty_replies = 0
         self._intent_nudges = 0
         self._intent_text = ""
+        active_cancel = cancel_event or current_cancel_event()
+
+        def is_cancelled() -> bool:
+            return (should_cancel is not None and should_cancel()) or (
+                active_cancel is not None and active_cancel.is_set()
+            )
+
         scope = RunScope(
-            should_cancel=should_cancel,
+            should_cancel=is_cancelled
+            if (should_cancel is not None or active_cancel is not None)
+            else None,
             max_tokens=self.max_tokens,
             max_spend_usd=self.max_spend_usd,
             parent=current_scope(),
@@ -547,6 +580,12 @@ class Agent:
                 on_step=on_step,
                 on_phase=on_phase,
                 on_thought=on_thought,
+                on_content_delta=on_content_delta,
+                on_thought_delta=on_thought_delta,
+                on_tool_start=on_tool_start,
+                on_tool_output=on_tool_output,
+                on_model_call=on_model_call,
+                cancel_event=active_cancel,
                 scope=scope,
             )
         run.empty_replies = self._empty_replies
@@ -560,6 +599,12 @@ class Agent:
         on_step: Callable[[AgentStep], None] | None,
         on_phase: Callable[[str, str | None], None] | None,
         on_thought: Callable[[str, float | None], None] | None,
+        on_content_delta: Callable[[str], None] | None = None,
+        on_thought_delta: Callable[[str], None] | None = None,
+        on_tool_start: Callable[[str, str, str], None] | None = None,
+        on_tool_output: Callable[[str, str], None] | None = None,
+        on_model_call: Callable[[ModelCall], None] | None = None,
+        cancel_event: threading.Event | None = None,
         scope: RunScope,
     ) -> AgentRun:
         """Run the loop for :meth:`advance`; ``scope`` carries cancel and budget."""
@@ -588,10 +633,16 @@ class Agent:
             config = getattr(self.model, "config", None)
             reasoning = True if config is None else bool(getattr(config, "reasoning", True))
             emit("thinking" if reasoning else "working")
-            if _estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
-                change = _compact(messages, protected_user=current_user, root=self.artifacts.root)
+            limit = self.context_limit if self.context_limit is not None else MAX_CONTEXT_TOKENS
+            trigger = (
+                int(limit * _COMPACT_TRIGGER_FRACTION) if self.context_limit is not None else limit
+            )
+            if _estimate_tokens(messages) > trigger:
+                change = _compact(
+                    messages, protected_user=current_user, root=self.artifacts.root, limit=limit
+                )
                 _merge_compaction(compaction, change)
-                if _estimate_tokens(messages) > MAX_CONTEXT_TOKENS:
+                if _estimate_tokens(messages) > limit:
                     return AgentRun(
                         response=_STOPPED_CONTEXT,
                         steps=steps,
@@ -599,7 +650,17 @@ class Agent:
                         stopped_for_context=True,
                         compaction=compaction,
                     )
-            completed = self._complete(messages, current_user, steps, calls, compaction)
+            completed = self._complete(
+                messages,
+                current_user,
+                steps,
+                calls,
+                compaction,
+                on_content_delta=on_content_delta,
+                on_thought_delta=on_thought_delta,
+                should_cancel=scope.cancelled,
+                cancel_event=cancel_event,
+            )
             if isinstance(completed, AgentRun):
                 return completed
             response = completed
@@ -607,6 +668,8 @@ class Agent:
             if observed is not None:
                 calls.append(observed)
                 scope.charge(observed)
+                if on_model_call is not None:
+                    on_model_call(observed)
             empty = not response.tool_calls and not (response.content or "").strip()
             if empty:
                 self._empty_replies += 1
@@ -726,9 +789,16 @@ class Agent:
                     warning=warning,
                     emit=emit,
                     on_step=on_step,
+                    on_tool_start=on_tool_start,
+                    on_tool_output=on_tool_output,
+                    cancel_event=cancel_event,
                 )
                 executed += scope.take_descendant_tool_calls()
-                calls.extend(scope.take_descendant_calls())
+                descendant_calls = scope.take_descendant_calls()
+                calls.extend(descendant_calls)
+                if on_model_call is not None:
+                    for child_call in descendant_calls:
+                        on_model_call(child_call)
                 if scope.over_budget():
                     return AgentRun(
                         response=_STOPPED_BUDGET,
@@ -770,12 +840,25 @@ class Agent:
         warning: str | None,
         emit: Callable[[str, str | None], None],
         on_step: Callable[[AgentStep], None] | None,
+        on_tool_start: Callable[[str, str, str], None] | None = None,
+        on_tool_output: Callable[[str, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Run one round's tools and append a tool message for every call, in order."""
         for call in (*pending, *limited):
             emit("tool_calling", call.name)
-        argument_errors = response.argument_errors
-        results = self._run_round(pending, argument_errors, emit)
+        argument_errors = dict(response.argument_errors)
+        for call in pending:
+            if call.arguments_error is not None and call.id not in argument_errors:
+                argument_errors[call.id] = call.arguments_error
+        results = self._run_round(
+            pending,
+            argument_errors,
+            emit,
+            on_tool_start=on_tool_start,
+            on_tool_output=on_tool_output,
+            cancel_event=cancel_event,
+        )
         for call, step in zip(pending, results, strict=True):
             if call.id not in argument_errors:
                 self._add_notes(step, repeats)
@@ -864,6 +947,28 @@ class Agent:
             error=f"{type(exc).__name__}: {exc}",
         )
 
+    def _call_model(
+        self,
+        messages: list[ChatMessage],
+        on_content_delta: Callable[[str], None] | None,
+        on_thought_delta: Callable[[str], None] | None,
+        should_cancel: Callable[[], bool] | None,
+    ) -> ModelResponse:
+        if self._complete_params is None:
+            try:
+                self._complete_params = frozenset(inspect.signature(self.model.complete).parameters)
+            except (TypeError, ValueError):
+                self._complete_params = frozenset()
+        kwargs: dict[str, Any] = {}
+        for name, val in (
+            ("on_content_delta", on_content_delta),
+            ("on_thought_delta", on_thought_delta),
+            ("should_cancel", should_cancel),
+        ):
+            if name in self._complete_params:
+                kwargs[name] = val
+        return self.model.complete(messages, self.tools.definitions, **kwargs)
+
     def _complete(
         self,
         messages: list[ChatMessage],
@@ -871,6 +976,11 @@ class Agent:
         steps: list[AgentStep],
         calls: list[ModelCall],
         compaction: ContextCompaction,
+        *,
+        on_content_delta: Callable[[str], None] | None = None,
+        on_thought_delta: Callable[[str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> ModelResponse | AgentRun:
         """Call the model once, compacting and retrying on a context-length refusal.
 
@@ -881,7 +991,10 @@ class Agent:
         retries = 0
         while True:
             try:
-                return self.model.complete(messages, self.tools.definitions)
+                with tool_execution_scope(cancel_event=cancel_event):
+                    return self._call_model(
+                        messages, on_content_delta, on_thought_delta, should_cancel
+                    )
             except BaseException as exc:
                 if isinstance(exc, Cancelled):
                     return AgentRun(
@@ -934,6 +1047,9 @@ class Agent:
         calls: Sequence[ToolCall],
         *,
         on_phase: Callable[[str, str | None], None] | None = None,
+        on_tool_start: Callable[[str, str, str], None] | None = None,
+        on_tool_output: Callable[[str, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> list[AgentStep]:
         """Run one round's tool calls, returning them in request order.
 
@@ -947,17 +1063,54 @@ class Agent:
             for call in calls:
                 on_phase("tool_executing", call.name)
         if serial:
-            return [self._execute(call) for call in calls]
+            return [
+                self._execute(
+                    call,
+                    on_tool_start=on_tool_start,
+                    on_tool_output=on_tool_output,
+                    cancel_event=cancel_event,
+                )
+                for call in calls
+            ]
         scope = current_scope()
         with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_TOOLS, len(calls))) as pool:
-            return list(pool.map(lambda call: self._execute_scoped(call, scope), calls))
+            return list(
+                pool.map(
+                    lambda call: self._execute_scoped(
+                        call,
+                        scope,
+                        on_tool_start=on_tool_start,
+                        on_tool_output=on_tool_output,
+                        cancel_event=cancel_event,
+                    ),
+                    calls,
+                )
+            )
 
-    def _execute_scoped(self, call: ToolCall, scope: RunScope | None) -> AgentStep:
+    def _execute_scoped(
+        self,
+        call: ToolCall,
+        scope: RunScope | None,
+        *,
+        on_tool_start: Callable[[str, str, str], None] | None = None,
+        on_tool_output: Callable[[str, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> AgentStep:
         """Run one call with the run scope installed; pool threads start with no context."""
         if scope is None:
-            return self._execute(call)
+            return self._execute(
+                call,
+                on_tool_start=on_tool_start,
+                on_tool_output=on_tool_output,
+                cancel_event=cancel_event,
+            )
         with use_scope(scope):
-            return self._execute(call)
+            return self._execute(
+                call,
+                on_tool_start=on_tool_start,
+                on_tool_output=on_tool_output,
+                cancel_event=cancel_event,
+            )
 
     def _stop_cancelled(
         self,
@@ -992,10 +1145,24 @@ class Agent:
         pending: Sequence[ToolCall],
         argument_errors: dict[str, str],
         emit: Callable[[str, str | None], None],
+        *,
+        on_tool_start: Callable[[str, str, str], None] | None = None,
+        on_tool_output: Callable[[str, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> list[AgentStep]:
         """Execute a round, recording unparseable calls as validation steps unexecuted."""
         runnable = [call for call in pending if call.id not in argument_errors]
-        ran = iter(self._execute_all(runnable, on_phase=emit) if runnable else [])
+        ran = iter(
+            self._execute_all(
+                runnable,
+                on_phase=emit,
+                on_tool_start=on_tool_start,
+                on_tool_output=on_tool_output,
+                cancel_event=cancel_event,
+            )
+            if runnable
+            else []
+        )
         steps: list[AgentStep] = []
         for call in pending:
             if call.id in argument_errors:
@@ -1073,7 +1240,7 @@ class Agent:
         return text
 
     def _checkpoint(self, call: ToolCall) -> None:
-        """Snapshot a file a mutating tool is about to change."""
+        """Snapshot files a mutating tool is about to change."""
         # Satellite overwrite/path writes are directories or rasters, regenerable, so they
         # are skipped explicitly rather than snapshotted and logged.
         if call.name not in MUTATING_TOOLS or call.name in {"run_tests", "git_commit"}:
@@ -1103,23 +1270,44 @@ class Agent:
             return True
         return getattr(request, "dry_run", False) is True
 
-    def _execute(self, call: ToolCall) -> AgentStep:
+    def _execute(
+        self,
+        call: ToolCall,
+        *,
+        on_tool_start: Callable[[str, str, str], None] | None = None,
+        on_tool_output: Callable[[str, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> AgentStep:
+        if call.arguments_error is not None:
+            return _argument_error_step(call, call.arguments_error)
         decision = self._approve(call)
         if decision is not None:
             return AgentStep(call=call, error=decision, error_kind="denied")
         self._checkpoint(call)
+        if on_tool_start is not None:
+            on_tool_start(call.id, call.name, tool_summary(call))
+        sink = (
+            (lambda chunk: on_tool_output(call.id, chunk)) if on_tool_output is not None else None
+        )
         started = time.perf_counter()
         try:
-            result = self._run_tool(call)
+            with tool_execution_scope(cancel_event=cancel_event, output_sink=sink):
+                result = self._run_tool(call, cancel_event=cancel_event, output_sink=sink)
         except Cancelled:
+            ms = round((time.perf_counter() - started) * 1000, 1)
             audit_event(
                 self.artifacts,
                 "tool",
                 tool=call.name,
                 outcome="cancelled",
-                duration_ms=round((time.perf_counter() - started) * 1000, 1),
+                duration_ms=ms,
             )
-            return AgentStep(call=call, error="cancelled by the user", error_kind="cancelled")
+            return AgentStep(
+                call=call,
+                error="cancelled by the user",
+                error_kind="cancelled",
+                duration_ms=int(ms),
+            )
         except Exception as exc:
             if isinstance(exc, UnknownToolError):
                 error = self._unknown_tool_message(call.name)
@@ -1127,32 +1315,49 @@ class Agent:
                 error = self._validation_message(call, exc)
             else:
                 error = f"{type(exc).__name__}: {exc}"
+            ms = round((time.perf_counter() - started) * 1000, 1)
             audit_event(
                 self.artifacts,
                 "tool",
                 tool=call.name,
                 outcome="error",
                 error_kind=_kind(exc),
-                duration_ms=round((time.perf_counter() - started) * 1000, 1),
+                duration_ms=ms,
             )
-            return AgentStep(call=call, error=error, error_kind=_kind(exc))
+            return AgentStep(call=call, error=error, error_kind=_kind(exc), duration_ms=int(ms))
+        ms = round((time.perf_counter() - started) * 1000, 1)
         audit_event(
             self.artifacts,
             "tool",
             tool=call.name,
             outcome="ok",
-            duration_ms=round((time.perf_counter() - started) * 1000, 1),
+            duration_ms=ms,
         )
-        return AgentStep(call=call, result=result)
+        return AgentStep(call=call, result=result, duration_ms=int(ms))
 
-    def _run_tool(self, call: ToolCall) -> ToolResult:
+    def _run_tool(
+        self,
+        call: ToolCall,
+        *,
+        cancel_event: threading.Event | None = None,
+        output_sink: Callable[[str], None] | None = None,
+    ) -> ToolResult:
         """Execute a tool; read-only in-process tools run under a watchdog."""
         limit = _READ_ONLY_TIMEOUTS.get(call.name)
         if limit is None or _is_mutating(call):
             return self.tools.execute(call.name, call.arguments, self.artifacts)
-        return self._execute_watched(call, limit)
+        return self._execute_watched(
+            call, limit, cancel_event=cancel_event, output_sink=output_sink
+        )
 
-    def _execute_watched(self, call: ToolCall, limit: float) -> ToolResult:
+    def _execute_watched(
+        self,
+        call: ToolCall,
+        limit: float,
+        *,
+        cancel_event: threading.Event | None = None,
+        output_sink: Callable[[str], None] | None = None,
+    ) -> ToolResult:
         """Run a read-only tool in a daemon thread; abandon it after ``limit`` seconds.
 
         The abandoned thread keeps running (it cannot be killed); the caller gets a
@@ -1163,7 +1368,10 @@ class Agent:
 
         def work() -> None:
             try:
-                with use_scope(scope):
+                with (
+                    use_scope(scope),
+                    tool_execution_scope(cancel_event=cancel_event, output_sink=output_sink),
+                ):
                     result = self.tools.execute(call.name, call.arguments, self.artifacts)
                 outcome.append(("ok", result))
             except BaseException as exc:
@@ -1210,21 +1418,38 @@ class Agent:
             return None
         if self.read_only:
             return f"{call.name} is refused: this session is read-only"
-        if self.approval == "allow":
+        if self.approval == "allow" or call.name in self.session_allowed_tools:
             return None
         if self.approval == "deny":
             return f"{call.name} is refused: approval mode is deny"
         if self.on_permission is None:
             return f"{call.name} needs approval, but no approver is attached"
+        kind: Literal["diff", "command", "text"] = (
+            "command"
+            if call.name in {"bash", "bash_tool", "run_tests", "git_commit"}
+            else "diff"
+            if call.name in {"write_file", "edit_file", "patch_file", "apply_patch"}
+            else "text"
+        )
         request = PermissionRequest(
             id=call.id,
             tool=call.name,
             summary=_summary(call),
             arguments=call.arguments,
             preview=self._preview(call),
+            preview_kind=kind,
         )
-        if self.on_permission(request):
+        outcome = self.on_permission(request)
+        if outcome is True:
             return None
+        if isinstance(outcome, PermissionDecision):
+            if outcome.decision == "allow":
+                return None
+            if outcome.decision == "allow_session":
+                self.session_allowed_tools.add(call.name)
+                return None
+            if outcome.reason:
+                return f"{call.name} was denied: {outcome.reason}"
         return f"{call.name} was not approved"
 
     def _preview(self, call: ToolCall) -> str:
@@ -1268,6 +1493,35 @@ class Agent:
             )
         )
         return "".join(diff)[:_PREVIEW_LIMIT]
+
+
+def tool_summary(call: ToolCall) -> str:
+    """Return a concise one-line description for collapsed tool rows and approvals."""
+    args = call.arguments
+    if call.name in {"bash", "bash_tool"}:
+        prefix = "run in background: " if _truthy(args.get("run_in_background")) else "run: "
+        return f"{prefix}{str(args.get('command') or '')[:200]}"
+    if call.name == "run_tests":
+        cmd = _argv_text(args)
+        return f"run: {cmd[:200]}" if cmd else "run_tests"
+    if call.name == "apply_patch":
+        paths = _patch_paths(args)
+        if paths:
+            suffix = f" (+{len(paths) - 3})" if len(paths) > 3 else ""
+            return f"apply_patch {', '.join(paths[:3])}{suffix}"
+        return "apply_patch"
+    if call.name == "git_commit":
+        msg = str(args.get("message") or "").splitlines()[0][:80]
+        return f"git_commit {msg}" if msg else "git_commit"
+    if call.name == "spawn_agent":
+        task = str(args.get("task") or "").splitlines()[0][:80]
+        return f"spawn_agent {task}" if task else "spawn_agent"
+    for key in ("path", "pattern", "query", "url", "name"):
+        if isinstance(val := args.get(key), str) and val.strip():
+            return f"{call.name} {val.strip()[:160]}"
+    if isinstance(files := args.get("files"), list) and files:
+        return f"{call.name} ({len(files)} files)"
+    return call.name
 
 
 def _summary(call: ToolCall) -> str:

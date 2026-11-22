@@ -1,11 +1,4 @@
-"""A versioned on-disk record of one agent run.
-
-A benchmark replays and compares runs long after the harness that produced them
-changed. ``AgentRun`` round-trips through JSON on its own, but it carries no
-version, so a reader cannot tell which build wrote a record or whether the shape
-still matches. ``TraceRecord`` adds that version, and ``load_trace`` refuses a
-record it cannot interpret instead of silently dropping fields it does not know.
-"""
+"""Versioned on-disk JSON record for replaying and comparing agent runs."""
 
 from __future__ import annotations
 
@@ -16,8 +9,6 @@ from pydantic import BaseModel, Field
 
 from atlas.agent.runtime import AgentRun
 
-# Bump when a change makes an older record unreadable. Adding a field with a
-# default is compatible and keeps the number.
 TRACE_SCHEMA = 1
 
 __all__ = [
@@ -32,23 +23,21 @@ __all__ = [
 
 
 class TraceSchemaError(ValueError):
-    """A record is malformed or was written by an unreadable schema."""
+    """A trace record is malformed or uses an unsupported schema version."""
 
 
 class TraceRecord(BaseModel):
-    """One agent run plus the schema version that shapes it."""
+    """One agent run plus its schema version."""
 
     schema_version: int = Field(default=TRACE_SCHEMA)
     run: AgentRun
 
 
 def dump_trace(run: AgentRun) -> str:
-    """Serialize a run to a versioned JSON record."""
     return TraceRecord(run=run).model_dump_json()
 
 
 def load_trace(text: str) -> TraceRecord:
-    """Parse a versioned record, refusing a schema this build cannot read."""
     try:
         raw = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -64,12 +53,10 @@ def load_trace(text: str) -> TraceRecord:
 
 
 def write_trace(path: Path, run: AgentRun) -> Path:
-    """Write a versioned record to ``path``, creating parent directories."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(dump_trace(run) + "\n", encoding="utf-8")
     return path
 
 
 def read_trace(path: Path) -> TraceRecord:
-    """Read a versioned record from ``path``."""
     return load_trace(path.read_text(encoding="utf-8"))

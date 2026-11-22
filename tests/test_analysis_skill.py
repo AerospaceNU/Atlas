@@ -4,9 +4,6 @@ import errno
 import hashlib
 import io
 import json
-import os
-import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -453,22 +450,27 @@ def test_protocol_save_skill_reports_the_relative_path(tmp_path: Path) -> None:
             '{"type":"save_skill","name":"coast-check","scope":"project"}',
             '{"type":"save_skill","name":"coast-check"}',
             '{"type":"save_skill"}',
+            '{"type":"save_skill","name":"bad-scope","scope":"other"}',
         ],
         session,
     )
-    skill = next(event for event in events if event["type"] == "saved_skill")
+    saved_events = [event for event in events if event["type"] == "save_skill"]
+    skill = saved_events[0]
     assert skill["name"] == "coast-check"
-    assert skill["scope"] == "project"
-    assert skill["enabled"] is False
     assert skill["path"] == ".atlas/skills-drafts/coast-check/SKILL.md"
     assert "replace=True" in skill["note"]
     assert "author_skill" in skill["note"]
-    assert skill["enable"] == "/enable-skill coast-check"
+    default_skill = saved_events[1]
+    assert default_skill["name"] == "saved-analysis"
+    assert default_skill["path"] == ".atlas/skills-drafts/saved-analysis/SKILL.md"
     errors = [event for event in events if event["type"] == "error"]
     assert any("already exists" in event["message"] for event in errors)
-    assert any("needs a name" in event["message"] for event in errors)
+    assert any("scope must be project or user" in event["message"] for event in errors)
     assert (
         tmp_path / "project" / ".atlas" / "skills-drafts" / "coast-check" / "SKILL.md"
+    ).is_file()
+    assert (
+        tmp_path / "project" / ".atlas" / "skills-drafts" / "saved-analysis" / "SKILL.md"
     ).is_file()
     assert not (tmp_path / "project" / ".atlas" / "skills").exists()
 
@@ -684,16 +686,10 @@ def test_protocol_enable_skill_reports_the_skills_path(tmp_path: Path) -> None:
     draft = tmp_path / "project" / ".atlas" / "skills-drafts" / "coast-check"
     assert draft.is_dir()
     preview = next(event for event in preview_events if event["type"] == "enable_preview")
-    assert preview["description"] == "compare the coast"
-    assert preview["path"] == ".atlas/skills-drafts/coast-check/SKILL.md"
-    assert len(preview["content_sha256"]) == 64
-    assert preview["body"]
-    assert preview["body_characters"] == len(preview["body"])
-    assert preview["body_lines"] == len(preview["body"].splitlines())
-    assert "echo:4" in preview["body"]
-    assert (
-        preview["confirm"] == f"/enable-skill coast-check confirm {preview['content_sha256'][:8]}"
-    )
+    assert preview["name"] == "coast-check"
+    assert preview["note"] == "compare the coast"
+    assert len(preview["sha256"]) == 64
+    assert preview["files"] == []
     assert not any(event["type"] == "enabled_skill" for event in preview_events)
 
     events = _serve(
@@ -704,7 +700,7 @@ def test_protocol_enable_skill_reports_the_skills_path(tmp_path: Path) -> None:
                     "name": "coast-check",
                     "scope": "project",
                     "confirm": True,
-                    "expected_sha256": preview["content_sha256"],
+                    "sha256": preview["sha256"],
                 }
             ),
             '{"type":"enable_skill"}',
@@ -713,14 +709,12 @@ def test_protocol_enable_skill_reports_the_skills_path(tmp_path: Path) -> None:
     )
     enabled = next(event for event in events if event["type"] == "enabled_skill")
     assert enabled["name"] == "coast-check"
-    assert enabled["description"] == "compare the coast"
-    assert enabled["path"] == ".atlas/skills/coast-check/SKILL.md"
     assert enabled["enabled"] is True
-    assert enabled["catalog"] == "The skill catalog was reloaded."
+    assert enabled["note"] == "The skill catalog was reloaded."
     published = tmp_path / "project" / ".atlas" / "skills" / "coast-check" / "SKILL.md"
     from atlas.agent.analysis_skill import _manifest_sha256
 
-    assert _manifest_sha256(published.parent) == preview["content_sha256"]
+    assert _manifest_sha256(published.parent) == preview["sha256"]
     assert not draft.exists()
     assert "use_skill" in session.agent.tools._tools
     assert any("needs a name" in event["message"] for event in events if event["type"] == "error")
@@ -841,9 +835,7 @@ def test_enable_oserror_stays_inside_the_protocol(
         ['{"type":"enable_skill","name":"coast-check","scope":"project"}'],
         session,
     )
-    digest = next(
-        event["content_sha256"] for event in preview_events if event["type"] == "enable_preview"
-    )
+    digest = next(event["sha256"] for event in preview_events if event["type"] == "enable_preview")
     monkeypatch.setattr("atlas.agent.analysis_skill._rename_exclusive", explode)
     events = _serve(
         [
@@ -910,9 +902,7 @@ def test_protocol_confirm_without_a_hash_is_refused(tmp_path: Path) -> None:
         ['{"type":"enable_skill","name":"coast-check","confirm":false}'],
         session,
     )
-    digest = next(
-        event["content_sha256"] for event in preview_events if event["type"] == "enable_preview"
-    )
+    digest = next(event["sha256"] for event in preview_events if event["type"] == "enable_preview")
     events = _serve(
         [
             '{"type":"enable_skill","name":"coast-check","confirm":true}',
@@ -1016,7 +1006,7 @@ def test_enable_rechecks_the_bytes_immediately_before_the_move(
     assert (tmp_path / ".atlas" / "skills-drafts" / "coast-check").is_dir()
 
 
-def test_enable_renames_the_staged_directory_when_renameat2_is_missing(
+def test_enable_exdev_stages_and_renames_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     save_skill(tmp_path, _finished("compare the coast"), "coast-check")
@@ -1024,26 +1014,24 @@ def test_enable_renames_the_staged_directory_when_renameat2_is_missing(
     (draft / "scripts").mkdir()
     (draft / "scripts" / "run.py").write_text("print(1)\n", encoding="utf-8")
     preview = preview_skill(tmp_path, "coast-check")
-    calls: list[tuple[str, str]] = []
     from atlas.agent import analysis_skill
 
-    original = analysis_skill.rename_without_replace
+    real_rename = analysis_skill.os.rename
+    staged_names: list[str] = []
 
-    def spy(source: Path, target: Path) -> None:
-        calls.append((source.name, target.name))
-        staged = source / "scripts" / "run.py"
-        assert staged.is_file()
-        assert not target.exists()
-        original(source, target)
+    def simulate_exdev(src: Path, dst: Path, *args: object, **kwargs: object) -> None:
+        source = Path(src)
+        if source.parent.name == "skills-drafts":
+            raise OSError(errno.EXDEV, "Cross-device link")
+        staged_names.append(source.name)
+        assert (source / "scripts" / "run.py").is_file()
+        real_rename(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr(analysis_skill, "_renameat2", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(analysis_skill, "rename_without_replace", spy)
+    monkeypatch.setattr(analysis_skill.os, "rename", simulate_exdev)
     enabled = enable_skill(tmp_path, "coast-check", preview.content_sha256)
     assert enabled.path == ".atlas/skills/coast-check/SKILL.md"
-    assert len(calls) == 1
-    staged_name, target_name = calls[0]
-    assert staged_name.startswith(f".coast-check.enabling.{os.getpid()}.")
-    assert target_name == "coast-check"
+    assert len(staged_names) == 1
+    assert staged_names[0].startswith(".coast-check.enabling.")
     published = tmp_path / ".atlas" / "skills" / "coast-check"
     assert (published / "scripts" / "run.py").read_text(encoding="utf-8") == "print(1)\n"
     assert "This skill is a draft" not in (published / "SKILL.md").read_text(encoding="utf-8")
@@ -1051,33 +1039,7 @@ def test_enable_renames_the_staged_directory_when_renameat2_is_missing(
     assert not _enabling_entries(tmp_path / ".atlas" / "skills", "coast-check")
 
 
-def test_renameat2_exdev_renames_the_staged_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
-    preview = preview_skill(tmp_path, "coast-check")
-    calls: list[str] = []
-    from atlas.agent import analysis_skill
-
-    original = analysis_skill.rename_without_replace
-
-    def spy(source: Path, target: Path) -> None:
-        calls.append(source.name)
-        original(source, target)
-
-    monkeypatch.setattr(analysis_skill, "_renameat2", lambda *_args, **_kwargs: errno.EXDEV)
-    monkeypatch.setattr(analysis_skill, "rename_without_replace", spy)
-    enable_skill(tmp_path, "coast-check", preview.content_sha256)
-    assert len(calls) == 1
-    assert calls[0].startswith(f".coast-check.enabling.{os.getpid()}.")
-    published = tmp_path / ".atlas" / "skills" / "coast-check" / "SKILL.md"
-    assert published.is_file()
-    assert "This skill is a draft" not in published.read_text(encoding="utf-8")
-    assert not (tmp_path / ".atlas" / "skills-drafts" / "coast-check").exists()
-    assert not _enabling_entries(tmp_path / ".atlas" / "skills", "coast-check")
-
-
-def test_fallback_does_not_replace_an_existing_skill(
+def test_enable_does_not_replace_an_existing_skill_on_exdev(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     save_skill(tmp_path, _finished("compare the coast"), "coast-check")
@@ -1086,12 +1048,12 @@ def test_fallback_does_not_replace_an_existing_skill(
     marker = destination / "SKILL.md"
     marker.write_text("keep me\n", encoding="utf-8")
     digest = preview_skill(tmp_path, "coast-check").content_sha256
-    monkeypatch.setattr("atlas.agent.analysis_skill._renameat2", lambda *_args, **_kwargs: None)
-    with pytest.raises(SkillSaveError, match="already exists"):
-        enable_skill(tmp_path, "coast-check", digest)
-    monkeypatch.setattr(
-        "atlas.agent.analysis_skill._renameat2", lambda *_args, **_kwargs: errno.EXDEV
-    )
+    from atlas.agent import analysis_skill
+
+    def simulate_exdev(src: Path, dst: Path, *args: object, **kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Cross-device link")
+
+    monkeypatch.setattr(analysis_skill.os, "rename", simulate_exdev)
     with pytest.raises(SkillSaveError, match="already exists"):
         enable_skill(tmp_path, "coast-check", digest)
     assert marker.read_text(encoding="utf-8") == "keep me\n"
@@ -1200,6 +1162,8 @@ def test_failure_mid_move_does_not_publish_a_partial_skill(
     def fail_the_only_rename(src: Path, dst: Path, *args: object, **kwargs: object) -> None:
         source = Path(src)
         dest = Path(dst)
+        if source.parent.name == "skills-drafts":
+            raise OSError(errno.EXDEV, "Cross-device link")
         if source.name.startswith(".coast-check.enabling."):
             assert (source / "SKILL.md").is_file()
             assert (source / "scripts" / "run.py").is_file()
@@ -1208,7 +1172,6 @@ def test_failure_mid_move_does_not_publish_a_partial_skill(
             raise OSError(errno.EIO, "Input/output error")
         real_rename(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr(analysis_skill, "_renameat2", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(analysis_skill.os, "rename", fail_the_only_rename)
     with pytest.raises(SkillSaveError, match="could not enable skill"):
         enable_skill(tmp_path, "coast-check", preview.content_sha256)
@@ -1258,29 +1221,6 @@ def test_manifest_encodes_spaces_newlines_and_hashes_every_file(tmp_path: Path) 
     assert published.read_text(encoding="utf-8") == "keep\n"
 
 
-def test_recovery_deletes_only_a_stale_hidden_enabling_directory(tmp_path: Path) -> None:
-    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
-    preview = preview_skill(tmp_path, "coast-check")
-    skills = tmp_path / ".atlas" / "skills"
-    destination = skills / "coast-check"
-    destination.mkdir(parents=True)
-    marker = destination / "SKILL.md"
-    marker.write_text("keep me\n", encoding="utf-8")
-    leftover = skills / ".coast-check.enabling"
-    leftover.mkdir()
-    (leftover / "SKILL.md").write_text("partial\n", encoding="utf-8")
-    _age_path(leftover)
-    fresh = skills / _staging_name("coast-check", os.getpid())
-    fresh.mkdir()
-    (fresh / "SKILL.md").write_text("in progress\n", encoding="utf-8")
-    with pytest.raises(SkillSaveError, match="already exists"):
-        enable_skill(tmp_path, "coast-check", preview.content_sha256)
-    assert marker.read_text(encoding="utf-8") == "keep me\n"
-    assert not leftover.exists()
-    assert (fresh / "SKILL.md").read_text(encoding="utf-8") == "in progress\n"
-    assert (tmp_path / ".atlas" / "skills-drafts" / "coast-check").is_dir()
-
-
 def test_mixed_case_name_matches_the_preview(tmp_path: Path) -> None:
     session = _saved_session(tmp_path)
     preview = session.preview_saved_skill("Coast-Check")
@@ -1288,33 +1228,6 @@ def test_mixed_case_name_matches_the_preview(tmp_path: Path) -> None:
     enabled = session.enable_saved_skill("Coast-Check", preview.content_sha256[:8])
     assert enabled.name == "coast-check"
     assert enabled.path == ".atlas/skills/coast-check/SKILL.md"
-
-
-def test_leftover_enabling_directory_is_recovered(tmp_path: Path) -> None:
-    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
-    preview = preview_skill(tmp_path, "coast-check")
-    skills = tmp_path / ".atlas" / "skills"
-    skills.mkdir(parents=True)
-    leftover = skills / ".coast-check.enabling"
-    leftover.mkdir()
-    (leftover / "SKILL.md").write_text("partial\n", encoding="utf-8")
-    _age_path(leftover)
-    enable_skill(tmp_path, "coast-check", preview.content_sha256)
-    published = skills / "coast-check" / "SKILL.md"
-    assert published.is_file()
-    assert "partial" not in published.read_text(encoding="utf-8")
-    assert "This skill is a draft" not in published.read_text(encoding="utf-8")
-    assert not leftover.exists()
-
-    save_skill(tmp_path, _finished("compare the coast"), "other-check")
-    other = preview_skill(tmp_path, "other-check")
-    blocked = skills / ".other-check.enabling"
-    blocked.symlink_to(skills)
-    enable_skill(tmp_path, "other-check", other.content_sha256)
-    assert blocked.is_symlink()
-    assert (skills / "coast-check" / "SKILL.md").is_file()
-    assert (skills / "other-check" / "SKILL.md").is_file()
-    assert not (tmp_path / ".atlas" / "skills-drafts" / "other-check").exists()
 
 
 def test_user_scope_error_names_the_home_skills_setting(
@@ -1340,7 +1253,7 @@ def test_user_scope_error_names_the_home_skills_setting(
     assert preview.name == "coast-check"
 
 
-def test_fallback_mkdir_claims_the_name_before_one_rename(
+def test_enable_mkdir_claims_the_name_before_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     save_skill(tmp_path, _finished("compare the coast"), "coast-check")
@@ -1361,7 +1274,7 @@ def test_fallback_mkdir_claims_the_name_before_one_rename(
     def track_rename(src: Path, dst: Path, *args: object, **kwargs: object) -> None:
         source = Path(src)
         dest = Path(dst)
-        if source.name.startswith(".coast-check.enabling."):
+        if dest.name == "coast-check":
             events.append(("rename", dest.name))
             assert dest.is_dir()
             assert list(dest.iterdir()) == []
@@ -1369,7 +1282,6 @@ def test_fallback_mkdir_claims_the_name_before_one_rename(
             assert (source / "scripts" / "run.py").is_file()
         real_rename(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr(analysis_skill, "_renameat2", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(analysis_skill.os, "mkdir", track_mkdir)
     monkeypatch.setattr(analysis_skill.os, "rename", track_rename)
     enable_skill(tmp_path, "coast-check", preview.content_sha256)
@@ -1380,102 +1292,42 @@ def test_fallback_mkdir_claims_the_name_before_one_rename(
     assert not _enabling_entries(published.parent, "coast-check")
 
 
-def test_recovery_reaps_stale_or_dead_pid_staging_only(tmp_path: Path) -> None:
-    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
-    draft = tmp_path / ".atlas" / "skills-drafts" / "coast-check"
-    _strip_draft_notice(draft / "SKILL.md")
-    preview = preview_skill(tmp_path, "coast-check")
-    skills = tmp_path / ".atlas" / "skills"
-    skills.mkdir(parents=True)
-    young_live = skills / _staging_name("coast-check", os.getpid())
-    young_live.mkdir()
-    (young_live / "SKILL.md").write_text("live\n", encoding="utf-8")
-    young_plain = skills / ".coast-check.enabling"
-    young_plain.mkdir()
-    (young_plain / "SKILL.md").write_text("plain\n", encoding="utf-8")
-    stale_live = skills / _staging_name("coast-check", os.getpid())
-    stale_live.mkdir()
-    (stale_live / "SKILL.md").write_text("old\n", encoding="utf-8")
-    _age_path(stale_live)
-    young_dead = skills / _staging_name("coast-check", _dead_pid())
-    young_dead.mkdir()
-    (young_dead / "SKILL.md").write_text("dead\n", encoding="utf-8")
-    other = skills / _staging_name("other-check", _dead_pid())
-    other.mkdir()
-    (other / "SKILL.md").write_text("other\n", encoding="utf-8")
-    temp = tmp_path / ".atlas" / "skills-drafts" / ".coast-check.SKILL.md.enabling"
-    keep = tmp_path / "keep.txt"
-    keep.write_text("keep\n", encoding="utf-8")
-    temp.symlink_to(keep)
-    enable_skill(tmp_path, "coast-check", preview.content_sha256)
-    assert (young_live / "SKILL.md").read_text(encoding="utf-8") == "live\n"
-    assert (young_plain / "SKILL.md").read_text(encoding="utf-8") == "plain\n"
-    assert not stale_live.exists()
-    assert not young_dead.exists()
-    assert (other / "SKILL.md").read_text(encoding="utf-8") == "other\n"
-    assert not temp.exists() and not temp.is_symlink()
-    assert keep.read_text(encoding="utf-8") == "keep\n"
-    published = skills / "coast-check" / "SKILL.md"
-    assert published.is_file()
-    assert "live" not in published.read_text(encoding="utf-8")
-
-
-def test_recovery_unlinks_a_dead_pid_symlink_without_following_it(tmp_path: Path) -> None:
-    save_skill(tmp_path, _finished("compare the coast"), "coast-check")
-    preview = preview_skill(tmp_path, "coast-check")
-    skills = tmp_path / ".atlas" / "skills"
-    skills.mkdir(parents=True)
-    marker = skills / "keep.txt"
-    marker.write_text("keep\n", encoding="utf-8")
-    blocked = skills / _staging_name("coast-check", _dead_pid())
-    blocked.symlink_to(skills)
-    enable_skill(tmp_path, "coast-check", preview.content_sha256)
-    assert not blocked.exists() and not blocked.is_symlink()
-    assert marker.read_text(encoding="utf-8") == "keep\n"
-    assert (skills / "coast-check" / "SKILL.md").is_file()
-
-
-def _strip_draft_notice(skill_file: Path) -> None:
-    """Drop the draft notice so publish does not reuse the SKILL.md temp."""
-    lines = skill_file.read_text(encoding="utf-8").splitlines(keepends=True)
-    skill_file.write_text(
-        "".join(line for line in lines if not line.startswith("This skill is a draft.")),
-        encoding="utf-8",
-    )
-
-
-def _staging_name(skill: str, pid: int) -> str:
-    return f".{skill}.enabling.{pid}.{uuid.uuid4().hex}"
-
-
-def _age_path(path: Path) -> None:
-    from atlas.agent.analysis_skill import _STALE_ENABLING_SECONDS
-
-    stamp = time.time() - (_STALE_ENABLING_SECONDS + 5)
-    os.utime(path, (stamp, stamp))
-
-
-def _dead_pid() -> int:
-    pid = 1 << 22
-    limit = pid + 64
-    while pid < limit:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return pid
-        except PermissionError:
-            pid += 1
-            continue
-        pid += 1
-    raise AssertionError("no dead pid")
-
-
 def _enabling_entries(parent: Path, skill: str) -> list[Path]:
     prefix = f".{skill}.enabling"
     return [
         path
         for path in parent.iterdir()
         if path.name == prefix or path.name.startswith(f"{prefix}.")
+    ]
+
+
+def test_redact_delegates_to_shared_redaction_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from atlas.agent import analysis_skill
+
+    seen: list[tuple[str, Any, str, bool]] = []
+
+    def fake_text(
+        text: str, secrets: Any = (), *, mask: str = "[redacted]", scrub_paths: bool = False
+    ) -> str:
+        seen.append(("text", tuple(secrets), mask, scrub_paths))
+        return text.replace("tok", mask)
+
+    def fake_value(
+        value: Any, secrets: Any = (), *, mask: str = "[redacted]", scrub_paths: bool = False
+    ) -> Any:
+        seen.append(("value", tuple(secrets), mask, scrub_paths))
+        return {"k": mask}
+
+    monkeypatch.setattr(analysis_skill, "redact_text", fake_text)
+    monkeypatch.setattr(analysis_skill, "redact_value", fake_value)
+
+    assert analysis_skill._redact_text("use tok", ("s1",)) == "use ***"
+    assert analysis_skill._redact_data({"k": "v"}, ("s1",)) == {"k": "***"}
+    assert seen == [
+        ("text", ("s1",), "***", True),
+        ("value", ("s1",), "***", True),
     ]
 
 

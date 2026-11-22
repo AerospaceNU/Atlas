@@ -196,7 +196,13 @@ def test_session_key_stays_in_memory_and_is_not_printed(tmp_path: Path, name: st
     assert not (home / _FILES[name]).exists()
     assert secret not in json.dumps(events)
     assert secret not in _project_text(project)
-    assert events[1] == {"type": "key", "scope": "session", "saved": True, "name": name}
+    expected_provider = "earthdata" if name == EARTHDATA_TOKEN else "firms"
+    assert events[1] == {
+        "type": "key_set",
+        "provider": expected_provider,
+        "key_set": True,
+        "note": None,
+    }
     client = FirmsClient() if name == FIRMS_MAP_KEY else None
     if client is not None:
         assert client._map_key == ""
@@ -278,7 +284,7 @@ def test_errors_name_the_variable_and_redact_the_value(tmp_path: Path) -> None:
     assert messages == [
         "EARTHDATA_TOKEN needs scope session or user and a key",
         "EARTHDATA_TOKEN needs scope session or user and a key",
-        "set_key name must be OPENROUTER_API_KEY, EARTHDATA_TOKEN, or FIRMS_MAP_KEY",
+        "provider must be openrouter, earthdata, or firms",
         "FIRMS_MAP_KEY is empty or contains a newline",
     ]
 
@@ -337,13 +343,16 @@ def test_delete_removes_the_file_and_keeps_redacting_the_value(tmp_path: Path) -
     )
     assert not (home / _FILES[FIRMS_MAP_KEY]).exists()
     assert FIRMS_MAP_KEY not in session.credential_keys
-    deleted = next(event for event in events if event.get("scope") == "deleted")
+    deleted = next(
+        event
+        for event in events
+        if event.get("type") == "key_set" and event.get("key_set") is False
+    )
     assert deleted == {
-        "type": "key",
-        "scope": "deleted",
-        "saved": False,
-        "name": FIRMS_MAP_KEY,
-        "warning": ("FIRMS_MAP_KEY in the environment will still be used on the next launch"),
+        "type": "key_set",
+        "provider": "firms",
+        "key_set": False,
+        "note": ("FIRMS_MAP_KEY in the environment will still be used on the next launch"),
     }
     assert secret not in json.dumps(events)
     assert secret not in _project_text(project)
@@ -608,7 +617,7 @@ def test_env_and_file_keys_are_redacted(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert firms in session.secrets
     assert earth in session.secrets
     step = next(event for event in events if event["type"] == "step")
-    assert step["text"] == "***\n***"
+    assert step["text"] == "[redacted]\n[redacted]"
 
 
 def test_a_malformed_firms_key_is_rejected(tmp_path: Path) -> None:

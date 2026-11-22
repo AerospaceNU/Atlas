@@ -1,108 +1,83 @@
+//! Non-blocking row-major text selection painted over the live rendered buffer.
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
+use unicode_width::UnicodeWidthStr;
 
-const SELECTION_BG: Color = Color::Rgb(72, 60, 100);
-const SELECTION_FG: Color = Color::Rgb(225, 225, 225);
+use crate::theme::Theme;
 
-/// A row-major text selection over a rendered buffer snapshot.
-pub(super) struct TextSelection {
-    snapshot: Buffer,
+#[derive(Debug, Clone)]
+pub struct TextSelection {
+    area: Rect,
     anchor: Position,
     end: Position,
     pub dragging: bool,
 }
 
 impl TextSelection {
-    /// Starts a selection at `anchor`, clamped to the snapshot's area.
-    pub fn new(snapshot: Buffer, anchor: Position) -> Self {
-        let anchor = clamp_position(*snapshot.area(), anchor);
+    pub fn start(area: Rect, anchor: Position) -> Self {
+        let anchor = clamp(area, anchor);
         Self {
-            snapshot,
+            area,
             anchor,
             end: anchor,
             dragging: true,
         }
     }
 
-    /// Extends the selection to `end`, clamped to the snapshot's area.
     pub fn extend(&mut self, end: Position) {
-        self.end = clamp_position(*self.snapshot.area(), end);
+        self.end = clamp(self.area, end);
     }
 
-    /// Extends the selection and ends the drag.
     pub fn finish(&mut self, end: Position) {
         self.extend(end);
         self.dragging = false;
     }
 
-    /// Returns whether the selection spans more than the initial cell.
     pub fn moved(&self) -> bool {
         self.anchor != self.end
     }
-
-    /// Returns the area represented by the saved buffer snapshot.
     pub fn area(&self) -> Rect {
-        *self.snapshot.area()
+        self.area
     }
 
-    /// Returns the visible symbols in the inclusive row-major selection.
-    pub fn text(&self) -> String {
-        if !self.moved() || self.snapshot.area().is_empty() {
+    pub fn extract_text(&self, buffer: &Buffer) -> String {
+        if !self.moved() || *buffer.area() != self.area || self.area.is_empty() {
             return String::new();
         }
-
-        let (first, last) = self.ordered_endpoints();
-        let area = *self.snapshot.area();
-        let mut rows = Vec::with_capacity(usize::from(last.y - first.y) + 1);
-
-        for y in first.y..=last.y {
-            let (left, right) = self.row_bounds(y, first, last);
-            rows.push(self.row_text(y, left, right, area));
-        }
-
-        rows.join("\n")
+        let (first, last) = self.endpoints();
+        (first.y..=last.y)
+            .map(|y| {
+                let (l, r) = self.row_bounds(y, first, last);
+                let mut text = String::new();
+                walk_row(buffer, y, l, r, |_, _, sym| text.push_str(sym));
+                text.trim_end_matches(' ').to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    /// Copies the saved snapshot into `target` and paints the selected cells.
-    ///
-    /// Only coordinates present in both buffers are copied or styled.
-    pub fn paint(&self, target: &mut Buffer) {
-        let snapshot_area = *self.snapshot.area();
-        let target_area = *target.area();
-        let left = snapshot_area.x.max(target_area.x);
-        let top = snapshot_area.y.max(target_area.y);
-        let right = snapshot_area.right().min(target_area.right());
-        let bottom = snapshot_area.bottom().min(target_area.bottom());
-
-        if left >= right || top >= bottom {
+    pub fn paint(&self, target: &mut Buffer, theme: &Theme) {
+        if !self.moved() || *target.area() != self.area || self.area.is_empty() {
             return;
         }
-
-        for y in top..bottom {
-            for x in left..right {
-                let position = Position::new(x, y);
-                if let (Some(source), Some(destination)) =
-                    (self.snapshot.cell(position), target.cell_mut(position))
-                {
-                    *destination = source.clone();
+        let style = theme.selection_style();
+        let (first, last) = self.endpoints();
+        for y in first.y..=last.y {
+            let (l, r) = self.row_bounds(y, first, last);
+            let mut ranges = Vec::new();
+            walk_row(target, y, l, r, |x, span_r, _| ranges.push((x, span_r)));
+            for (x, span_r) in ranges {
+                for sx in x..=span_r {
+                    if let Some(cell) = target.cell_mut(Position::new(sx, y)) {
+                        cell.set_style(style);
+                    }
                 }
             }
         }
-
-        if !self.moved() || snapshot_area.is_empty() {
-            return;
-        }
-
-        let (first, last) = self.ordered_endpoints();
-        for y in first.y..=last.y {
-            let (selected_left, selected_right) = self.row_bounds(y, first, last);
-            self.paint_row(target, y, selected_left, selected_right, snapshot_area);
-        }
     }
 
-    fn ordered_endpoints(&self) -> (Position, Position) {
+    fn endpoints(&self) -> (Position, Position) {
         if (self.anchor.y, self.anchor.x) <= (self.end.y, self.end.x) {
             (self.anchor, self.end)
         } else {
@@ -111,177 +86,79 @@ impl TextSelection {
     }
 
     fn row_bounds(&self, y: u16, first: Position, last: Position) -> (u16, u16) {
-        let area = *self.snapshot.area();
-        let left = if y == first.y { first.x } else { area.x };
+        let left = if y == first.y { first.x } else { self.area.x };
         let right = if y == last.y {
             last.x
         } else {
-            area.right().saturating_sub(1)
+            self.area.right().saturating_sub(1)
         };
         (left, right)
     }
+}
 
-    fn row_text(&self, y: u16, selected_left: u16, selected_right: u16, area: Rect) -> String {
-        let row_right = area.right().saturating_sub(1);
-        let mut x = area.x;
-        let mut text = String::new();
-
-        while x <= row_right {
-            let position = Position::new(x, y);
-            let Some(cell) = self.snapshot.cell(position) else {
-                break;
-            };
-            let symbol = cell.symbol();
-            let width = Span::raw(symbol).width();
-            let display_width = width.max(1);
-            let span_right = x
-                .saturating_add(u16::try_from(display_width - 1).unwrap_or(u16::MAX))
-                .min(row_right);
-
-            if x <= selected_right && span_right >= selected_left {
-                text.push_str(symbol);
-            }
-
-            let next_x = x.saturating_add(u16::try_from(display_width).unwrap_or(u16::MAX));
-            if next_x <= x {
-                break;
-            }
-            x = next_x;
+fn walk_row(buf: &Buffer, y: u16, sel_l: u16, sel_r: u16, mut f: impl FnMut(u16, u16, &str)) {
+    let area = *buf.area();
+    let row_r = area.right().saturating_sub(1);
+    let mut x = area.x;
+    while x <= row_r {
+        let Some(cell) = buf.cell(Position::new(x, y)) else {
+            break;
+        };
+        let sym = cell.symbol();
+        let w = sym.width().max(1);
+        let span_r = x
+            .saturating_add(u16::try_from(w - 1).unwrap_or(u16::MAX))
+            .min(row_r);
+        if x <= sel_r && span_r >= sel_l {
+            f(x, span_r, sym);
         }
-
-        text.trim_end_matches(' ').to_string()
-    }
-
-    fn paint_row(
-        &self,
-        target: &mut Buffer,
-        y: u16,
-        selected_left: u16,
-        selected_right: u16,
-        area: Rect,
-    ) {
-        let row_right = area.right().saturating_sub(1);
-        let mut x = area.x;
-
-        while x <= row_right {
-            let position = Position::new(x, y);
-            let Some(cell) = self.snapshot.cell(position) else {
-                break;
-            };
-            let display_width = Span::raw(cell.symbol()).width().max(1);
-            let span_right = x
-                .saturating_add(u16::try_from(display_width - 1).unwrap_or(u16::MAX))
-                .min(row_right);
-
-            if x <= selected_right && span_right >= selected_left {
-                let mut selected_x = x;
-                while selected_x <= span_right {
-                    if let Some(cell) = target.cell_mut(Position::new(selected_x, y)) {
-                        cell.set_bg(SELECTION_BG)
-                            .set_fg(SELECTION_FG)
-                            .set_style(Style::default().add_modifier(Modifier::REVERSED));
-                    }
-                    if selected_x == u16::MAX {
-                        break;
-                    }
-                    selected_x += 1;
-                }
-            }
-
-            let next_x = x.saturating_add(u16::try_from(display_width).unwrap_or(u16::MAX));
-            if next_x <= x {
-                break;
-            }
-            x = next_x;
+        let next = x.saturating_add(u16::try_from(w).unwrap_or(u16::MAX));
+        if next <= x {
+            break;
         }
+        x = next;
     }
 }
 
-fn clamp_position(area: Rect, position: Position) -> Position {
+fn clamp(area: Rect, pos: Position) -> Position {
     if area.is_empty() {
         return Position::new(area.x, area.y);
     }
-
     Position::new(
-        position.x.clamp(area.x, area.right().saturating_sub(1)),
-        position.y.clamp(area.y, area.bottom().saturating_sub(1)),
+        pos.x.clamp(area.x, area.right().saturating_sub(1)),
+        pos.y.clamp(area.y, area.bottom().saturating_sub(1)),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use ratatui::style::{Color, Style};
+    use ratatui::style::{Modifier, Style};
 
     use super::*;
 
     #[test]
-    fn forward_and_reverse_multiline_selection_match() {
-        let snapshot = Buffer::with_lines(["abcde", "fghij", "klmno"]);
-        let mut forward = TextSelection::new(snapshot.clone(), Position::new(1, 0));
-        forward.finish(Position::new(2, 2));
+    fn selection_extracts_wide_chars_and_paints_without_double_reverse() {
+        let buf = Buffer::with_lines(["abcde", "fghij", "klmno"]);
+        let mut fwd = TextSelection::start(*buf.area(), Position::new(1, 0));
+        fwd.finish(Position::new(2, 2));
+        let mut rev = TextSelection::start(*buf.area(), Position::new(2, 2));
+        rev.finish(Position::new(1, 0));
+        assert_eq!(fwd.extract_text(&buf), "bcde\nfghij\nklm");
+        assert_eq!(rev.extract_text(&buf), fwd.extract_text(&buf));
 
-        let mut reverse = TextSelection::new(snapshot, Position::new(2, 2));
-        reverse.finish(Position::new(1, 0));
-
-        assert_eq!(forward.text(), "bcde\nfghij\nklm");
-        assert_eq!(reverse.text(), forward.text());
-        assert_eq!(forward.area(), Rect::new(0, 0, 5, 3));
-    }
-
-    #[test]
-    fn text_trims_row_padding_and_preserves_blank_lines_and_indentation() {
-        let snapshot = Buffer::with_lines(["  ind  ", "", "  next   "]);
-        let mut selection = TextSelection::new(snapshot, Position::new(0, 0));
-        selection.finish(Position::new(8, 2));
-
-        assert_eq!(selection.text(), "  ind\n\n  next");
-    }
-
-    #[test]
-    fn same_cell_is_empty_and_partial_row_is_inclusive() {
-        let snapshot = Buffer::with_lines(["abcde"]);
-        let mut click = TextSelection::new(snapshot.clone(), Position::new(2, 0));
-        assert_eq!(click.text(), "");
-        assert!(!click.moved());
-
-        click.extend(Position::new(4, 0));
-        assert_eq!(click.text(), "cde");
-        assert!(click.moved());
-    }
-
-    #[test]
-    fn wide_graphemes_and_combining_accents_are_copied_as_visible_symbols() {
-        let mut snapshot = Buffer::empty(Rect::new(0, 0, 7, 1));
-        snapshot.set_string(0, 0, "Aé中e\u{301}Z", Style::default());
-
-        let mut full = TextSelection::new(snapshot.clone(), Position::new(0, 0));
+        let mut wide = Buffer::empty(Rect::new(0, 0, 7, 1));
+        wide.set_string(0, 0, "Aé中e\u{301}Z", Style::default());
+        let mut full = TextSelection::start(*wide.area(), Position::new(0, 0));
         full.finish(Position::new(5, 0));
-        assert_eq!(full.text(), "Aé中e\u{301}Z");
+        assert_eq!(full.extract_text(&wide), "Aé中e\u{301}Z");
 
-        let mut across_filler = TextSelection::new(snapshot, Position::new(3, 0));
-        across_filler.finish(Position::new(4, 0));
-        assert_eq!(across_filler.text(), "中e\u{301}");
-    }
-
-    #[test]
-    fn paint_copies_snapshot_and_highlights_clipped_target_without_mutating_snapshot() {
-        let snapshot = Buffer::with_lines(["hello"]);
-        let mut selection = TextSelection::new(snapshot.clone(), Position::new(1, 0));
-        selection.finish(Position::new(3, 0));
-        let mut target = Buffer::empty(Rect::new(1, 0, 3, 1));
-
-        selection.paint(&mut target);
-
-        assert_eq!(target.cell((1, 0)).unwrap().symbol(), "e");
-        assert_eq!(target.cell((3, 0)).unwrap().symbol(), "l");
-        assert_eq!(target.cell((1, 0)).unwrap().bg, Color::Rgb(72, 60, 100));
-        assert_eq!(target.cell((1, 0)).unwrap().fg, Color::Rgb(225, 225, 225));
-        assert!(target
-            .cell((1, 0))
-            .unwrap()
-            .modifier
-            .contains(Modifier::REVERSED));
-        assert_eq!(snapshot.cell((1, 0)).unwrap().symbol(), "e");
-        assert_eq!(snapshot.cell((1, 0)).unwrap().bg, Color::Reset);
+        let theme = Theme::truecolor();
+        let mut target = Buffer::with_lines(["hello"]);
+        let mut sel = TextSelection::start(*target.area(), Position::new(1, 0));
+        sel.finish(Position::new(3, 0));
+        sel.paint(&mut target, &theme);
+        let cell = target.cell((1, 0)).unwrap();
+        assert_eq!((cell.bg, cell.fg), (theme.selection_bg, theme.selection_fg));
+        assert!(!cell.modifier.contains(Modifier::REVERSED));
     }
 }

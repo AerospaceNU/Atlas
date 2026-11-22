@@ -85,7 +85,7 @@ class DiagnosticsTool(Tool):
         if target.is_file() and target.suffix not in _PYTHON_SUFFIXES:
             skipped = [n for n in wanted if n in ("ruff", "mypy")]
             wanted = [n for n in wanted if n not in ("ruff", "mypy")]
-        checks, missing = self._resolve(wanted, root, request.path) if wanted else ([], [])
+        checks, missing = self._resolve(wanted, root, target, request.path) if wanted else ([], [])
         rows: list[str] = []
         if missing:
             rows.append("missing: " + ", ".join(missing))
@@ -105,7 +105,7 @@ class DiagnosticsTool(Tool):
         return ToolResult(text=text)
 
     def _resolve(
-        self, wanted: list[DiagnosticName], root: Path, path: str
+        self, wanted: list[DiagnosticName], root: Path, target: Path, path: str
     ) -> tuple[list[_Check], list[str]]:
         """Return runnable checks and the names that are unavailable."""
         checks: list[_Check] = []
@@ -143,14 +143,15 @@ class DiagnosticsTool(Tool):
                 )
             else:
                 binary = shutil.which("cargo")
-                if binary is None or not (root / "Cargo.toml").is_file():
+                cargo_dir = _find_cargo_dir(target, root)
+                if binary is None or cargo_dir is None:
                     missing.append("cargo")
                     continue
                 checks.append(
                     _Check(
                         name="cargo",
                         argv=[binary, "check", "--quiet", "--message-format=short"],
-                        cwd=root,
+                        cwd=cargo_dir,
                     )
                 )
         return checks, missing
@@ -185,6 +186,17 @@ class DiagnosticsTool(Tool):
             if len(diagnostics) > _MAX_DIAGNOSTICS:
                 rows.append(f"... [{len(diagnostics) - _MAX_DIAGNOSTICS} more diagnostics]")
         return "\n".join(rows)
+
+
+def _find_cargo_dir(target: Path, root: Path) -> Path | None:
+    """Return the nearest directory containing ``Cargo.toml`` for ``target``."""
+    current = target if target.is_dir() else target.parent
+    while True:
+        if (current / "Cargo.toml").is_file():
+            return current
+        if current == root or current.parent == current:
+            return None
+        current = current.parent
 
 
 def _find_binary(root: Path, name: str) -> str | None:

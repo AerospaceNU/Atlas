@@ -1,29 +1,33 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import random
 import re
 import threading
 import time
-from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
-from datetime import timedelta
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any, Self
 from urllib.parse import urljoin, urlparse
 
 import httpx
+from httpx_sse import EventSource
+from tenacity import RetryCallState, Retrying, retry_if_exception, stop_after_attempt
 
 from atlas.agent.contracts import (
     CallTiming,
     CatalogModel,
     ChatMessage,
-    ModelImage,
     ModelResponse,
     Role,
     TokenUsage,
     ToolCall,
     ToolDefinition,
+    current_cancel_event,
 )
 from atlas.agent.images import apply_image_budget
 from atlas.agent.scope import ModelCancelled, cancel_requested
@@ -31,30 +35,13 @@ from atlas.agent.scope import ModelCancelled, cancel_requested
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 _ERROR_BODY_LIMIT = 180
-# Transient provider failures worth another attempt: rate limits, gateway
-# hiccups, and timeouts. Everything else (bad request, auth, billing) is final.
 _RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _MAX_ATTEMPTS = 4
 _RETRY_BASE_DELAY = 0.5
 _RETRY_BACKOFF = 2.0
 _RETRY_AFTER_CAP = 30.0
-_CANCEL_SLICE = 0.1
-
-
-def _interruptible_sleep(seconds: float) -> None:
-    """Sleep up to seconds in short slices, returning early once the run is cancelled.
-
-    Returns silently on cancel; the caller raises. Cooperative: it never kills a thread.
-    """
-    deadline = time.monotonic() + seconds
-    while not cancel_requested():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        time.sleep(min(_CANCEL_SLICE, remaining))
-
-
-_sleep = _interruptible_sleep
+_MIN_RETRY_AFTER = 0.25
+_CANCEL_SLICE = 0.05
 _OVERFLOW_STATUS = frozenset({400, 413, 422})
 _OVERFLOW_MARKERS = (
     "context_length_exceeded",
@@ -73,7 +60,6 @@ _OVERFLOW_MARKERS = (
     "reduce your input",
 )
 _OVERFLOW_COUNT_RE = re.compile(r"\b(?:tokens?|prompt|input)\b[^.\n]{0,60}exceed")
-_MIN_RETRY_AFTER = 0.25
 _CATALOG_PAGE_LIMIT = 20
 _CATALOG_TIME_LIMIT = 15.0
 _CATALOG_CACHE_SECONDS = 30.0
@@ -83,15 +69,49 @@ _ANSI_ESCAPE = re.compile(
 )
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _BIDI_CHARS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
-
 MISSING_KEY_MESSAGE = (
     "OPENROUTER_API_KEY is not set. Set it in the environment, the repo .env, "
     "or with /key session or /key user."
 )
+REASONING_EFFORTS = ("max", "xhigh", "high", "medium", "low", "minimal", "none")
 
 
 class MissingOpenRouterKey(RuntimeError):
     """The process has no OpenRouter key in memory, the environment, or the user file."""
+
+
+class StreamCancelledError(ModelCancelled):
+    """A model completion or retry wait was cancelled mid-flight."""
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep up to ``seconds`` in short slices, returning early once cancelled."""
+    ev = current_cancel_event()
+    deadline = time.monotonic() + seconds
+    while not cancel_requested() and not (ev is not None and ev.is_set()):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if ev is not None:
+            if ev.wait(min(_CANCEL_SLICE, remaining)):
+                return
+        else:
+            time.sleep(min(_CANCEL_SLICE, remaining))
+
+
+_sleep = _interruptible_sleep
+
+
+def _jitter() -> float:
+    """Return a multiplier applied to the exponential delay; tests pin it."""
+    return random.uniform(0.75, 1.25)
+
+
+def validate_reasoning_effort(value: str | None) -> str | None:
+    """Return ``value`` if it is None or a supported OpenRouter reasoning effort."""
+    if value is not None and value not in REASONING_EFFORTS:
+        raise ValueError(f"reasoning_effort must be one of {', '.join(REASONING_EFFORTS)}")
+    return value
 
 
 class OpenRouterHTTPError(RuntimeError):
@@ -105,29 +125,17 @@ class OpenRouterHTTPError(RuntimeError):
         time_to_first_token_seconds: float | None = None,
         *,
         retry_after: float | None = None,
-        context_overflow: bool = False,
+        context_overflow: bool | None = None,
     ) -> None:
         self.status_code = status_code
         self.body = body
         self.retry_after = retry_after
-        self.is_context_overflow = context_overflow
+        self.is_context_overflow = (
+            _is_overflow(status_code, body) if context_overflow is None else context_overflow
+        )
         self.elapsed_seconds = elapsed_seconds
         self.time_to_first_token_seconds = time_to_first_token_seconds
         super().__init__(f"OpenRouter HTTP {status_code}: {body}")
-
-
-REASONING_EFFORTS = ("max", "xhigh", "high", "medium", "low", "minimal", "none")
-
-
-def validate_reasoning_effort(value: str | None) -> str | None:
-    """Return ``value`` if it is None or an OpenRouter effort level.
-
-    Raises:
-        ValueError: The value is not one of ``REASONING_EFFORTS``.
-    """
-    if value is not None and value not in REASONING_EFFORTS:
-        raise ValueError(f"reasoning_effort must be one of {', '.join(REASONING_EFFORTS)}")
-    return value
 
 
 @dataclass
@@ -146,11 +154,7 @@ class ModelConfig:
         validate_reasoning_effort(self.reasoning_effort)
 
     def provider_payload(self) -> dict[str, Any] | None:
-        """Return the OpenRouter ``provider`` routing object, or None for default routing.
-
-        A non-empty ``provider_order`` pins requests to those providers in order
-        with no fallback, so every call of a run is served the same way.
-        """
+        """Return the OpenRouter ``provider`` routing object, or None for default routing."""
         if not self.provider_order:
             return None
         return {"order": list(self.provider_order), "allow_fallbacks": False}
@@ -162,45 +166,50 @@ class ModelConfig:
         return {"enabled": self.reasoning}
 
 
+@dataclass
+class _ToolAcc:
+    id: str = ""
+    name: str = ""
+    arguments: str = ""
+
+
+@dataclass
+class _StreamAcc:
+    content: list[str] = field(default_factory=list)
+    reasoning: list[str] = field(default_factory=list)
+    reasoning_content: list[str] = field(default_factory=list)
+    details: list[dict[str, Any]] = field(default_factory=list)
+    calls: dict[int, _ToolAcc] = field(default_factory=dict)
+    usage: dict[str, Any] | None = None
+    finish_reason: str | None = None
+
+
 class OpenRouterModel:
     def __init__(self, config: ModelConfig, client: httpx.Client | None = None) -> None:
         self.config = config
-        self.history: list[ChatMessage] = []
         self._client = client or httpx.Client(timeout=config.timeout, follow_redirects=False)
         self._owns_client = client is None
 
-    def __call__(self, prompt: str) -> str:
-        self.history.append(ChatMessage(role=Role.USER, content=prompt))
-        try:
-            response = self.complete(self.history, [])
-            content = response.content
-            if content is None:
-                raise ValueError("OpenRouter returned no text content")
-        except Exception:
-            self.history.pop()
-            raise
-        self.history.append(ChatMessage(role=Role.ASSISTANT, content=content))
-        return content
-
-    def complete(self, messages: list[ChatMessage], tools: list[ToolDefinition]) -> ModelResponse:
-        """Call OpenRouter using its OpenAI-compatible native tool-calling format.
-
-        Older image attachments are removed until the newest ones fit in the
-        request budget. Those bytes are not sent again on a later call.
-
-        Raises:
-            ModelCancelled: The run was cancelled before or during the request.
-        """
-        _raise_if_cancelled()
+    def complete(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolDefinition],
+        *,
+        on_content_delta: Callable[[str], None] | None = None,
+        on_thought_delta: Callable[[str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> ModelResponse:
+        """Call OpenRouter with streaming deltas, retry-after backoff, and cancel checks."""
         apply_image_budget(messages)
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": [_serialize_message(message) for message in messages],
+            "messages": [_serialize_message(m) for m in messages],
             "reasoning": self.config.reasoning_payload(),
             "max_tokens": self.config.max_new_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
-        provider = self.config.provider_payload()
-        if provider is not None:
+        if (provider := self.config.provider_payload()) is not None:
             payload["provider"] = provider
         if self.config.temperature is not None:
             payload["temperature"] = self.config.temperature
@@ -211,19 +220,55 @@ class OpenRouterModel:
                 {
                     "type": "function",
                     "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
                     },
                 }
-                for tool in tools
+                for t in tools
             ]
-        # Tokens arrive as server-sent events. The read timeout is the silence
-        # between those events, so a reply longer than `timeout` is not cut off
-        # while chunks are still arriving.
-        payload["stream"] = True
-        payload["stream_options"] = {"include_usage": True}
-        response, timing = self._complete_with_retry(payload)
+
+        def is_cancelled() -> bool:
+            ev = current_cancel_event()
+            return (
+                cancel_requested()
+                or (should_cancel is not None and should_cancel())
+                or (ev is not None and ev.is_set())
+            )
+
+        def sleep_cancelable(seconds: float) -> None:
+            if seconds <= 0:
+                return
+            if is_cancelled():
+                raise StreamCancelledError("cancelled during retry wait")
+            if _sleep is not _interruptible_sleep:
+                _sleep(seconds)
+                if is_cancelled():
+                    raise StreamCancelledError("cancelled during retry wait")
+                return
+            deadline = time.monotonic() + seconds
+            while (remaining := deadline - time.monotonic()) > 0:
+                if is_cancelled():
+                    raise StreamCancelledError("cancelled during retry wait")
+                _interruptible_sleep(min(_CANCEL_SLICE, remaining))
+
+        def is_retryable(exc: BaseException) -> bool:
+            if isinstance(exc, ModelCancelled) or is_cancelled():
+                return False
+            if isinstance(exc, OpenRouterHTTPError):
+                return (not exc.is_context_overflow) and exc.status_code in _RETRY_STATUS
+            return isinstance(exc, httpx.TimeoutException | httpx.TransportError)
+
+        retrying = Retrying(
+            stop=stop_after_attempt(_MAX_ATTEMPTS),
+            retry=retry_if_exception(is_retryable),
+            wait=_retry_wait,
+            sleep=sleep_cancelable,
+            reraise=True,
+        )
+        response, timing = retrying(
+            self._complete_once, payload, on_content_delta, on_thought_delta, is_cancelled
+        )
         try:
             message = response["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -236,12 +281,8 @@ class OpenRouterModel:
         parsed.timing = timing
         return parsed
 
-    def list_models(self) -> CatalogFetch:
-        """Fetch the live OpenRouter model catalog with this client's key."""
-        return fetch_model_catalog(self._client, self.config.api_key)
-
-    def reset(self) -> None:
-        self.history.clear()
+    def list_models(self, *, refresh: bool = False) -> CatalogFetch:
+        return fetch_model_catalog(self._client, self.config.api_key, bypass_cache=refresh)
 
     def close(self) -> None:
         if self._owns_client:
@@ -253,200 +294,153 @@ class OpenRouterModel:
     def __exit__(self, *_exc_info: object) -> None:
         self.close()
 
-    def _complete(self, payload: dict[str, Any]) -> tuple[dict[str, Any], CallTiming]:
+    def _complete_once(
+        self,
+        payload: dict[str, Any],
+        on_content_delta: Callable[[str], None] | None,
+        on_thought_delta: Callable[[str], None] | None,
+        is_cancelled: Callable[[], bool],
+    ) -> tuple[dict[str, Any], CallTiming]:
         if not self.config.api_key.strip():
             raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
+        if is_cancelled():
+            raise StreamCancelledError("cancelled before request")
         started = time.perf_counter()
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }
-        timeout = _chunk_timeout(self.config.timeout)
+        t = self.config.timeout
+        timeout = httpx.Timeout(connect=t, read=t, write=t, pool=t)
         stream = getattr(self._client, "stream", None)
         if callable(stream):
             with stream(
                 "POST", OPENROUTER_URL, headers=headers, json=payload, timeout=timeout
             ) as resp:
-                return _read_completion(resp, started)
+                return _read_completion(
+                    resp, started, on_content_delta, on_thought_delta, is_cancelled
+                )
         resp = self._client.post(OPENROUTER_URL, headers=headers, json=payload)
-        return _read_completion(resp, started)
-
-    def _complete_with_retry(self, payload: dict[str, Any]) -> tuple[dict[str, Any], CallTiming]:
-        """Retry a transient provider failure, then give up.
-
-        A rate limit, a gateway error, a timeout, or a transport failure is
-        not a reason to end the turn: the same request is sent again, at most
-        :data:`_MAX_ATTEMPTS` times. The wait is the server's ``Retry-After``
-        (capped) or a jittered doubling delay. A context overflow and every
-        other failure is final on the first response.
-
-        Args:
-            payload: The chat-completions request body.
-
-        Returns:
-            The parsed completion body and its timing.
-
-        Raises:
-            OpenRouterHTTPError: A non-retryable status, or the last attempt.
-            httpx.TimeoutException: The last attempt timed out.
-            httpx.TransportError: The last attempt could not reach the host.
-        """
-        delay = _RETRY_BASE_DELAY
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
-            retry_after: float | None = None
-            _raise_if_cancelled()
-            try:
-                return self._complete(payload)
-            except OpenRouterHTTPError as exc:
-                if (
-                    exc.is_context_overflow
-                    or exc.status_code not in _RETRY_STATUS
-                    or attempt == _MAX_ATTEMPTS
-                ):
-                    raise
-                retry_after = exc.retry_after
-            except (httpx.TimeoutException, httpx.TransportError):
-                if attempt == _MAX_ATTEMPTS:
-                    raise
-            backoff = delay * _jitter()
-            wait = retry_after if retry_after is not None else backoff
-            if wait < _MIN_RETRY_AFTER:
-                wait = backoff
-            _sleep(min(wait, _RETRY_AFTER_CAP))
-            delay *= _RETRY_BACKOFF
-        raise AssertionError("retry loop ended without a result")
+        return _read_completion(resp, started, on_content_delta, on_thought_delta, is_cancelled)
 
 
-def _jitter() -> float:
-    """Return a multiplier applied to the exponential delay; tests pin it."""
-    return random.uniform(0.75, 1.25)
+def _retry_wait(state: RetryCallState) -> float:
+    base = _RETRY_BASE_DELAY * (_RETRY_BACKOFF ** max(0, state.attempt_number - 1))
+    backoff = float(base * _jitter())
+    exc = state.outcome.exception() if state.outcome is not None else None
+    retry_after = exc.retry_after if isinstance(exc, OpenRouterHTTPError) else None
+    wait = retry_after if retry_after is not None and retry_after >= _MIN_RETRY_AFTER else backoff
+    return min(wait, _RETRY_AFTER_CAP)
 
 
-def _chunk_timeout(seconds: float) -> httpx.Timeout:
-    """Bound each socket wait, not the whole completion.
-
-    While server-sent events are arriving, ``read`` is the gap allowed
-    between chunks. A quiet socket still fails after ``seconds``.
-    """
-    return httpx.Timeout(connect=seconds, read=seconds, write=seconds, pool=seconds)
-
-
-@dataclass
-class _ToolAcc:
-    id: str = ""
-    name: str = ""
-    arguments: str = ""
-
-
-@dataclass
-class _StreamAcc:
-    content: list[str]
-    reasoning: list[str]
-    reasoning_content: list[str]
-    details: list[dict[str, Any]]
-    calls: dict[int, _ToolAcc]
-    usage: dict[str, Any] | None = None
-    finish_reason: str | None = None
-
-
-def _json_type_name(value: object) -> str:
-    """Name a decoded JSON value by its JSON type, not its Python type."""
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, (int, float)):
-        return "number"
-    if isinstance(value, str):
-        return "string"
-    if isinstance(value, list):
-        return "array"
-    return type(value).__name__
-
-
-def _read_completion(resp: Any, started: float) -> tuple[dict[str, Any], CallTiming]:
-    status = _status_code(resp)
-    elapsed = _completion_elapsed(resp, started)
-    ttft = _completion_ttft(resp, None)
-    if status < 200 or status >= 300:
-        _buffer_body(resp)
-        raise _http_error(status, resp, elapsed, ttft)
-    measured: list[float] = []
-    message, usage, finish_reason = _assemble_completion(resp, started, measured)
-    elapsed = _completion_elapsed(resp, started)
-    ttft = _completion_ttft(resp, measured[0] if measured else None)
-    timing = CallTiming(
-        http_status=status,
-        elapsed_seconds=elapsed,
-        time_to_first_token_seconds=ttft,
-    )
-    choice = {"message": message, "finish_reason": finish_reason}
-    return {"choices": [choice], "usage": usage}, timing
-
-
-def _completion_elapsed(resp: Any, started: float) -> float:
-    """Wall time for a streamed body, read after that body has arrived.
-
-    ``Response.elapsed`` stops at the headers, which arrive before the tokens.
-    An injected ``elapsed_seconds`` still wins so tests can pin the duration.
-    The clock used here includes generation only when the stream was consumed
-    first; pairing it with a time to first token taken at the same instant
-    collapses the rate.
-    """
-    explicit = getattr(resp, "elapsed_seconds", None)
-    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and explicit >= 0:
-        return float(explicit)
-    return max(0.0, time.perf_counter() - started)
-
-
-def _completion_ttft(resp: Any, measured: float | None) -> float | None:
-    """Time to the first token.
-
-    ``measured`` is the instant the first chunk was applied. An injected
-    ``time_to_first_token_seconds`` still wins so tests can pin it.
-    """
-    if hasattr(resp, "time_to_first_token_seconds"):
-        return _as_optional_seconds(resp.time_to_first_token_seconds)
-    return measured
-
-
-def _buffer_body(resp: Any) -> None:
-    read = getattr(resp, "read", None)
-    if not callable(read):
-        return
+def _parse_retry_after(resp: Any) -> float | None:
+    headers = getattr(resp, "headers", None)
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
     try:
-        read()
+        value = float(text)
+    except ValueError:
+        value = None
+    if value is not None:
+        return value if value == value and value >= 0 else None
+    try:
+        target = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    return max(0.0, (target - datetime.now(UTC)).total_seconds())
+
+
+def _is_overflow(status: int, text: str) -> bool:
+    """True for a 400/413/422 whose full message says the prompt is too long."""
+    if status not in _OVERFLOW_STATUS:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _OVERFLOW_MARKERS) or bool(
+        _OVERFLOW_COUNT_RE.search(lowered)
+    )
+
+
+def _full_error_text(resp: Any) -> str:
+    """Return the untruncated error message, used only for overflow classification."""
+    try:
+        payload = resp.json()
     except Exception:
-        return
+        payload = None
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        message = err.get("message") if isinstance(err, dict) else err
+        if isinstance(message, str):
+            return message
+    text = getattr(resp, "text", "")
+    return text if isinstance(text, str) else ""
 
 
-def _assemble_completion(
-    resp: Any, started: float, measured: list[float]
-) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
-    acc = _StreamAcc(content=[], reasoning=[], reasoning_content=[], details=[], calls={})
+def _http_error(status: int, resp: Any, elapsed: float, ttft: float | None) -> OpenRouterHTTPError:
+    return OpenRouterHTTPError(
+        status,
+        _short_error_body(resp),
+        elapsed,
+        ttft,
+        retry_after=_parse_retry_after(resp),
+        context_overflow=_is_overflow(status, _full_error_text(resp)),
+    )
+
+
+def _finish_reason_of(response: dict[str, Any]) -> str | None:
+    try:
+        reason = response["choices"][0].get("finish_reason")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return None
+    return reason if isinstance(reason, str) and reason else None
+
+
+def _read_completion(
+    resp: Any,
+    started: float,
+    on_content_delta: Callable[[str], None] | None,
+    on_thought_delta: Callable[[str], None] | None,
+    is_cancelled: Callable[[], bool],
+) -> tuple[dict[str, Any], CallTiming]:
+    raw_status = getattr(resp, "status_code", 200)
+    status = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else 200
+    if status < 200 or status >= 300:
+        if callable(read := getattr(resp, "read", None)):
+            with contextlib.suppress(Exception):
+                read()
+        raise _http_error(
+            status,
+            resp,
+            _elapsed(resp, started, use_response_elapsed=False),
+            _num_opt(getattr(resp, "time_to_first_token_seconds", None)),
+        )
+
+    measured: list[float] = []
+    acc = _StreamAcc()
     for payload in _iter_events(resp):
-        if isinstance(payload.get("error"), (dict, str)):
+        if is_cancelled():
+            raise StreamCancelledError("cancelled during stream")
+        if isinstance(payload.get("error"), dict | str):
             raise _stream_error(payload, resp, started)
-        usage = payload.get("usage")
-        if isinstance(usage, dict):
-            acc.usage = usage
-        choices = payload.get("choices")
-        if not isinstance(choices, list):
-            continue
-        for choice in choices:
-            if isinstance(choice, dict):
-                _apply_choice(acc, choice, started, measured)
-                if choice.get("finish_reason") == "error":
-                    detail = choice.get("error") or payload.get("error")
-                    raise _stream_error({"error": detail}, resp, started)
-    if (
-        not acc.content
-        and not acc.calls
-        and not acc.reasoning
-        and not acc.reasoning_content
-        and not acc.details
-    ):
+        if isinstance(payload.get("usage"), dict):
+            acc.usage = payload["usage"]
+        if isinstance(choices := payload.get("choices"), list):
+            for choice in choices:
+                if isinstance(choice, dict):
+                    _apply_choice(
+                        acc, choice, started, measured, on_content_delta, on_thought_delta
+                    )
+                    if choice.get("finish_reason") == "error":
+                        detail = choice.get("error") or payload.get("error")
+                        raise _stream_error({"error": detail}, resp, started)
+    if not any((acc.content, acc.calls, acc.reasoning, acc.reasoning_content, acc.details)):
         raise ValueError("Unexpected OpenRouter response shape: no streamed message")
+
     message: dict[str, Any] = {"content": "".join(acc.content) if acc.content else None}
     if acc.reasoning:
         message["reasoning"] = "".join(acc.reasoning)
@@ -457,66 +451,46 @@ def _assemble_completion(
     if acc.calls:
         message["tool_calls"] = [
             {
-                "id": acc.calls[index].id,
-                "function": {
-                    "name": acc.calls[index].name,
-                    "arguments": acc.calls[index].arguments,
-                },
+                "id": acc.calls[i].id,
+                "function": {"name": acc.calls[i].name, "arguments": acc.calls[i].arguments},
             }
-            for index in sorted(acc.calls)
+            for i in sorted(acc.calls)
         ]
-    return message, acc.usage, acc.finish_reason
-
-
-def _stream_error(payload: dict[str, Any], resp: Any, started: float) -> OpenRouterHTTPError:
-    err = payload.get("error")
-    message = ""
-    full = ""
-    code = 502
-    if isinstance(err, dict):
-        text = err.get("message")
-        if isinstance(text, str):
-            full = text
-            message = text[:_ERROR_BODY_LIMIT]
-        raw_code = err.get("code")
-        if isinstance(raw_code, int) and not isinstance(raw_code, bool) and 400 <= raw_code <= 599:
-            code = raw_code
-    elif isinstance(err, str):
-        full = err
-        message = err[:_ERROR_BODY_LIMIT]
-    if not message:
-        message = "request failed"
-    return OpenRouterHTTPError(
-        code,
-        message,
-        _completion_elapsed(resp, started),
-        _completion_ttft(resp, None),
-        retry_after=_retry_after(resp),
-        context_overflow=_is_overflow(code, full),
+    ttft = (
+        _num_opt(resp.time_to_first_token_seconds)
+        if hasattr(resp, "time_to_first_token_seconds")
+        else (measured[0] if measured else None)
     )
-
-
-def _raise_if_cancelled() -> None:
-    if cancel_requested():
-        raise ModelCancelled("model request cancelled")
+    timing = CallTiming(
+        http_status=status,
+        elapsed_seconds=_elapsed(resp, started, use_response_elapsed=False),
+        time_to_first_token_seconds=ttft,
+    )
+    choice_out = {"message": message, "finish_reason": acc.finish_reason}
+    return {"choices": [choice_out], "usage": acc.usage}, timing
 
 
 def _iter_events(resp: Any) -> Iterator[dict[str, Any]]:
-    """Yield SSE payloads as each line arrives.
+    """Yield decoded JSON dicts from an SSE stream or JSON fallback response."""
+    if isinstance(resp, httpx.Response):
+        if "text/event-stream" in resp.headers.get("content-type", "").lower():
+            for sse in EventSource(resp).iter_sse():
+                data = sse.data.strip()
+                if data == "[DONE]":
+                    break
+                if data:
+                    yield from _parse_json_dict(data)
+            return
+        if isinstance(body := resp.json(), dict):
+            yield body
+        return
 
-    The first token is timestamped while this iterator is consumed. Buffering
-    every line before that stamp puts the first chunk and the end of the
-    stream on the same instant, and the generation window collapses to the
-    time spent walking an already-finished body.
-    """
     lines = getattr(resp, "iter_lines", None)
-    if callable(lines):
-        raw_lines = lines()
-    else:
-        body = resp.json()
-        raw_lines = (json.dumps(body), "[DONE]")
-    for raw in raw_lines:
-        _raise_if_cancelled()
+    if not callable(lines):
+        if isinstance(body := resp.json(), dict):
+            yield body
+        return
+    for raw in lines():
         text = raw.decode() if isinstance(raw, bytes) else raw
         if not isinstance(text, str):
             continue
@@ -527,66 +501,100 @@ def _iter_events(resp: Any) -> Iterator[dict[str, Any]]:
             line = line[5:].strip()
         if line == "[DONE]":
             break
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Unexpected OpenRouter stream event: {line!r}") from exc
-        if isinstance(payload, dict):
-            yield payload
+        yield from _parse_json_dict(line)
+
+
+def _parse_json_dict(line: str) -> Iterator[dict[str, Any]]:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Unexpected OpenRouter stream event: {line!r}") from exc
+    if isinstance(payload, dict):
+        yield payload
+
+
+def _stream_error(payload: dict[str, Any], resp: Any, started: float) -> OpenRouterHTTPError:
+    err, message, full, code = payload.get("error"), "", "", 502
+    if isinstance(err, dict):
+        if isinstance(err.get("message"), str):
+            full = err["message"]
+            message = full[:_ERROR_BODY_LIMIT]
+        raw_code = err.get("code")
+        if isinstance(raw_code, int) and not isinstance(raw_code, bool) and 400 <= raw_code <= 599:
+            code = raw_code
+    elif isinstance(err, str):
+        full = err
+        message = full[:_ERROR_BODY_LIMIT]
+    return OpenRouterHTTPError(
+        code,
+        message or "request failed",
+        _elapsed(resp, started, use_response_elapsed=False),
+        _num_opt(getattr(resp, "time_to_first_token_seconds", None)),
+        retry_after=_parse_retry_after(resp),
+        context_overflow=_is_overflow(code, full),
+    )
 
 
 def _apply_choice(
-    acc: _StreamAcc, choice: dict[str, Any], started: float, measured: list[float]
+    acc: _StreamAcc,
+    choice: dict[str, Any],
+    started: float,
+    measured: list[float],
+    on_content_delta: Callable[[str], None] | None,
+    on_thought_delta: Callable[[str], None] | None,
 ) -> None:
+    def mark() -> None:
+        if not measured:
+            measured.append(max(0.0, time.perf_counter() - started))
+
     reason = choice.get("finish_reason")
     if not (isinstance(reason, str) and reason):
         reason = choice.get("native_finish_reason")
     if isinstance(reason, str) and reason:
         acc.finish_reason = reason
+
     for key in ("delta", "message"):
         piece = choice.get(key)
-        if isinstance(piece, dict):
-            _apply_piece(acc, piece, started, measured)
+        if not isinstance(piece, dict):
+            continue
+        if isinstance(content := piece.get("content"), str) and content:
+            acc.content.append(content)
+            mark()
+            if on_content_delta is not None:
+                on_content_delta(content)
 
+        emitted_thought = False
+        for rkey, target in (
+            ("reasoning", acc.reasoning),
+            ("reasoning_content", acc.reasoning_content),
+        ):
+            if isinstance(val := piece.get(rkey), str) and val:
+                target.append(val)
+                mark()
+                if not emitted_thought and on_thought_delta is not None:
+                    on_thought_delta(val)
+                    emitted_thought = True
 
-def _apply_piece(
-    acc: _StreamAcc, piece: dict[str, Any], started: float, measured: list[float]
-) -> None:
-    _append_text(acc.content, piece.get("content"), started, measured)
-    _append_text(acc.reasoning, piece.get("reasoning"), started, measured)
-    _append_text(acc.reasoning_content, piece.get("reasoning_content"), started, measured)
-    details = piece.get("reasoning_details")
-    if isinstance(details, list):
-        for item in details:
-            if isinstance(item, dict):
-                _merge_detail(acc, item)
-                if not measured:
-                    measured.append(max(0.0, time.perf_counter() - started))
-    calls = piece.get("tool_calls")
-    if isinstance(calls, list):
-        for index, call in enumerate(calls):
-            if isinstance(call, dict):
-                _merge_tool_call(acc, call, index)
-                if not measured:
-                    measured.append(max(0.0, time.perf_counter() - started))
+        if isinstance(details := piece.get("reasoning_details"), list):
+            for item in details:
+                if isinstance(item, dict):
+                    _merge_detail(acc, item)
+                    mark()
+                    if not emitted_thought and on_thought_delta is not None:
+                        for dkey in ("text", "summary", "content"):
+                            if isinstance(dval := item.get(dkey), str) and dval:
+                                on_thought_delta(dval)
+                                break
 
-
-def _append_text(parts: list[str], value: object, started: float, measured: list[float]) -> None:
-    """Append text and, on the first chunk, record when it arrived.
-
-    The stamp is time to first token only when this runs as the chunk is
-    read. A body that was buffered first records the end of the stream.
-    """
-    if not isinstance(value, str) or not value:
-        return
-    parts.append(value)
-    if not measured:
-        measured.append(max(0.0, time.perf_counter() - started))
+        if isinstance(calls := piece.get("tool_calls"), list):
+            for idx, call in enumerate(calls):
+                if isinstance(call, dict):
+                    _merge_tool_call(acc, call, idx)
+                    mark()
 
 
 def _merge_detail(acc: _StreamAcc, item: dict[str, Any]) -> None:
     index = item.get("index")
-    slot: dict[str, Any] | None = None
     if isinstance(index, int) and not isinstance(index, bool):
         while len(acc.details) <= index:
             acc.details.append({})
@@ -597,51 +605,35 @@ def _merge_detail(acc: _StreamAcc, item: dict[str, Any]) -> None:
     for key, value in item.items():
         if key == "index":
             continue
-        current = slot.get(key)
-        if (
-            key in ("text", "summary", "content")
+        cur = slot.get(key)
+        slot[key] = (
+            cur + value
+            if key in ("text", "summary", "content")
             and isinstance(value, str)
-            and isinstance(current, str)
-        ):
-            slot[key] = current + value
-        else:
-            slot[key] = value
+            and isinstance(cur, str)
+            else value
+        )
 
 
 def _merge_tool_call(acc: _StreamAcc, call: dict[str, Any], fallback: int) -> None:
-    raw_index = call.get("index", fallback)
-    index = (
-        raw_index if isinstance(raw_index, int) and not isinstance(raw_index, bool) else fallback
-    )
-    slot = acc.calls.get(index)
-    if slot is None:
-        slot = _ToolAcc()
-        acc.calls[index] = slot
-    call_id = call.get("id")
-    if isinstance(call_id, str) and call_id:
-        slot.id = call_id
-    function = call.get("function")
-    if not isinstance(function, dict):
+    raw = call.get("index", fallback)
+    idx = raw if isinstance(raw, int) and not isinstance(raw, bool) else fallback
+    slot = acc.calls.setdefault(idx, _ToolAcc())
+    if isinstance(call.get("id"), str) and call["id"]:
+        slot.id = call["id"]
+    if not isinstance(fn := call.get("function"), dict):
         return
-    name = function.get("name")
-    if isinstance(name, str) and name:
-        slot.name = name
-    arguments = function.get("arguments")
-    if isinstance(arguments, str):
-        slot.arguments += arguments
-    elif isinstance(arguments, dict) and not slot.arguments:
-        slot.arguments = json.dumps(arguments)
+    if isinstance(fn.get("name"), str) and fn["name"]:
+        slot.name = fn["name"]
+    args = fn.get("arguments")
+    if isinstance(args, str):
+        slot.arguments += args
+    elif isinstance(args, dict) and not slot.arguments:
+        slot.arguments = json.dumps(args)
 
 
 @dataclass
 class CatalogFetch:
-    """Models read from the OpenRouter catalog, plus a later-page error if any.
-
-    ``models`` keeps every page that succeeded. ``error`` is set when a later
-    page fails or the total time cap is reached, and stays empty when the walk
-    finishes cleanly. The selected model is not changed here.
-    """
-
     models: list[CatalogModel]
     error: str | None = None
 
@@ -657,45 +649,58 @@ _catalog_cache: _CatalogCacheEntry | None = None
 _catalog_cache_lock = threading.Lock()
 
 
+def _catalog_now() -> float:
+    return time.perf_counter()
+
+
 def clear_model_catalog_cache() -> None:
-    """Drop the short-lived catalog cache. Tests use this between cases."""
     global _catalog_cache
     with _catalog_cache_lock:
         _catalog_cache = None
 
 
 def peek_model_catalog(api_key: str) -> list[CatalogModel] | None:
-    """Return a cached catalog for ``api_key`` when it is still fresh."""
     if not api_key.strip():
         return None
-    return _read_catalog_cache(api_key)
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    with _catalog_cache_lock:
+        entry = _catalog_cache
+        if (
+            entry is None
+            or entry.key_id != key_hash
+            or _catalog_now() - entry.stored_at >= _CATALOG_CACHE_SECONDS
+        ):
+            return None
+        return list(entry.models)
 
 
-def fetch_model_catalog(client: Any, api_key: str) -> CatalogFetch:
-    """GET the OpenRouter models endpoint and parse id, context length, and price.
+def filter_model_catalog(models: Sequence[CatalogModel], query: str) -> list[CatalogModel]:
+    """Return catalog rows whose id or display name matches ``query``."""
+    needle = query.strip().casefold()
+    if not needle:
+        return list(models)
+    return [
+        m
+        for m in models
+        if needle in m.id.casefold() or (m.name is not None and needle in m.name.casefold())
+    ]
 
-    The first request omits ``offset`` and ``limit`` so OpenRouter returns the
-    full list. When a page includes ``links.next``, later pages are followed
-    only while the URL stays on ``https://openrouter.ai``. Redirects are not
-    followed. A repeated URL, the page cap, or the total time cap ends the
-    walk. A failure after the first page keeps the rows already parsed and
-    reports the error. Duplicate ids keep one row, and a row that does not
-    list ``tools`` stays in the list with ``supports_tools`` false. A fresh
-    result is cached briefly.
-    """
+
+def fetch_model_catalog(client: Any, api_key: str, *, bypass_cache: bool = False) -> CatalogFetch:
+    """GET the OpenRouter models endpoint, following safe same-host pagination."""
+    global _catalog_cache
     if not api_key.strip():
         raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
-    cached = _read_catalog_cache(api_key)
-    if cached is not None:
+    if not bypass_cache and (cached := peek_model_catalog(api_key)) is not None:
         return CatalogFetch(models=cached)
+
     started = _catalog_now()
     deadline = started + _CATALOG_TIME_LIMIT
     headers = {"Authorization": f"Bearer {api_key}"}
     url: str | None = OPENROUTER_MODELS_URL
     seen: set[str] = set()
     models: list[CatalogModel] = []
-    pages = 0
-    error: str | None = None
+    pages, error = 0, None
     while url is not None and url not in seen and pages < _CATALOG_PAGE_LIMIT:
         remaining = deadline - _catalog_now()
         if remaining <= 0:
@@ -704,168 +709,92 @@ def fetch_model_catalog(client: Any, api_key: str) -> CatalogFetch:
         seen.add(url)
         pages += 1
         try:
-            resp = client.get(
-                url,
-                headers=headers,
-                follow_redirects=False,
-                timeout=remaining,
-            )
-            payload, _timing = _interpret_response(resp, started)
+            resp = client.get(url, headers=headers, follow_redirects=False, timeout=remaining)
+            raw_s = getattr(resp, "status_code", 200)
+            status = raw_s if isinstance(raw_s, int) and not isinstance(raw_s, bool) else 200
+            elapsed = _elapsed(resp, started, use_response_elapsed=True)
+            ttft = _num_opt(getattr(resp, "time_to_first_token_seconds", None))
+            if status < 200 or status >= 300:
+                raise OpenRouterHTTPError(status, _short_error_body(resp), elapsed, ttft)
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                raise TypeError(f"Expected OpenRouter response object, got {type(payload)}")
             page = parse_model_catalog(payload)
         except Exception as exc:
             if models:
-                error = _catalog_error_text(exc)
+                error = (
+                    str(exc)
+                    if isinstance(exc, OpenRouterHTTPError | MissingOpenRouterKey)
+                    else f"{type(exc).__name__}: {exc}"[:300]
+                )
                 break
             raise
         models.extend(page)
         url = _next_catalog_page(payload, url)
-    fetched = CatalogFetch(models=_dedupe_models(models), error=error)
-    if error is None:
-        _write_catalog_cache(api_key, fetched.models)
-    return fetched
 
-
-def _catalog_now() -> float:
-    return time.perf_counter()
-
-
-def _catalog_error_text(exc: Exception) -> str:
-    if isinstance(exc, OpenRouterHTTPError | MissingOpenRouterKey):
-        return str(exc)
-    return f"{type(exc).__name__}: {exc}"[:300]
-
-
-def _key_id(api_key: str) -> str:
-    return hashlib.sha256(api_key.encode()).hexdigest()
-
-
-def _read_catalog_cache(api_key: str) -> list[CatalogModel] | None:
-    with _catalog_cache_lock:
-        entry = _catalog_cache
-        if entry is None or entry.key_id != _key_id(api_key):
-            return None
-        if _catalog_now() - entry.stored_at >= _CATALOG_CACHE_SECONDS:
-            return None
-        return list(entry.models)
-
-
-def _write_catalog_cache(api_key: str, models: list[CatalogModel]) -> None:
-    global _catalog_cache
-    with _catalog_cache_lock:
-        _catalog_cache = _CatalogCacheEntry(
-            key_id=_key_id(api_key),
-            stored_at=_catalog_now(),
-            models=list(models),
-        )
-
-
-def _dedupe_models(models: list[CatalogModel]) -> list[CatalogModel]:
-    """Keep one row per id, including rows that cannot call tools.
-
-    The first row wins. A later copy replaces it only when that copy lists
-    ``tools`` and the kept row does not, so the flag records tool support.
-    """
-    order: list[str] = []
     kept: dict[str, CatalogModel] = {}
     for model in models:
-        current = kept.get(model.id)
-        if current is None:
-            order.append(model.id)
+        cur = kept.get(model.id)
+        if cur is None or (model.supports_tools and not cur.supports_tools):
             kept[model.id] = model
-            continue
-        if model.supports_tools and not current.supports_tools:
-            kept[model.id] = model
-    return [kept[model_id] for model_id in order]
+    deduped = list(kept.values())
+    if error is None:
+        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+        with _catalog_cache_lock:
+            _catalog_cache = _CatalogCacheEntry(key_hash, _catalog_now(), list(deduped))
+    return CatalogFetch(models=deduped, error=error)
 
 
 def _next_catalog_page(payload: dict[str, Any], current: str) -> str | None:
-    """Return the next OpenRouter catalog URL, or None when the walk should stop."""
     links = payload.get("links")
-    if not isinstance(links, dict):
+    raw = links.get("next") if isinstance(links, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
         return None
-    raw = links.get("next")
-    if not isinstance(raw, str):
-        return None
-    text = raw.strip()
-    if not text:
-        return None
-    joined = urljoin(current, text)
+    joined = urljoin(current, raw.strip())
     parsed = urlparse(joined)
-    host = parsed.hostname
-    if parsed.scheme != "https" or host is None or host.casefold() != _OPENROUTER_HOST:
-        return None
-    if parsed.port not in (None, 443):
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.hostname.casefold() != _OPENROUTER_HOST
+        or parsed.port not in (None, 443)
+    ):
         return None
     return joined
 
 
 def parse_usage(raw: object) -> TokenUsage:
-    """Read token counts and cost from a provider usage object.
-
-    Cached tokens come from ``prompt_tokens_details.cached_tokens``, then
-    ``cached_tokens``, then ``cache_read_input_tokens``. Reasoning tokens come
-    from ``completion_tokens_details.reasoning_tokens``, then a top-level
-    ``reasoning_tokens``. The first present field wins, including an explicit
-    zero, so a later alias does not replace it.
-    """
     if not isinstance(raw, dict):
         return TokenUsage()
-    prompt = _as_int(raw.get("prompt_tokens"))
-    completion = _as_int(raw.get("completion_tokens"))
+    prompt = int(_num_opt(raw.get("prompt_tokens"), allow_neg=True) or 0)
+    completion = int(_num_opt(raw.get("completion_tokens"), allow_neg=True) or 0)
     total_raw = raw.get("total_tokens")
-    total = _as_int(total_raw) if total_raw is not None else prompt + completion
+    total = (
+        int(_num_opt(total_raw, allow_neg=True) or 0)
+        if total_raw is not None
+        else prompt + completion
+    )
+    p_det, c_det = raw.get("prompt_tokens_details"), raw.get("completion_tokens_details")
+    cached_src = (
+        p_det["cached_tokens"]
+        if isinstance(p_det, dict) and "cached_tokens" in p_det
+        else raw.get("cached_tokens", raw.get("cache_read_input_tokens", 0))
+    )
+    reason_src = (
+        c_det["reasoning_tokens"]
+        if isinstance(c_det, dict) and "reasoning_tokens" in c_det
+        else raw.get("reasoning_tokens", 0)
+    )
     return TokenUsage(
         prompt_tokens=prompt,
         completion_tokens=completion,
         total_tokens=total,
-        cached_tokens=_cached_tokens(raw),
-        reasoning_tokens=_reasoning_tokens(raw),
-        cost=_as_cost(raw.get("cost")),
+        cached_tokens=int(_num_opt(cached_src) or 0),
+        reasoning_tokens=int(_num_opt(reason_src) or 0),
+        cost=_num_opt(raw.get("cost"), allow_neg=True),
     )
 
 
-def _cached_tokens(raw: dict[str, Any]) -> int:
-    cached = _detail_count(raw, "prompt_tokens_details", "cached_tokens")
-    if cached is not None:
-        return cached
-    for key in ("cached_tokens", "cache_read_input_tokens"):
-        if key in raw:
-            return _as_count(raw.get(key))
-    return 0
-
-
-def _reasoning_tokens(raw: dict[str, Any]) -> int:
-    reasoning = _detail_count(raw, "completion_tokens_details", "reasoning_tokens")
-    if reasoning is not None:
-        return reasoning
-    if "reasoning_tokens" in raw:
-        return _as_count(raw.get("reasoning_tokens"))
-    return 0
-
-
-def _detail_count(raw: dict[str, Any], group: str, key: str) -> int | None:
-    details = raw.get(group)
-    if not isinstance(details, dict) or key not in details:
-        return None
-    return _as_count(details.get(key))
-
-
-def _as_count(value: object) -> int:
-    number = _as_int(value)
-    if number < 0:
-        return 0
-    return number
-
-
 def parse_model_catalog(payload: object) -> list[CatalogModel]:
-    """Parse an OpenRouter ``/models`` payload.
-
-    Rows without an id are skipped. Missing context length or pricing stays unset.
-    Names and descriptions lose control characters, ANSI sequences, and bidi
-    overrides. An id that contains a control character or a bidi override is
-    rejected rather than rewritten. ``supports_tools`` records whether
-    ``supported_parameters`` lists ``tools``.
-    """
     if not isinstance(payload, dict):
         raise ValueError("model catalog must be an object")
     data = payload.get("data")
@@ -875,192 +804,86 @@ def parse_model_catalog(payload: object) -> list[CatalogModel]:
     for item in data:
         if not isinstance(item, dict):
             continue
-        model_id = _model_id(item.get("id"))
-        if model_id is None:
+        raw_id = item.get("id")
+        if (
+            not isinstance(raw_id, str)
+            or _CONTROL_CHARS.search(raw_id)
+            or _BIDI_CHARS.search(raw_id)
+        ):
             continue
-        pricing = item.get("pricing")
-        prompt_price = None
-        completion_price = None
-        cache_read_price = None
-        if isinstance(pricing, dict):
-            prompt_price = _as_price(pricing.get("prompt"))
-            completion_price = _as_price(pricing.get("completion"))
-            cache_read_price = _as_price(pricing.get("input_cache_read"))
+        if not (model_id := raw_id.strip()):
+            continue
+        raw_pricing = item.get("pricing")
+        pricing: dict[str, Any] = raw_pricing if isinstance(raw_pricing, dict) else {}
+        ctx = _num_opt(item.get("context_length"))
+        supported = item.get("supported_parameters")
         models.append(
             CatalogModel(
                 id=model_id,
                 name=_sanitize_display(item.get("name")),
                 description=_sanitize_display(item.get("description")),
-                context_length=_as_optional_int(item.get("context_length")),
-                prompt_price=prompt_price,
-                completion_price=completion_price,
-                cache_read_price=cache_read_price,
-                supports_tools=_lists_tools(item.get("supported_parameters")),
+                context_length=int(ctx) if ctx is not None else None,
+                prompt_price=_as_price(pricing.get("prompt")),
+                completion_price=_as_price(pricing.get("completion")),
+                cache_read_price=_as_price(pricing.get("input_cache_read")),
+                supports_tools=isinstance(supported, list) and "tools" in supported,
             )
         )
     return models
 
 
-def _lists_tools(value: object) -> bool:
-    if not isinstance(value, list):
-        return False
-    return any(isinstance(item, str) and item == "tools" for item in value)
-
-
-def _model_id(value: object) -> str | None:
-    """Return a model id, or None when the row should be skipped.
-
-    Surrounding whitespace is ignored. A control character or a bidi override
-    rejects the row so the id is never rewritten into a different model.
-    """
-    if not isinstance(value, str):
-        return None
-    if _CONTROL_CHARS.search(value) or _BIDI_CHARS.search(value):
-        return None
-    text = value.strip()
-    return text or None
-
-
 def _sanitize_display(value: object) -> str | None:
-    """Remove ANSI sequences, control characters, and bidi overrides from text."""
     if not isinstance(value, str):
         return None
-    text = _ANSI_ESCAPE.sub("", value)
-    text = _CONTROL_CHARS.sub("", text)
-    text = _BIDI_CHARS.sub("", text).strip()
-    return text or None
+    return _BIDI_CHARS.sub("", _CONTROL_CHARS.sub("", _ANSI_ESCAPE.sub("", value))).strip() or None
 
 
-def filter_model_catalog(models: Sequence[CatalogModel], query: str) -> list[CatalogModel]:
-    """Keep catalog rows whose id contains ``query``, case-insensitively."""
-    needle = query.strip().casefold()
-    if not needle:
-        return list(models)
-    return [model for model in models if needle in model.id.casefold()]
-
-
-def _interpret_response(resp: Any, started: float) -> tuple[dict[str, Any], CallTiming]:
-    elapsed = _elapsed_seconds(resp, started)
-    ttft = _as_optional_seconds(getattr(resp, "time_to_first_token_seconds", None))
-    status = _status_code(resp)
-    timing = CallTiming(
-        http_status=status,
-        elapsed_seconds=elapsed,
-        time_to_first_token_seconds=ttft,
-    )
-    if status < 200 or status >= 300:
-        raise _http_error(status, resp, elapsed, ttft)
-    response = resp.json()
-    if not isinstance(response, dict):
-        raise TypeError(f"Expected OpenRouter response object, got {type(response)}")
-    return response, timing
-
-
-def _status_code(resp: Any) -> int:
-    raw = getattr(resp, "status_code", 200)
-    if isinstance(raw, bool) or not isinstance(raw, int):
-        return 200
-    return raw
-
-
-def _elapsed_seconds(resp: Any, started: float) -> float:
-    explicit = getattr(resp, "elapsed_seconds", None)
-    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and explicit >= 0:
-        return float(explicit)
-    elapsed = getattr(resp, "elapsed", None)
-    if isinstance(elapsed, timedelta):
-        return max(0.0, elapsed.total_seconds())
-    if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) and elapsed >= 0:
-        return float(elapsed)
+def _elapsed(resp: Any, started: float, *, use_response_elapsed: bool) -> float:
+    if (explicit := _num_opt(getattr(resp, "elapsed_seconds", None))) is not None:
+        return explicit
+    if use_response_elapsed:
+        elapsed = getattr(resp, "elapsed", None)
+        if isinstance(elapsed, timedelta):
+            return max(0.0, elapsed.total_seconds())
+        if (val := _num_opt(elapsed)) is not None:
+            return val
     return max(0.0, time.perf_counter() - started)
 
 
-def _is_overflow(status: int, text: str) -> bool:
-    """True for a 400/413/422 whose full message says the prompt is too long."""
-    if status not in _OVERFLOW_STATUS:
-        return False
-    lowered = text.lower()
-    return any(marker in lowered for marker in _OVERFLOW_MARKERS) or bool(
-        _OVERFLOW_COUNT_RE.search(lowered)
-    )
-
-
-def _retry_after(resp: Any) -> float | None:
-    """Read a numeric ``Retry-After`` in seconds; fakes without headers give None."""
-    headers = getattr(resp, "headers", None)
-    if headers is None:
-        return None
-    try:
-        raw = headers.get("retry-after") or headers.get("Retry-After")
-        value = float(raw) if raw is not None else None
-    except (AttributeError, TypeError, ValueError):
-        return None
-    if value is None or value != value or value < 0:
-        return None
-    return value
-
-
-def _http_error(status: int, resp: Any, elapsed: float, ttft: float | None) -> OpenRouterHTTPError:
-    return OpenRouterHTTPError(
-        status,
-        _short_error_body(resp),
-        elapsed,
-        ttft,
-        retry_after=_retry_after(resp),
-        context_overflow=_is_overflow(status, _full_error_text(resp)),
-    )
-
-
-def _full_error_text(resp: Any) -> str:
-    """The untruncated error message, used only for classification."""
-    try:
-        payload = resp.json()
-    except Exception:
-        payload = None
-    if isinstance(payload, dict):
-        err = payload.get("error")
-        message = err.get("message") if isinstance(err, dict) else None
-        if isinstance(message, str):
-            return message
-        if isinstance(err, str):
-            return err
-    text = getattr(resp, "text", "")
-    return text if isinstance(text, str) else ""
-
-
-def _finish_reason_of(response: dict[str, Any]) -> str | None:
-    try:
-        reason = response["choices"][0].get("finish_reason")
-    except (KeyError, IndexError, TypeError, AttributeError):
-        return None
-    return reason if isinstance(reason, str) and reason else None
-
-
 def _short_error_body(resp: Any) -> str:
-    payload: object
     try:
         payload = resp.json()
     except Exception:
         payload = None
     if isinstance(payload, dict):
         err = payload.get("error")
-        message = err.get("message") if isinstance(err, dict) else None
-        if isinstance(message, str):
-            return message[:_ERROR_BODY_LIMIT]
-        if isinstance(err, str):
-            return err[:_ERROR_BODY_LIMIT]
+        msg = err.get("message") if isinstance(err, dict) else err
+        if isinstance(msg, str) and msg:
+            return msg[:_ERROR_BODY_LIMIT]
     text = getattr(resp, "text", "")
-    if isinstance(text, str) and text.strip():
-        return text.strip()[:_ERROR_BODY_LIMIT]
-    return "request failed"
+    return (
+        text.strip()[:_ERROR_BODY_LIMIT]
+        if isinstance(text, str) and text.strip()
+        else "request failed"
+    )
 
 
 def _serialize_message(message: ChatMessage) -> dict[str, Any]:
     data: dict[str, Any] = {"role": message.role.value}
-    # Tool results stay text. Image bytes travel on a following user message.
     images = [] if message.role is Role.TOOL else message.images
     if images:
-        data["content"] = _content_with_images(message.content, images)
+        parts: list[dict[str, Any]] = []
+        if message.content is not None:
+            parts.append({"type": "text", "text": message.content})
+        for img in images:
+            parts.append({"type": "text", "text": f"Image artifact: {img.path}"})
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{img.media_type};base64,{img.data}"},
+                }
+            )
+        data["content"] = parts
     elif message.content is not None:
         data["content"] = message.content
     elif message.role is Role.ASSISTANT and not message.tool_calls:
@@ -1070,11 +893,11 @@ def _serialize_message(message: ChatMessage) -> dict[str, Any]:
     if message.tool_calls:
         data["tool_calls"] = [
             {
-                "id": call.id,
+                "id": c.id,
                 "type": "function",
-                "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+                "function": {"name": c.name, "arguments": json.dumps(c.arguments)},
             }
-            for call in message.tool_calls
+            for c in message.tool_calls
         ]
     if message.reasoning:
         data["reasoning"] = message.reasoning
@@ -1083,101 +906,18 @@ def _serialize_message(message: ChatMessage) -> dict[str, Any]:
     return data
 
 
-def _content_with_images(content: str | None, images: list[ModelImage]) -> list[dict[str, Any]]:
-    """Turn text plus local image artifacts into OpenRouter vision parts.
-
-    Each image is a data URL. A short text part names the artifact path so
-    the model can refer to the file the bytes came from.
-    """
-    parts: list[dict[str, Any]] = []
-    if content is not None:
-        parts.append({"type": "text", "text": content})
-    for image in images:
-        parts.append({"type": "text", "text": f"Image artifact: {image.path}"})
-        parts.append(_image_part(image))
-    return parts
-
-
-def _image_part(image: ModelImage) -> dict[str, Any]:
-    return {
-        "type": "image_url",
-        "image_url": {"url": f"data:{image.media_type};base64,{image.data}"},
-    }
-
-
-def _optional_text(value: object) -> str | None:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    return text or None
-
-
-def _detail_text(item: object) -> str | None:
-    if isinstance(item, str):
-        return _optional_text(item)
-    if not isinstance(item, dict):
-        return None
-    for key in ("text", "summary", "content"):
-        found = _optional_text(item.get(key))
-        if found is not None:
-            return found
-    return None
-
-
-def _parse_reasoning(message: dict[str, Any]) -> tuple[str | None, list[dict[str, Any]]]:
-    """Return display text and the provider's reasoning payload.
-
-    OpenRouter uses ``reasoning``. DeepSeek-style replies use
-    ``reasoning_content``. ``reasoning_details`` is kept whole so a later
-    request can echo it, including entries that have no displayable text.
-    """
-    details_raw = message.get("reasoning_details")
-    details: list[dict[str, Any]] = []
-    detail_parts: list[str] = []
-    if isinstance(details_raw, list):
-        for item in details_raw:
-            if isinstance(item, dict):
-                details.append(item)
-            text = _detail_text(item)
-            if text is not None:
-                detail_parts.append(text)
-    reasoning = _optional_text(message.get("reasoning"))
-    if reasoning is None:
-        reasoning = _optional_text(message.get("reasoning_content"))
-    if reasoning is None and detail_parts:
-        reasoning = "\n\n".join(detail_parts)
-    return reasoning, details
-
-
-def _parse_response(message: dict[str, Any]) -> ModelResponse:
-    content = message.get("content")
-    if content is not None and not isinstance(content, str):
-        raise TypeError(f"Expected string or null content, got {type(content)}")
-    calls: list[ToolCall] = []
-    raw_calls = message.get("tool_calls", [])
-    if not isinstance(raw_calls, list):
-        raise TypeError(f"Expected list tool_calls, got {type(raw_calls)}")
-    argument_errors: dict[str, str] = {}
-    for raw_call in raw_calls:
-        try:
-            function = raw_call["function"]
-            call_id = raw_call["id"]
-            name = function["name"]
-            raw_arguments = function.get("arguments")
-        except (KeyError, TypeError, AttributeError) as exc:
-            raise ValueError(f"Unexpected OpenRouter tool call: {raw_call!r}") from exc
-        arguments, problem = _decode_arguments(raw_arguments)
-        if problem is not None:
-            argument_errors[call_id] = problem
-        calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
-    reasoning, reasoning_details = _parse_reasoning(message)
-    return ModelResponse(
-        content=content,
-        tool_calls=calls,
-        reasoning=reasoning,
-        reasoning_details=reasoning_details,
-        argument_errors=argument_errors,
-    )
+def _json_type_name(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
 
 
 def _decode_arguments(raw: object) -> tuple[dict[str, Any], str | None]:
@@ -1201,39 +941,59 @@ def _decode_arguments(raw: object) -> tuple[dict[str, Any], str | None]:
     return {}, f"arguments must be a JSON object, got {_json_type_name(value)}."
 
 
-def _as_int(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return 0
-    return int(value)
+def _parse_response(message: dict[str, Any]) -> ModelResponse:
+    content = message.get("content")
+    if content is not None and not isinstance(content, str):
+        raise TypeError(f"Expected string or null content, got {type(content)}")
+    raw_calls = message.get("tool_calls", [])
+    if not isinstance(raw_calls, list):
+        raise TypeError(f"Expected list tool_calls, got {type(raw_calls)}")
+    calls: list[ToolCall] = []
+    argument_errors: dict[str, str] = {}
+    for raw_call in raw_calls:
+        if not isinstance(raw_call, dict) or not isinstance(fn := raw_call.get("function"), dict):
+            raise ValueError(f"Unexpected OpenRouter tool call: {raw_call!r}")
+        call_id = raw_call.get("id")
+        name = fn.get("name")
+        if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+            raise ValueError(f"Unexpected OpenRouter tool call: {raw_call!r}")
+        arguments, problem = _decode_arguments(fn.get("arguments"))
+        if problem is not None:
+            argument_errors[call_id] = problem
+        calls.append(ToolCall(id=call_id, name=name, arguments=arguments, arguments_error=problem))
+
+    details, detail_parts = [], []
+    if isinstance(raw_details := message.get("reasoning_details"), list):
+        for item in raw_details:
+            if isinstance(item, dict):
+                details.append(item)
+                for key in ("text", "summary", "content"):
+                    if isinstance(v := item.get(key), str) and v.strip():
+                        detail_parts.append(v.strip())
+                        break
+            elif isinstance(item, str) and item.strip():
+                detail_parts.append(item.strip())
+    reasoning = (
+        (r.strip() or None if isinstance(r := message.get("reasoning"), str) else None)
+        or (rc.strip() or None if isinstance(rc := message.get("reasoning_content"), str) else None)
+        or ("\n\n".join(detail_parts) if detail_parts else None)
+    )
+    return ModelResponse(
+        content=content,
+        tool_calls=calls,
+        reasoning=reasoning,
+        reasoning_details=details,
+        argument_errors=argument_errors,
+    )
 
 
-def _as_optional_int(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+def _num_opt(value: object, *, allow_neg: bool = False) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    number = int(value)
-    if number < 0:
-        return None
-    return number
-
-
-def _as_optional_seconds(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if value < 0:
-        return None
-    return float(value)
-
-
-def _as_cost(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
+    return float(value) if allow_neg or value >= 0 else None
 
 
 def _as_price(value: object) -> str | None:
-    if isinstance(value, bool) or value is None:
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
         return None
-    if isinstance(value, (int, float, str)):
-        text = str(value).strip()
-        return text or None
-    return None
+    return str(value).strip() or None

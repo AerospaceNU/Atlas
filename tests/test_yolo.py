@@ -137,7 +137,10 @@ def test_yolo_toggle_before_a_permission_callback_does_not_wait(tmp_path: Path) 
         PermissionRequest(id="late", tool="write_file", summary="write a file", arguments={}),
         events.append,
     )
-    assert events == [{"type": "yolo", "enabled": True}]
+    assert len(events) == 1
+    assert events[0]["type"] == "yolo"
+    assert events[0]["enabled"] is True
+    assert events[0]["status"]["yolo_enabled"] is True
     assert not session.permission_slots
 
 

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from os import PathLike
 from typing import IO
 
+from atlas.agent.contracts import current_cancel_event, emit_tool_output
 from atlas.agent.scope import cancel_requested
 
 DEFAULT_MAX_CHARS = 200_000
@@ -40,6 +41,26 @@ class Captured:
     cancelled: bool = False
 
 
+def _is_cancelled() -> bool:
+    ev = current_cancel_event()
+    return cancel_requested() or (ev is not None and ev.is_set())
+
+
+def _drain_stream(handle: IO[bytes], offset: int) -> int:
+    pread = getattr(os, "pread", None)
+    if pread is None:
+        return offset
+    fd = handle.fileno()
+    size = os.fstat(fd).st_size
+    if size <= offset:
+        return offset
+    chunk = pread(fd, min(size - offset, 16_384), offset)
+    if chunk:
+        emit_tool_output(chunk.decode("utf-8", errors="replace"))
+        offset += len(chunk)
+    return offset
+
+
 def run_captured(
     argv: Sequence[str],
     *,
@@ -59,7 +80,7 @@ def run_captured(
     output so far is returned with ``cancelled=True`` and ``exit_code=None``; an
     already-cancelled scope returns without spawning.
     """
-    if cancel_requested():
+    if _is_cancelled():
         return Captured(None, "", "", False, cancelled=True)
     with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
         process = subprocess.Popen(
@@ -102,8 +123,9 @@ def _wait(
     stops the wait; a child that already exited is never reported as cancelled.
     """
     deadline = time.monotonic() + timeout
+    out_off, err_off = 0, 0
     while True:
-        if cancel_requested():
+        if _is_cancelled():
             return False, False, True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -111,11 +133,15 @@ def _wait(
         try:
             process.wait(timeout=min(_POLL_SECONDS, remaining))
         except subprocess.TimeoutExpired:
-            if cancel_requested():
+            out_off = _drain_stream(out_file, out_off)
+            err_off = _drain_stream(err_file, err_off)
+            if _is_cancelled():
                 return False, False, True
             if _over_cap(out_file) or _over_cap(err_file):
                 return False, True, False
             continue
+        _drain_stream(out_file, out_off)
+        _drain_stream(err_file, err_off)
         return False, False, False
 
 

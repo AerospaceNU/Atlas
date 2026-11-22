@@ -4,7 +4,6 @@ import argparse
 import contextlib
 import json
 import os
-import queue
 import sys
 import threading
 import time
@@ -13,10 +12,11 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any, Literal
+from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from atlas.agent import layout
 from atlas.agent.analysis_skill import (
     AnalysisStep,
     AnalysisTurn,
@@ -24,7 +24,6 @@ from atlas.agent.analysis_skill import (
     SavedSkill,
     SkillPreview,
     SkillSaveError,
-    enable_command,
     enable_skill,
     preview_skill,
     save_skill,
@@ -33,67 +32,34 @@ from atlas.agent.analysis_skill import (
 )
 from atlas.agent.artifacts import LocalArtifactStore
 from atlas.agent.audit import record as audit_event
-from atlas.agent.checkpoints import restore_latest
 from atlas.agent.contracts import (
     CatalogModel,
     ChatMessage,
+    ModelCall,
     Role,
     ToolCapableModel,
     ToolRegistry,
+    ToolResult,
     default_registry,
 )
 from atlas.agent.images import ingest_images
-from atlas.agent.layout import (
-    ATLAS_SKILLS_RELATIVE,
-    EARTHDATA_TOKEN,
-    FIRMS_MAP_KEY,
-    KEY_VARIABLES,
-    OPENROUTER_API_KEY,
-    AtlasPathError,
-    bind_session_credentials,
-    bind_session_secrets,
-    delete_user_key,
-    ensure_project_layout,
-    ensure_user_layout,
-    list_entries,
-    prepare_credential,
-    prepare_openrouter_key,
-    project_artifact_dir,
-    project_artifacts_dir,
-    project_atlas_root,
-    project_session_dir,
-    quiet_http_client_logs,
-    read_user_key,
-    remove_entry,
-    resolve_credential,
-    resolve_openrouter_key,
-    unbind_session_credentials,
-    unbind_session_secrets,
-    user_atlas_root,
-    write_user_key,
-)
-from atlas.agent.metrics import (
-    SessionTotals,
-    apply_call,
-    apply_http_error,
-    format_tui_status,
-    reported_spend,
-)
+from atlas.agent.metrics import SessionTotals, apply_call, reported_spend
 from atlas.agent.model import (
-    _CATALOG_TIME_LIMIT,
     MISSING_KEY_MESSAGE,
     CatalogFetch,
     MissingOpenRouterKey,
     ModelConfig,
-    OpenRouterHTTPError,
     OpenRouterModel,
-    peek_model_catalog,
 )
+from atlas.agent.redaction import redact_text
+from atlas.agent.redaction import redact_value as redact_value
 from atlas.agent.runtime import (
     Agent,
     AgentRun,
     AgentStep,
     ContextCompaction,
+    PermissionDecision,
+    PermissionRequest,
     _compact,
     _estimate_tokens,
     ensure_agent_config,
@@ -105,56 +71,70 @@ from atlas.agent.runtime import (
     load_read_only,
     load_reasoning_effort,
     load_spend_limit,
+    tool_summary,
 )
 from atlas.agent.sessions import (
-    call_summary,
     discard_unused_session,
     first_prompt,
-    list_sessions,
-    newest_session,
     repair_history,
-    replay_items,
     write_meta,
 )
 from atlas.agent.skill_author import normalize_skill_name
 from atlas.agent.skills import Skill, load_skills, register_skill_tool
 
-_REDACTED = "***"
-_STDOUT_LOCK = threading.Lock()
 _GOAL_MAX_CHARS = 2_000
-_GOAL_TOO_LONG = f"goal text must be at most {_GOAL_MAX_CHARS} characters"
 _GOAL_OPEN = "<session_goal>"
 _GOAL_CLOSE = "</session_goal>"
-_NO_GOAL_MESSAGE = "none is set"
-_GOAL_CLEARED_MESSAGE = "goal cleared"
-_GOAL_USAGE = "usage: /goal [text] | /goal clear"
 _PROJECT_INSTRUCTION_PREFIX = "<untrusted_project_instructions"
+PERMISSION_TIMEOUT = 300.0
 
 
 def session_goal_text(goal: str) -> str:
-    """Return the session-context block the model sees for ``goal``.
-
-    The goal is wrapped in ``<session_goal>`` tags. The block is one user
-    message. When it is inserted after a turn has already run, it sits
-    directly before that earlier user turn, so the model sees two user
-    messages in a row. They are not merged.
-    """
     return f"{_GOAL_OPEN}\n{goal}\n{_GOAL_CLOSE}"
 
 
-class AgentSession:
-    """A persistent agent conversation that survives across turns.
+def _find_repo_root(start: Path | None = None) -> Path | None:
+    return layout.find_repo_root(start)
 
-    The first message is the trusted system prompt. When the project root
-    contains an honored instruction file, the next message is that file as
-    delimited project guidance. An active session goal, when one is set, is
-    the following message. The session keeps a reference to that message and
-    does not choose it by matching text. The goal is wrapped in
-    ``<session_goal>`` tags. It is session text for later turns. It is not a
-    tool and it does not change the store roots. Setting it after a turn
-    has already run leaves it directly before that turn, so the model sees
-    two user messages in a row. Those messages stay separate.
-    """
+
+def _git_branch(workspace: Path | None) -> str | None:
+    if workspace is None:
+        return None
+    for candidate in (workspace, *workspace.parents):
+        dotgit = candidate / ".git"
+        if dotgit.is_dir():
+            head_file = dotgit / "HEAD"
+        elif dotgit.is_file():
+            try:
+                text = dotgit.read_text(encoding="utf-8").strip()
+            except OSError:
+                return None
+            if not text.startswith("gitdir:"):
+                return None
+            gitdir = Path(text[7:].strip())
+            head_file = (
+                gitdir if gitdir.is_absolute() else (candidate / gitdir).resolve()
+            ) / "HEAD"
+        else:
+            continue
+        try:
+            head = head_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return head[16:] if head.startswith("ref: refs/heads/") else (head[:8] or None)
+    return None
+
+
+def _stop_jobs(reason: str) -> None:
+    """Stop background bash jobs this process started; never raises."""
+    with contextlib.suppress(Exception):
+        from atlas.agent.tools._jobs import stop_all
+
+        stop_all(reason)
+
+
+class AgentSession:
+    """A persistent agent conversation surviving across turns and RPC commands."""
 
     AUTOSAVE_SECONDS: float = 5.0
 
@@ -177,12 +157,11 @@ class AgentSession:
         self.goal = ""
         self._goal_message: ChatMessage | None = None
         self.totals = SessionTotals()
-        self.fetch_models: Callable[[], CatalogFetch | list[CatalogModel]] | None = None
+        self.fetch_models: Callable[..., CatalogFetch | list[CatalogModel]] | None = None
         self._catalog_thread: threading.Thread | None = None
         self._catalog_inflight = False
         self._catalog_lock = threading.Lock()
-        config = getattr(agent.model, "config", None)
-        if config is not None:
+        if (config := getattr(agent.model, "config", None)) is not None:
             self.model_id = str(getattr(config, "model", "") or "")
             self.totals.model = self.model_id
             key = str(getattr(config, "api_key", "") or "").strip()
@@ -190,7 +169,7 @@ class AgentSession:
             if key:
                 self.secrets.append(key)
         # Bound to the live list, so a key added later through set_key is covered too.
-        self.agent.redact_output = lambda text: _redact_value(text, self.secrets)
+        self.agent.redact_output = lambda text: redact_text(text, self.secrets)
         self.skill_catalog_note = ""
         self._skill_previews: dict[tuple[str, str], str] = {}
         self._analysis_turns: list[AnalysisTurn] = []
@@ -198,112 +177,145 @@ class AgentSession:
         self._analysis_request = ""
         self._analysis_steps: list[AnalysisStep] = []
         self._analysis_response = ""
-        # Set by the protocol reader thread. The runtime polls it between
-        # rounds and before a tool batch, so a turn can be stopped without
-        # killing the process that holds the history.
         self.cancel_event = threading.Event()
-        # A ``quit`` read while turn N runs stops turn N only; later turns run.
         self.quit_turn: int | None = None
         self._turn_no = 0
         self.loaded_at_launch = False
-        # Set when this session has a directory under .atlas/sessions.
         self.session_id: str | None = None
-        # Approval round-trip. The reader thread fills a slot when a
-        # ``permission`` message arrives; the turn waits on it.
         self.permission_slots: dict[str, list[object]] = {}
         self.permission_lock = threading.RLock()
 
     @property
     def yolo_enabled(self) -> bool:
-        """Whether this process skips per-call approval prompts."""
         return self.agent.approval == "allow"
 
-    def toggle_yolo(self, emit: Callable[[dict[str, Any]], None]) -> None:
-        """Toggle automatic approval and release any pending prompt when enabled."""
+    @property
+    def key_set(self) -> bool:
+        return (not self.requires_api_key) or bool(self.active_key and self.active_key.strip())
+
+    def remember_secret(self, key: str) -> None:
+        if (cleaned := key.strip()) and cleaned not in self.secrets:
+            self.secrets.append(cleaned)
+
+    def install_key(self, key: str) -> None:
+        self.remember_secret(key)
+        self.active_key = key
+        if (config := getattr(self.agent.model, "config", None)) is not None:
+            config.api_key = key
+
+    def clear_installed_key(self) -> None:
+        self.active_key = None
+        if (config := getattr(self.agent.model, "config", None)) is not None:
+            config.api_key = ""
+
+    def _active_catalog_row(self) -> CatalogModel | None:
+        model_id = self.totals.model or self.model_id
+        if not model_id:
+            return None
+        with self._catalog_lock:
+            return next((item for item in self.catalog if item.id == model_id), None)
+
+    def apply_known_context_limit(self) -> None:
+        chosen = self._active_catalog_row()
+        if chosen is not None and chosen.context_length is not None:
+            self.totals.context_limit = chosen.context_length
+            self.agent.context_limit = chosen.context_length
+
+    def status_snapshot(self) -> dict[str, Any]:
+        """Build the v2 ``StatusSnapshot`` payload dict."""
+        self.apply_known_context_limit()
+        t, ws = self.totals, self.workspace or self.agent.artifacts.root
+        return {
+            "model": t.model or self.model_id,
+            "context_used": t.context_used,
+            "context_limit": t.context_limit,
+            "prompt_tokens": t.prompt_tokens,
+            "completion_tokens": t.completion_tokens,
+            "total_tokens": t.total_tokens,
+            "cached_tokens": t.cached_tokens,
+            "reasoning_tokens": t.reasoning_tokens,
+            "spend": reported_spend(t),
+            "tokens_per_second": t.tokens_per_second,
+            "yolo_enabled": self.yolo_enabled,
+            "estimated": t.estimated,
+            "branch": _git_branch(ws),
+            "workspace": str(ws) if ws is not None else None,
+            "goal": self.goal or None,
+            "active_skills": list(self.active_skills),
+        }
+
+    def set_yolo(
+        self, enabled: bool | None, emit: Callable[[dict[str, Any]], None] | None = None
+    ) -> bool:
         with self.permission_lock:
-            enabled = not self.yolo_enabled
-            self.agent.approval = "allow" if enabled else "ask"
-            emit({"type": "yolo", "enabled": enabled})
-            if enabled:
+            target = (not self.yolo_enabled) if enabled is None else bool(enabled)
+            self.agent.approval = "allow" if target else "ask"
+            if emit is not None:
+                emit({"type": "yolo", "enabled": target, "status": self.status_snapshot()})
+            if target:
                 for slot in self.permission_slots.values():
-                    slot[1] = True
-                    event = slot[0]
-                    assert isinstance(event, threading.Event)
-                    event.set()
+                    slot[1] = PermissionDecision(decision="allow")
+                    assert isinstance(slot[0], threading.Event)
+                    slot[0].set()
+            return target
 
-    def turn(
-        self,
-        request: str,
-        *,
-        images: Sequence[str] = (),
-        on_step: Callable[[AgentStep], None] | None = None,
-        on_phase: Callable[[str, str | None], None] | None = None,
-        on_thought: Callable[[str, float | None], None] | None = None,
-    ) -> AgentRun:
-        """Append the user message and advance the shared history one turn.
+    def toggle_yolo(self, emit: Callable[[dict[str, Any]], None]) -> None:
+        self.set_yolo(None, emit)
 
-        ``images`` are paths the store can resolve, including absolute paths.
-        A path that cannot be read is not appended.
-        """
-        self._require_key()
-        self._cancel_event_clear()
-        message = ChatMessage(role=Role.USER, content=request)
-        if images:
-            message.images = ingest_images(self.agent.artifacts, list(images))
-        self._begin_analysis(request)
-        self.messages.append(message)
-        self.interrupted = True
-        self._autosave(force=True)
-        return self._advance(on_step, on_phase, on_thought)
+    def cancel(self) -> None:
+        """Cancel the active turn and immediately wake any waiting permission prompt."""
+        self.cancel_event.set()
+        with self.permission_lock:
+            for slot in self.permission_slots.values():
+                slot[1] = PermissionDecision(decision="deny", reason="cancelled by the user")
+                assert isinstance(slot[0], threading.Event)
+                slot[0].set()
 
-    def resume(
-        self,
-        *,
-        on_step: Callable[[AgentStep], None] | None = None,
-        on_phase: Callable[[str, str | None], None] | None = None,
-        on_thought: Callable[[str, float | None], None] | None = None,
-    ) -> AgentRun:
-        """Continue a turn that stopped at the tool-call limit, with a fresh budget."""
-        self._require_key()
-        if not (self.stopped_for_limit or self.interrupted):
-            raise RuntimeError("Session is not stopped for the tool-call limit")
-        self.interrupted = True
-        self._autosave(force=True)
-        return self._advance(on_step, on_phase, on_thought)
-
-    def _advance(
-        self,
-        on_step: Callable[[AgentStep], None] | None,
-        on_phase: Callable[[str, str | None], None] | None,
-        on_thought: Callable[[str, float | None], None] | None,
-    ) -> AgentRun:
-        """Advance the history one turn; usage of a failed turn is still counted.
-
-        When the model raises, the work collected before the failure
-        (``agent.partial_run``) is accounted like a finished run and the same
-        exception propagates.
-        """
-        self._turn_no += 1
-        try:
-            run = self.agent.advance(
-                self.messages,
-                on_step=on_step,
-                on_phase=self._autosaving_phase(on_phase),
-                on_thought=on_thought,
-                should_cancel=self._should_cancel,
+    def ask_permission(
+        self, request: PermissionRequest, emit: Callable[[dict[str, Any]], None]
+    ) -> PermissionDecision:
+        slot: list[object] = [threading.Event(), PermissionDecision(decision="deny")]
+        with self.permission_lock:
+            if self.yolo_enabled:
+                return PermissionDecision(decision="allow")
+            if self.cancel_event.is_set():
+                return PermissionDecision(decision="deny", reason="cancelled by the user")
+            self.permission_slots[request.id] = slot
+            emit(
+                {
+                    "type": "permission_request",
+                    "id": request.id,
+                    "tool": request.tool,
+                    "summary": request.summary,
+                    "preview": request.preview,
+                    "preview_kind": request.preview_kind,
+                    "arguments": request.arguments,
+                }
             )
-        except BaseException:
-            partial = self.agent.partial_run
-            if partial is not None:
-                # Accounting must never replace the failure being reported.
-                with contextlib.suppress(Exception):
-                    self._note(partial)
-            raise
-        self.stopped_for_limit = run.stopped_for_limit
-        self.interrupted = False
-        self._note(run)
-        self._capture_analysis(run)
-        return run
+        assert isinstance(slot[0], threading.Event)
+        slot[0].wait(PERMISSION_TIMEOUT)
+        with self.permission_lock:
+            self.permission_slots.pop(request.id, None)
+        assert isinstance(slot[1], PermissionDecision)
+        return slot[1]
+
+    def resolve_permission(
+        self, request_id: str, allow: bool | PermissionDecision, *, reason: str | None = None
+    ) -> bool:
+        decision = (
+            allow
+            if isinstance(allow, PermissionDecision)
+            else PermissionDecision(
+                decision="allow" if allow else "deny", reason=reason if not allow else None
+            )
+        )
+        with self.permission_lock:
+            if (slot := self.permission_slots.get(request_id)) is None:
+                return False
+            slot[1] = decision
+            assert isinstance(slot[0], threading.Event)
+            slot[0].set()
+        return True
 
     def _should_cancel(self) -> bool:
         quit_turn = self.quit_turn
@@ -334,13 +346,123 @@ class AgentSession:
         with contextlib.suppress(Exception):
             self.save_state(only_if_dir_exists=True)
 
-    def compact(self) -> ContextCompaction:
-        """Halve the estimated context when possible, keeping protected messages.
+    def _record_call(
+        self, call: ModelCall, on_status: Callable[[dict[str, Any]], None] | None = None
+    ) -> None:
+        row = self._active_catalog_row()
+        apply_call(
+            self.totals,
+            call,
+            prompt_price=row.prompt_price if row else None,
+            completion_price=row.completion_price if row else None,
+            cache_read_price=row.cache_read_price if row else None,
+        )
+        timing = call.timing
+        audit_event(
+            self.agent.artifacts,
+            "model",
+            model=self.model_id or self.totals.model,
+            http_status=timing.http_status if timing else None,
+            duration_s=timing.elapsed_seconds if timing else None,
+            prompt_tokens=call.usage.prompt_tokens,
+            completion_tokens=call.usage.completion_tokens,
+        )
+        if on_status is not None:
+            on_status(self.status_snapshot())
 
-        The trigger is half the current estimate, passed as an explicit limit;
-        ``MAX_CONTEXT_TOKENS`` is never changed. The system prompt, project
-        instructions, the goal message and every real user message stay.
-        """
+    def _advance(
+        self,
+        *,
+        on_status: Callable[[dict[str, Any]], None] | None,
+        callbacks: dict[str, Any],
+    ) -> AgentRun:
+        self._turn_no += 1
+        self.cancel_event.clear()
+        self.apply_known_context_limit()
+        recorded_calls = 0
+
+        def handle_model_call(call: ModelCall) -> None:
+            nonlocal recorded_calls
+            recorded_calls += 1
+            self._record_call(call, on_status)
+
+        on_phase = callbacks.pop("on_phase", None)
+        try:
+            run = self.agent.advance(
+                self.messages,
+                on_phase=self._autosaving_phase(on_phase),
+                on_model_call=handle_model_call,
+                should_cancel=self._should_cancel,
+                cancel_event=self.cancel_event,
+                **callbacks,
+            )
+        except BaseException:
+            self._analysis_open = False
+            self._analysis_request, self._analysis_steps, self._analysis_response = "", [], ""
+            partial = self.agent.partial_run
+            if partial is not None:
+                with contextlib.suppress(Exception):
+                    for call in partial.calls[recorded_calls:]:
+                        self._record_call(call, None)
+            raise
+        for call in run.calls[recorded_calls:]:
+            self._record_call(call, on_status)
+        self.stopped_for_limit = run.stopped_for_limit
+        self.interrupted = False
+        if self._analysis_open:
+            self._analysis_steps.extend(successful_steps(run))
+            self._analysis_response = run.response
+            if not run.stopped_for_limit:
+                self._analysis_turns.append(
+                    AnalysisTurn(
+                        request=self._analysis_request,
+                        response=self._analysis_response,
+                        steps=list(self._analysis_steps),
+                    )
+                )
+                self._analysis_open = False
+                self._analysis_request, self._analysis_steps, self._analysis_response = "", [], ""
+        return run
+
+    def turn(
+        self,
+        request: str,
+        *,
+        images: Sequence[str] = (),
+        on_status: Callable[[dict[str, Any]], None] | None = None,
+        **callbacks: Any,
+    ) -> AgentRun:
+        """Append the user message and advance the shared history one turn."""
+        if not self.key_set:
+            raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
+        msg = ChatMessage(role=Role.USER, content=request)
+        if images:
+            msg.images = ingest_images(self.agent.artifacts, list(images))
+        (
+            self._analysis_open,
+            self._analysis_request,
+            self._analysis_steps,
+            self._analysis_response,
+        ) = (True, request, [], "")
+        self.messages.append(msg)
+        self.interrupted = True
+        self._autosave(force=True)
+        return self._advance(on_status=on_status, callbacks=callbacks)
+
+    def resume(
+        self, *, on_status: Callable[[dict[str, Any]], None] | None = None, **callbacks: Any
+    ) -> AgentRun:
+        """Continue a turn that stopped at the tool-call limit or was interrupted."""
+        if not self.key_set:
+            raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
+        if not (self.stopped_for_limit or self.interrupted):
+            raise RuntimeError("Session is not stopped for the tool-call limit")
+        self.interrupted = True
+        self._autosave(force=True)
+        return self._advance(on_status=on_status, callbacks=callbacks)
+
+    def compact(self) -> ContextCompaction:
+        """Halve the estimated context when possible, keeping protected messages."""
         limit = max(1, _estimate_tokens(self.messages) // 2)
         change = _compact(self.messages, root=self.agent.artifacts.root, limit=limit)
         if change.occurred:
@@ -348,142 +470,76 @@ class AgentSession:
         return change
 
     def start_fresh(self) -> None:
-        """Start a new conversation without reopening the process.
-
-        History and running totals return to their initial state. A skill
-        applied during this conversation leaves with that history. The skill
-        catalog on the system prompt stays. Project instructions are loaded
-        again from the project root after writes move; they are not copied
-        from the previous transcript. The session goal is cleared with the
-        conversation. The current model id and context window are kept, and
-        writes move to a new session artifact directory inside the same
-        workspace. Reads keep the previous read root, so this never widens
-        write access to the workspace.
-        """
+        """Start a new conversation without reopening the process."""
         _stop_jobs("new conversation")
         old_id = self.session_id
-        self.goal = ""
-        self._goal_message = None
-        self.active_skills = []
+        self.goal, self._goal_message, self.active_skills = "", None, []
         self.stopped_for_limit = False
         self.interrupted = False
         self._last_autosave = None
+        self.agent.session_allowed_tools.clear()
         self.totals = SessionTotals(
-            model=self.model_id or self.totals.model,
-            context_limit=self.totals.context_limit,
+            model=self.model_id or self.totals.model, context_limit=self.totals.context_limit
         )
-        self._clear_analysis()
+        self._analysis_turns, self._analysis_open = [], False
+        self._analysis_request, self._analysis_steps, self._analysis_response = "", [], ""
         if self.workspace is not None:
-            session_id = _remember_session(self.workspace, self.model_id)
-            self.session_id = session_id
-            artifact_root = project_artifact_dir(self.workspace, session_id)
-            self.agent.artifacts = LocalArtifactStore(self.workspace, artifact_root=artifact_root)
-            if isinstance(old_id, str) and old_id != session_id:
+            self.session_id = _remember_session(self.workspace, self.model_id)
+            self.agent.artifacts = LocalArtifactStore(
+                self.workspace,
+                artifact_root=layout.project_artifact_dir(self.workspace, self.session_id),
+            )
+            if isinstance(old_id, str) and old_id != self.session_id:
                 discard_unused_session(self.workspace, old_id)
         self.messages = self.agent.opening_messages()
 
+    def _goal_index(self) -> int | None:
+        if self._goal_message is None:
+            return None
+        for idx, message in enumerate(self.messages):
+            if message is self._goal_message:
+                return idx
+        return None
+
     def set_goal(self, text: str) -> None:
-        """Remember ``text`` as the session goal the model sees on later turns.
-
-        Surrounding whitespace is removed. The stored goal must be at most
-        2,000 characters. The goal is conversation text placed after the
-        system prompt and any project instructions, wrapped in
-        ``<session_goal>`` tags. It does not register a tool and it does not
-        change the store roots.
-
-        The goal is the message object this session inserted. A user turn is
-        left alone even when its text looks like a goal. Setting the goal
-        after a turn has already run inserts that message directly before
-        the earlier user turn. The model then sees two user messages in a
-        row, and Atlas does not merge them.
-
-        Raises:
-            ValueError: ``text`` is empty after stripping whitespace, or
-                longer than 2,000 characters.
-        """
         cleaned = text.strip()
         if not cleaned:
             raise ValueError("goal text must be a non-empty string")
         if len(cleaned) > _GOAL_MAX_CHARS:
-            raise ValueError(_GOAL_TOO_LONG)
+            raise ValueError(f"goal text must be at most {_GOAL_MAX_CHARS} characters")
         self.goal = cleaned
         self._place_goal_message()
 
     def clear_goal(self) -> None:
-        """Drop the session goal so later turns do not see it."""
         self.goal = ""
-        index = self._goal_index()
-        if index is not None:
-            del self.messages[index]
+        if (idx := self._goal_index()) is not None:
+            del self.messages[idx]
         self._goal_message = None
 
     def _place_goal_message(self) -> None:
         content = session_goal_text(self.goal)
-        index = self._goal_index()
-        if index is None:
-            message = ChatMessage(role=Role.USER, content=content)
-            self._goal_message = message
-            self.messages.insert(self._context_end(), message)
+        if (idx := self._goal_index()) is not None:
+            self.messages[idx].content = content
             return
-        self.messages[index].content = content
-
-    def _goal_index(self) -> int | None:
-        """Return the index of the goal message this session placed.
-
-        The match is the message object. A user turn is not selected because
-        its text looks like a goal.
-        """
-        target = self._goal_message
-        if target is None:
-            return None
-        for index, message in enumerate(self.messages):
-            if message is target:
-                return index
-        return None
-
-    def _context_end(self) -> int:
-        """Return the index after the system prompt and project instructions."""
-        if not self.messages or self.messages[0].role != Role.SYSTEM:
-            return 0
-        end = 1
-        if len(self.messages) > 1:
-            content = self.messages[1].content or ""
-            if content.startswith(_PROJECT_INSTRUCTION_PREFIX):
-                end = 2
-        return end
+        self._goal_message = ChatMessage(role=Role.USER, content=content)
+        end = 0
+        if self.messages and self.messages[0].role == Role.SYSTEM:
+            end = (
+                2
+                if len(self.messages) > 1
+                and (self.messages[1].content or "").startswith(_PROJECT_INSTRUCTION_PREFIX)
+                else 1
+            )
+        self.messages.insert(end, self._goal_message)
 
     def use_skill(self, name: str, argument: str | None = None) -> Skill:
-        """Apply a named skill for later turns in this conversation.
-
-        The name is looked up in the catalog loaded at session start
-        (``self.agent.skills``). A skill written after that catalog was built
-        is not available. The first activation re-reads the file and refuses
-        it when the bytes changed, then appends the tool text as a user
-        message. A later activation of the same skill appends only a new
-        ``Argument:`` line. The system prompt stays the catalog.
-
-        Args:
-            name: Skill name from the catalog, matched with
-                :func:`atlas.agent.skill_author.normalize_skill_name`.
-            argument: Optional text from the user, kept outside the skill body.
-
-        Returns:
-            The skill that was activated.
-
-        Raises:
-            ValueError: ``name`` is empty, fails
-                :func:`atlas.agent.skill_author.normalize_skill_name`, the
-                file changed, or it cannot be parsed.
-            FileNotFoundError: No skill with that name is in the catalog.
-        """
-        cleaned = name.strip()
-        if not cleaned:
+        if not (cleaned := name.strip()):
             raise ValueError("skill name must be a non-empty string")
         requested, errors = normalize_skill_name(cleaned)
         if requested is None or errors:
             raise ValueError("; ".join(errors))
         skills = list(self.agent.skills)
-        skill = next((item for item in skills if item.name == requested), None)
+        skill = next((s for s in skills if s.name == requested), None)
         if skill is None:
             raise FileNotFoundError(f"Skill {requested} is missing")
         extra = argument.strip() if isinstance(argument, str) else ""
@@ -491,90 +547,57 @@ class AgentSession:
             if extra:
                 self.messages.append(ChatMessage(role=Role.USER, content=f"Argument: {extra}"))
             return skill
-        registry = ToolRegistry()
-        register_skill_tool(registry, skills)
-        result = registry.execute("use_skill", {"name": requested}, self.agent.artifacts)
-        content = result.text
-        if extra:
-            content = f"{content}\n\nArgument: {extra}"
+        reg = ToolRegistry()
+        register_skill_tool(reg, skills)
+        result = reg.execute("use_skill", {"name": requested}, self.agent.artifacts)
+        content = f"{result.text}\n\nArgument: {extra}" if extra else result.text
         self.messages.append(ChatMessage(role=Role.USER, content=content))
         self.active_skills.append(skill.name)
         return skill
 
     def save_state(self, *, only_if_dir_exists: bool = False) -> None:
-        """Write this conversation to ``.atlas/sessions/<id>/state.json``.
-
-        The file holds the model id, the goal, the message history, and the
-        running totals, so reopening the session restores the region, the
-        dates, the earlier results, and the spend. Image bytes and known
-        secrets are removed before the write; a resumed session re-reads
-        artifacts from the workspace instead of carrying base64 again.
-        """
+        """Write this conversation to ``.atlas/sessions/<id>/state.json``."""
         if self.workspace is None or self.session_id is None:
             return
-        directory = project_session_dir(self.workspace, self.session_id)
+        directory = layout.project_session_dir(self.workspace, self.session_id)
         if only_if_dir_exists and not directory.is_dir():
             return
         directory.mkdir(parents=True, exist_ok=True)
         snapshot = list(self.messages)
-        messages = []
-        for message in snapshot:
-            dumped = message.model_dump(mode="json")
-            dumped["images"] = []
-            messages.append(dumped)
+        saved_at = datetime.now(UTC).isoformat()
         payload = {
             "id": self.session_id,
             "model": self.model_id,
             "goal": self.goal,
-            "messages": messages,
+            "active_skills": list(self.active_skills),
+            "messages": [{**m.model_dump(mode="json"), "images": []} for m in snapshot],
             "totals": self.totals.model_dump(mode="json"),
-            "saved": datetime.now(UTC).isoformat(),
+            "saved": saved_at,
             "interrupted": self.interrupted,
             "stopped_for_limit": self.stopped_for_limit,
         }
-        text = json.dumps(payload, indent=2)
-        for secret in self.secrets:
-            if secret:
-                text = text.replace(secret, "[redacted]")
-        target = directory / "state.json"
-        temporary = directory / ".state.json.tmp"
-        temporary.write_text(text + "\n", encoding="utf-8")
-        os.replace(temporary, target)
-        prompt = first_prompt(snapshot)
-        for secret in self.secrets:
-            if secret:
-                prompt = prompt.replace(secret, "[redacted]")
+        text = redact_text(json.dumps(payload, indent=2), self.secrets)
+        temp = directory / ".state.json.tmp"
+        temp.write_text(text + "\n", encoding="utf-8")
+        os.replace(temp, directory / "state.json")
+        prompt = redact_text(first_prompt(snapshot), self.secrets)
         with contextlib.suppress(OSError):
             write_meta(
                 directory,
                 session_id=self.session_id,
                 model=self.model_id,
                 messages=sum(1 for item in snapshot if item.role is not Role.SYSTEM),
-                saved=str(payload["saved"]),
+                saved=saved_at,
                 interrupted=self.interrupted,
                 stopped_for_limit=self.stopped_for_limit,
                 prompt=prompt,
             )
 
     def load_state(self, session_id: str, *, adopt_model: bool = True) -> bool:
-        """Restore a saved conversation into this session.
-
-        Args:
-            session_id: Directory name under ``.atlas/sessions``.
-            adopt_model: Take the saved model id; False keeps the current one.
-
-        Returns:
-            True when a saved state was loaded. A missing file leaves the
-            session untouched and returns False.
-
-        Raises:
-            ValueError: The saved state is not valid JSON or does not match
-                the message schema.
-        """
+        """Restore a saved conversation and rebind model, goal, skills, and artifact store."""
         if self.workspace is None:
             return False
-        directory = project_session_dir(self.workspace, session_id)
-        path = directory / "state.json"
+        path = layout.project_session_dir(self.workspace, session_id) / "state.json"
         if not path.is_file():
             return False
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -585,108 +608,111 @@ class AgentSession:
         self.session_id = session_id
         self.messages = messages
         self.goal = str(payload.get("goal") or "")
-        totals = payload.get("totals")
-        if isinstance(totals, dict):
+        raw_skills = payload.get("active_skills")
+        self.active_skills = (
+            [s for s in raw_skills if isinstance(s, str)] if isinstance(raw_skills, list) else []
+        )
+        if isinstance(totals := payload.get("totals"), dict):
             self.totals = SessionTotals.model_validate(totals)
-        model = payload.get("model")
-        if adopt_model and isinstance(model, str) and model.strip():
+        if adopt_model and isinstance(model := payload.get("model"), str) and model.strip():
             self.model_id = model.strip()
             self.totals.model = self.model_id
-        artifact_root = project_artifact_dir(self.workspace, session_id)
-        self.agent.artifacts = LocalArtifactStore(self.workspace, artifact_root=artifact_root)
+            if (cfg := getattr(self.agent.model, "config", None)) is not None:
+                cfg.model = self.model_id
+        self.agent.context_limit = self.totals.context_limit
+        self.agent.artifacts = LocalArtifactStore(
+            self.workspace, artifact_root=layout.project_artifact_dir(self.workspace, session_id)
+        )
         if messages and messages[0].role is Role.SYSTEM:
             messages[0] = self.agent.opening_messages()[0]
-        goal_text = session_goal_text(self.goal) if self.goal else None
-        self._goal_message = next(
-            (m for m in messages if goal_text and m.role is Role.USER and m.content == goal_text),
-            None,
-        )
+        self._goal_message = None
+        if self.goal:
+            expected = session_goal_text(self.goal)
+            matched = next(
+                (m for m in self.messages if m.role is Role.USER and m.content == expected),
+                None,
+            )
+            if matched is not None:
+                self._goal_message = matched
+            else:
+                self._place_goal_message()
         self.stopped_for_limit = bool(payload.get("stopped_for_limit"))
         self.interrupted = bool(payload.get("interrupted")) or inserted > 0
         last = messages[-1] if messages else None
         if last is not None and last.role is Role.ASSISTANT and not last.tool_calls:
             self.interrupted = False
         self._last_autosave = None
+        self.agent.session_allowed_tools.clear()
+        self._analysis_turns, self._analysis_open = [], False
         return True
 
-    def ask_permission(self, request: Any, emit: Callable[[dict[str, Any]], None]) -> bool:
-        """Ask the interface to approve one mutating call.
+    def replay_messages(
+        self, *, limit: int | None = None, max_chars: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Build v2 ``session_loaded.messages`` replay items from ``self.messages``."""
+        items, _ = self.replay_items_with_omitted(limit=limit, max_chars=max_chars)
+        return items
 
-        The request is written to the client, then this call blocks until a
-        matching ``permission`` message arrives or :data:`PERMISSION_TIMEOUT`
-        seconds pass. A timeout is a refusal, so an unattended session fails
-        closed.
+    def replay_items_with_omitted(
+        self, *, limit: int | None = 40, max_chars: int | None = 1500
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Build v2 replay items plus the count of omitted earlier items."""
+        calls_by_id = {c.id: c for m in self.messages for c in m.tool_calls}
+        items: list[dict[str, Any]] = []
 
-        Args:
-            request: ``PermissionRequest`` from the runtime.
-            emit: Callback that writes one protocol event.
+        def clip(text: str) -> str:
+            if max_chars is None or len(text) <= max_chars:
+                return text
+            return text[: max(0, max_chars - 3)] + "..."
 
-        Returns:
-            True when the person allowed the call.
-        """
-        slot: list[object] = [threading.Event(), False]
-        with self.permission_lock:
-            # A toggle can arrive after the runtime chose to ask but before
-            # this callback registers its wait. Publish both transitions and
-            # requests under the same lock so the client sees their order.
-            if self.yolo_enabled:
-                return True
-            self.permission_slots[request.id] = slot
-            emit(
-                {
-                    "type": "permission_request",
-                    "id": request.id,
-                    "tool": request.tool,
-                    "summary": request.summary,
-                    "preview": request.preview,
-                }
-            )
-        event = slot[0]
-        assert isinstance(event, threading.Event)
-        event.wait(PERMISSION_TIMEOUT)
-        with self.permission_lock:
-            self.permission_slots.pop(request.id, None)
-        return bool(slot[1])
-
-    def resolve_permission(self, request_id: str, allow: bool) -> bool:
-        """Record an approval answer and wake the waiting turn."""
-        with self.permission_lock:
-            slot = self.permission_slots.get(request_id)
-            if slot is None:
-                return False
-            slot[1] = allow
-            event = slot[0]
-            assert isinstance(event, threading.Event)
-            event.set()
-        return True
-
-    def _cancel_event_clear(self) -> None:
-        self.cancel_event.clear()
-
-    def _require_key(self) -> None:
-        if self.requires_api_key and not (self.active_key and self.active_key.strip()):
-            raise MissingOpenRouterKey(MISSING_KEY_MESSAGE)
-
-    def _note(self, run: AgentRun) -> None:
-        prompt_price, completion_price, cache_read_price = _catalog_prices(self)
-        for call in run.calls:
-            apply_call(
-                self.totals,
-                call,
-                prompt_price=prompt_price,
-                completion_price=completion_price,
-                cache_read_price=cache_read_price,
-            )
-            timing = call.timing
-            audit_event(
-                self.agent.artifacts,
-                "model",
-                model=self.model_id or self.totals.model,
-                http_status=timing.http_status if timing else None,
-                duration_s=timing.elapsed_seconds if timing else None,
-                prompt_tokens=call.usage.prompt_tokens,
-                completion_tokens=call.usage.completion_tokens,
-            )
+        for msg in self.messages:
+            if msg.role is Role.SYSTEM or msg.tool_observation:
+                continue
+            if msg.role is Role.USER:
+                text = msg.content or ""
+                if (
+                    msg is self._goal_message
+                    or not text
+                    or text.startswith(_PROJECT_INSTRUCTION_PREFIX)
+                ):
+                    continue
+                items.append({"role": "user", "text": clip(text)})
+            elif msg.role is Role.ASSISTANT:
+                if msg.reasoning:
+                    items.append({"role": "thought", "text": clip(msg.reasoning)})
+                if msg.content:
+                    items.append({"role": "assistant", "text": clip(msg.content)})
+            elif msg.role is Role.TOOL:
+                call = calls_by_id.get(msg.tool_call_id or "")
+                name = call.name if call else "tool"
+                summary = tool_summary(call) if call else name
+                raw, ok, text, diff = msg.content or "", True, msg.content or "", None
+                try:
+                    res = ToolResult.model_validate_json(raw)
+                    text, diff = res.text, res.diff
+                    if res.summary:
+                        summary = res.summary
+                except Exception:
+                    try:
+                        err = json.loads(raw)
+                        if isinstance(err, dict) and "error" in err:
+                            ok, text = False, str(err.get("error") or "")
+                    except ValueError:
+                        pass
+                items.append(
+                    {
+                        "role": "tool",
+                        "text": clip(text),
+                        "name": name,
+                        "summary": summary,
+                        "ok": ok,
+                        "diff": clip(diff) if diff is not None else None,
+                    }
+                )
+        if limit is not None and len(items) > limit:
+            omitted = len(items) - limit
+            return items[-limit:], omitted
+        return items, 0
 
     def save_finished_skill(
         self,
@@ -696,7 +722,6 @@ class AgentSession:
         replace: bool = False,
         scope: str = "project",
     ) -> SavedSkill:
-        """Save the finished analysis as a draft in the shared drafts directory."""
         if self._analysis_open:
             raise SkillSaveError("analysis is not finished")
         if not self._analysis_turns:
@@ -714,9 +739,21 @@ class AgentSession:
             home=self.home,
         )
 
+    def default_skill_name(self) -> str:
+        if self._analysis_turns and (words := self._analysis_turns[0].request.strip().split()[:4]):
+            try:
+                return skill_slug(" ".join(words))
+            except SkillSaveError:
+                pass
+        return "saved-analysis"
+
     def preview_saved_skill(self, name: str, *, scope: str = "project") -> SkillPreview:
-        """Show a draft's description and body hash without promoting it."""
-        self._require_user_skills(scope)
+        if scope == "user" and (
+            self.workspace is None or not load_home_skills_enabled(self.workspace)
+        ):
+            raise SkillSaveError(
+                "home skills are off; set ATLAS_HOME_SKILLS or home_skills = true in ~/.atlas/config.toml"
+            )
         if self.workspace is None:
             raise SkillSaveError("project scope needs a workspace")
         slug = skill_slug(name)
@@ -725,1358 +762,116 @@ class AgentSession:
         return preview
 
     def enable_saved_skill(
-        self,
-        name: str,
-        expected_sha256: str,
-        *,
-        scope: str = "project",
+        self, name: str, expected_sha256: str, *, scope: str = "project"
     ) -> SavedSkill:
-        """Move a previewed draft into the live skills directory.
-
-        ``expected_sha256`` is the digest from :meth:`preview_saved_skill`, or
-        its first eight hex characters. Enabling without that preview is refused.
-        """
-        self._require_user_skills(scope)
+        if scope == "user" and (
+            self.workspace is None or not load_home_skills_enabled(self.workspace)
+        ):
+            raise SkillSaveError(
+                "home skills are off; set ATLAS_HOME_SKILLS or home_skills = true in ~/.atlas/config.toml"
+            )
         if self.workspace is None:
             raise SkillSaveError("project scope needs a workspace")
         slug = skill_slug(name)
-        full_hash = self._expected_preview_hash(slug, scope, expected_sha256)
-        saved = enable_skill(
-            self.workspace,
-            slug,
-            full_hash,
-            scope=scope,
-            home=self.home,
-        )
+        if (stored := self._skill_previews.get((slug, scope))) is None:
+            raise SkillSaveError("enable needs a preview")
+        token = expected_sha256.strip().lower()
+        if token != stored and not (len(token) == 8 and stored.startswith(token)):
+            raise SkillSaveError("skill hash does not match the preview")
+        saved = enable_skill(self.workspace, slug, stored, scope=scope, home=self.home)
         self._skill_previews.pop((saved.name, scope), None)
         self.skill_catalog_note = _add_enabled_skill(self, saved.name, scope)
         return saved
 
-    def _expected_preview_hash(self, name: str, scope: str, presented: str) -> str:
-        stored = self._skill_previews.get((name, scope))
-        if stored is None:
-            raise SkillSaveError("enable needs a preview")
-        token = presented.strip().lower()
-        if token != stored and not (len(token) == 8 and stored.startswith(token)):
-            raise SkillSaveError("skill hash does not match the preview")
-        return stored
-
-    def _require_user_skills(self, scope: str) -> None:
-        if scope != "user":
-            return
-        if self.workspace is None or not load_home_skills_enabled(self.workspace):
-            raise SkillSaveError(
-                "home skills are off; set ATLAS_HOME_SKILLS or home_skills = true "
-                "in ~/.atlas/config.toml"
-            )
-
-    def _begin_analysis(self, request: str) -> None:
-        # A turn that stopped for the tool-call limit is not finished.
-        # Starting another turn drops it instead of recording it.
-        self._analysis_open = True
-        self._analysis_request = request
-        self._analysis_steps = []
-        self._analysis_response = ""
-
-    def _capture_analysis(self, run: AgentRun) -> None:
-        if not self._analysis_open:
-            return
-        self._analysis_steps.extend(successful_steps(run))
-        self._analysis_response = run.response
-        if run.stopped_for_limit:
-            return
-        self._analysis_turns.append(
-            AnalysisTurn(
-                request=self._analysis_request,
-                response=self._analysis_response,
-                steps=list(self._analysis_steps),
-            )
-        )
-        self._analysis_open = False
-        self._analysis_request = ""
-        self._analysis_steps = []
-        self._analysis_response = ""
-
-    def _clear_analysis(self) -> None:
-        self._analysis_turns = []
-        self._analysis_open = False
-        self._analysis_request = ""
-        self._analysis_steps = []
-        self._analysis_response = ""
-
-
-PERMISSION_TIMEOUT = 300.0
-
-
-def _write_line(stdout: IO[str], payload: dict[str, Any], secrets: list[str]) -> None:
-    text = json.dumps(_redact_value(payload, secrets), ensure_ascii=False)
-    with _STDOUT_LOCK:
-        stdout.write(text + "\n")
-        stdout.flush()
-
-
-def redact_value(value: Any, secrets: list[str]) -> Any:
-    if isinstance(value, str):
-        for secret in secrets:
-            if secret:
-                value = value.replace(secret, _REDACTED)
-        return value
-    if isinstance(value, dict):
-        return {key: _redact_value(item, secrets) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_value(item, secrets) for item in value]
-    return value
-
-
-def step_event(step: AgentStep) -> dict[str, Any]:
-    result = step.result
-    return {
-        "type": "step",
-        "name": step.call.name,
-        "call_id": step.call.id,
-        "arguments": step.call.arguments,
-        "ok": result is not None,
-        "text": result.text if result is not None else None,
-        "error": step.error,
-        "error_kind": step.error_kind,
-        "artifacts": result.artifacts if result is not None else [],
-        "notes": step.notes,
-        "summary": _safe_summary(step),
-    }
-
-
-@contextlib.contextmanager
-def session_bound(session: AgentSession) -> Iterator[None]:
-    """Bind the session credential and secret maps for the duration of the block."""
-    bind_session_credentials(session.credential_keys)
-    bind_session_secrets(session.secrets)
-    quiet_http_client_logs()
-    try:
-        yield
-    finally:
-        unbind_session_credentials()
-        unbind_session_secrets()
-
-
-def _safe_summary(step: AgentStep) -> str:
-    try:
-        return call_summary(step.call.name, step.call.arguments)
-    except Exception:
-        return ""
-
-
-def _stop_jobs(reason: str) -> None:
-    """Stop background bash jobs this process started; never raises."""
-    with contextlib.suppress(Exception):
-        from atlas.agent.tools._jobs import stop_all
-
-        stop_all(reason)
-
-
-def serve(
-    session: AgentSession,
-    stdin: IO[str],
-    stdout: IO[str],
-    *,
-    redact: str | None = None,
-) -> int:
-    """Run the line-delimited JSON protocol until EOF or ``quit``.
-
-    Recoverable problems are reported as ``error`` events and the loop keeps
-    reading; only ``quit`` (or EOF) ends the session. Key material in
-    ``redact`` and in ``session.secrets`` is replaced before a line is written.
-    """
-    if redact and redact not in session.secrets:
-        session.secrets.append(redact)
-    session.agent.on_permission = lambda request: session.ask_permission(
-        request,
-        lambda event: _write_line(stdout, event, session.secrets),
-    )
-    with session_bound(session):
-        _remember_resolved_credentials(session)
-        try:
-            code = _serve_bound(session, stdin, stdout)
-        finally:
-            _stop_jobs("session ended")
-        if session.has_conversation():
-            with contextlib.suppress(Exception):
-                session.save_state(only_if_dir_exists=True)
-        return code
-
-
-def _serve_bound(session: AgentSession, stdin: IO[str], stdout: IO[str]) -> int:
-    """Read the protocol after the session credential map is bound."""
-    _write_line(stdout, _ready_event(session), session.secrets)
-    if session.loaded_at_launch:
-        session.loaded_at_launch = False
-        _write_line(stdout, _session_loaded_event(session), session.secrets)
-    lines: queue.Queue[str | None] = queue.Queue()
-    reader = threading.Thread(
-        target=_read_protocol, args=(stdin, lines, session, stdout), daemon=True
-    )
-    reader.start()
-    while True:
-        line = lines.get()
-        if line is None:
-            break
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            message = json.loads(stripped)
-        except json.JSONDecodeError:
-            _write_line(stdout, {"type": "error", "message": "Invalid JSON input"}, session.secrets)
-            continue
-        if not isinstance(message, dict):
-            _write_line(
-                stdout, {"type": "error", "message": "Expected a JSON object"}, session.secrets
-            )
-            continue
-        kind = message.get("type")
-        if kind == "quit":
-            _join_catalog_fetch(session)
-            return 0
-        if kind == "user":
-            _handle_user(session, stdout, message)
-            continue
-        if kind == "resume":
-            _handle_resume(session, stdout)
-            continue
-        if kind == "compact":
-            _handle_compact(session, stdout)
-            continue
-        if kind == "undo":
-            _handle_undo(session, stdout)
-            continue
-        if kind == "load_session":
-            _handle_load_session(session, stdout, message)
-            continue
-        if kind == "new":
-            _handle_new(session, stdout)
-            continue
-        if kind == "goal":
-            _handle_goal(session, stdout, message)
-            continue
-        if kind == "skill":
-            _handle_skill(session, stdout, message)
-            continue
-        if kind == "models":
-            _handle_models(session, stdout)
-            continue
-        if kind == "select_model":
-            _handle_select_model(session, stdout, message)
-            continue
-        if kind == "set_key":
-            _handle_set_key(session, stdout, message)
-            continue
-        if kind == "delete_key":
-            _handle_delete_key(session, stdout, message)
-            continue
-        if kind == "list":
-            _handle_list(session, stdout, message)
-            continue
-        if kind == "remove":
-            _handle_remove(session, stdout, message)
-            continue
-        if kind == "save_skill":
-            _handle_save_skill(session, stdout, message)
-            continue
-        if kind == "enable_skill":
-            _handle_enable_skill(session, stdout, message)
-            continue
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"Unknown message type: {kind!r}"},
-            session.secrets,
-        )
-    reader.join(timeout=1)
-    _join_catalog_fetch(session)
-    return 0
-
-
-def _read_protocol(
-    stdin: IO[str], lines: queue.Queue[str | None], session: AgentSession, stdout: IO[str]
-) -> None:
-    """Forward protocol lines and handle turn controls without waiting for a turn.
-
-    A ``cancel`` message is consumed here rather than queued, because the
-    session loop is blocked inside a turn when one arrives. Approval answers
-    and YOLO toggles also run here so a pending prompt can be released.
-    """
-    for line in stdin:
-        text = line.strip()
-        if not text:
-            continue
-        try:
-            message = json.loads(text)
-        except json.JSONDecodeError:
-            lines.put(text)
-            continue
-        if isinstance(message, dict) and message.get("type") == "cancel":
-            session.cancel_event.set()
-            continue
-        if isinstance(message, dict) and message.get("type") == "quit":
-            session.quit_turn = session._turn_no
-            lines.put(text)
-            return
-        if isinstance(message, dict) and message.get("type") == "permission":
-            request_id = message.get("id")
-            if isinstance(request_id, str):
-                session.resolve_permission(request_id, bool(message.get("allow")))
-            continue
-        if isinstance(message, dict) and message.get("type") == "yolo":
-            session.toggle_yolo(lambda event: _write_line(stdout, event, session.secrets))
-            continue
-        lines.put(text)
-    lines.put(None)
-
-
-def _handle_user(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
-    text = message.get("text")
-    if not isinstance(text, str) or not text:
-        _write_line(
-            stdout,
-            {"type": "error", "message": "user text must be a non-empty string"},
-            session.secrets,
-        )
-        return
-    on_step = _step_writer(stdout, session.secrets)
-    on_phase = _phase_writer(stdout, session.secrets)
-    on_thought = _thought_writer(stdout, session.secrets)
-    try:
-        run = session.turn(text, on_step=on_step, on_phase=on_phase, on_thought=on_thought)
-    except MissingOpenRouterKey as exc:
-        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
-        return
-    except KeyboardInterrupt:
-        _save_after_failure(session)
-        raise
-    except OpenRouterHTTPError as exc:
-        _save_after_failure(session)
-        _write_http_error(session, stdout, exc)
-        return
-    except Exception as exc:
-        _save_after_failure(session)
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
-            session.secrets,
-        )
-        return
-    session.save_state()
-    _write_line(stdout, _done_event(session, run), session.secrets)
-
-
-def _save_after_failure(session: AgentSession) -> None:
-    """Persist history appended before a failed turn; a save error never masks the cause."""
-    with contextlib.suppress(Exception):
-        session.save_state()
-
-
-def _handle_compact(session: AgentSession, stdout: IO[str]) -> None:
-    """Compact the history on request and report the result."""
-    try:
-        compaction = session.compact()
-        session.save_state()
-    except Exception as exc:
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
-            session.secrets,
-        )
-        return
-    payload: dict[str, Any] = {"type": "compacted", "compaction": compaction.model_dump()}
-    payload.update(_status_fields(session))
-    _write_line(stdout, payload, session.secrets)
-
-
-def _handle_resume(session: AgentSession, stdout: IO[str]) -> None:
-    on_step = _step_writer(stdout, session.secrets)
-    on_phase = _phase_writer(stdout, session.secrets)
-    on_thought = _thought_writer(stdout, session.secrets)
-    try:
-        run = session.resume(on_step=on_step, on_phase=on_phase, on_thought=on_thought)
-    except MissingOpenRouterKey as exc:
-        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
-        return
-    except KeyboardInterrupt:
-        _save_after_failure(session)
-        raise
-    except OpenRouterHTTPError as exc:
-        _save_after_failure(session)
-        _write_http_error(session, stdout, exc)
-        return
-    except Exception as exc:
-        _save_after_failure(session)
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
-            session.secrets,
-        )
-        return
-    session.save_state()
-    _write_line(stdout, _done_event(session, run), session.secrets)
-
-
-def _handle_undo(session: AgentSession, stdout: IO[str]) -> None:
-    """Restore the newest checkpointed file and report which one."""
-    restored = restore_latest(session.agent.artifacts)
-    if restored is None:
-        _write_line(
-            stdout,
-            {"type": "undo", "restored": None, "message": "no checkpoint to restore"},
-            session.secrets,
-        )
-        return
-    _write_line(stdout, {"type": "undo", "restored": restored}, session.secrets)
-
-
-def _handle_load_session(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
-    """Restore a saved conversation by id and report the restored state."""
-    session_id = message.get("id")
-    if not isinstance(session_id, str) or not session_id.strip():
-        _write_line(
-            stdout,
-            {"type": "error", "message": "session id must be a non-empty string"},
-            session.secrets,
-        )
-        return
-    wanted = session_id.strip()
-    previous = session.session_id
-    if wanted == "last" and session.workspace is not None:
-        newest = newest_session(session.workspace, exclude=previous)
-        if newest is None:
-            _write_line(stdout, {"type": "error", "message": "No saved session"}, session.secrets)
-            return
-        wanted = newest
-    try:
-        loaded = session.load_state(wanted)
-    except (OSError, ValueError, ValidationError) as exc:
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"Could not reopen session: {exc}"},
-            session.secrets,
-        )
-        return
-    if not loaded:
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"No saved session {wanted}"},
-            session.secrets,
-        )
-        return
-    if (
-        session.workspace is not None
-        and isinstance(previous, str)
-        and previous != session.session_id
-    ):
-        discard_unused_session(session.workspace, previous)
-    _write_line(stdout, _session_loaded_event(session), session.secrets)
-
-
-def _session_loaded_event(session: AgentSession) -> dict[str, Any]:
-    replay, omitted = replay_items(session.messages, limit=40, max_chars=1500)
-    return {
-        "type": "session_loaded",
-        "id": session.session_id,
-        "goal": session.goal,
-        "messages": len(session.messages),
-        "saved_model": session.model_id,
-        "stopped_for_limit": session.stopped_for_limit,
-        "interrupted": session.interrupted,
-        "replay": replay,
-        "omitted": omitted,
-        **_status_fields(session),
-    }
-
-
-def _handle_new(session: AgentSession, stdout: IO[str]) -> None:
-    """Start a fresh conversation and report the reset status."""
-    session.start_fresh()
-    _write_line(stdout, _ready_event(session), session.secrets)
-
-
-def _handle_goal(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
-    """Set, clear, or report the session goal without calling the model.
-
-    A payload with neither ``text`` nor ``clear`` reports the current goal.
-    ``clear`` true drops it. ``text`` sets it when the goal is within the
-    length limit. Any other combination is refused and leaves the goal
-    unchanged. A goal past that limit is an error and leaves the goal
-    unchanged.
-    """
-    has_clear = "clear" in message
-    has_text = "text" in message
-    if not has_clear and not has_text:
-        _write_line(stdout, _goal_event(session, cleared=False), session.secrets)
-        return
-    clear = message.get("clear")
-    text = message.get("text")
-    if has_clear and clear is not True:
-        _reject_goal(session, stdout)
-        return
-    if clear is True:
-        if has_text:
-            _reject_goal(session, stdout)
-            return
-        session.clear_goal()
-        _write_line(stdout, _goal_event(session, cleared=True), session.secrets)
-        return
-    if not isinstance(text, str) or not text.strip():
-        _reject_goal(session, stdout)
-        return
-    try:
-        session.set_goal(text)
-    except ValueError as exc:
-        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
-        return
-    _write_line(stdout, _goal_event(session, cleared=False), session.secrets)
-
-
-def _reject_goal(session: AgentSession, stdout: IO[str]) -> None:
-    _write_line(stdout, {"type": "error", "message": _GOAL_USAGE}, session.secrets)
-
-
-def _goal_event(session: AgentSession, *, cleared: bool) -> dict[str, Any]:
-    text = session.goal
-    if cleared:
-        message = _GOAL_CLEARED_MESSAGE
-    elif text:
-        message = text
-    else:
-        message = _NO_GOAL_MESSAGE
-    return {"type": "goal", "text": text, "cleared": cleared, "message": message}
-
-
-def _handle_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
-    """Apply a named skill without calling the model."""
-    name = message.get("name")
-    argument = message.get("argument")
-    if not isinstance(name, str) or not name.strip():
-        _write_line(
-            stdout,
-            {"type": "error", "message": "skill name must be a non-empty string"},
-            session.secrets,
-        )
-        return
-    if argument is not None and not isinstance(argument, str):
-        _write_line(
-            stdout,
-            {"type": "error", "message": "skill argument must be a string"},
-            session.secrets,
-        )
-        return
-    try:
-        skill = session.use_skill(name, argument if isinstance(argument, str) else None)
-    except OSError:
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"Skill {name.strip()} could not be read"},
-            session.secrets,
-        )
-        return
-    except (ValueError, ValidationError, KeyError) as exc:
-        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
-        return
-    _write_line(
-        stdout,
-        {
-            "type": "skill",
-            "name": skill.name,
-            "description": skill.description,
-            "location": skill.directory,
-            "active": list(session.active_skills),
-        },
-        session.secrets,
-    )
-
-
-def _handle_models(session: AgentSession, stdout: IO[str]) -> None:
-    """Start a catalog fetch. A failure leaves the selected model id unchanged.
-
-    A fresh cache hit is written immediately. Otherwise paging runs on a
-    background thread so the session loop can keep reading. The thread is
-    joined when the loop ends.
-    """
-    fetcher = session.fetch_models
-    if fetcher is None:
-        _write_line(
-            stdout,
-            {
-                "type": "models",
-                "ok": False,
-                "message": "model catalog is unavailable",
-                "models": [],
-            },
-            session.secrets,
-        )
-        return
-    key = _catalog_api_key(session)
-    cached = peek_model_catalog(key) if key else None
-    if cached is not None:
-        _publish_catalog(session, stdout, CatalogFetch(models=cached))
-        return
-    if session._catalog_inflight:
-        return
-    session._catalog_inflight = True
-    thread = threading.Thread(
-        target=_catalog_worker,
-        args=(session, stdout),
-        daemon=True,
-        name="atlas-model-catalog",
-    )
-    session._catalog_thread = thread
-    thread.start()
-
-
-def _catalog_worker(session: AgentSession, stdout: IO[str]) -> None:
-    try:
-        fetcher = session.fetch_models
-        if fetcher is None:
-            fetched = CatalogFetch(models=[], error="model catalog is unavailable")
-        else:
-            fetched = _coerce_catalog(fetcher())
-        _publish_catalog(session, stdout, fetched)
-    except Exception as exc:
-        _write_line(
-            stdout,
-            {"type": "models", "ok": False, "message": _public_error(exc), "models": []},
-            session.secrets,
-        )
-    finally:
-        session._catalog_inflight = False
-
-
-def _join_catalog_fetch(session: AgentSession) -> None:
-    thread = session._catalog_thread
-    if thread is not None and thread is not threading.current_thread():
-        thread.join(timeout=_CATALOG_TIME_LIMIT + 5)
-
-
-def _coerce_catalog(value: CatalogFetch | list[CatalogModel]) -> CatalogFetch:
-    if isinstance(value, CatalogFetch):
-        return value
-    return CatalogFetch(models=list(value))
-
-
-def _include_selected_model(
-    session: AgentSession, models: list[CatalogModel]
-) -> list[CatalogModel]:
-    """Keep the active model in the list when a fetch does not return it.
-
-    A short or empty catalog would otherwise leave the picker with nothing to
-    select. A row already stored for that id keeps its context and tool flag.
-    """
-    selected = session.model_id.strip()
-    if not selected or any(model.id == selected for model in models):
-        return list(models)
-    previous = next((model for model in session.catalog if model.id == selected), None)
-    kept = list(models)
-    if previous is not None:
-        kept.append(previous)
-    else:
-        kept.append(CatalogModel(id=selected, supports_tools=True))
-    return kept
-
-
-def _publish_catalog(session: AgentSession, stdout: IO[str], fetched: CatalogFetch) -> None:
-    with session._catalog_lock:
-        models = _include_selected_model(session, fetched.models)
-        session.catalog = models
-    _apply_known_context_limit(session)
-    payload: dict[str, Any] = {
-        "type": "models",
-        "ok": fetched.error is None,
-        "message": fetched.error or "",
-        "models": [model.model_dump() for model in models],
-    }
-    payload.update(_status_fields(session))
-    _write_line(stdout, payload, session.secrets)
-
-
-def _catalog_api_key(session: AgentSession) -> str:
-    config = getattr(session.agent.model, "config", None)
-    if config is not None:
-        key = str(getattr(config, "api_key", "") or "").strip()
-        if key:
-            return key
-    return (session.active_key or "").strip()
-
-
-def _handle_select_model(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
-    model_id = message.get("id")
-    previous = session.model_id
-    previous_limit = session.totals.context_limit
-    if not isinstance(model_id, str) or not model_id.strip():
-        _write_line(
-            stdout,
-            {"type": "error", "message": "model id must be a non-empty string"},
-            session.secrets,
-        )
-        return
-    with session._catalog_lock:
-        chosen = next((item for item in session.catalog if item.id == model_id), None)
-        if chosen is not None:
-            chosen = chosen.model_copy()
-    if chosen is None:
-        session.model_id = previous
-        session.totals.context_limit = previous_limit
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"Unknown model: {model_id}"},
-            session.secrets,
-        )
-        return
-    config = getattr(session.agent.model, "config", None)
-    if config is not None:
-        config.model = chosen.id
-    session.model_id = chosen.id
-    session.totals.model = chosen.id
-    session.totals.context_limit = chosen.context_length
-    payload = {"type": "model", "id": chosen.id, "context_length": chosen.context_length}
-    payload.update(_status_fields(session))
-    _write_line(stdout, payload, session.secrets)
-
-
-_KEY_NAME_ERROR = "set_key name must be OPENROUTER_API_KEY, EARTHDATA_TOKEN, or FIRMS_MAP_KEY"
-
-
-def _credential_name(message: dict[str, Any]) -> str:
-    """Return the key variable named by ``message``, defaulting to OpenRouter.
-
-    Raises:
-        ValueError: if ``name`` is present and not an allowed variable. The
-        message does not echo the supplied name.
-    """
-    if "name" not in message or message.get("name") is None:
-        return OPENROUTER_API_KEY
-    name = message.get("name")
-    if not isinstance(name, str) or name not in KEY_VARIABLES:
-        raise ValueError(_KEY_NAME_ERROR)
-    return name
-
-
-def _handle_set_key(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
-    try:
-        name = _credential_name(message)
-    except ValueError:
-        _write_line(stdout, {"type": "error", "message": _KEY_NAME_ERROR}, session.secrets)
-        return
-    if name != OPENROUTER_API_KEY:
-        _handle_set_named_key(session, stdout, message, name)
-        return
-    scope = message.get("scope")
-    key = message.get("key")
-    if scope not in {"session", "user"} or not isinstance(key, str) or not key.strip():
-        _write_line(
-            stdout,
-            {"type": "error", "message": "set_key needs scope session or user and a key"},
-            session.secrets,
-        )
-        return
-    try:
-        # User scope warns inside write_user_key. Session scope warns here.
-        cleaned, warning = prepare_openrouter_key(key, warn=scope != "user")
-    except ValueError:
-        _write_line(
-            stdout,
-            {"type": "error", "message": "set_key rejected a key that contains a newline"},
-            session.secrets,
-        )
-        return
-    _remember_secret(session, cleaned)
-    try:
-        if scope == "user":
-            write_user_key(cleaned, session.home)
-            if not (session.session_key and session.session_key.strip()):
-                _install_key(session, cleaned)
-        else:
-            session.session_key = cleaned
-            _install_key(session, cleaned)
-    except Exception as exc:
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"Could not save the key: {type(exc).__name__}"},
-            session.secrets,
-        )
-        return
-    payload: dict[str, Any] = {"type": "key", "scope": scope, "saved": True}
-    if warning:
-        payload["warning"] = warning
-    _write_line(stdout, payload, session.secrets)
-
-
-def _handle_set_named_key(
-    session: AgentSession, stdout: IO[str], message: dict[str, Any], name: str
-) -> None:
-    """Store ``EARTHDATA_TOKEN`` or ``FIRMS_MAP_KEY`` for the session or the user.
-
-    The value is never written into the reply. A session value stays in
-    ``session.credential_keys``. A user value is the private file under
-    ``~/.atlas/keys``. The session value is left in place when a user value
-    is saved.
-    """
-    scope = message.get("scope")
-    key = message.get("key")
-    if scope not in {"session", "user"} or not isinstance(key, str) or not key.strip():
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"{name} needs scope session or user and a key"},
-            session.secrets,
-        )
-        return
-    try:
-        cleaned = prepare_credential(key, name=name)
-    except ValueError as exc:
-        _write_line(
-            stdout,
-            {"type": "error", "message": str(exc)},
-            session.secrets,
-        )
-        return
-    _remember_secret(session, cleaned)
-    try:
-        if scope == "user":
-            write_user_key(cleaned, session.home, name=name)
-        else:
-            session.credential_keys[name] = cleaned
-    except Exception as exc:
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"Could not save {name}: {type(exc).__name__}"},
-            session.secrets,
-        )
-        return
-    _write_line(
-        stdout,
-        {"type": "key", "scope": scope, "saved": True, "name": name},
-        session.secrets,
-    )
-
-
-def _handle_delete_key(
-    session: AgentSession, stdout: IO[str], message: dict[str, Any] | None = None
-) -> None:
-    """Remove the saved user key and stop using any key in this process.
-
-    The reply warns that the environment variable is still used on the next
-    launch. ``EARTHDATA_TOKEN`` and ``FIRMS_MAP_KEY`` name that variable.
-    OpenRouter keeps its existing reply. The value is not printed.
-    """
-    payload = message or {}
-    try:
-        name = _credential_name(payload)
-    except ValueError:
-        _write_line(stdout, {"type": "error", "message": _KEY_NAME_ERROR}, session.secrets)
-        return
-    if name != OPENROUTER_API_KEY:
-        _handle_delete_named_key(session, stdout, name)
-        return
-    try:
-        delete_user_key(session.home)
-    except Exception as exc:
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"Could not delete the key: {type(exc).__name__}"},
-            session.secrets,
-        )
-        return
-    session.session_key = None
-    _clear_installed_key(session)
-    _write_line(
-        stdout,
-        {
-            "type": "key",
-            "scope": "deleted",
-            "saved": False,
-            "warning": (
-                "OPENROUTER_API_KEY in the environment will still be used on the next launch"
-            ),
-        },
-        session.secrets,
-    )
-
-
-def _handle_delete_named_key(session: AgentSession, stdout: IO[str], name: str) -> None:
-    """Remove the saved user file and the in-memory session value for ``name``.
-
-    The value is remembered for redaction and is not written into the reply.
-    The environment variable is left set; the reply says the next launch
-    still reads it.
-    """
-    current = session.credential_keys.get(name)
-    if current:
-        _remember_secret(session, current)
-    try:
-        stored = read_user_key(session.home, name=name)
-    except ValueError:
-        stored = None
-    if stored:
-        _remember_secret(session, stored)
-    try:
-        delete_user_key(session.home, name=name)
-    except Exception as exc:
-        _write_line(
-            stdout,
-            {"type": "error", "message": f"Could not delete {name}: {type(exc).__name__}"},
-            session.secrets,
-        )
-        return
-    session.credential_keys.pop(name, None)
-    _write_line(
-        stdout,
-        {
-            "type": "key",
-            "scope": "deleted",
-            "saved": False,
-            "name": name,
-            "warning": (f"{name} in the environment will still be used on the next launch"),
-        },
-        session.secrets,
-    )
-
-
-def _handle_list(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
-    try:
-        root = _atlas_root(session, message.get("scope"))
-        names = list_entries(root, str(message.get("kind")))
-    except (AtlasPathError, TypeError) as exc:
-        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
-        return
-    payload: dict[str, Any] = {
-        "type": "listing",
-        "scope": message.get("scope"),
-        "kind": message.get("kind"),
-        "names": names,
-    }
-    if message.get("kind") == "sessions" and message.get("scope") == "project":
-        payload["sessions"] = _session_rows(session)
-    _write_line(stdout, payload, session.secrets)
-
-
-def _session_rows(session: AgentSession) -> list[dict[str, Any]]:
-    if session.workspace is None:
-        return []
-    try:
-        found = list_sessions(session.workspace, limit=50)
-    except OSError:
-        return []
-    rows: list[dict[str, Any]] = []
-    for item in found:
-        row = item.model_dump()
-        prompt = str(row.get("prompt", ""))
-        row["prompt"] = prompt if len(prompt) <= 120 else prompt[:117] + "..."
-        rows.append(row)
-    return rows
-
-
-def _handle_remove(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
-    name = message.get("name")
-    kind = message.get("kind")
-    if not isinstance(name, str) or not isinstance(kind, str):
-        _write_line(
-            stdout,
-            {"type": "error", "message": "remove needs a kind and a name"},
-            session.secrets,
-        )
-        return
-    try:
-        root = _atlas_root(session, message.get("scope"))
-        remove_entry(root, kind, name, confirm=message.get("confirm") is True)
-    except (AtlasPathError, FileNotFoundError, TypeError) as exc:
-        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
-        return
-    _write_line(
-        stdout,
-        {"type": "removed", "scope": message.get("scope"), "kind": kind, "name": name},
-        session.secrets,
-    )
-
-
-def _handle_save_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
-    name = message.get("name")
-    if not isinstance(name, str) or not name.strip():
-        _write_line(
-            stdout, {"type": "error", "message": "save_skill needs a name"}, session.secrets
-        )
-        return
-    description = message.get("description")
-    if description is not None and not isinstance(description, str):
-        _write_line(
-            stdout,
-            {"type": "error", "message": "description must be a string"},
-            session.secrets,
-        )
-        return
-    try:
-        scope = _skill_scope(message.get("scope"))
-        saved = session.save_finished_skill(
-            name,
-            description=description,
-            replace=message.get("replace") is True,
-            scope=scope,
-        )
-    except (SkillSaveError, AtlasPathError) as exc:
-        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
-        return
-    _write_line(
-        stdout,
-        {
-            "type": "saved_skill",
-            "name": saved.name,
-            "description": saved.description,
-            "scope": scope,
-            "path": saved.path,
-            "enabled": saved.enabled,
-            "enable": enable_command(saved.name),
-            "note": saved.note,
-        },
-        session.secrets,
-    )
-
-
-def _handle_enable_skill(session: AgentSession, stdout: IO[str], message: dict[str, Any]) -> None:
-    name = message.get("name")
-    if not isinstance(name, str) or not name.strip():
-        _write_line(
-            stdout, {"type": "error", "message": "enable_skill needs a name"}, session.secrets
-        )
-        return
-    try:
-        scope = _skill_scope(message.get("scope"))
-        if message.get("confirm") is not True:
-            preview = session.preview_saved_skill(name, scope=scope)
-            _write_line(
-                stdout,
-                {
-                    "type": "enable_preview",
-                    "name": preview.name,
-                    "description": preview.description,
-                    "scope": scope,
-                    "path": preview.path,
-                    "content_sha256": preview.content_sha256,
-                    "body": preview.body,
-                    "body_characters": preview.body_characters,
-                    "body_lines": preview.body_lines,
-                    "resources": [item.model_dump() for item in preview.resources],
-                    "confirm": preview.confirm,
-                },
-                session.secrets,
-            )
-            return
-        expected = message.get("expected_sha256")
-        if not isinstance(expected, str) or not expected.strip():
-            raise SkillSaveError("enable needs a preview")
-        saved = session.enable_saved_skill(name, expected, scope=scope)
-        catalog = session.skill_catalog_note
-    except OSError:
-        _write_line(stdout, {"type": "error", "message": "could not enable skill"}, session.secrets)
-        return
-    except (SkillSaveError, AtlasPathError) as exc:
-        _write_line(stdout, {"type": "error", "message": str(exc)}, session.secrets)
-        return
-    _write_line(
-        stdout,
-        {
-            "type": "enabled_skill",
-            "name": saved.name,
-            "description": saved.description,
-            "scope": scope,
-            "path": saved.path,
-            "enabled": saved.enabled,
-            "catalog": catalog,
-        },
-        session.secrets,
-    )
-
-
-def _skill_scope(scope: object) -> str:
-    if scope is None:
-        return "project"
-    if scope in {"project", "user"}:
-        return str(scope)
-    raise SkillSaveError("scope must be project or user")
-
 
 def _add_enabled_skill(session: AgentSession, name: str, scope: str) -> str:
-    """Add ``name`` to the live catalog without rehashing skills already loaded."""
     from atlas.agent.skills import UseSkillTool, load_skill_directory, user_skill_load_parts
 
     restart = "Restart Atlas to load this skill."
-    workspace = session.workspace
-    if workspace is None:
+    if (workspace := session.workspace) is None:
         return restart
     if scope == "user":
         if session.home is None or not load_home_skills_enabled(workspace):
             return restart
         base, relative, label = user_skill_load_parts(session.home, name)
     else:
-        base = workspace
-        relative = f"{ATLAS_SKILLS_RELATIVE}/{name}"
-        label = ""
+        base, relative, label = workspace, f"{layout.ATLAS_SKILLS_RELATIVE}/{name}", ""
     try:
         skill = load_skill_directory(
             base,
             relative,
             label_prefix=label,
-            artifact_root=project_artifacts_dir(workspace),
+            artifact_root=layout.project_artifacts_dir(workspace),
         )
     except OSError:
         return restart
     if skill is None:
         return restart
-    skills = [item for item in session.agent.skills if item.name != skill.name]
-    skills.append(skill)
-    skills.sort(key=lambda item: item.name)
+    skills = sorted(
+        [*[s for s in session.agent.skills if s.name != skill.name], skill], key=lambda s: s.name
+    )
     session.agent.skills = skills
     session.agent.tools.replace(UseSkillTool(skills))
     if session.messages and session.messages[0].role == Role.SYSTEM:
-        session.messages[0] = ChatMessage(
-            role=Role.SYSTEM,
-            content=session.agent.system_prompt(),
-        )
+        system = f"{session.agent.system_prompt()}\n\n{session.agent.environment_context()}"
+        session.messages[0] = ChatMessage(role=Role.SYSTEM, content=system)
     return "The skill catalog was reloaded."
 
 
-def _remember_resolved_credentials(session: AgentSession) -> None:
-    """Remember env and file credentials before any tool result is written.
-
-    In-session ``set_key`` already records the value it stores. A key that
-    arrived from the environment or ``~/.atlas/keys`` is resolved here, and
-    ``resolve_credential`` appends it to the bound secret list.
-    """
-    home = session.home
-    for name in (EARTHDATA_TOKEN, FIRMS_MAP_KEY):
-        try:
-            resolve_credential(name, home=home)
-        except ValueError:
-            continue
-    resolve_openrouter_key(
-        session_key=session.session_key,
-        env_key=os.environ.get(OPENROUTER_API_KEY),
-        home=home,
-    )
-
-
-def _remember_secret(session: AgentSession, key: str) -> None:
-    if key and key not in session.secrets:
-        session.secrets.append(key)
-
-
-def _install_key(session: AgentSession, key: str) -> None:
-    _remember_secret(session, key)
-    session.active_key = key
-    config = getattr(session.agent.model, "config", None)
-    if config is not None:
-        config.api_key = key
-
-
-def _clear_installed_key(session: AgentSession) -> None:
-    session.active_key = None
-    config = getattr(session.agent.model, "config", None)
-    if config is not None:
-        config.api_key = ""
-
-
-def _atlas_root(session: AgentSession, scope: object) -> Path:
-    if scope == "project":
-        if session.workspace is None:
-            raise AtlasPathError("project workspace is not set")
-        return project_atlas_root(session.workspace)
-    if scope == "user":
-        return user_atlas_root(session.home)
-    raise AtlasPathError("scope must be project or user")
-
-
-def _write_http_error(session: AgentSession, stdout: IO[str], exc: OpenRouterHTTPError) -> None:
-    apply_http_error(
-        session.totals,
-        http_status=exc.status_code,
-        elapsed_seconds=exc.elapsed_seconds,
-        time_to_first_token_seconds=exc.time_to_first_token_seconds,
-    )
-    payload: dict[str, Any] = {
-        "type": "error",
-        "message": str(exc),
-        "http_status": exc.status_code,
-        "elapsed_seconds": exc.elapsed_seconds,
-        "time_to_first_token_seconds": exc.time_to_first_token_seconds,
-        "error_body": exc.body,
-    }
-    payload.update(_status_fields(session))
-    _write_line(stdout, payload, session.secrets)
-
-
-def _public_error(exc: Exception) -> str:
-    if isinstance(exc, MissingOpenRouterKey | OpenRouterHTTPError):
-        return str(exc)
-    text = f"{type(exc).__name__}: {exc}"
-    return text[:300]
-
-
-def _step_writer(stdout: IO[str], secrets: list[str]) -> Callable[[AgentStep], None]:
-    def write(step: AgentStep) -> None:
-        _write_line(stdout, _step_event(step), secrets)
-
-    return write
-
-
-def _thought_writer(stdout: IO[str], secrets: list[str]) -> Callable[[str, float | None], None]:
-    def write(text: str, speed: float | None) -> None:
-        if not text.strip():
-            return
-        payload: dict[str, Any] = {"type": "thought", "text": text}
-        if speed is not None and speed > 0:
-            payload["tokens_per_second"] = speed
-        _write_line(stdout, payload, secrets)
-
-    return write
-
-
-def _phase_writer(stdout: IO[str], secrets: list[str]) -> Callable[[str, str | None], None]:
-    def write(phase: str, name: str | None) -> None:
-        payload: dict[str, Any] = {"type": "phase", "phase": phase}
-        if name:
-            payload["name"] = name
-        _write_line(stdout, payload, secrets)
-
-    return write
-
-
-def _key_set(session: AgentSession) -> bool:
-    if not session.requires_api_key:
-        return True
-    return bool(session.active_key and session.active_key.strip())
-
-
-def _catalog_prices(session: AgentSession) -> tuple[str | None, str | None, str | None]:
-    """Return prompt, completion, and cache-read prices for the active model.
-
-    Any rate the catalog row does not carry is None. A missing cache-read
-    price means cached tokens are priced at the prompt rate.
-    """
-    model_id = session.totals.model or session.model_id
-    if not model_id:
-        return None, None, None
-    with session._catalog_lock:
-        chosen = next((item for item in session.catalog if item.id == model_id), None)
-    if chosen is None:
-        return None, None, None
-    return chosen.prompt_price, chosen.completion_price, chosen.cache_read_price
-
-
-def _apply_known_context_limit(session: AgentSession) -> None:
-    """Copy the active model's catalog window onto the dashboard totals.
-
-    The limit stays unset when the catalog has not been loaded or has no row
-    for the model. A known window replaces ``unknown`` on the next status line.
-    """
-    model_id = session.totals.model or session.model_id
-    if not model_id:
-        return
-    with session._catalog_lock:
-        chosen = next((item for item in session.catalog if item.id == model_id), None)
-        context_length = chosen.context_length if chosen is not None else None
-    if context_length is not None:
-        session.totals.context_limit = context_length
+@contextlib.contextmanager
+def session_bound(session: AgentSession) -> Iterator[None]:
+    """Bind the session credential and secret maps for the duration of the block."""
+    layout.bind_session_credentials(session.credential_keys)
+    layout.bind_session_secrets(session.secrets)
+    layout.quiet_http_client_logs()
+    try:
+        yield
+    finally:
+        layout.unbind_session_credentials()
+        layout.unbind_session_secrets()
 
 
 def status_fields(session: AgentSession) -> dict[str, Any]:
-    _apply_known_context_limit(session)
-    totals = session.totals
-    return {
-        "status_line": format_tui_status(totals),
-        "model": totals.model,
-        "context_used": totals.context_used,
-        "context_limit": totals.context_limit,
-        "prompt_tokens": totals.prompt_tokens,
-        "completion_tokens": totals.completion_tokens,
-        "total_tokens": totals.total_tokens,
-        "cached_tokens": totals.cached_tokens,
-        "reasoning_tokens": totals.reasoning_tokens,
-        "spend": reported_spend(totals),
-        "estimated": totals.estimated,
-        "tokens_per_second": totals.tokens_per_second,
-        "http_status": totals.last_http_status,
-        "elapsed_seconds": totals.last_elapsed_seconds,
-        "time_to_first_token_seconds": totals.last_ttft_seconds,
-        "recent": list(totals.recent),
-    }
+    return session.status_snapshot()
 
 
-def _ready_event(session: AgentSession) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "type": "ready",
-        "yolo_enabled": session.yolo_enabled,
-        "tools": [tool.model_dump() for tool in session.agent.tools.definitions],
-        "key_set": _key_set(session),
-    }
-    payload.update(_status_fields(session))
-    return payload
+def step_event(step: AgentStep) -> dict[str, Any]:
+    from atlas.agent.rpc import step_event as _step
+
+    return _step(step)
 
 
 def done_event(session: AgentSession, run: AgentRun) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "type": "done",
-        "response": run.response,
-        "stopped_for_limit": run.stopped_for_limit,
-        "stopped_for_budget": run.stopped_for_budget,
-        "stopped_for_context": run.stopped_for_context,
-        "cancelled": run.cancelled,
-        "compaction": run.compaction.model_dump(),
-        "empty_replies": run.empty_replies,
-        "intent_nudges": run.intent_nudges,
-    }
-    payload.update(_status_fields(session))
-    return payload
+    from atlas.agent.rpc import done_event as _done
 
-
-def _find_repo_root(start: Path) -> Path | None:
-    for directory in (start, *start.parents):
-        pyproject = directory / "pyproject.toml"
-        if pyproject.is_file() and 'name = "atlas"' in pyproject.read_text(encoding="utf-8"):
-            return directory
-    return None
-
-
-def resolve_model(workspace: Path, cli_model: str | None) -> str:
-    """Choose the OpenRouter model id for a session.
-
-    ``--model`` wins, then ``ATLAS_MODEL``, then ``model`` in the workspace
-    ``.atlas/agent.toml``, then :data:`atlas.agent.runtime.DEFAULT_MODEL`.
-    """
-    if cli_model is not None and cli_model.strip():
-        return cli_model.strip()
-    env_model = os.environ.get("ATLAS_MODEL", "").strip()
-    if env_model:
-        return env_model
-    return load_model(workspace)
-
-
-def _remember_session(workspace: Path, model_id: str) -> str:
-    """Create a project session directory and a matching artifact directory."""
-    ensure_project_layout(workspace)
-    session_id = uuid.uuid4().hex[:12]
-    session_dir = project_session_dir(workspace, session_id)
-    session_dir.mkdir(parents=True, exist_ok=True)
-    project_artifact_dir(workspace, session_id).mkdir(parents=True, exist_ok=True)
-    (session_dir / "meta.json").write_text(
-        json.dumps(
-            {
-                "id": session_id,
-                "model": model_id,
-                "created": datetime.now(UTC).isoformat(),
-            }
-        ),
-        encoding="utf-8",
-    )
-    return session_id
+    return _done(session, run)
 
 
 _redact_value = redact_value
 _step_event = step_event
 _status_fields = status_fields
 _done_event = done_event
+
+
+def resolve_model(workspace: Path, cli_model: str | None) -> str:
+    if cli_model is not None and cli_model.strip():
+        return cli_model.strip()
+    if env_model := os.environ.get("ATLAS_MODEL", "").strip():
+        return env_model
+    return load_model(workspace)
+
+
+def _remember_session(workspace: Path, model_id: str) -> str:
+    layout.ensure_project_layout(workspace)
+    session_id = uuid.uuid4().hex[:12]
+    session_dir = layout.project_session_dir(workspace, session_id)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    layout.project_artifact_dir(workspace, session_id).mkdir(parents=True, exist_ok=True)
+    (session_dir / "meta.json").write_text(
+        json.dumps({"id": session_id, "model": model_id, "created": datetime.now(UTC).isoformat()}),
+        encoding="utf-8",
+    )
+    return session_id
 
 
 class SessionNotFound(LookupError):
@@ -2109,7 +904,7 @@ def _check_resume(workspace: Path, resume: str) -> None:
     """Raise SessionNotFound unless ``resume`` names a saved session; writes nothing."""
     if not resume or resume in {".", ".."} or "/" in resume or "\\" in resume:
         raise SessionNotFound(f"no saved session {resume}")
-    if not (project_session_dir(workspace, resume) / "state.json").is_file():
+    if not (layout.project_session_dir(workspace, resume) / "state.json").is_file():
         raise SessionNotFound(f"no saved session {resume}")
 
 
@@ -2130,9 +925,6 @@ def build_session(
     Explicit arguments win over ``agent.toml``. A ``resume`` id is validated before
     anything is written, and the session is bound to its workspace before its saved
     state loads. An injected ``model`` is not closed by the bundle. Never serves.
-
-    Raises:
-        SessionNotFound: ``resume`` names no saved session.
     """
     workspace = workspace.resolve()
     home = home or Path.home()
@@ -2140,26 +932,21 @@ def build_session(
         _check_resume(workspace, resume)
     if write_config:
         ensure_agent_config(workspace)
-    ensure_user_layout(home)
+    layout.ensure_user_layout(home)
     api_key = ""
     if model is None:
         api_key = (
-            resolve_openrouter_key(
+            layout.resolve_openrouter_key(
                 session_key=None,
-                env_key=os.environ.get("OPENROUTER_API_KEY"),
+                env_key=os.environ.get(layout.OPENROUTER_API_KEY),
                 home=home,
             )
             or ""
         )
-    model_id = resolve_model(workspace, model_id)
-    session_id = resume or _remember_session(workspace, model_id)
-    # Relative tool paths resolve against the workspace the person pointed the
-    # session at, which does not have to be a git checkout; absolute paths are
-    # allowed. Tool outputs land in this session's artifact directory, inside
-    # the workspace, so removing the session removes them.
-    artifact_root = project_artifact_dir(workspace, session_id)
+    resolved_model = resolve_model(workspace, model_id)
+    session_id = resume or _remember_session(workspace, resolved_model)
+    artifact_root = layout.project_artifact_dir(workspace, session_id)
     store = LocalArtifactStore(workspace, artifact_root=artifact_root)
-    # Home skills are opt-in. The default session sees only the workspace.
     skill_home = home if load_home_skills_enabled(workspace) else None
     skills = load_skills(store, home=skill_home)
     registry = default_registry()
@@ -2169,7 +956,7 @@ def build_session(
     if model is None:
         active = OpenRouterModel(
             ModelConfig(
-                model=model_id,
+                model=resolved_model,
                 api_key=api_key,
                 reasoning_effort=load_reasoning_effort(workspace),
             )
@@ -2181,7 +968,6 @@ def build_session(
             active,
             registry,
             store,
-            # Budgets live in the workspace .atlas/agent.toml unless given.
             max_tool_calls=(
                 max_tool_calls if max_tool_calls is not None else load_max_tool_calls(workspace)
             ),
@@ -2196,11 +982,11 @@ def build_session(
         from atlas.agent.tools._subagent import SubagentTool
 
         def build_child(child_store: LocalArtifactStore, allow_writes: bool, budget: int) -> Agent:
-            child_registry = default_registry()
-            register_skill_tool(child_registry, skills)
+            child_reg = default_registry()
+            register_skill_tool(child_reg, skills)
             return Agent(
                 active,
-                child_registry,
+                child_reg,
                 child_store,
                 max_tool_calls=budget,
                 max_tokens=agent.max_tokens,
@@ -2209,6 +995,7 @@ def build_session(
                 approval=agent.approval,
                 on_permission=agent.on_permission,
                 skills=skills,
+                context_limit=agent.context_limit,
             )
 
         registry.register(SubagentTool(build_child))
@@ -2242,8 +1029,14 @@ def build_session(
     )
 
 
+def serve(*args: Any, **kwargs: Any) -> int:
+    from atlas.agent.rpc import serve as _serve
+
+    return _serve(*args, **kwargs)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Console entry for ``python -m atlas.agent.session``."""
+    """Console entry for ``python -m atlas.agent`` / ``python -m atlas.agent.session``."""
     parser = argparse.ArgumentParser(prog="atlas.agent.session")
     parser.add_argument("--workspace", default=".")
     parser.add_argument("--model", default=None)
@@ -2284,7 +1077,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"atlas: cannot resume {args.resume}: {exc}", file=sys.stderr)
         return 2
     try:
-        return serve(bundle.session, sys.stdin, sys.stdout, redact=bundle.api_key or None)
+        return serve(
+            bundle.session,
+            sys.stdin,
+            sys.stdout,
+            redact=bundle.api_key or None,
+            resumed=bundle.session.loaded_at_launch,
+        )
     finally:
         if bundle.session.session_id:
             discard_unused_session(bundle.workspace, bundle.session.session_id)

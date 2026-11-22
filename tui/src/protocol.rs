@@ -1,806 +1,452 @@
-//! Parsing for one line of the Atlas agent session protocol.
+//! Frozen v2 JSON-lines protocol between `atlas-tui` and Python `atlas.agent`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Changes the runtime made to the model context for the finished turn.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct StatusSnapshot {
+    pub model: String,
+    pub context_used: i64,
+    pub context_limit: Option<i64>,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub cached_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub spend: Option<f64>,
+    pub tokens_per_second: Option<f64>,
+    pub yolo_enabled: bool,
+    pub estimated: bool,
+    pub branch: Option<String>,
+    pub workspace: Option<String>,
+    pub goal: Option<String>,
+    pub active_skills: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct CatalogEntry {
+    pub id: String,
+    pub name: Option<String>,
+    pub context_length: Option<i64>,
+    pub prompt_price: Option<String>,
+    pub completion_price: Option<String>,
+    #[serde(default = "default_true")]
+    pub supports_tools: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
 pub struct Compaction {
-    #[serde(default)]
     pub occurred: bool,
-    #[serde(default)]
     pub tokens_reclaimed: i64,
-    #[serde(default)]
     pub tool_results_shortened: i64,
-    #[serde(default)]
     pub messages_dropped: i64,
-    #[serde(default)]
     pub digest_inserted: bool,
-    #[serde(default)]
     pub digest_chars: i64,
 }
 
 impl Compaction {
-    /// One transcript line for a turn that compacted its context.
     pub fn notice(&self) -> Option<String> {
         if !self.occurred {
             return None;
         }
-        let mut parts = vec![format!(
+        let mut p = vec![format!(
             "context compacted: {} tokens reclaimed",
             self.tokens_reclaimed
         )];
         if self.messages_dropped > 0 {
-            parts.push(format!("{} messages dropped", self.messages_dropped));
+            p.push(format!("{} messages dropped", self.messages_dropped));
         }
         if self.tool_results_shortened > 0 {
-            parts.push(format!(
+            p.push(format!(
                 "{} tool results shortened",
                 self.tool_results_shortened
             ));
         }
         if self.digest_inserted {
-            parts.push(format!("digest kept ({} chars)", self.digest_chars));
+            p.push(format!("digest kept ({} chars)", self.digest_chars));
         }
-        Some(parts.join(", "))
+        Some(p.join(", "))
     }
 }
 
-/// One replayed transcript item of a resumed session.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-pub struct ReplayItem {
-    #[serde(default)]
-    pub role: String,
-    #[serde(default)]
-    pub text: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub summary: String,
-}
-
-/// One saved session in a `sessions` listing.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
 pub struct SessionInfo {
-    #[serde(default)]
     pub id: String,
-    #[serde(default)]
     pub saved: String,
-    #[serde(default)]
     pub model: String,
-    #[serde(default)]
     pub messages: i64,
-    #[serde(default)]
     pub prompt: String,
-    #[serde(default)]
     pub interrupted: bool,
-    #[serde(default)]
     pub stopped_for_limit: bool,
 }
 
-/// A single server -> client message.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ServerMessage {
-    Ready {
-        tools: Vec<ToolInfo>,
-        key_set: bool,
-        status: StatusSnapshot,
-    },
-    Step {
-        name: String,
-        call_id: String,
-        ok: bool,
-        arguments: Value,
-        text: Option<String>,
-        error: Option<String>,
-        error_kind: Option<String>,
-        artifacts: Vec<String>,
-        summary: String,
-        notes: Vec<String>,
-    },
-    Thought {
-        text: String,
-        tokens_per_second: Option<f64>,
-    },
-    Done {
-        response: String,
-        stopped_for_limit: bool,
-        stopped_for_budget: bool,
-        stopped_for_context: bool,
-        cancelled: bool,
-        compaction: Compaction,
-        status: StatusSnapshot,
-    },
-    Compacted {
-        compaction: Compaction,
-        status: StatusSnapshot,
-    },
-    PermissionRequest {
-        id: String,
-        tool: String,
-        summary: String,
-        preview: String,
-    },
-    Yolo {
-        enabled: bool,
-    },
-    Error {
-        message: String,
-        http_status: Option<u16>,
-        elapsed_seconds: Option<f64>,
-        error_body: Option<String>,
-        status_line: String,
-    },
-    Models {
-        ok: bool,
-        message: String,
-        models: Vec<CatalogEntry>,
-        status: StatusSnapshot,
-    },
-    ModelSelected {
-        id: String,
-        context_length: Option<i64>,
-        status: StatusSnapshot,
-    },
-    KeySet {
-        scope: String,
-        saved: bool,
-        warning: String,
-        name: String,
-    },
-    Listing {
-        scope: String,
-        kind: String,
-        names: Vec<String>,
-        sessions: Vec<SessionInfo>,
-    },
-    SessionLoaded {
-        id: String,
-        goal: String,
-        messages: i64,
-        saved_model: String,
-        stopped_for_limit: bool,
-        interrupted: bool,
-        replay: Vec<ReplayItem>,
-        omitted: i64,
-        status: StatusSnapshot,
-    },
-    Undo {
-        restored: Option<String>,
-        message: String,
-    },
-    Removed {
-        scope: String,
-        kind: String,
-        name: String,
-    },
-    Skill {
-        name: String,
-        description: String,
-        location: String,
-        active: Vec<String>,
-    },
-    Goal {
-        text: String,
-        cleared: bool,
-        message: String,
-    },
-    Phase {
-        phase: String,
-        name: Option<String>,
-    },
-    /// A line we do not understand yet.
-    Unknown,
-    SaveSkill {
-        name: String,
-        description: String,
-        scope: String,
-        path: String,
-        enabled: bool,
-        enable: String,
-        note: String,
-    },
-    EnablePreview {
-        name: String,
-        description: String,
-        path: String,
-        content_sha256: String,
-        body: String,
-        body_characters: i64,
-        body_lines: i64,
-        resources: Vec<ResourcePreview>,
-        confirm: String,
-    },
-    EnabledSkill {
-        name: String,
-        path: String,
-        enabled: bool,
-        catalog: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
-pub struct ResourcePreview {
-    #[serde(default)]
-    pub path: String,
-    #[serde(default)]
-    pub sha256: String,
-    #[serde(default)]
-    pub characters: i64,
-    #[serde(default)]
-    pub lines: i64,
-    #[serde(default)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct ReplayMessage {
+    pub role: String,
     pub text: String,
-    #[serde(default)]
-    pub omitted: String,
+    pub name: Option<String>,
+    pub summary: Option<String>,
+    pub ok: Option<bool>,
+    pub diff: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-pub struct StatusSnapshot {
-    #[serde(default)]
-    pub status_line: String,
-    #[serde(default)]
+#[serde(default)]
+pub struct ReadyPayload {
+    pub session_id: String,
     pub model: String,
-    #[serde(default)]
-    pub yolo_enabled: Option<bool>,
-    #[serde(default)]
-    pub context_used: i64,
-    #[serde(default)]
-    pub context_limit: Option<i64>,
-    #[serde(default)]
-    pub prompt_tokens: i64,
-    #[serde(default)]
-    pub completion_tokens: i64,
-    #[serde(default)]
-    pub total_tokens: i64,
-    #[serde(default)]
-    pub cached_tokens: i64,
-    #[serde(default)]
-    pub reasoning_tokens: i64,
-    #[serde(default)]
-    pub spend: Option<f64>,
-    #[serde(default)]
-    pub tokens_per_second: Option<f64>,
-    #[serde(default)]
-    pub http_status: Option<u16>,
-    #[serde(default)]
-    pub elapsed_seconds: Option<f64>,
-    #[serde(default)]
-    pub time_to_first_token_seconds: Option<f64>,
-    #[serde(default)]
-    pub recent: Vec<String>,
+    pub workspace: String,
+    pub tools: Vec<String>,
+    pub key_set: bool,
+    pub status: StatusSnapshot,
+    pub goal: String,
+    pub active_skills: Vec<String>,
+    pub yolo_enabled: bool,
 }
 
-fn default_supports_tools() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct CatalogEntry {
-    pub id: String,
-    #[serde(default)]
-    pub context_length: Option<i64>,
-    #[serde(default)]
-    pub prompt_price: Option<String>,
-    #[serde(default)]
-    pub completion_price: Option<String>,
-    /// False when the provider did not list ``tools``. Missing on older
-    /// payloads, which are treated as tool-capable.
-    #[serde(default = "default_supports_tools")]
-    pub supports_tools: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct ToolInfo {
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct StepPayload {
+    pub call_id: String,
     pub name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub parameters: Value,
+    pub summary: String,
+    pub ok: bool,
+    pub duration_ms: u64,
+    pub text: String,
+    pub error: Option<String>,
+    pub error_kind: Option<String>,
+    pub diff: Option<String>,
+    pub lines: i64,
+    pub omitted: Option<String>,
+    pub arguments: Option<Value>,
+    pub artifacts: Vec<String>,
+    pub notes: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum RawMessage {
-    #[serde(rename = "ready")]
-    Ready {
-        tools: Vec<ToolInfo>,
-        #[serde(default)]
-        key_set: bool,
-        #[serde(flatten)]
-        status: StatusSnapshot,
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct PermissionPayload {
+    pub id: String,
+    pub tool: String,
+    pub summary: String,
+    pub preview: String,
+    pub preview_kind: String,
+    pub arguments: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct DonePayload {
+    pub response: String,
+    pub thoughts: Option<String>,
+    pub cancelled: bool,
+    pub stopped_for_limit: bool,
+    pub stopped_for_budget: bool,
+    pub stopped_for_context: bool,
+    pub compaction: Compaction,
+    pub empty_replies: u64,
+    pub intent_nudges: u64,
+    pub status: StatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct SessionLoadedPayload {
+    pub session_id: String,
+    pub model: String,
+    pub goal: String,
+    pub active_skills: Vec<String>,
+    pub status: StatusSnapshot,
+    pub messages: Vec<ReplayMessage>,
+    pub stopped_for_limit: bool,
+    pub interrupted: bool,
+    pub omitted: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct ErrorPayload {
+    pub message: String,
+    pub http_status: Option<u16>,
+    pub elapsed_seconds: Option<f64>,
+    pub error_body: Option<String>,
+    pub status: Option<StatusSnapshot>,
+}
+
+/// Server -> Client v2 JSON-lines message.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMessage {
+    Ready(Box<ReadyPayload>),
+    Phase {
+        phase: String,
+        detail: Option<String>,
     },
-    #[serde(rename = "step")]
-    Step {
+    ContentDelta {
+        text: String,
+    },
+    ThoughtDelta {
+        text: String,
+    },
+    ToolStart {
+        call_id: String,
         name: String,
         #[serde(default)]
-        call_id: String,
-        #[serde(default)]
-        ok: bool,
-        #[serde(default)]
-        arguments: Value,
-        #[serde(default)]
-        text: Option<String>,
-        #[serde(default)]
-        error: Option<String>,
-        #[serde(default)]
-        error_kind: Option<String>,
-        #[serde(default)]
-        artifacts: Vec<String>,
-        #[serde(default)]
         summary: String,
-        #[serde(default)]
-        notes: Vec<String>,
     },
-    #[serde(rename = "done")]
-    Done {
-        #[serde(default)]
-        response: String,
-        #[serde(default)]
-        stopped_for_limit: bool,
-        #[serde(default)]
-        stopped_for_budget: bool,
-        #[serde(default)]
-        stopped_for_context: bool,
-        #[serde(default)]
-        cancelled: bool,
-        #[serde(default)]
-        compaction: Compaction,
-        #[serde(flatten)]
+    ToolOutputDelta {
+        call_id: String,
+        chunk: String,
+    },
+    Step(Box<StepPayload>),
+    PermissionRequest(Box<PermissionPayload>),
+    Status {
         status: StatusSnapshot,
     },
-    #[serde(rename = "compacted")]
+    Done(Box<DonePayload>),
     Compacted {
         #[serde(default)]
         compaction: Compaction,
-        #[serde(flatten)]
+        #[serde(default)]
         status: StatusSnapshot,
     },
-    #[serde(rename = "permission_request")]
-    PermissionRequest {
+    SessionLoaded(Box<SessionLoadedPayload>),
+    Undo {
+        ok: bool,
+        path: Option<String>,
         #[serde(default)]
-        id: String,
-        #[serde(default)]
-        tool: String,
-        #[serde(default)]
-        summary: String,
-        #[serde(default)]
-        preview: String,
-    },
-    #[serde(rename = "yolo")]
-    Yolo { enabled: bool },
-    #[serde(rename = "error")]
-    Error {
         message: String,
-        #[serde(default)]
-        http_status: Option<u16>,
-        #[serde(default)]
-        elapsed_seconds: Option<f64>,
-        #[serde(default)]
-        error_body: Option<String>,
-        #[serde(default)]
-        status_line: String,
     },
-    #[serde(rename = "models")]
     Models {
         #[serde(default)]
-        ok: bool,
-        #[serde(default)]
-        message: String,
-        #[serde(default)]
         models: Vec<CatalogEntry>,
-        #[serde(flatten)]
-        status: StatusSnapshot,
-    },
-    #[serde(rename = "model")]
-    Model {
-        id: String,
         #[serde(default)]
+        selected: String,
+    },
+    ModelSelected {
+        model: String,
         context_length: Option<i64>,
-        #[serde(flatten)]
+        #[serde(default)]
         status: StatusSnapshot,
     },
-    #[serde(rename = "key")]
-    Key {
-        #[serde(default)]
-        scope: String,
-        #[serde(default)]
-        saved: bool,
-        #[serde(default)]
-        warning: String,
-        #[serde(default)]
-        name: String,
-    },
-    #[serde(rename = "listing")]
-    Listing {
-        #[serde(default)]
-        scope: String,
-        #[serde(default)]
+    List {
         kind: String,
         #[serde(default)]
-        names: Vec<String>,
+        items: Vec<String>,
+        note: Option<String>,
         #[serde(default)]
         sessions: Vec<SessionInfo>,
     },
-    #[serde(rename = "session_loaded")]
-    SessionLoaded {
-        #[serde(default)]
-        id: String,
-        #[serde(default)]
-        goal: String,
-        #[serde(default)]
-        messages: i64,
-        #[serde(default)]
-        saved_model: String,
-        #[serde(default)]
-        stopped_for_limit: bool,
-        #[serde(default)]
-        interrupted: bool,
-        #[serde(default)]
-        replay: Vec<ReplayItem>,
-        #[serde(default)]
-        omitted: i64,
-        #[serde(flatten)]
-        status: StatusSnapshot,
-    },
-    #[serde(rename = "undo")]
-    Undo {
-        #[serde(default)]
-        restored: Option<String>,
-        #[serde(default)]
-        message: String,
-    },
-    #[serde(rename = "phase")]
-    Phase {
-        phase: String,
-        #[serde(default)]
-        name: Option<String>,
-    },
-    #[serde(rename = "thought")]
-    Thought {
-        #[serde(default)]
-        text: String,
-        #[serde(default)]
-        tokens_per_second: Option<f64>,
-    },
-    #[serde(rename = "skill")]
-    Skill {
-        #[serde(default)]
-        name: String,
-        #[serde(default)]
-        description: String,
-        #[serde(default)]
-        location: String,
-        #[serde(default)]
-        active: Vec<String>,
-    },
-    #[serde(rename = "goal")]
     Goal {
         #[serde(default)]
         text: String,
         #[serde(default)]
         cleared: bool,
         #[serde(default)]
-        message: String,
+        status: StatusSnapshot,
     },
-    #[serde(rename = "saved_skill")]
+    Skill {
+        name: String,
+        #[serde(default)]
+        active: bool,
+        note: Option<String>,
+        #[serde(default)]
+        status: StatusSnapshot,
+    },
     SaveSkill {
-        #[serde(default)]
         name: String,
         #[serde(default)]
-        description: String,
-        #[serde(default)]
-        scope: String,
-        #[serde(default)]
         path: String,
-        #[serde(default)]
-        enabled: bool,
-        #[serde(default)]
-        enable: String,
-        #[serde(default)]
-        note: String,
+        note: Option<String>,
     },
-    #[serde(rename = "enable_preview")]
     EnablePreview {
-        #[serde(default)]
         name: String,
         #[serde(default)]
-        description: String,
+        sha256: String,
         #[serde(default)]
-        path: String,
-        #[serde(default)]
-        content_sha256: String,
-        #[serde(default)]
-        body: String,
-        #[serde(default)]
-        body_characters: i64,
-        #[serde(default)]
-        body_lines: i64,
-        #[serde(default)]
-        resources: Vec<ResourcePreview>,
-        #[serde(default)]
-        confirm: String,
+        files: Vec<String>,
+        note: Option<String>,
     },
-    #[serde(rename = "enabled_skill")]
     EnabledSkill {
-        #[serde(default)]
         name: String,
-        #[serde(default)]
-        path: String,
         #[serde(default)]
         enabled: bool,
-        #[serde(default)]
-        catalog: String,
+        note: Option<String>,
     },
-    #[serde(rename = "removed")]
-    Removed {
+    KeySet {
         #[serde(default)]
-        scope: String,
+        provider: String,
         #[serde(default)]
-        kind: String,
-        #[serde(default)]
-        name: String,
+        key_set: bool,
+        note: Option<String>,
     },
+    Yolo {
+        enabled: bool,
+        #[serde(default)]
+        status: StatusSnapshot,
+    },
+    Error(Box<ErrorPayload>),
+    #[serde(skip)]
+    Unknown,
 }
 
-/// Parse one protocol line. Blank lines yield `Ok(None)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    Allow,
+    AllowSession,
+    Deny,
+}
+
+/// Client -> Server v2 JSON-lines message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientMessage {
+    User {
+        text: String,
+    },
+    Resume,
+    Cancel,
+    Permission {
+        id: String,
+        decision: PermissionDecision,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    Yolo {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+    },
+    LoadSession {
+        id: String,
+    },
+    Undo,
+    New,
+    Compact,
+    Models {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        refresh: Option<bool>,
+    },
+    SelectModel {
+        model: String,
+    },
+    Goal {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    Skill {
+        name: String,
+    },
+    SaveSkill {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    EnableSkill {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+    },
+    List {
+        kind: String,
+    },
+    SetKey {
+        key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+    },
+    DeleteKey {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+    },
+    Quit,
+}
+
 pub fn parse_line(line: &str) -> Result<Option<ServerMessage>, serde_json::Error> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Ok(None);
     }
-    match serde_json::from_str::<RawMessage>(trimmed) {
-        Ok(raw) => Ok(Some(raw.into())),
-        // Objects we do not model are tolerated; malformed JSON is not.
+    match serde_json::from_str::<ServerMessage>(trimmed) {
+        Ok(msg) => Ok(Some(msg)),
         Err(err) => match serde_json::from_str::<Value>(trimmed) {
-            Ok(_) => Ok(Some(ServerMessage::Unknown)),
-            Err(_) => Err(err),
+            Ok(Value::Object(_)) => Ok(Some(ServerMessage::Unknown)),
+            _ => Err(err),
         },
     }
 }
 
-impl From<RawMessage> for ServerMessage {
-    fn from(raw: RawMessage) -> Self {
-        match raw {
-            RawMessage::Yolo { enabled } => ServerMessage::Yolo { enabled },
-            RawMessage::Ready {
-                tools,
-                key_set,
-                status,
-            } => ServerMessage::Ready {
-                tools,
-                key_set,
-                status,
-            },
-            RawMessage::Step {
-                name,
-                call_id,
-                ok,
-                arguments,
-                text,
-                error,
-                error_kind,
-                artifacts,
-                summary,
-                notes,
-            } => ServerMessage::Step {
-                name,
-                call_id,
-                ok,
-                arguments,
-                text,
-                error,
-                error_kind,
-                artifacts,
-                summary,
-                notes,
-            },
-            RawMessage::Done {
-                response,
-                stopped_for_limit,
-                stopped_for_budget,
-                stopped_for_context,
-                cancelled,
-                compaction,
-                status,
-            } => ServerMessage::Done {
-                response,
-                stopped_for_limit,
-                stopped_for_budget,
-                stopped_for_context,
-                cancelled,
-                compaction,
-                status,
-            },
-            RawMessage::Compacted { compaction, status } => {
-                ServerMessage::Compacted { compaction, status }
-            }
-            RawMessage::PermissionRequest {
-                id,
-                tool,
-                summary,
-                preview,
-            } => ServerMessage::PermissionRequest {
-                id,
-                tool,
-                summary,
-                preview,
-            },
-            RawMessage::Error {
-                message,
-                http_status,
-                elapsed_seconds,
-                error_body,
-                status_line,
-            } => ServerMessage::Error {
-                message,
-                http_status,
-                elapsed_seconds,
-                error_body,
-                status_line,
-            },
-            RawMessage::Models {
-                ok,
-                message,
-                models,
-                status,
-            } => ServerMessage::Models {
-                ok,
-                message,
-                models,
-                status,
-            },
-            RawMessage::Model {
-                id,
-                context_length,
-                status,
-            } => ServerMessage::ModelSelected {
-                id,
-                context_length,
-                status,
-            },
-            RawMessage::Key {
-                scope,
-                saved,
-                warning,
-                name,
-            } => ServerMessage::KeySet {
-                scope,
-                saved,
-                warning,
-                name,
-            },
-            RawMessage::Listing {
-                scope,
-                kind,
-                names,
-                sessions,
-            } => ServerMessage::Listing {
-                scope,
-                kind,
-                names,
-                sessions,
-            },
-            RawMessage::SessionLoaded {
-                id,
-                goal,
-                messages,
-                saved_model,
-                stopped_for_limit,
-                interrupted,
-                replay,
-                omitted,
-                status,
-            } => ServerMessage::SessionLoaded {
-                id,
-                goal,
-                messages,
-                saved_model,
-                stopped_for_limit,
-                interrupted,
-                replay,
-                omitted,
-                status,
-            },
-            RawMessage::Undo { restored, message } => ServerMessage::Undo { restored, message },
-            RawMessage::Removed { scope, kind, name } => {
-                ServerMessage::Removed { scope, kind, name }
-            }
-            RawMessage::Skill {
-                name,
-                description,
-                location,
-                active,
-            } => ServerMessage::Skill {
-                name,
-                description,
-                location,
-                active,
-            },
-            RawMessage::Goal {
-                text,
-                cleared,
-                message,
-            } => ServerMessage::Goal {
-                text,
-                cleared,
-                message,
-            },
-            RawMessage::Phase { phase, name } => ServerMessage::Phase { phase, name },
-            RawMessage::Thought {
-                text,
-                tokens_per_second,
-            } => ServerMessage::Thought {
-                text,
-                tokens_per_second,
-            },
-            RawMessage::SaveSkill {
-                name,
-                description,
-                scope,
-                path,
-                enabled,
-                enable,
-                note,
-            } => ServerMessage::SaveSkill {
-                name,
-                description,
-                scope,
-                path,
-                enabled,
-                enable,
-                note,
-            },
-            RawMessage::EnablePreview {
-                name,
-                description,
-                path,
-                content_sha256,
-                body,
-                body_characters,
-                body_lines,
-                resources,
-                confirm,
-            } => ServerMessage::EnablePreview {
-                name,
-                description,
-                path,
-                content_sha256,
-                body,
-                body_characters,
-                body_lines,
-                resources,
-                confirm,
-            },
-            RawMessage::EnabledSkill {
-                name,
-                path,
-                enabled,
-                catalog,
-            } => ServerMessage::EnabledSkill {
-                name,
-                path,
-                enabled,
-                catalog,
-            },
+pub fn format_tokens(tokens: i64) -> String {
+    if tokens <= 0 {
+        return "0".into();
+    }
+    let v = tokens as f64;
+    for (unit, suffix) in [(1e9, "B"), (1e6, "M"), (1e3, "K")] {
+        if v >= unit {
+            let s = v / unit;
+            let p = if s >= 100.0 {
+                0
+            } else {
+                usize::from(s < 10.0) + 1
+            };
+            return format!("{s:.p$}{suffix}");
         }
     }
+    tokens.to_string()
 }
 
-/// Status text used before the session sends a line, and as a fallback.
-///
-/// The words match `format_tui_status` for an empty session so the first
-/// frame is never a blank status row.
-pub fn default_status_line() -> String {
-    "model unset  context 0/unknown  spend $0  last n/a tok/s".to_string()
+pub fn price_per_million(token_price: &str) -> Option<String> {
+    let val: f64 = token_price.trim().parse().ok()?;
+    (val.is_finite() && val >= 0.0).then(|| {
+        format!("{:.6}", val * 1e6)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .into()
+    })
 }
 
-pub fn status_text(status: &StatusSnapshot) -> String {
-    if status.status_line.is_empty() {
-        default_status_line()
-    } else {
-        status.status_line.clone()
+pub fn format_duration(ms: u64) -> String {
+    match ms {
+        0..=999 => format!("{ms}ms"),
+        1_000..=59_999 => format!("{:.1}s", ms as f64 / 1e3),
+        _ => format!("{}m {}s", ms / 60_000, (ms / 1_000) % 60),
     }
+}
+
+/// `7s`, `1m12s` or `1h02m`.
+pub fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// First `max` characters with newlines flattened, `...` when cut.
+pub fn clip_chars(text: &str, max: usize) -> String {
+    let flat: String = text
+        .trim()
+        .chars()
+        .map(|ch| if matches!(ch, '\n' | '\r') { ' ' } else { ch })
+        .collect();
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max).collect();
+    format!("{cut}...")
 }
 
 #[cfg(test)]
@@ -808,377 +454,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_ready() {
-        let line = r#"{"type":"ready","tools":[{"name":"list_images","description":"d","parameters":{}}]}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Ready { tools, .. }) => {
-                assert_eq!(tools.len(), 1);
-                assert_eq!(tools[0].name, "list_images");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+    fn parses_v2_messages_and_serializes_client_messages() {
+        assert_eq!(
+            parse_line(r#"{"type":"future_event"}"#).unwrap(),
+            Some(ServerMessage::Unknown)
+        );
+        assert!(parse_line("   ").unwrap().is_none() && parse_line("{bad").is_err());
+        let perm = serde_json::to_value(ClientMessage::Permission {
+            id: "c1".into(),
+            decision: PermissionDecision::AllowSession,
+            reason: Some("ok".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            perm,
+            serde_json::json!({"type":"permission","id":"c1","decision":"allow_session","reason":"ok"})
+        );
+        assert_eq!(
+            (
+                format_tokens(1_048_576),
+                price_per_million("0.0000000198"),
+                format_duration(12),
+                format_elapsed(7),
+                format_elapsed(72),
+                format_elapsed(3720),
+                clip_chars("hello\nworld", 20),
+                clip_chars("abcdef", 4),
+            ),
+            (
+                "1.05M".into(),
+                Some("0.0198".into()),
+                "12ms".into(),
+                "7s".into(),
+                "1m12s".into(),
+                "1h02m".into(),
+                "hello world".into(),
+                "abcd...".into(),
+            )
+        );
     }
 
     #[test]
-    fn parses_step() {
-        let line = r#"{"type":"step","name":"inspect_image","call_id":"c1","arguments":{},"ok":true,"text":"20x10","error":null,"error_kind":null,"artifacts":["a.png"]}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Step {
-                name,
-                ok,
-                arguments,
-                text,
-                artifacts,
-                ..
-            }) => {
-                assert_eq!(name, "inspect_image");
-                assert!(ok);
-                assert_eq!(arguments, serde_json::json!({}));
-                assert_eq!(text.as_deref(), Some("20x10"));
-                assert_eq!(artifacts, vec!["a.png".to_string()]);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_thought() {
-        let line = r#"{"type":"thought","text":"check the coast","tokens_per_second":12.5}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Thought {
-                text,
-                tokens_per_second,
-            }) => {
-                assert_eq!(text, "check the coast");
-                assert_eq!(tokens_per_second, Some(12.5));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        let plain = r#"{"type":"thought","text":"check the coast"}"#;
-        match parse_line(plain).unwrap() {
-            Some(ServerMessage::Thought {
-                tokens_per_second, ..
-            }) => assert_eq!(tokens_per_second, None),
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_goal() {
-        let line =
-            r#"{"type":"goal","text":"map the flood","cleared":false,"message":"map the flood"}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Goal {
-                text,
-                cleared,
-                message,
-            }) => {
-                assert_eq!(text, "map the flood");
-                assert!(!cleared);
-                assert_eq!(message, "map the flood");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        let empty = r#"{"type":"goal","text":"","cleared":false,"message":"none is set"}"#;
-        match parse_line(empty).unwrap() {
-            Some(ServerMessage::Goal {
-                text,
-                cleared,
-                message,
-            }) => {
-                assert!(text.is_empty());
-                assert!(!cleared);
-                assert_eq!(message, "none is set");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_skill() {
-        let line = r#"{"type":"skill","name":"flood-check","description":"Check water.","location":"project","active":["flood-check"]}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Skill {
-                name,
-                description,
-                location,
-                active,
-            }) => {
-                assert_eq!(name, "flood-check");
-                assert_eq!(description, "Check water.");
-                assert_eq!(location, "project");
-                assert_eq!(active, vec!["flood-check".to_string()]);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        let omitted = r#"{"type":"skill","name":"flood-check","description":"Check water.","location":"project"}"#;
-        match parse_line(omitted).unwrap() {
-            Some(ServerMessage::Skill { active, .. }) => assert!(active.is_empty()),
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_done() {
-        let line = r#"{"type":"done","response":"hello","stopped_for_limit":false}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Done {
-                response,
-                stopped_for_limit,
-                ..
-            }) => {
-                assert_eq!(response, "hello");
-                assert!(!stopped_for_limit);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_done_stopped_for_context() {
-        let line = r#"{"type":"done","response":"","stopped_for_context":true}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Done {
-                stopped_for_context,
-                ..
-            }) => assert!(stopped_for_context),
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_compacted() {
-        let line = r#"{"type":"compacted","compaction":{"occurred":true,"tokens_reclaimed":50,"tool_results_shortened":1,"messages_dropped":2,"digest_inserted":true,"digest_chars":10},"context_used":7,"context_limit":1000}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Compacted { compaction, status }) => {
-                assert!(compaction.occurred);
-                assert_eq!(compaction.tokens_reclaimed, 50);
-                assert_eq!(compaction.messages_dropped, 2);
-                assert_eq!(status.context_used, 7);
-                assert_eq!(status.context_limit, Some(1000));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+    fn parses_017_compacted_done_step_sessions_and_session_loaded() {
+        let Some(ServerMessage::Compacted { compaction, status }) = parse_line(
+            r#"{"type":"compacted","compaction":{"occurred":true,"tokens_reclaimed":50,"tool_results_shortened":1,"messages_dropped":2,"digest_inserted":true,"digest_chars":10},"status":{"context_used":7,"context_limit":1000}}"#,
+        )
+        .unwrap() else {
+            panic!("expected compacted");
+        };
+        let note = compaction.notice().unwrap();
+        assert!(
+            note.contains("50 tokens reclaimed")
+                && note.contains("2 messages dropped")
+                && note.contains("1 tool results shortened")
+                && note.contains("digest kept (10 chars)")
+                && (status.context_used, status.context_limit) == (7, Some(1000))
+        );
         assert!(matches!(
             parse_line(r#"{"type":"compacted"}"#).unwrap(),
             Some(ServerMessage::Compacted { .. })
         ));
-    }
-
-    #[test]
-    fn parses_compaction_in_done() {
-        let line = r#"{"type":"done","response":"hi","compaction":{"occurred":true,"tokens_reclaimed":123,"tool_results_shortened":2,"messages_dropped":4,"digest_inserted":true,"digest_chars":80}}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Done { compaction, .. }) => {
-                assert!(compaction.occurred);
-                assert_eq!(compaction.tokens_reclaimed, 123);
-                assert_eq!(compaction.tool_results_shortened, 2);
-                assert_eq!(compaction.messages_dropped, 4);
-                assert!(compaction.digest_inserted);
-                assert!(compaction
-                    .notice()
-                    .unwrap()
-                    .contains("123 tokens reclaimed"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_done_status_fields() {
-        let line = r#"{"type":"done","response":"hi","stopped_for_limit":false,"status_line":"context 12/128000  tokens 16 (prompt 12 completion 4)  spend $0.02  8.0 tok/s  http 200  latency 0.50s","context_used":12,"context_limit":128000,"prompt_tokens":12,"completion_tokens":4,"total_tokens":16,"spend":0.02,"tokens_per_second":8.0,"http_status":200,"elapsed_seconds":0.5}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Done { status, .. }) => {
-                assert_eq!(status.context_used, 12);
-                assert_eq!(status.context_limit, Some(128000));
-                assert_eq!(status.prompt_tokens, 12);
-                assert_eq!(status.completion_tokens, 4);
-                assert_eq!(status.http_status, Some(200));
-                let text = status_text(&status);
-                assert!(text.contains("context 12/128000"));
-                assert!(text.contains("prompt 12"));
-                assert!(text.contains("completion 4"));
-                assert!(text.contains("spend $0.02"));
-                assert!(text.contains("tok/s"));
-                assert!(text.contains("http 200"));
-                assert!(text.contains("latency 0.50s"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn default_status_is_not_blank() {
-        let text = default_status_line();
-        assert!(text.contains("context 0/unknown"));
-        assert!(!text.contains("tokens"));
-        assert!(!text.contains("prompt"));
-        assert!(!text.contains("completion"));
-        assert!(text.contains("spend $0"));
-        assert!(!text.contains("spend unknown"));
-        assert!(!text.contains("~$"));
-        assert!(text.contains("last n/a tok/s"));
-        assert!(!text.contains("0.0 tok/s"));
-        assert!(text.contains("tok/s"));
-        assert!(!text.contains("http"));
-        assert!(!text.contains("latency"));
-        assert!(!text.contains("ttft"));
-        assert!(!text.contains("recent"));
-    }
-
-    #[test]
-    fn parses_error() {
-        let line = r#"{"type":"error","message":"OPENROUTER_API_KEY is not set"}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Error { message, .. }) => {
-                assert_eq!(message, "OPENROUTER_API_KEY is not set");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_http_error() {
-        let line = r#"{"type":"error","message":"OpenRouter HTTP 429: slow down","http_status":429,"elapsed_seconds":0.25,"error_body":"slow down","status_line":"http 429  latency 0.25s"}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Error {
-                http_status,
-                error_body,
-                status_line,
-                ..
-            }) => {
-                assert_eq!(http_status, Some(429));
-                assert_eq!(error_body.as_deref(), Some("slow down"));
-                assert!(status_line.contains("http 429"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_model_catalog_failure_without_dropping_fields() {
-        let line =
-            r#"{"type":"models","ok":false,"message":"OpenRouter HTTP 500: down","models":[]}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Models {
-                ok,
-                message,
-                models,
-                ..
-            }) => {
-                assert!(!ok);
-                assert!(message.contains("500"));
-                assert!(models.is_empty());
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_tool_support_and_defaults_missing_flag_to_true() {
-        let line = r#"{"type":"models","ok":true,"models":[{"id":"plain/text","supports_tools":false},{"id":"vendor/model","supports_tools":true},{"id":"legacy/model"}]}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::Models { models, .. }) => {
-                assert!(!models[0].supports_tools);
-                assert!(models[1].supports_tools);
-                assert!(models[2].supports_tools);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_saved_skill() {
-        let line = r#"{"type":"saved_skill","name":"coast-check","description":"compare the coast","scope":"project","path":".atlas/skills-drafts/coast-check/SKILL.md","enabled":false,"enable":"/enable-skill coast-check","note":"replace=True overwrites a draft of the same name, including one written by the author_skill tool."}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::SaveSkill {
-                name,
-                description,
-                scope,
-                path,
-                enabled,
-                enable,
-                note,
-            }) => {
-                assert_eq!(name, "coast-check");
-                assert_eq!(description, "compare the coast");
-                assert_eq!(scope, "project");
-                assert_eq!(path, ".atlas/skills-drafts/coast-check/SKILL.md");
-                assert!(!enabled);
-                assert_eq!(enable, "/enable-skill coast-check");
-                assert!(note.contains("replace=True"));
-                assert!(note.contains("author_skill"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_enabled_skill() {
-        let line = r#"{"type":"enabled_skill","name":"coast-check","path":".atlas/skills/coast-check/SKILL.md","enabled":true,"catalog":"The skill catalog was reloaded."}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::EnabledSkill {
-                name,
-                path,
-                enabled,
-                catalog,
-            }) => {
-                assert_eq!(name, "coast-check");
-                assert_eq!(path, ".atlas/skills/coast-check/SKILL.md");
-                assert!(enabled);
-                assert!(catalog.contains("reloaded"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_enable_preview_before_promotion() {
-        let line = r#"{"type":"enable_preview","name":"coast-check","description":"compare the coast","path":".atlas/skills-drafts/coast-check/SKILL.md","content_sha256":"abcd1234","body":"Replay this procedure","body_characters":21,"body_lines":1,"resources":[{"path":"scripts/run.py","sha256":"abc","characters":9,"lines":1,"text":"print(1)\n","omitted":""}],"confirm":"/enable-skill coast-check confirm abcd1234"}"#;
-        match parse_line(line).unwrap() {
-            Some(ServerMessage::EnablePreview {
-                name,
-                description,
-                path,
-                content_sha256,
-                body,
-                body_characters,
-                body_lines,
-                resources,
-                confirm,
-            }) => {
-                assert_eq!(name, "coast-check");
-                assert_eq!(description, "compare the coast");
-                assert_eq!(path, ".atlas/skills-drafts/coast-check/SKILL.md");
-                assert_eq!(content_sha256, "abcd1234");
-                assert_eq!(body, "Replay this procedure");
-                assert_eq!(body_characters, 21);
-                assert_eq!(body_lines, 1);
-                assert_eq!(
-                    resources,
-                    vec![ResourcePreview {
-                        path: "scripts/run.py".to_string(),
-                        sha256: "abc".to_string(),
-                        characters: 9,
-                        lines: 1,
-                        text: "print(1)\n".to_string(),
-                        omitted: String::new(),
-                    }]
-                );
-                assert_eq!(confirm, "/enable-skill coast-check confirm abcd1234");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ignores_blank_lines() {
-        assert_eq!(parse_line("   ").unwrap(), None);
-        assert_eq!(parse_line("").unwrap(), None);
-    }
-
-    #[test]
-    fn rejects_invalid_json() {
-        assert!(parse_line("not json at all").is_err());
+        assert!(matches!(
+            parse_line(r#"{"type":"done","response":"","stopped_for_context":true,"empty_replies":2,"intent_nudges":1,"compaction":{"occurred":true,"tokens_reclaimed":123}}"#).unwrap(),
+            Some(ServerMessage::Done(d)) if d.stopped_for_context && d.compaction.occurred && d.empty_replies == 2 && d.intent_nudges == 1
+        ));
+        assert!(matches!(
+            parse_line(r#"{"type":"step","name":"bash","ok":true,"notes":["repeated result"],"artifacts":["out.png"]}"#).unwrap(),
+            Some(ServerMessage::Step(s)) if s.notes == ["repeated result"] && s.artifacts == ["out.png"]
+        ));
+        assert!(matches!(
+            parse_line(r#"{"type":"list","kind":"sessions","items":["s1"],"sessions":[{"id":"s1","saved":"2026-11-22","model":"m","messages":4,"prompt":"hello","interrupted":true,"stopped_for_limit":true}]}"#).unwrap(),
+            Some(ServerMessage::List { sessions, .. }) if sessions.len() == 1 && sessions[0].interrupted && sessions[0].stopped_for_limit
+        ));
+        assert!(matches!(
+            parse_line(r#"{"type":"session_loaded","session_id":"s1","model":"m","interrupted":true,"omitted":5,"messages":[]}"#).unwrap(),
+            Some(ServerMessage::SessionLoaded(s)) if s.interrupted && !s.stopped_for_limit && s.omitted == 5
+        ));
     }
 }

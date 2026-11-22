@@ -1,21 +1,11 @@
-"""Per-turn file checkpoints so one bad edit can be undone.
-
-A mutating file tool asks this module to copy the target before it writes.
-The copy lives beside the session artifacts, under
-``<workspace>/.atlas/checkpoints/<session>/<sequence>/<relative path>``, and
-the highest sequence is the one ``restore_latest`` puts back.
-
-Only paths that exist before the write are copied, so a newly created file is
-undone by removing it rather than by restoring bytes. Subagents write into their
-parent's chain, so the parent's undo restores their edits. The shell tool is not
-checkpointed: its targets are not known before it runs.
-"""
+"""Per-turn file checkpoints so bad edits or multi-file patches can be undone."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 
 from atlas.agent.artifacts import LocalArtifactStore
@@ -32,28 +22,18 @@ def _session_name(store: LocalArtifactStore) -> str:
 
 
 def checkpoints_root(store: LocalArtifactStore) -> Path:
-    """Return the checkpoint directory for this session.
-
-    Checkpoints live in the workspace's ``.atlas`` tree, beside artifacts but
-    outside them, so removing a session does not throw away its undo history.
-    """
+    """Return the checkpoint directory for this session under ``.atlas/checkpoints``."""
     return store.root / ".atlas" / "checkpoints" / _session_name(store)
 
 
 def _next_sequence(root: Path) -> int:
     if not root.is_dir():
         return 1
-    numbers = [int(path.name) for path in root.iterdir() if path.is_dir() and path.name.isdigit()]
+    numbers = [int(p.name) for p in root.iterdir() if p.is_dir() and p.name.isdigit()]
     return max(numbers, default=0) + 1
 
 
 def _saved_path(directory: Path, path: str) -> Path:
-    """Return where a checkpoint copy of ``path`` lives under ``directory``.
-
-    A plain relative path keeps its shape so the checkpoint is easy to
-    inspect. An absolute path or a ``..`` traversal gets a digest name, since
-    neither can be joined beneath the checkpoint directory safely.
-    """
     candidate = Path(path).expanduser()
     if not candidate.is_absolute() and ".." not in candidate.parts:
         return directory / candidate
@@ -61,68 +41,87 @@ def _saved_path(directory: Path, path: str) -> Path:
     return directory / "external" / f"{digest}.bin"
 
 
-def snapshot(store: LocalArtifactStore, relative_path: str) -> None:
-    """Copy one file before a mutating tool changes it.
-
-    A path that does not exist yet is recorded without bytes so a restore can
-    delete it. A symlink or a non-regular file is not copied and does not
-    raise.
-
-    Args:
-        store: Session store whose working tree and artifacts bound the copy.
-        relative_path: Path the tool is about to change.
-    """
-    # Sequence allocation is race-free only because writing children are serialised.
+def _record_file(
+    directory: Path, store: LocalArtifactStore, relative_path: str
+) -> dict[str, object] | None:
     source = store.resolve_read(relative_path)
     if source.is_symlink() or (source.exists() and not source.is_file()):
-        return
-    root = checkpoints_root(store) / str(_next_sequence(checkpoints_root(store)))
-    entry: dict[str, object] = {"path": Path(relative_path).as_posix()}
+        return None
+    entry: dict[str, object] = {"path": Path(relative_path).as_posix(), "existed": False}
     if source.is_file():
-        destination = _saved_path(root, relative_path)
+        destination = _saved_path(directory, relative_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
         entry["existed"] = True
-    else:
-        entry["existed"] = False
+    return entry
+
+
+def snapshot(store: LocalArtifactStore, relative_path: str) -> None:
+    """Copy one file before a mutating tool changes it."""
+    base = checkpoints_root(store)
+    root = base / str(_next_sequence(base))
+    entry = _record_file(root, store, relative_path)
+    if entry is None:
+        return
     root.mkdir(parents=True, exist_ok=True)
     (root / _MANIFEST).write_text(json.dumps(entry) + "\n", encoding="utf-8")
 
 
+def snapshot_many(store: LocalArtifactStore, paths: Sequence[str]) -> None:
+    """Snapshot one or more target paths as a single undoable checkpoint."""
+    unique = [p for p in dict.fromkeys(paths) if p]
+    if not unique:
+        return
+    if len(unique) == 1:
+        snapshot(store, unique[0])
+        return
+    base = checkpoints_root(store)
+    root = base / str(_next_sequence(base))
+    entries = [entry for rel in unique if (entry := _record_file(root, store, rel)) is not None]
+    if not entries:
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    (root / _MANIFEST).write_text(json.dumps({"files": entries}) + "\n", encoding="utf-8")
+
+
+def _restore_entry(
+    directory: Path, store: LocalArtifactStore, entry: dict[str, object]
+) -> str | None:
+    relative = str(entry.get("path") or "")
+    if not relative:
+        return None
+    target = store.resolve(relative)
+    saved = _saved_path(directory, relative)
+    if entry.get("existed") and saved.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(saved, target)
+    elif not entry.get("existed"):
+        target.unlink(missing_ok=True)
+    return relative
+
+
 def restore_latest(store: LocalArtifactStore) -> str | None:
-    """Restore the newest checkpoint and remove it.
-
-    Args:
-        store: Session store to restore into.
-
-    Returns:
-        The restored workspace-relative path, or None when no checkpoint
-        exists.
-    """
+    """Restore the newest checkpoint (single or multi-file) and remove it."""
     root = checkpoints_root(store)
     if not root.is_dir():
         return None
     sequences = sorted(
-        (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
-        key=lambda path: int(path.name),
+        (p for p in root.iterdir() if p.is_dir() and p.name.isdigit()),
+        key=lambda p: int(p.name),
     )
     for directory in reversed(sequences):
         manifest = directory / _MANIFEST
         if not manifest.is_file():
             shutil.rmtree(directory, ignore_errors=True)
             continue
-        entry = json.loads(manifest.read_text(encoding="utf-8"))
-        relative = str(entry.get("path") or "")
-        if not relative:
-            shutil.rmtree(directory, ignore_errors=True)
-            continue
-        target = store.resolve(relative)
-        saved = _saved_path(directory, relative)
-        if entry.get("existed") and saved.is_file():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(saved, target)
-        elif not entry.get("existed"):
-            target.unlink(missing_ok=True)
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        entries = data["files"] if isinstance(data.get("files"), list) else [data]
+        restored = [
+            rel
+            for item in entries
+            if isinstance(item, dict) and (rel := _restore_entry(directory, store, item))
+        ]
         shutil.rmtree(directory, ignore_errors=True)
-        return relative
+        if restored:
+            return restored[0] if len(restored) == 1 else ", ".join(restored)
     return None
